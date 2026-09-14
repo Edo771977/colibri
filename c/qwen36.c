@@ -61,7 +61,8 @@ static int qwen36_max_ctx(void) {
 #include "cli_args.h"
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
-#include "qwen36_tier.h"   /* optional transparent Vulkan compute backend for MoE experts */
+#include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
+#include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -615,7 +616,10 @@ typedef struct {
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
-typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; float *gs, *us, *ds; uint64_t used; } Slot;
+/* pw: the expert as expert_ffn.h wants it (planar int4, gate|up|down), the
+ * only weight copy a slot holds when the shared kernel is active; g/u/d and
+ * g4/u4/d4 are then NULL. */
+typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used; } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -734,6 +738,7 @@ static int tm_on(void){ if(g_timers<0){ const char *e=getenv("COLI_TIMERS"); g_t
 double g_qt_iss=0, g_qt_cpu=0, g_qt_tak=0;   /* QTIER-Phasen (Decode) */
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
 double g_tm_step=0;                           /* step() total (decode) */
+static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
 static double g_tm_win_moe=0; static int g_tm_win_n=0;
 static void tm_add(int S, int idx, double ms){
     if(S==1){
@@ -763,6 +768,9 @@ static void tm_report(void){
     if(g_dn_sub[0]+g_dn_sub[1]+g_dn_sub[2]+g_dn_sub[3]>0)
         fprintf(stderr,"[timers]   dn-sub: proj %.1f | conv %.1f | l2n+rec %.1f | norm+out %.1f ms/token\n",
             g_dn_sub[0]/g_tm_dec_tokens,g_dn_sub[1]/g_tm_dec_tokens,g_dn_sub[2]/g_tm_dec_tokens,g_dn_sub[3]/g_tm_dec_tokens);
+    if(g_xf_load+g_xf_run>0)
+        fprintf(stderr,"[timers]   expert kernel: fetch %.2f | compute %.2f ms/token\n",
+                g_xf_load/g_tm_dec_tokens, g_xf_run/g_tm_dec_tokens);
     if(g_qt_iss+g_qt_cpu+g_qt_tak>0)
         fprintf(stderr,"[timers]   qtier: issue %.2f | cpu-miss %.2f | take %.2f ms/token\n",
                 g_qt_iss/g_tm_dec_tokens, g_qt_cpu/g_tm_dec_tokens, g_qt_tak/g_tm_dec_tokens);
@@ -959,6 +967,37 @@ static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load *
  * Same signal main's nbytes probe and tier_warmstart receive; the decode path
  * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
 static int g_expert_is_int4 = 1;
+
+/* Shared expert kernel (expert_ffn.h): routed experts stay planar int4 in
+ * RAM and a layer runs as (expert, row-chunk) items. On by default for an
+ * int4 gs=64 container whose widths are multiples of 64, off under the CUDA
+ * expert tier (it uploads the pair-layout int4 and computes misses from the
+ * int8 copy) and with QWEN_EXPERT_KERNEL=0, which keeps the historical
+ * unpack-to-int8 path for A/Bs. Decided once from the container itself. */
+static int container_layer_is_int4(Model *m, int layer);
+static int xf_mode(Model *m) {
+    static int v = -1;
+    if (v >= 0) return v;
+    const char *e = getenv("QWEN_EXPERT_KERNEL");
+    int on = !(e && *e == '0');
+#ifdef COLI_CUDA
+    { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') on = 0; }
+#endif
+    Cfg *c = &m->c;
+    if (c->expert_gs != XF_BLOCK || !xf_layout_ok(c->hidden) || !xf_layout_ok(c->inter)) on = 0;
+    if (on) {
+        int probe = -1;
+        for (int l = 0; l < c->n_layers && probe < 0; l++) {
+            char nm[256];
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.0.merged_weight", m->active_of[l]);
+            if (st_find(&m->S, nm)) probe = container_layer_is_int4(m, m->active_of[l]);
+        }
+        if (probe != 1) on = 0;
+    }
+    v = on;
+    if (v) fprintf(stderr, "[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack\n");
+    return v;
+}
 
 /* The single offer decision the decode path makes for a routed expert: offer
  * whichever format the container actually packed, exactly what tier_warmstart
@@ -1417,10 +1456,19 @@ static int64_t scale_count_gu(const Cfg *c){ return c->expert_gs ? (int64_t)c->i
 static int64_t scale_count_d (const Cfg *c){ return c->expert_gs ? (int64_t)c->hidden * ((c->inter  + c->expert_gs - 1) / c->expert_gs) : c->hidden; }
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
-    if (s->g) return;
+    if (s->g || s->pw) return;
     Cfg *c = &m->c;
     int64_t ng = (int64_t)c->inter * c->hidden;
     int64_t nd = (int64_t)c->hidden * c->inter;
+    if (xf_mode(m)) {
+        /* half the bytes of the int8 block: the int4 stays packed */
+        s->pw = malloc((size_t)(ng + ng + nd) / 2);
+        if (!s->pw) { fprintf(stderr, "Error: OOM allocating slot weights\n"); exit(1); }
+        float *s_block = falloc(2*scale_count_gu(c) + scale_count_d(c));
+        s->gs = s_block; s->us = s_block + scale_count_gu(c); s->ds = s_block + 2*scale_count_gu(c);
+        s->pinned = 0; s->is_int4 = 1; s->g = s->u = s->d = NULL; s->g4 = s->u4 = s->d4 = NULL;
+        return;
+    }
     int8_t *w_block = malloc(ng + ng + nd);
     if (!w_block) { fprintf(stderr, "Error: OOM allocating slot weights\n"); exit(1); }
     s->g = w_block;
@@ -1517,10 +1565,21 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
        each nibble is signed 4-bit (sign-extend if bit3 set). */
     if (tw->nbytes == want_w / 2) {
         static int noted = 0;
-        if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — unpacking to int8 in slot\n"); noted = 1; }
+        if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — %s\n", s->pw ? "kept int4, repacked planar for expert_ffn.h" : "unpacking to int8 in slot"); noted = 1; }
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
         st_read_raw(&m->S, nm, raw, 1);
+        if (s->pw) {
+            /* shared kernel: pairs -> planar, never int8 */
+            int64_t gp = ng / 2;
+            xf_repack_pairs_signed(s->pw,          raw,          cc->inter,  cc->hidden);
+            xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  cc->hidden);
+            xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, cc->hidden, cc->inter);
+            s->is_int4 = 1;
+            free(raw);
+            st_read_f32(&m->S, qsnm, s->gs, 0);
+            return;
+        }
         unpack_int4_to_int8(s->g, raw, want_w);
         s->is_int4 = 1;
         /* Free any previous occupant first (LRU slot reuse). */
@@ -1930,6 +1989,51 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
 /* MoE: grouped top-k routing (+ optional router bias) + shared expert.
  * Mirrors HF Qwen3 MoE: softmax(gate), optional group-limited top-k, normalized
  * weights, sum routed experts, then add the un-gated shared expert. */
+/* One MoE layer through expert_ffn.h. The experts a run holds must all be
+ * resident at once, so the batch is cut to what the layer cache can hold:
+ * the whole prompt chunk when cap covers S*K slots, one token when it covers
+ * K, one (token, expert) pair otherwise (cap=1 in CI evicts on every routed
+ * expert). A pair run adds val*expert into out exactly as the per-token loop
+ * did: out starts at zero and the kernel's rank-order sum is one fma per
+ * element, so the three cuts produce the same bits. */
+static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
+    Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
+    int cap = m->cache[layer].cap;
+    int64_t gp = (int64_t)F * D / 2;
+    int per = cap >= S * K ? S : 1;           /* tokens per run */
+    int kper = cap >= K ? K : 1;              /* experts per run */
+    int n = per * kper;
+    XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
+    const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
+    int *ridx = malloc(sizeof(int) * (size_t)n); float *rval = falloc(n);
+    float *tmp = kper < K ? falloc(D) : NULL;
+    void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
+    if (!ex || !exp || !ridx || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
+    int timed = tm_on() && S == 1;
+    for (int s0 = 0; s0 < S; s0 += per) {
+        for (int k0 = 0; k0 < K; k0 += kper) {
+            double t0 = timed ? tm_now() : 0;
+            for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
+                int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
+                ridx[dst] = idx[src]; rval[dst] = val[src]; exp[dst] = NULL;
+                if (idx[src] < 0) continue;
+                Slot *e; expert_get(m, layer, idx[src], &e);
+                ex[dst].g4 = e->pw; ex[dst].u4 = e->pw + gp; ex[dst].d4 = e->pw + 2 * gp;
+                ex[dst].gs = e->gs; ex[dst].us = e->us; ex[dst].ds = e->ds;
+                exp[dst] = &ex[dst];
+            }
+            double t1 = timed ? tm_now() : 0;
+            if (kper == K) xf_moe_run(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, K, D, F, ridx, rval, exp, 0, scratch);
+            else {
+                xf_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, 0, scratch);
+                float *os = out + (int64_t)s0 * D; for (int d = 0; d < D; d++) os[d] += tmp[d];
+            }
+            if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
+        }
+    }
+    free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
@@ -1943,6 +2047,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
     int use_qt = qt_ready();
+    int use_xf = !use_qt && xf_mode(m);
+    int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
+    float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
@@ -1993,7 +2100,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
         const float *xs = x + (int64_t)s*D;
-        if (use_qt) {
+        if (use_xf) {
+            for (int kk = 0; kk < K; kk++) { xidx[s*K+kk] = idx[kk]; xval[s*K+kk] = val[kk]; }
+        } else if (use_qt) {
             /* CUDA expert tier: run the resident experts as async groups on
              * all devices, compute the misses on the CPU (overlapped), then
              * collect the GPU results. */
@@ -2059,6 +2168,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
     }
+    if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
@@ -3187,6 +3297,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         LCache *cache = &model->cache[layer];
         for (int slot = 0; slot < cache->n; slot++) {
             free(cache->slots[slot].g);
+            free(cache->slots[slot].pw);
             free(cache->slots[slot].gs);
             free(cache->slots[slot].g4);
             free(cache->slots[slot].u4);
