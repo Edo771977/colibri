@@ -467,6 +467,7 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 | `COLI_QUEUE_TIMEOUT` | `300` | Seconds a request may wait in the queue. |
 | `COLI_KV_SLOTS` | `1` | Independent KV conversation slots (→ engine `KV_SLOTS`). |
 | `COLI_POLICY` | `quality` | Resource policy (shared with the engine): `quality` \| `balanced` \| `experimental-fast`. |
+| `COLI_CHAT_STATS` | `full` | Default for `coli chat --stats`: the footer after each answer. `full` = tokens, seconds, tok/s; `compact` = tokens, tok/s; `off` = no footer. Counts are exact (no `~`) when the server reports `completion_tokens` in the streamed usage block, the chars/4 estimate otherwise. The flag wins over the variable. |
 | `COLI_COLOR` | auto (TTY) | `COLI_COLOR=1` forces colored `coli` output when not a TTY. |
 | `COLI_RAW` | `0` | `coli` raw output mode. |
 

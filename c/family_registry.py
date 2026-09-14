@@ -1457,7 +1457,11 @@ def resolve_model(model_dir):
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except OSError as error:
-        raise FamilyConfigError(f"cannot read config.json: {model}") from error
+        raise FamilyConfigError(
+            f"cannot read config.json: {model}\n"
+            "  coli picks the engine from config.json, so nothing runs without it. Copy the\n"
+            "  checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)\n"
+            "  from the model repo next to the shards.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
     family = family_for_config(config)

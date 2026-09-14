@@ -68,6 +68,7 @@
 
 #include "cli_args.h"
 #include "json.h"
+#include "stop_ids.h"
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
@@ -2331,31 +2332,21 @@ static int argmax(const float *v, int n) {
 
 /* Gli id di fine generazione. GLM ne dichiara piu' di uno (fine turno, fine
  * testo, fine blocco strumenti) e fermarsi solo sul primo vuol dire vedere il
- * modello continuare a parlare oltre la sua risposta. */
+ * modello continuare a parlare oltre la sua risposta. Vengono da
+ * generation_config.json, o da config.json (top level o text_config) quando
+ * quel file non c'e': un container convertito senza generation_config.json
+ * non si fermava mai (#1478). */
 static int load_stops(const char *dir, int *out, int max) {
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/generation_config.json", dir);
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
-    char *text = malloc((size_t)size + 1);
-    if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) {
-        free(text); fclose(f); return 0;
+    const char *source = "";
+    int n = coli_load_stop_ids(dir, out, max, &source);
+    static int noted = 0;
+    if (!noted) {
+        noted = 1;
+        if (n) fprintf(stderr, "[glm53] %d stop id(s) from %s\n", n, source);
+        else fprintf(stderr, "[glm53] no eos_token_id in generation_config.json or config.json: "
+                             "generation stops only at the token limit\n");
     }
-    text[size] = 0; fclose(f);
-    char *arena = NULL;
-    jval *root = json_parse(text, &arena);
-    int found = 0;
-    if (root && root->t == J_OBJ) {
-        jval *eos = json_get(root, "eos_token_id");
-        if (eos && eos->t == J_NUM && found < max) out[found++] = (int)eos->num;
-        else if (eos && eos->t == J_ARR)
-            for (int i = 0; i < eos->len && found < max; i++)
-                if (eos->kids[i]->t == J_NUM) out[found++] = (int)eos->kids[i]->num;
-    }
-    free(arena);
-    free(text);
-    return found;
+    return n;
 }
 
 /* ================= protocollo serve =================

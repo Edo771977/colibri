@@ -54,6 +54,30 @@ class CliOutputLanguageTest(unittest.TestCase):
         self.assertIn("disk", result.stdout)
         self.assertIn("engine", result.stdout)
 
+    def test_info_without_config_names_no_engine(self):
+        """A directory of shards without config.json used to show the GLM engine
+        as if it were the one to run: the family is unknown, so the engine is
+        unknown, and the line must say what to copy where."""
+        with tempfile.TemporaryDirectory() as model:
+            for i in (1, 2):
+                (Path(model) / f"model-0000{i}-of-00002.safetensors").write_bytes(b"\0" * 8)
+            result = self.run_cli("info", "--model", model)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unknown until config.json is present", result.stdout)
+        self.assertIn("2 shard(s) found here", result.stdout)
+        self.assertIn("model.safetensors.index.json", result.stdout)
+        self.assertNotIn("ready", result.stdout)
+        self.assertNotIn("not built", result.stdout)
+
+    def test_chat_without_config_says_what_to_copy(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "tokenizer.json").write_text("{}", encoding="utf-8")
+            result = self.run_cli("run", "--model", model, "hello")
+        self.assertNotEqual(result.returncode, 0)
+        out = result.stdout + result.stderr
+        self.assertIn("cannot read config.json", out)
+        self.assertIn("coli picks the engine from config.json", out)
+
     def test_info_reads_registered_nested_text_config(self):
         with tempfile.TemporaryDirectory() as model:
             (Path(model) / "config.json").write_text(json.dumps({
