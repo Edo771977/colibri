@@ -472,6 +472,35 @@ jobs:
             echo "FAIL: sanitizer diagnostic under PILOT"; cat san.log; exit 1
           fi
           echo "sanitizers clean:"; grep -E "Matching tokens" san.log || true
+      - name: Expert kernel A/B on an int4 gs64 fixture (old path vs expert_ffn.h, byte-identical ids)
+        run: |
+          cd c
+          make clean >/dev/null 2>&1 || true
+          make qwen36
+          # The int8 gate above never enters the shared kernel (it needs an int4
+          # gs=64 container with widths that are multiples of 64: the default
+          # tiny has inter=32). This fixture does. The reference is the same
+          # torch model, but what this step asserts is not oracle agreement
+          # (int4 experts drift from f32 by design): it is that the kernel and
+          # the unpack-to-int8 path it replaces emit the SAME ids at every cap,
+          # including cap=1 (one expert resident: the per-pair cut) and cap=16
+          # (the whole prompt in one run).
+          python3 tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 \
+                  --emit-ref qwen36_tiny64/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+          for cap in 1 2 8 16; do
+            for k in 0 1; do
+              QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c \
+                ./qwen36 "$cap" 4 qwen36_tiny64/ref_full.json > ab_${cap}_$k.log 2>&1 || true
+              grep -E "^C engine" ab_${cap}_$k.log > ids_${cap}_$k.txt
+            done
+            grep -q "expert kernel: planar int4" ab_${cap}_1.log || { echo "FAIL: kernel did not engage at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
+            grep -q "expert kernel: planar int4" ab_${cap}_0.log && { echo "FAIL: QWEN_EXPERT_KERNEL=0 still engaged the kernel"; exit 1; }
+            test -s ids_${cap}_1.txt || { echo "FAIL: no ids at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
+            cmp ids_${cap}_0.txt ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; cat ids_${cap}_0.txt ids_${cap}_1.txt; exit 1; }
+            echo "cap=$cap: identical ($(cat ids_${cap}_1.txt))"
+          done
+          make tests/test_expert_ffn && ./tests/test_expert_ffn
       - name: A malformed container is refused, not read
         run: |
           cd c
@@ -673,6 +702,8 @@ jobs:
         run: pip install -r c/tools/requirements-qwen38-tiny.txt
       - name: Generate the upstream text fixture and run the token-and-logit oracle
         run: make -C c qwen38-tiny-check
+      - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
+        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check
       - name: Repeat the eviction path under ASan and UBSan
         run: |
           cd c

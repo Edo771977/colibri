@@ -617,6 +617,7 @@ c/
 │
 ├── st.h                  safetensors index and range reads
 ├── quant.h               canonical container decoders
+├── expert_ffn.h          routed-expert FFN kernel shared by the MoE engines (planar int4, layer runner)
 ├── tok.h, json.h         tokenizer and JSON parser
 ├── compat.h              Windows/macOS shims (POSIX names, one place)
 ├── expert_store.h        streaming expert cache
