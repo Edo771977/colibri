@@ -423,6 +423,15 @@ def operator_cap(a, arch):
         cap=0
     return cap if cap else None
 
+def _accelerator_env(env):
+    """True when the launch environment selects a GPU path (CUDA, Metal,
+    Vulkan). COLI_GPU/COLI_GPUS count by presence: "0" names device 0."""
+    def on(key):
+        return str(env.get(key, "")).strip() not in ("", "0")
+    return (on("COLI_CUDA") or on("COLI_METAL") or on("COLI_VULKAN")
+            or on("CUDA_EXPERT_GB") or "COLI_GPU" in env or "COLI_GPUS" in env)
+
+
 def env_for_engine(a, arch, plan=None):
     if arch == "glm":
         return env_for(a)
@@ -558,6 +567,17 @@ def env_for_engine(a, arch, plan=None):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
+    if (sys.platform == "win32" and arch != "deepseek_v4"
+            and not env.get("COLI_NO_OMP_TUNE") and not _accelerator_env(env)):
+        # CPU-only sister engines on Windows: the hot-team defaults env_for()
+        # gives GLM. libgomp reads them before main() and no sister engine
+        # re-execs itself to seed them, so they have to come from here.
+        # Not under CUDA/Metal/Vulkan: active spin contends with GPU dispatch
+        # and synchronization (docs/tuning.md, hybrid CUDA/CPU override).
+        for k, v in (("OMP_WAIT_POLICY", "active"),
+                     ("GOMP_SPINCOUNT", "200000"),
+                     ("OMP_DYNAMIC", "FALSE")):
+            env.setdefault(k, v)
     if getattr(a, "auto_tier", False):
         # GLM has historically applied both the resource plan and its measured
         # profile inside env_for().  The sibling launcher returned above that
