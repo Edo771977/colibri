@@ -361,6 +361,29 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
                     env = self.coli.env_for_engine(self.args(), arch)
                     self.assertEqual(env.get("OMP_NUM_THREADS"), "6")
 
+    def test_other_engines_get_hot_team_on_windows_only(self):
+        for platform, expected in (("win32", "active"), ("linux", None)):
+            with self.subTest(platform=platform), \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(self.coli.sys, "platform", platform), \
+                 mock.patch("resource_plan.physical_cpu_count", return_value=6):
+                env = self.coli.env_for_engine(self.args(), "olmoe")
+                self.assertEqual(env.get("OMP_WAIT_POLICY"), expected)
+                self.assertEqual(env.get("GOMP_SPINCOUNT"),
+                                 "200000" if expected else None)
+
+    def test_other_engines_hot_team_respects_overrides(self):
+        with mock.patch.dict(os.environ, {"OMP_WAIT_POLICY": "passive"}, clear=True), \
+             mock.patch.object(self.coli.sys, "platform", "win32"), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=6):
+            env = self.coli.env_for_engine(self.args(), "olmoe")
+        self.assertEqual(env["OMP_WAIT_POLICY"], "passive")
+        with mock.patch.dict(os.environ, {"COLI_NO_OMP_TUNE": "1"}, clear=True), \
+             mock.patch.object(self.coli.sys, "platform", "win32"):
+            env = self.coli.env_for_engine(self.args(), "olmoe")
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT", "OMP_DYNAMIC"):
+            self.assertNotIn(key, env)
+
     def test_v4_delegates_thread_team_to_runtime(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
              mock.patch("resource_plan.physical_cpu_count",

@@ -456,6 +456,14 @@ def env_for_engine(a, arch, plan=None):
         if arch != "deepseek_v4":
             from resource_plan import physical_cpu_count
             env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+            if sys.platform == "win32":
+                # Same hot-team defaults env_for() gives GLM on Windows: libgomp
+                # reads them before main(), and no sister engine re-execs itself
+                # to seed them, so on Windows they have to come from here.
+                for k, v in (("OMP_WAIT_POLICY", "active"),
+                             ("GOMP_SPINCOUNT", "200000"),
+                             ("OMP_DYNAMIC", "FALSE")):
+                    env.setdefault(k, v)
         else:
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
