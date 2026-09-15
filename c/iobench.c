@@ -19,12 +19,14 @@
 #include <omp.h>
 #endif
 static double now(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
-/* Un fd PER THREAD, non uno condiviso. Su Windows compat_open_direct() apre un
+/* Un fd PER THREAD, non uno condiviso. Su Windows compat_open_direct() apriva un
  * handle SINCRONO (FILE_FLAG_NO_BUFFERING senza FILE_FLAG_OVERLAPPED), e ReadFile
  * su un handle sincrono viene serializzato dal lock dell'oggetto file: con un fd
  * condiviso il parametro [threads] non aveva alcun effetto e la misura restava
- * sempre a queue-depth 1. Su Linux/macOS la pread posizionale gia' concorre; un
- * fd per thread e' comunque corretto e non costa nulla. */
+ * sempre a queue-depth 1. Ora l'handle diretto e' OVERLAPPED (compat.h) e un fd
+ * condiviso concorre anche li'; IOBENCH_SHARED=1 misura proprio quel caso, e
+ * COLI_WIN_SYNC_DIRECT=1 riapre il vecchio handle sincrono per il confronto.
+ * Su Linux/macOS la pread posizionale gia' concorre. */
 static int bench_open(const char *path, int *direct){
 #ifdef O_DIRECT
     int fd=open(path,O_RDONLY|(*direct?O_DIRECT:0));
@@ -67,22 +69,28 @@ int main(int argc,char**argv){
      * copre solo i primi 134 MB del file (tutti in page cache = misura falsa). */
     off_t *offs=malloc(n*sizeof(off_t)); srand(1234);
     for(int i=0;i<n;i++){ off_t r30=((off_t)rand()<<15)|rand(); off_t o=(r30*4096)%(sz-blk); offs[i]=o&~4095L; }
+    /* IOBENCH_SHARED=1: tutti i thread leggono dallo STESSO fd, come fa il motore
+     * (st.h apre un fd diretto per shard). Confrontato col default (fd per thread)
+     * dice se le letture concorrenti su un fd condiviso arrivano davvero al disco
+     * in parallelo: su Windows con l'handle sincrono restavano a queue-depth 1. */
+    const char *shared_env=getenv("IOBENCH_SHARED");
+    int shared=shared_env && *shared_env && strcmp(shared_env,"0")!=0;
     double t0=now(); int64_t tot=0;   /* long e' 32-bit su Windows (LLP64): >2GB andava in overflow */
     #pragma omp parallel num_threads(nth) reduction(+:tot)
     {
         void *buf; if(posix_memalign(&buf,4096,blk)){perror("memalign");exit(1);}
-        int d2=direct, tfd=bench_open(argv[1],&d2);   /* fd privato: vedi bench_open */
+        int d2=direct, tfd=shared?fd:bench_open(argv[1],&d2);   /* fd privato: vedi bench_open */
         if(tfd<0){perror("open");exit(1);}
         #pragma omp for schedule(dynamic,1)
         for(int i=0;i<n;i++){
             ssize_t r=pread(tfd,buf,blk,offs[i]);
             if(r<0) perror("pread"); else tot+=r;
         }
-        close(tfd);
+        if(!shared) close(tfd);
         compat_aligned_free(buf);   /* su Windows posix_memalign=_aligned_malloc: free() corrompe l'heap */
     }
     double dt=now()-t0;
-    printf("%s x%d threads: %d reads x %.4g MB = %.1f GB in %.2fs -> %.2f GB/s (%.1f effective ms/block)\n",
-        direct?"O_DIRECT":"buffered", nth, n, blk/1048576.0, tot/1e9, dt, tot/1e9/dt, dt/n*1000);
+    printf("%s x%d threads (%s fd): %d reads x %.4g MB = %.1f GB in %.2fs -> %.2f GB/s (%.1f effective ms/block)\n",
+        direct?"O_DIRECT":"buffered", nth, shared?"shared":"per-thread", n, blk/1048576.0, tot/1e9, dt, tot/1e9/dt, dt/n*1000);
     close(fd); free(offs); return 0;
 }
