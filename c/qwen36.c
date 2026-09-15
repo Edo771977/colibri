@@ -632,6 +632,7 @@ typedef struct {
     shards S;
     int quant_bits;
     float *embed, *lm_head, *final_norm;
+    int8_t *embed_q; float *embed_sc;   /* QWEN36_EMBED_I8=1: per-row int8 embedding, embed == NULL */
     Layer *L;
     LCache *cache;          /* [n_layers] */
     int *active_of;         /* [n_layers] original->active idx (Phase 2: identity for all layers) */
@@ -1076,6 +1077,7 @@ static int dense_i8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("CO
 static int dense_batch_on(void){ const char *e=getenv("QWEN_DENSE_BATCH"); return !(e&&*e=='0'); }
 static void qdw_register(const float *W, int I, int O){
     if (!W || !dense_i8_on() || g_qdw_n >= QDW_MAX) return;
+    for (int i = 0; i < g_qdw_n; i++) if (g_qdw[i].w == W) return;   /* already quantized at load */
     int8_t *q = malloc((size_t)O*I); float *sc = malloc((size_t)O*sizeof(float));
     if (!q || !sc) { free(q); free(sc); return; }
     #pragma omp parallel for schedule(static)
@@ -1087,6 +1089,54 @@ static void qdw_register(const float *W, int I, int O){
         for (int i = 0; i < I; i++) { int v = (int)lrintf(r[i]*inv); if (v>127) v=127; if (v<-127) v=-127; d[i] = (int8_t)v; }
     }
     g_qdw[g_qdw_n].w=W; g_qdw[g_qdw_n].q=q; g_qdw[g_qdw_n].sc=sc; g_qdw[g_qdw_n].I=I; g_qdw[g_qdw_n].O=O; g_qdw_n++;
+}
+
+/* Quantize-at-load. main() used to load EVERY dense f32 matrix, then quantize
+ * them all, then free the f32 originals: at the peak the whole f32 trunk and its
+ * whole int8 copy were resident together (closed #1218 measured VmHWM
+ * 11.6 -> 5.1 GiB on this model by interleaving the two). With g_qdw_incremental
+ * set, model_init_range quantizes each matrix right after reading it and shrinks
+ * the f32 block to one float. Same qdw_register on the same bytes, so the int8
+ * weights are bit-identical; only the peak moves.
+ *
+ * The f32 pointer is the lookup key in matmul_d, so it must stay a LIVE, unique
+ * allocation: freeing it here would let the next load_t_n reuse the address for
+ * another matrix and alias two registry entries. realloc to one float keeps the
+ * key alive for a few bytes; main's free loop releases it as before.
+ * QWEN36_QUANT_AT_LOAD=0 restores the old order (A/B, CI identity check). */
+static int g_qdw_incremental = 0;
+static double g_qdw_freed_at_load = 0;
+static void qdw_take(float **Wp, int I, int O){
+    if (!g_qdw_incremental || !Wp || !*Wp) return;
+    int before = g_qdw_n;
+    qdw_register(*Wp, I, O);
+    if (g_qdw_n == before) return;                 /* not registered: keep the f32 path */
+    float *t = realloc(*Wp, sizeof(float));
+    if (t) { *Wp = t; g_qdw[g_qdw_n-1].w = t; g_qdw_freed_at_load += (double)I*O*sizeof(float); }
+}
+
+/* QWEN36_EMBED_I8=1 (opt-in): the embedding table is the largest dense tensor
+ * left in f32 after dense-i8 (vocab x hidden: ~1.9 GB on the 35B), and it is
+ * only ever gathered one row per token. Per-row symmetric int8, the same scheme
+ * qdw_register uses for lm_head, cuts it to ~0.47 GB. Unlike quantize-at-load
+ * this CHANGES the numbers (every input row is dequantized), so it stays off by
+ * default: measure output quality before relying on it. */
+static void embed_quantize(Model *m){
+    if (!m->embed) return;
+    int V = m->c.vocab, D = m->c.hidden;
+    int8_t *q = malloc((size_t)V * D); float *sc = malloc((size_t)V * sizeof(float));
+    if (!q || !sc) { free(q); free(sc); fprintf(stderr, "[embed-i8] out of memory, keeping f32\n"); return; }
+    #pragma omp parallel for schedule(static)
+    for (int v = 0; v < V; v++) {
+        const float *r = m->embed + (int64_t)v*D; float am = 0.f;
+        for (int i = 0; i < D; i++) { float a = fabsf(r[i]); if (a > am) am = a; }
+        float s = am > 1e-12f ? am/127.f : 1.f; sc[v] = s; float inv = 1.f/s;
+        int8_t *d = q + (int64_t)v*D;
+        for (int i = 0; i < D; i++) { int x = (int)lrintf(r[i]*inv); if (x>127) x=127; if (x<-127) x=-127; d[i] = (int8_t)x; }
+    }
+    free(m->embed); m->embed = NULL; m->embed_q = q; m->embed_sc = sc;
+    fprintf(stderr, "[embed-i8] embedding quantized to int8: %.2f GB -> %.2f GB (opt-in, changes numerics)\n",
+            (double)V*D*sizeof(float)/1073741824.0, ((double)V*D + (double)V*sizeof(float))/1073741824.0);
 }
 static void matmul_d(float *y, const float *x, const float *W, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
@@ -1345,6 +1395,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     if (load_boundaries) {
         m->embed      = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
         m->lm_head    = load_t_n(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
+        qdw_take(&m->lm_head, c->hidden, c->vocab);
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
     }
     m->L = calloc((size_t)c->n_layers, sizeof(Layer));
@@ -1409,6 +1460,18 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             LD4(dn_out, "out_proj.weight",    (int64_t)c->hidden * vdim_tot);
             #undef LD4
         }
+        /* same matrices and shapes main() registers after load (quantize-at-load) */
+        qdw_take(&l->q, c->hidden, c->q_heads * c->q_head_dim);
+        qdw_take(&l->k, c->hidden, c->kv_heads * c->k_head_dim);
+        qdw_take(&l->v, c->hidden, c->kv_heads * c->k_head_dim);
+        qdw_take(&l->o, c->o_in, c->hidden);
+        qdw_take(&l->gate, c->hidden, c->n_experts);
+        qdw_take(&l->sh_g, c->hidden, c->shared_inter);
+        qdw_take(&l->sh_u, c->hidden, c->shared_inter);
+        qdw_take(&l->sh_d, c->shared_inter, c->hidden);
+        qdw_take(&l->dn_qkv, c->hidden, c->dn_conv_dim);
+        qdw_take(&l->dn_z, c->hidden, c->dn_vheads * c->dn_vdim);
+        qdw_take(&l->dn_out, c->dn_vheads * c->dn_vdim, c->hidden);
     }
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
@@ -2410,7 +2473,11 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
                     ids[s], c->vocab - 1);
             exit(1);
         }
-        memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+        if (m->embed_q) {
+            const int8_t *qr = m->embed_q + (int64_t)ids[s]*D; float sc = m->embed_sc[ids[s]];
+            for (int i = 0; i < D; i++) x[(int64_t)s*D + i] = (float)qr[i] * sc;
+        } else
+            memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
     m->token_count += S; m->freq_token_count += S;
@@ -3054,7 +3121,12 @@ int main(int argc, char **argv) {
      * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
+    {
+        const char *qal = getenv("QWEN36_QUANT_AT_LOAD");
+        g_qdw_incremental = dense_i8_on() && !getenv("COLI_KEEP_F32") && !(qal && *qal == '0');
+    }
     static Model m; model_init(&m, snap, cap, bits);
+    if (getenv("QWEN36_EMBED_I8") && atoi(getenv("QWEN36_EMBED_I8")) > 0) embed_quantize(&m);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
@@ -3085,8 +3157,9 @@ int main(int argc, char **argv) {
                 free((void*)g_qdw[i].w);
             }
         }
-        fprintf(stderr, "[dense-i8] %d matrices quantized in %.1f s, %.1f GB f32 freed\n",
-                g_qdw_n, now_s()-tq, freed/1073741824.0);
+        fprintf(stderr, "[dense-i8] %d matrices quantized in %.1f s, %.1f GB f32 freed%s\n",
+                g_qdw_n, now_s()-tq, freed/1073741824.0,
+                g_qdw_freed_at_load > 0 ? " (at load: the f32 trunk was never resident all at once)" : "");
     }
 
     /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
