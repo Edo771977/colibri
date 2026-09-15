@@ -11698,10 +11698,33 @@ static float head_bf16_dot(const uint16_t *weight, const float *hidden,
     return sum;
 }
 
+/* PROF phases beyond the expert store (#1491): a turn's /profile used to show
+ * expert disk and expert matmul and a literal zero for everything else, so a
+ * warm decode on a GPU box read as 98% "other". These accumulate the time
+ * spent in the layer blocks (attention, indexer, dense, mixers and the experts
+ * within), the time in the head, and the positions forwarded; v4_serve_one
+ * reports per-turn deltas. Timing only: no numeric path changes. */
+static double g_v4_prof_block_s = 0.0, g_v4_prof_head_s = 0.0;
+static long long g_v4_prof_forwards = 0;
+static double spec_now(void);   /* defined with the speculative-decode helpers below */
+
+static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
+                            const ColiSafetensorsIndex *index,
+                            const ColiDeepSeekV4Config *config,
+                            int *best_token, float *best_logit);
 static int head_argmax(ColiV4Engine *engine, const float *hidden,
                        const ColiSafetensorsIndex *index,
                        const ColiDeepSeekV4Config *config,
                        int *best_token, float *best_logit) {
+    double t0 = spec_now();
+    int result = head_argmax_impl(engine, hidden, index, config, best_token, best_logit);
+    g_v4_prof_head_s += spec_now() - t0;
+    return result;
+}
+static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
+                            const ColiSafetensorsIndex *index,
+                            const ColiDeepSeekV4Config *config,
+                            int *best_token, float *best_logit) {
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
     if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1)
@@ -12108,7 +12131,31 @@ static int v4_prefill_pool_enabled(void) {
     return enabled;
 }
 
+static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                        ColiDeepSeekV4WindowAttentionState **attention,
+                        const ColiSafetensorsIndex *index,
+                        const ColiDeepSeekV4Config *config,
+                        ColiExpertStore *experts, const int *tokens,
+                        int start, int batch, int use_prefill_pool,
+                        ColiV4SessionAbortFn should_abort, void *abort_ctx,
+                        char *error, size_t error_size);
 static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                        ColiDeepSeekV4WindowAttentionState **attention,
+                        const ColiSafetensorsIndex *index,
+                        const ColiDeepSeekV4Config *config,
+                        ColiExpertStore *experts, const int *tokens,
+                        int start, int batch, int use_prefill_pool,
+                        ColiV4SessionAbortFn should_abort, void *abort_ctx,
+                        char *error, size_t error_size) {
+    double t0 = spec_now();
+    int result = target_batch_impl(engine, state_ptr, next_ptr, attention, index, config,
+                                   experts, tokens, start, batch, use_prefill_pool,
+                                   should_abort, abort_ctx, error, error_size);
+    g_v4_prof_block_s += spec_now() - t0;
+    if (batch > 0) g_v4_prof_forwards += batch;
+    return result;
+}
+static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
@@ -12198,7 +12245,26 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     return 0;
 }
 
+static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                        ColiDeepSeekV4WindowAttentionState **attention,
+                        const ColiSafetensorsIndex *index,
+                        const ColiDeepSeekV4Config *config,
+                        ColiExpertStore *experts, int token, int position,
+                        char *error, size_t error_size);
 static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                        ColiDeepSeekV4WindowAttentionState **attention,
+                        const ColiSafetensorsIndex *index,
+                        const ColiDeepSeekV4Config *config,
+                        ColiExpertStore *experts, int token, int position,
+                        char *error, size_t error_size) {
+    double t0 = spec_now();
+    int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
+                                   experts, token, position, error, error_size);
+    g_v4_prof_block_s += spec_now() - t0;
+    g_v4_prof_forwards += 1;
+    return result;
+}
+static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
@@ -13858,15 +13924,23 @@ static void v4_hwinfo_emit(void) {
 }
 
 /* PROF wall_s prompt_tokens completion_tokens expert_disk_s expert_wait_s
- * expert_matmul_s attention_s lm_head_s forwards — disk (I/O) and matmul
- * (expert-forward compute) are the two phases the runtime tracks per turn
- * (#890); the frontend folds the remainder — attention, head, framing — into
- * "other". Before this the matmul field was hardcoded 0 and every turn read as
- * 100% other whenever the model sat warm in page cache. */
+ * expert_matmul_s attention_s lm_head_s forwards. disk (I/O) and matmul come
+ * from the expert store (#890). attention_s is the layer-block time not
+ * attributed to the expert compute: attention, DSA indexer, dense projections
+ * and hyper-connection mixers, plus any expert wait that blocked the block
+ * (disk seconds are summed across loader lanes and can exceed the wall on
+ * their own, so they are reported as they are and not subtracted; clamped at
+ * zero). lm_head_s is the head matmul; forwards the
+ * positions pushed through the blocks (prefill rows, decode tokens, draft
+ * verifies). Before #1491 the last three were literal zeros and a warm decode
+ * on a GPU box read as 98% "other". The frontend still folds what is left
+ * (sampling, framing) into "other". */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
-                         double expert_disk_s, double expert_matmul_s) {
-    printf("PROF %.3f %d %d %.3f 0.000 %.3f 0.000 0.000 0\n",
-           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s);
+                         double expert_disk_s, double expert_matmul_s,
+                         double attention_s, double head_s, long long forwards) {
+    printf("PROF %.3f %d %d %.3f 0.000 %.3f %.3f %.3f %lld\n",
+           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s,
+           attention_s, head_s, forwards);
     fflush(stdout);
 }
 
@@ -14053,6 +14127,8 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     double matmul_before =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
+    double block_before = g_v4_prof_block_s, head_before = g_v4_prof_head_s;
+    long long forwards_before = g_v4_prof_forwards;
     V4ServeStream stream = {session, request->id, 0, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
@@ -14098,8 +14174,14 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     double expert_matmul_s = engine->experts
         ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
         : 0.0;
+    /* Block time minus the expert compute measured inside it. The store's disk
+     * seconds are NOT subtracted: summed across loader lanes, they exceeded the
+     * wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
+    double attention_s = (g_v4_prof_block_s - block_before) - expert_matmul_s;
+    if (attention_s < 0.0) attention_s = 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
-                 expert_disk_s, expert_matmul_s);
+                 expert_disk_s, expert_matmul_s, attention_s,
+                 g_v4_prof_head_s - head_before, g_v4_prof_forwards - forwards_before);
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_hybrid_enabled() && (g_v4_hyb_gpu_n + g_v4_hyb_cpu_n +
                            g_v4_hyb_upload_n + g_v4_hyb_skip_n))

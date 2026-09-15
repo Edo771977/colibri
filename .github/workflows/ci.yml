@@ -590,6 +590,10 @@ jobs:
         run: |
           cd c
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_dashboard_hits
+      - name: "Over-long prompt: CONTEXT_EXCEEDED, so the gateway answers 400"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_context_exceeded
 
   dsv41-tiny-check:
     name: DeepSeek V4.1 tiny oracle (engram + DSA + fp4 experts + vision)

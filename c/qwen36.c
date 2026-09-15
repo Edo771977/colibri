@@ -59,6 +59,7 @@ static int qwen36_max_ctx(void) {
 #endif
 #include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
+#include "omp_tune.h"   /* physical-core OpenMP team sizing (#718/#1518) */
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
@@ -2864,7 +2865,10 @@ static void serve_one(Model *m, ServeReq *q){
     hits_emit(m);
     {
         double disk=m->t_disk-s_disk, moe=tm_sum(2)-s_moe;
-        printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", dt, np, gen,
+        /* microsecond resolution: a tiny-fixture turn on a fast runner is under
+         * a millisecond, and at %.3f every phase (and the wall) printed 0.000,
+         * which the dashboard tests read as "not measured" (dev CI, 2026-09-14) */
+        printf("PROF %.6f %d %d %.6f %.6f %.6f %.6f %.6f %llu\n", dt, np, gen,
                disk, 0.0, moe>disk?moe-disk:0.0, tm_sum(0)+tm_sum(1)-s_attn, tm_sum(5)-s_head,
                (unsigned long long)forwards);   /* contati, non dedotti: l'ultimo token non ne fa uno */
         fflush(stdout);
@@ -2963,6 +2967,15 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
 }
 
 int main(int argc, char **argv) {
+    /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
+     * do. Without it this engine takes one thread per logical CPU, which on an
+     * SMT host doubles the team for no arithmetic and pays a barrier per tiny
+     * per-expert region (#718 measured +2.3x from the sizing alone on a
+     * 16C/32T part). Through `coli` OMP_NUM_THREADS is already set and this
+     * is a no-op; it matters when the binary is launched directly (#1534:
+     * Qwen3.6 int4 on a 16C/32T Zen5, 18.9 -> 23.7 tok/s).
+     * OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
+    coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;

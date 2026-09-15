@@ -62,6 +62,7 @@
 #include "st.h"
 #include "quant.h"
 #include "sparse_attn.h"
+#include "omp_tune.h"
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -178,6 +179,26 @@ static void cfg_load(Cfg *c, const char *snap) {
     c->hc_iters   = (int)jnum(t, "hc_sinkhorn_iters", 20);
     c->hc_eps     = (float)jnum(t, "hc_eps", 1e-6);
     c->max_positions = (int)jnum(t, "max_seq_len", jnum(t, "max_position_embeddings", 4096));
+    /* CTX caps the context, and with it every buffer sized from it: the compressed
+     * KV and index keys of the four source layers, and both rope tables. Every
+     * other engine in the registry reads its own context variable (CTX, GLM53_MAXT,
+     * CTX_MAX, K3_MAXT, Q36_MAXT, Q38_MAXT); this one read none, so `coli --ctx`
+     * set CTX for the planner and the engine ignored it. The planner sizes those
+     * buffers from the context it was asked for, which at the default 4096 is
+     * 0.02 GiB against the 6.25 GiB the engine allocated for the checkpoint's
+     * 1,048,576 -- 6.23 GiB of unbudgeted allocation, and a machine planned to the
+     * number would not have it. Keeping CTX <= max_positions also means the
+     * checkpoint's own ceiling still wins: this can only ask for less. */
+    const char *ctx_env = getenv("CTX");
+    if (ctx_env && *ctx_env) {
+        int ctx = atoi(ctx_env);
+        if (ctx >= 2 && ctx < c->max_positions) c->max_positions = ctx;
+        else if (ctx >= 2)
+            fprintf(stderr, "[v41] CTX=%d is at or above the checkpoint's own ceiling "
+                            "of %d positions; keeping the ceiling\n", ctx, c->max_positions);
+        else
+            fprintf(stderr, "[v41] CTX=%d is below the 2-position minimum; ignored\n", ctx);
+    }
     /* YaRN, as the vendor spells it: rope_scaling.factor when present */
     jval *scaling = json_get(t, "rope_scaling");
     if (scaling && scaling->t == J_OBJ) {
@@ -3317,6 +3338,18 @@ static int *load_ids(jval *root, const char *key, int *count) {
 }
 
 int main(int argc, char **argv) {
+    /* Size the team to PHYSICAL cores before anything else touches the model.
+     * This engine issues ~720 OpenMP regions per decoded token -- three per
+     * expert application, 240 applications a token -- and every one of them is
+     * only a few thousand rows wide, so the barrier is a real share of the work
+     * rather than a rounding error. Left at the OpenMP default (one thread per
+     * logical CPU) the region cost dominates: on a 208-logical-CPU host 93% of
+     * all cycles land inside libgomp and the turn runs 18.7x slower than at 32
+     * threads and 11.7x slower than at the 104 physical cores this picks.
+     * colibri/inkling/kimi_k3/olmoe already call it; see
+     * docs/experiments/dsv41-omp-team-2026-09-15.md.
+     * OMP_NUM_THREADS still wins, COLI_NO_OMP_TUNE=1 still disables it. */
+    coli_omp_tune_threads("deepseek-v41");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "SNAP=<container dir> is required\n"); return 2; }
     int cap = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 8;
