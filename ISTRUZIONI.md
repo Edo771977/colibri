@@ -86,6 +86,28 @@ da provare `COLI_CUDA_MTP=1` su GLM-5.2. Con 32 GB aspettarsi circa 0,1–0,3 to
 3. Tuning automatico: `coli tune --model <dir>` (salva il profilo migliore).
 4. Scaldare la cache (PowerShell, dalla cartella `c\`): `.\warmup.ps1 -Model <dir> -Rounds 10 -Ngen 32`.
 
+### A/B dell'I/O parallelo su Windows
+
+Dopo aver ricompilato `iobench.exe` e il motore con questo fork, da `cmd` (sostituire il file con
+uno shard grande del modello, meglio se non letto di recente):
+
+```bat
+rem 1) come il vecchio motore: un fd condiviso, handle sincrono
+set IOBENCH_SHARED=1
+set COLI_WIN_SYNC_DIRECT=1
+iobench.exe D:\modelli\<shard>.safetensors 19 256 16 1
+rem 2) come il motore nuovo: un fd condiviso, handle OVERLAPPED
+set COLI_WIN_SYNC_DIRECT=
+iobench.exe D:\modelli\<shard>.safetensors 19 256 16 1
+rem 3) riferimento: un fd per thread
+set IOBENCH_SHARED=
+iobench.exe D:\modelli\<shard>.safetensors 19 256 16 1
+```
+
+Atteso: la 1) molto più lenta, la 2) vicina alla 3). Se è così, ripetere sul motore con un modello
+grande (`DIRECT=1`), confrontando `COLI_WIN_SYNC_DIRECT=1` e senza, a parità di prompt e cache
+(stesso ordine alternato, almeno 3 giri): tok/s e tempo disco nella riga `[PROF]`.
+
 ## 5. RAM: piano di aggiornamento
 
 - Il salto utile è da 32 a 64–96 GB (GLM-5.2 e DeepSeek V4 trovano molti più esperti in RAM).
@@ -96,7 +118,7 @@ da provare `COLI_CUDA_MTP=1` su GLM-5.2. Con 32 GB aspettarsi circa 0,1–0,3 to
 
 | Tema | Stato |
 |---|---|
-| I/O parallelo su Windows: un solo handle sincrono per file, Windows serializza le `ReadFile` (vedi commento in `c/iobench.c`) | in lavorazione in una PR separata del fork |
+| I/O parallelo su Windows: un solo handle sincrono per file, Windows serializza le `ReadFile` (vedi commento in `c/iobench.c`) | fatto in questo fork (handle diretto OVERLAPPED), **da misurare** con l'A/B della sezione 4 |
 | RAM di Qwen3.6: quantizzazione incrementale al caricamento (idea di #1218) + embedding in int8 | da fare |
 | Copie CPU↔GPU sincrone della parte densa in VRAM (`c/backend_cuda.cu`, `coli_cuda_matmul`) | da fare, collegato a #431 |
 | Due motori (draft esterno) per Qwen3.6: serve un modello piccolo con lo stesso vocabolario da 248.320 token | da valutare, issue #494 |

@@ -68,6 +68,40 @@ int main(void){
     free(verify);
     close(wfd);
 
+    /* fd diretto CONDIVISO tra thread (come st.h lo usa nel motore): con l'handle
+     * OVERLAPPED le pread concorrenti devono restituire ognuna i propri byte esatti,
+     * anche quando ReadFile resta pendente e compat_pread la attende. */
+    int bad = 0;
+    #pragma omp parallel num_threads(8) reduction(+:bad)
+    {
+        void *tb = NULL;
+        if(posix_memalign(&tb, 4096, 16*4096) != 0) bad++;
+        else {
+            #pragma omp for schedule(dynamic,1)
+            for(int i = 0; i < 256; i++){
+                off_t o = (off_t)((i * 37) % 200) * 4096;
+                if(pread(dfd, tb, 16*4096, o) != 16*4096 || memcmp(tb, pat + o, 16*4096) != 0) bad++;
+            }
+            compat_aligned_free(tb);
+        }
+    }
+    if(bad) return fail("concurrent pread on a shared direct fd");
+
+    /* WILLNEED sul fd diretto: la ReadFile di riscaldamento puo' restare pendente e
+     * non deve toccare il buffer dopo che compat_fadvise lo ha liberato */
+    if(posix_fadvise(dfd, 0, 64*1024, POSIX_FADV_WILLNEED)!=0) return fail("WILLNEED on direct fd");
+    if(pread(dfd, buf, 64*1024, 4096)!=64*1024 || memcmp(buf, pat+4096, 64*1024)!=0)
+        return fail("pread after WILLNEED on direct fd");
+
+    /* COLI_WIN_SYNC_DIRECT=1 riapre l'handle sincrono di prima: stessi byte */
+    _putenv_s("COLI_WIN_SYNC_DIRECT", "1");
+    int sfd = compat_open_direct(TMPF);
+    _putenv_s("COLI_WIN_SYNC_DIRECT", "");
+    if(sfd<0) return fail("compat_open_direct with COLI_WIN_SYNC_DIRECT=1");
+    if(pread(sfd, buf, 64*1024, 8192)!=64*1024 || memcmp(buf, pat+8192, 64*1024)!=0)
+        return fail("pread on synchronous direct fd");
+    close(sfd);
+
     close(dfd);
     compat_aligned_free(buf); free(pat); remove(TMPF);
     puts("compat direct tests: ok");

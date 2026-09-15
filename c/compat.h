@@ -150,7 +150,11 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
      * completes — but crucially it populates the standby page cache for this region,
      * so the later synchronous pread on the same offsets faults from RAM not disk. */
     DWORD got=0;
-    ReadFile(h, buf, (DWORD)rdlen, &got, &ov);
+    /* su un handle OVERLAPPED ReadFile puo' restare pendente: attenderla prima di
+     * liberare il buffer (compat_read_at), altrimenti il kernel scriverebbe in
+     * memoria gia' rilasciata. */
+    if(!ReadFile(h, buf, (DWORD)rdlen, &got, &ov) && GetLastError() == ERROR_IO_PENDING)
+        GetOverlappedResult(h, &ov, &got, TRUE);
     _aligned_free(buf);
     return 0;
 }
@@ -166,6 +170,28 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
  * dal campo diventa un tirare a indovinare (#307: tre giri di ipotesi tra
  * tre persone perche' il codice vero non compariva da nessuna parte). */
 static __thread DWORD compat_pread_lasterr __attribute__((unused));
+/* Evento per thread su cui attendere una ReadFile rimasta pendente. Serve solo ai
+ * handle aperti con FILE_FLAG_OVERLAPPED (compat_open_direct): su quelli ReadFile
+ * puo' tornare ERROR_IO_PENDING, e un OVERLAPPED senza hEvent farebbe attendere
+ * sull'handle stesso, che non e' affidabile con piu' letture concorrenti sullo
+ * stesso file. Manual-reset: ReadFile lo azzera da sola all'avvio dell'I/O.
+ * NULL se CreateEvent fallisce -> GetOverlappedResult attende sull'handle. */
+static inline HANDLE compat_io_event(void){
+    static __thread HANDLE ev = NULL;
+    if(!ev) ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+    return ev;
+}
+
+/* ReadFile a offset esplicito che funziona su handle sincroni e OVERLAPPED:
+ * se la lettura resta pendente, la attende qui. Ritorna TRUE/FALSE come ReadFile,
+ * con *rd valorizzato e GetLastError() significativo in caso di FALSE. */
+static inline BOOL compat_read_at(HANDLE h, void *buf, DWORD len, DWORD *rd, OVERLAPPED *ov){
+    ov->hEvent = compat_io_event();
+    if(ReadFile(h, buf, len, rd, ov)) return TRUE;
+    if(GetLastError() != ERROR_IO_PENDING) return FALSE;
+    return GetOverlappedResult(h, ov, rd, TRUE);
+}
+
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
@@ -178,7 +204,7 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
         ov.Offset     = (DWORD)( (off + (off_t)total)        & 0xFFFFFFFFULL);
         ov.OffsetHigh = (DWORD)(((off + (off_t)total) >> 32) & 0xFFFFFFFFULL);
         DWORD rd = 0;
-        if(!ReadFile(h, (char*)buf + total, chunk32, &rd, &ov)){
+        if(!compat_read_at(h, (char*)buf + total, chunk32, &rd, &ov)){
             DWORD err = GetLastError();
             if(err == ERROR_HANDLE_EOF) break;  /* past EOF → return bytes read (0 if none, matching POSIX pread) */
             compat_pread_lasterr = err;         /* preserva il codice VERO per il report (#307) */
@@ -300,11 +326,23 @@ static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
  * buffer del chiamante devono essere allineati a 4K (gli slab expert usano
  * posix_memalign(4096) e il percorso DIRECT=1 del motore allinea gia' offset
  * e len); richieste non allineate falliscono con -1, mai dati corrotti.
- * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED). */
+ * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED).
+ *
+ * FILE_FLAG_OVERLAPPED: st.h apre UN solo fd diretto per shard, condiviso da tutti
+ * i thread di caricamento degli expert. Su un handle sincrono Windows serializza le
+ * ReadFile concorrenti sul lock dell'oggetto file, quindi il parallelismo del motore
+ * arrivava al disco a queue-depth 1 (lo stesso difetto che iobench.c aggira con un
+ * fd per thread). Con l'handle OVERLAPPED le letture posizionali concorrono davvero;
+ * compat_pread attende da sola quelle pendenti, quindi per i chiamanti non cambia
+ * nulla. L'handle va usato solo via pread/compat_fsize/close, mai con read() del CRT.
+ * COLI_WIN_SYNC_DIRECT=1 riapre il vecchio handle sincrono (per misure A/B). */
 static inline int compat_open_direct(const char *path){
+    const char *sync = getenv("COLI_WIN_SYNC_DIRECT");
+    DWORD flags = FILE_FLAG_NO_BUFFERING;
+    if(!(sync && *sync && strcmp(sync, "0") != 0)) flags |= FILE_FLAG_OVERLAPPED;
     HANDLE h = CreateFileA(path, GENERIC_READ,
                            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
+                           NULL, OPEN_EXISTING, flags, NULL);
     if(h == INVALID_HANDLE_VALUE) return -1;
     int fd = _open_osfhandle((intptr_t)h, _O_RDONLY|_O_BINARY);
     if(fd < 0){ CloseHandle(h); return -1; }
