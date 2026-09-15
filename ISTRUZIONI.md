@@ -21,7 +21,7 @@ al codice di questo fork e vanno ricontrollati dopo ogni aggiornamento da upstre
 |---|---|---|
 | Compilare con `ARCH=native` (e `CUDA_ARCH=sm_89` per la DLL) | Su Windows il default è `x86-64-v3`, solo AVX2: i kernel int8/int4 AVX-512/VNNI del 7950X vengono esclusi. Non usare i binari già pronti. | `c/Makefile:105` |
 | Impostare sempre `COLI_GPU=0` | Senza, su Windows la GPU poteva non essere trovata e il motore restava sulla CPU senza avvisi. Corretto da #1542 (incluso in questo fork), ma impostarla esplicitamente resta la scelta più sicura. | JustVugg/colibri#1542 |
-| `OMP_WAIT_POLICY=active` e `GOMP_SPINCOUNT=200000` | Tengono "caldi" i thread OpenMP tra le tante piccole regioni parallele per esperto. Da questo fork `coli` le imposta su Windows per tutti i motori; vanno messe a mano solo lanciando direttamente gli eseguibili (`qwen36.exe`, `qwen38.exe`, ...). | `c/coli` (`env_for_engine`) |
+| `OMP_WAIT_POLICY=active` e `GOMP_SPINCOUNT=200000` **solo senza GPU** | Tengono "caldi" i thread OpenMP tra le tante piccole regioni parallele per esperto. Da questo fork `coli` le imposta su Windows per i motori che girano solo su CPU. **Con CUDA no**: l'attesa attiva compete con la GPU e ha dato forti peggioramenti misurati; con la GPU si prova solo misurando con e senza. | `c/coli` (`env_for_engine`), `docs/tuning.md` (Hybrid CUDA/CPU) |
 | Attivare EXPO nel BIOS | La RAM oggi lavora a 4800 MT/s invece di 6000: +25% di banda di memoria. BIOS (Canc) → Ai Tweaker → Ai Overclock Tuner → EXPO I. Se il PC è instabile tornare su Auto o provare 5600. | — |
 | Non usare `DSV4_CUDA_TC=1` | Usa l'FP8 a microscaling delle Blackwell (RTX 50): sulla 4070 Ti SUPER fallisce a ogni chiamata e rimanda il lavoro alla CPU. | `c/backend_cuda_dsv4.cu:1704` |
 
@@ -55,14 +55,13 @@ set CUDA_EXPERT_GB=auto
 set COLI_PLACE=auto
 set HEAT_FILE=heat.bin
 set OMP_NUM_THREADS=16
-set OMP_WAIT_POLICY=active
-set GOMP_SPINCOUNT=200000
 set SNAP=D:\modelli\qwen36_int4
 set N_NEW=200
 qwen36.exe 256 4 prompt.txt
 ```
 
 - `HEAT_FILE` salva gli esperti più usati: dalla seconda esecuzione la VRAM parte già riempita bene.
+- `OMP_WAIT_POLICY=active` qui non va messo di default (vedi sezione 1): provarlo solo con una misura A/B.
 - Picco di RAM documentato ~29 GB (misurato con due GPU da 8 GB): con 32 GB chiudere i programmi pesanti.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
