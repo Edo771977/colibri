@@ -581,6 +581,10 @@ CUDA_OBJ   = backend_cuda.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
+# The kernel test binaries link the HIP runtime explicitly: hipcc does not add
+# it for a plain link the way nvcc adds cudart (#1499: `make hip-test` failed
+# with undefined hipStreamSynchronize and the suite never ran on ROCm).
+GPU_TEST_LIBS = -L$(ROCM_HOME)/lib -lamdhip64
 # rocWMMA needs matrix cores (MFMA gfx908+ / WMMA gfx11xx); on these archs its
 # headers static_assert (ROCm/TheRock#1944). Compile the WMMA paths out and
 # let backend_gpu_compat.h fall back via COLI_GPU_HAS_WMMA=0. The flag must
@@ -752,7 +756,8 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 cuda-dll: backend_cuda.cu backend_cuda.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
-	@cl 2>&1 | grep -q "for x64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
+	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
+	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
@@ -828,7 +833,7 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
-	@cl 2>&1 | grep -q "for x64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
+	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
 		-Xlinker /DEF:dsv4.def \
 		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
@@ -841,7 +846,7 @@ DEEPGEMM_INC = -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlas
 cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_STAMP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
-	@cl 2>&1 | grep -q "for x64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
+	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \
 		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM \
 		$(DEEPGEMM_INC) -shared \
@@ -861,6 +866,27 @@ backend_metal.o: backend_metal.mm backend_metal.h
 metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
+
+# GLM-5.3 Metal correctness oracles. These exercise the clamped SwiGLU
+
+# primitive and the complete routed gate/up/SwiGLU/down/scatter MoE block
+
+# against their CPU references. Requires real Apple Metal hardware.
+
+.PHONY: glm53-metal-check
+
+glm53-metal-check: backend_metal.o tests/test_glm53_clamped_metal.c tests/test_glm53_moe_block_metal.c
+
+	@test "$(METAL)" = "1" || { echo "usage: make glm53-metal-check METAL=1" >&2; false; }
+
+	$(CC) $(CFLAGS) tests/test_glm53_clamped_metal.c backend_metal.o -o glm53_clamped_metal_test $(LDFLAGS)
+
+	./glm53_clamped_metal_test
+
+	$(CC) $(CFLAGS) tests/test_glm53_moe_block_metal.c backend_metal.o -o glm53_moe_block_metal_test $(LDFLAGS)
+
+	./glm53_moe_block_metal_test
+	$(RM) glm53_clamped_metal_test glm53_moe_block_metal_test
 
 # Standalone large-batch GEMM correctness sweep — reproduces the long-context prefill
 # corruption in seconds (no model). OMP-parallel CPU reference.
@@ -901,23 +927,23 @@ $(RANSLIB): tools/rans_ctypes.c rans.h
 
 cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
 	./ragged_attention_test$(EXE)
 	# weight_at's device-side refusal (the __trap()) on real silicon. The
 	# host-side half is tests/test_cuda_fmt_guard.c, which runs in the CPU
 	# suite and cannot execute device code. Includes backend_cuda.cu itself:
 	# weight_at is file-static, and the trap is unreachable through the public
 	# API by design. Re-execs itself per probe (the trap poisons the context).
-	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_fmt_trap_test$(EXE)
 	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
 	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
 	# itself (kernel-level oracle), so only the test file is compiled.
 	# Runs BEFORE the MXFP4 test: that one has a pre-existing exponent-255
 	# failure on some hosts and would otherwise abort the recipe first.
-	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./fp8_warp_test$(EXE)
 	# The batch and ragged absorb kernels must reproduce their own output: they
 	# reduce in a fixed tree order with no atomics, so two identical launches
@@ -929,18 +955,18 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# test in the recipe, and it should not cost the broader kernel suites if
 	# it trips. It stays BEFORE MXFP4 so it still runs on the hosts where that
 	# one is expected to fail.
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
 	./absorb_determinism_test$(EXE)
 	# fmt=8 (fp8-e4m3) kernel oracle + public API (LUT gate, dense, expert
 	# group, byte accounting). Includes backend_cuda.cu itself, so only the
 	# test file is compiled. Also runs BEFORE the MXFP4 test (same reason).
-	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./fp8_cuda_test$(EXE)
 	# Upload-failure ownership: a failed H2D weight copy must release the
 	# bytes it allocated (weights_owned set by the malloc, not the copy).
 	# Includes backend_cuda.cu itself to plant the memcpy failure, so only
 	# the test file is compiled.
-	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./weights_owned_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
@@ -959,14 +985,14 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# below no longer pulls the runtime, and CI could not catch it because CI
 	# never runs cuda-test. -Xclang appears nowhere else in CFLAGS.
 	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_TEST_LIBS)
 	./mxfp4_cuda_test$(EXE)
 	# Allocator footprint (#687): what a cudaMalloc really takes off the card,
 	# which is what the expert tier has to be charged rather than the logical
 	# byte count. Runs LAST on purpose - it is the only test here that
 	# allocates in bulk to measure an amortised cost, so it should not leave
 	# the card fragmented underneath a kernel test that follows it.
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_alloc_footprint_cuda.cu -o alloc_footprint_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_alloc_footprint_cuda.cu -o alloc_footprint_test$(EXE) $(GPU_TEST_LIBS)
 	./alloc_footprint_test$(EXE)
 
 
@@ -994,12 +1020,12 @@ hip-test:
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
-	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
-	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
-	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1034,11 +1060,11 @@ olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.
 # -DCOLI_CUDA and linking -lcudart for a build that calls neither only made
 # `make qwen36` depend on a toolkit it never touches. With CUDA=1 the tier is
 # real CUDA and takes the normal flags back.
-ifeq ($(CUDA),1)
-QWEN36_TIER_SRC = qwen36_tier.c
-QWEN36_CFLAGS   = $(CFLAGS)
-QWEN36_LDFLAGS  = $(LDFLAGS)
-else ifeq ($(HIP),1)
+# CUDA_DLL=1 / HIP_DLL=1 are the Windows spellings (CUDA=1 is refused there):
+# the tier compiles in through the runtime loader exactly as it does through
+# the direct link, or `make qwen36.exe CUDA_DLL=1` silently produced a CPU-only
+# engine (#1533).
+ifneq (,$(filter 1,$(CUDA) $(CUDA_DLL) $(HIP) $(HIP_DLL)))
 QWEN36_TIER_SRC = qwen36_tier.c
 QWEN36_CFLAGS   = $(CFLAGS)
 QWEN36_LDFLAGS  = $(LDFLAGS)
@@ -1256,6 +1282,9 @@ tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_overlay$(EXE): tests/test_st_overlay.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_mem$(EXE): tests/test_compat_mem.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_missing$(EXE): tests/test_st_missing.c st.h json.h compat.h
@@ -1856,6 +1885,11 @@ tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c st.h uring.h json.h
 # bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
 # NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
 tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_router_select is a microbenchmark (duplicate-prefix scan vs marked-score scan),
+# not a test gate. Build on demand: make tests/bench_router_select.
+tests/bench_router_select$(EXE): tests/bench_router_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_indexer_allocations: microbenchmark (DeepSeek V4 indexer malloc vs persistent arena scratch), NOT a test gate.

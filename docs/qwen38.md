@@ -429,8 +429,10 @@ arithmetic rather than a defect, and the threshold sits between it and the
 
 ### Wired up
 
-Images work end to end. Send an OpenAI `image_url` part with a base64 data URI or
-a local path; the gateway preprocesses it, replaces the part with
+Images work end to end. Send an OpenAI `image_url` part with a base64 data URI
+(a local path is accepted only under `COLI_IMAGE_ROOT`, see
+`docs/ENVIRONMENT.md`; `coli chat` reads a pasted path itself and sends the
+data URI); the gateway preprocesses it, replaces the part with
 `<|vision_start|>` + N x `<|image_pad|>` + `<|vision_end|>`, and hands the patches
 to the engine in an `IMAGE` frame ahead of the `SUBMIT` they belong to. The engine
 runs the tower once and substitutes its output for the embedding of each
