@@ -62,6 +62,7 @@
 #include "st.h"
 #include "quant.h"
 #include "sparse_attn.h"
+#include "omp_tune.h"
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -3337,6 +3338,18 @@ static int *load_ids(jval *root, const char *key, int *count) {
 }
 
 int main(int argc, char **argv) {
+    /* Size the team to PHYSICAL cores before anything else touches the model.
+     * This engine issues ~720 OpenMP regions per decoded token -- three per
+     * expert application, 240 applications a token -- and every one of them is
+     * only a few thousand rows wide, so the barrier is a real share of the work
+     * rather than a rounding error. Left at the OpenMP default (one thread per
+     * logical CPU) the region cost dominates: on a 208-logical-CPU host 93% of
+     * all cycles land inside libgomp and the turn runs 18.7x slower than at 32
+     * threads and 11.7x slower than at the 104 physical cores this picks.
+     * colibri/inkling/kimi_k3/olmoe already call it; see
+     * docs/experiments/dsv41-omp-team-2026-09-15.md.
+     * OMP_NUM_THREADS still wins, COLI_NO_OMP_TUNE=1 still disables it. */
+    coli_omp_tune_threads("deepseek-v41");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "SNAP=<container dir> is required\n"); return 2; }
     int cap = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 8;
