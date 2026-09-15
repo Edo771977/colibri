@@ -61,7 +61,6 @@ static int qwen36_max_ctx(void) {
 #include "cli_args.h"
 #include "omp_tune.h"   /* physical-core OpenMP team sizing (#718/#1518) */
 #include "st.h"
-#include "omp_tune.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
@@ -2972,25 +2971,13 @@ int main(int argc, char **argv) {
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny
      * per-expert region (#718 measured +2.3x from the sizing alone on a
-     * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
+     * 16C/32T part). Through `coli` OMP_NUM_THREADS is already set and this
+     * is a no-op; it matters when the binary is launched directly (#1534:
+     * Qwen3.6 int4 on a 16C/32T Zen5, 18.9 -> 23.7 tok/s).
+     * OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
     coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6"); return 1; }
-    /* Physical-core team sizing for the DIRECT-LAUNCH path.
-     *
-     * coli already sets OMP_NUM_THREADS from physical_cpu_count() for this
-     * engine (see the "sister engines that do not size their own team" block),
-     * so through the launcher this call is a deliberate no-op -- the helper
-     * returns at its own getenv("OMP_NUM_THREADS") guard.  Running the binary
-     * directly bypasses that, and libgomp then defaults to nproc, i.e. LOGICAL
-     * cores: two threads per core contending for the same memory pipes on a
-     * memory-bound int4 GEMV.  Measured on a 16C/32T Zen5 (Strix Halo),
-     * Qwen3.6 int4: 18.9 -> 23.7 tok/s, and the treated arm lands on the same
-     * operating point the launcher reaches (#718, #1518).
-     *
-     * No-op without SMT, with OMP_NUM_THREADS set, with COLI_NO_OMP_TUNE=1, or
-     * when the physical-core count is not determinable. */
-    coli_omp_tune_threads("qwen36");
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     if (g_wide < 1) g_wide = 1; if (g_wide > 4) g_wide = 4;
