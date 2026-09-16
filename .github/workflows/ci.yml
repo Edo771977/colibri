@@ -513,6 +513,17 @@ jobs:
           fi
           grep -q "at load: the f32 trunk" san_i8.log || { echo "FAIL: quantize-at-load did not engage under sanitizers"; cat san_i8.log; exit 1; }
           echo "sanitizers clean (dense int8 at load, embed int8):"; grep -E "Matching tokens" san_i8.log || true
+      - name: KV prefix reuse is token-identical (serve, several turns)
+        run: |
+          cd c
+          # Reusing a previous turn's state must change the timing and nothing
+          # else. A wrong reuse length does not crash: it answers from another
+          # conversation's state and still reads plausibly, so this is the only
+          # gate that would catch it. The sanitizer step above rebuilt the
+          # engine, so rebuild the normal one first.
+          make clean >/dev/null 2>&1 || true
+          make qwen36
+          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve
       - name: Expert kernel A/B on an int4 gs64 fixture (old path vs expert_ffn.h, byte-identical ids)
         run: |
           cd c
@@ -635,6 +646,14 @@ jobs:
         run: |
           cd c
           COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_context_exceeded
+      - name: KV prefix reuse is token-identical (serve, several turns)
+        run: |
+          cd c
+          # Same contract as the Qwen3.6 job runs, from the same harness: a
+          # reused prefix must produce exactly what a cold engine produces for
+          # the same prompt. Wrong reuse is silent, so the gate is the only
+          # thing between it and a user.
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_serve
 
   dsv41-tiny-check:
     name: DeepSeek V4.1 tiny oracle (engram + DSA + fp4 experts + vision)
@@ -706,6 +725,16 @@ jobs:
           SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_divergent ./deepseek_v41 8 dsv41_tiny/ref.json > divergent.txt 2>divergent.err
           cmp primary.txt divergent.txt
           grep -q "header differs from the primary copy" divergent.err
+      - name: KV prefix reuse (opt-in here) and the resumed-prefill exactness
+        run: |
+          cd c
+          # Two gates in one file. The first is exactness and is ours: a prefill
+          # that resumes mid-sequence must compute what a cold prefill computes,
+          # which is what the index-key schedule fix is for. The second is the
+          # shared contract, minus the one scenario this engine cannot satisfy --
+          # a prefix holding generated positions, which attend differently from
+          # prefilled ones by the vendor's own design. The override says so.
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
       - name: "A prompt longer than one block, so the block boundary is crossed"
         run: |
           cd c
@@ -1177,7 +1206,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe qwen38
+        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 

@@ -61,6 +61,7 @@ static int qwen36_max_ctx(void) {
 #include "cli_args.h"
 #include "omp_tune.h"   /* physical-core OpenMP team sizing (#718/#1518) */
 #include "st.h"
+#include "kv_prefix.h"   /* riuso del prefisso tra turni (shared) */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
@@ -644,6 +645,11 @@ typedef struct {
     double t_disk;
     uint8_t **ehit;
     float **K, **V; int kv_len, max_t, kv_cap;
+    /* What the current attention and DeltaNet state was built from, so a
+     * turn that resends the transcript prefills only the new tail. The ids
+     * are recorded where they are fed, never derived from a counter: see
+     * kv_prefix.h for why that distinction is the whole safety argument. */
+    kv_prefix kvp;
     float *attn_sc;            /* [attn_sc_thr * kv_cap] score rows, one per thread */
     int attn_sc_thr;
     double dense_load_s;
@@ -1074,6 +1080,10 @@ static int g_qdw_n = 0;
 static uint64_t g_qwen_matmul_d_calls;
 #endif
 static int dense_i8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_I8"); v=!(e&&*e=='0'); } return v; }
+/* COLI_KV_PREFIX=0: never reuse a previous turn's state. Kept as an escape
+ * hatch and as the B arm of the A/B that shows reuse changes nothing but
+ * the time. */
+static int kv_prefix_off(void){ const char *e=getenv("COLI_KV_PREFIX"); return e && *e=='0'; }
 static int dense_batch_on(void){ const char *e=getenv("QWEN_DENSE_BATCH"); return !(e&&*e=='0'); }
 static void qdw_register(const float *W, int I, int O){
     if (!W || !dense_i8_on() || g_qdw_n >= QDW_MAX) return;
@@ -2480,6 +2490,10 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
+    /* Recorded HERE, where the tokens actually entered the state, rather than
+     * derived from the caller's bookkeeping: the invariant that fed[0..len-1]
+     * are the ids the state was built from is the whole safety argument. */
+    kv_prefix_record(&m->kvp, ids, pos_base, S);
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
     m->kv_len = pos_base + S;
@@ -2619,6 +2633,10 @@ static float *g_last_logit = NULL;
  * generation (the CLI runs once, so this is also correct there). */
 static void reset_recurrent(Model *m){
     Cfg *c = &m->c;
+    /* Paired with the record on purpose: whoever zeroes the state must also
+     * forget what it was built from, or the two disagree in favour of the one
+     * nobody can check. */
+    kv_prefix_clear(&m->kvp);
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]) continue;
         if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -2631,17 +2649,48 @@ static void reset_recurrent(Model *m){
  * growth so the server doesn't leak KV memory across requests. */
 static void ensure_kv(Model *m){
     Cfg *c = &m->c;
-    if (m->kv_cap >= m->max_t && m->K) return;
-    if (m->K){
-        for (int i = 0; i < c->n_layers; i++){ if (m->K[i]) free(m->K[i]); if (m->V[i]) free(m->V[i]); }
-        free(m->K); free(m->V); m->K = NULL; m->V = NULL;
+    if (m->kv_cap >= m->max_t && m->K) {
+        /* max_t is the ROW STRIDE of the KV cache, not just a capacity: a row
+         * lives at (head*max_t + position)*head_dim. Callers set it per request
+         * from prompt+max_tok, so a shorter request used to shrink the stride
+         * while the allocation stayed the same size -- harmless only as long as
+         * every turn rewrote every row from position 0. Reuse reads rows an
+         * earlier turn wrote, so the stride has to stay the one they were
+         * written with: the allocation's, which is kv_cap. */
+        m->max_t = m->kv_cap;
+        return;
     }
+    /* Growth COPIES the rows instead of discarding them. A chat resends a
+     * longer transcript every turn, so this reallocation lands on exactly the
+     * turn that wants to reuse the previous one's state: freeing the rows here
+     * would make kv_prefix_reuse miss in the one case it exists for. The copy
+     * is a memcpy at DRAM speed; the prefill it saves is seconds of expert
+     * reads on a streaming engine. The row stride IS max_t, so the copy must be
+     * per head -- one flat memcpy would land every head but the first at the
+     * wrong offset, and that reads as a plausible answer from another
+     * conversation rather than as a crash. */
+    float **oldK = m->K, **oldV = m->V;
+    int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
+    if (keep > old_stride) keep = old_stride;
+    if (keep > m->max_t)   keep = m->max_t;
     m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
-            m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * c->k_head_dim);
-            m->V[i] = falloc((int64_t)c->kv_heads * m->max_t * c->k_head_dim);
+            int64_t kvd = c->k_head_dim;
+            m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
+            m->V[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
+            if (keep > 0 && oldK && oldK[i] && oldV[i])
+                for (int h = 0; h < c->kv_heads; h++){
+                    memcpy(m->K[i] + (int64_t)h*m->max_t*kvd,
+                           oldK[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+                    memcpy(m->V[i] + (int64_t)h*m->max_t*kvd,
+                           oldV[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+                }
         } else { m->K[i] = NULL; m->V[i] = NULL; }
+    }
+    if (oldK){
+        for (int i = 0; i < c->n_layers; i++){ if (oldK[i]) free(oldK[i]); if (oldV[i]) free(oldV[i]); }
+        free(oldK); free(oldV);
     }
     /* Attention scores: one row per thread, indexed by absolute position, so
      * each row must hold max_t entries. Sized here rather than in attention()
@@ -2655,6 +2704,15 @@ static void ensure_kv(Model *m){
 #endif
     m->attn_sc = falloc((int64_t)m->attn_sc_thr * m->max_t);
     m->kv_cap = m->max_t;
+    /* The record describes those same positions, so it survives with them. If
+     * its own allocation fails, reuse simply stops: this is an optimisation and
+     * must never be the reason a turn fails. */
+    if (keep > 0) {
+        if (!kv_prefix_grow(&m->kvp, m->max_t, keep)) { kv_prefix_clear(&m->kvp); m->kv_len = 0; }
+        else if (m->kv_len > keep) m->kv_len = keep;
+    } else if (!kv_prefix_alloc(&m->kvp, m->max_t)) {
+        kv_prefix_clear(&m->kvp);
+    }
 }
 
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
@@ -2885,7 +2943,29 @@ static void serve_one(Model *m, ServeReq *q){
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     m->max_t = np + q->max_tok;
-    reset_recurrent(m); ensure_kv(m); m->kv_len = 0;
+    /* Grow the cache BEFORE deciding, so the decision sees the state that will
+     * actually be there: ensure_kv preserves both the rows and the record. */
+    ensure_kv(m);
+    /* A chat client resends the whole transcript every turn. If this prompt
+     * begins with the ids the current state was built from, that state already
+     * IS the state at those positions: prefill only the tail. Either the reused
+     * positions are token-identical or nothing is reused -- there is no partial
+     * case, because nothing here can rewind a state. COLI_KV_PREFIX=0 turns it
+     * off for an A/B; COLI_PREFIX_LOG=1 reports the decision and its reason,
+     * because "it did not get faster" is otherwise indistinguishable from
+     * "reuse is not wired up". */
+    int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
+    if (getenv("COLI_PREFIX_LOG")) {
+        if (reuse)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse, np, 100.0 * reuse / np);
+        else
+            fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s\n",
+                    m->kvp.len, m->kvp.cap, np, m->kvp.tainted ? " tainted" : "",
+                    (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
+        fflush(stderr);
+    }
+    if (!reuse) { reset_recurrent(m); m->kv_len = 0; }
     /* Per-REQUEST state, not per-process: without this the server keeps the
      * first request's prefill flag and expert-collection set forever, so
      * COLIBRI_RESIDENT=1 collects on request #1 and never again, and the
@@ -2895,7 +2975,9 @@ static void serve_one(Model *m, ServeReq *q){
     if (m->momentum_logits)
         memset(m->momentum_logits, 0,
                (size_t)m->c.n_layers * m->c.n_experts * sizeof(float));
-    float *lo = step(m, ids, np, 0);
+    /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
+     * the KV rows are position-indexed, so this has to be the real offset. */
+    float *lo = step(m, ids + reuse, np - reuse, reuse);
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
     const double s_disk=m->t_disk, s_attn=tm_sum(0)+tm_sum(1), s_moe=tm_sum(2), s_head=tm_sum(5);
     int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
