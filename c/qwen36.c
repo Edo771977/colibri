@@ -150,17 +150,24 @@ static int uclass(unsigned cp){
     if (cp>=0x2030&&cp<=0x205E) return U_P;
     return U_O;
 }
+/* A serving payload is byte-counted and may end in a truncated multibyte
+ * sequence. Treat that byte as one invalid unit without reading past it: this
+ * is qwen38's utf8_decode, which the two engines share a pre-tokenizer with. */
 static int utf8_decode(const char *s,int i,int n,int *adv){
+    if(!s||i<0||i>=n){if(adv)*adv=0;return 0xfffd;}
     unsigned char c=(unsigned char)s[i]; int cp,a;
     if(c<0x80){cp=c;a=1;}
     else if((c>>5)==6){cp=c&0x1F;a=2;}
     else if((c>>4)==14){cp=c&0x0F;a=3;}
     else if((c>>3)==30){cp=c&0x07;a=4;}
     else {cp=c;a=1;}
-    for(int k=1;k<a;k++){ if(i+k<n && ((unsigned char)s[i+k]&0xC0)==0x80) cp=(cp<<6)|((unsigned char)s[i+k]&0x3F); }
+    for(int k=1;k<a;k++){
+        if(i+k>=n||((unsigned char)s[i+k]&0xC0)!=0x80){if(adv)*adv=1;return c;}
+        cp=(cp<<6)|((unsigned char)s[i+k]&0x3F);
+    }
     if(adv)*adv=a; return cp;
 }
-static int utf8_adv(const char *s,int i){ int a; utf8_decode(s,i,0x7fffffff,&a); return a; }
+static int utf8_adv(const char *s,int i,int n){ int a; utf8_decode(s,i,n,&a); return a?a:1; }
 
 static void build_byte_sym(void){
     for(int i=0;i<512;i++) g_unmap[i]=-1;
@@ -253,7 +260,8 @@ static void encode_text(const char *text,int **out_ids,int *out_n){
     while(i<tlen){
         int sid; int L=try_special(text,i,tlen,&sid);
         if(L>0){ push_id(&ids,&n,&cap,sid); i+=L; continue; }
-        int j=pretok_end(text,i,tlen); if(j<=i) j=i+utf8_adv(text,i);
+        int j=pretok_end(text,i,tlen); if(j<=i) j=i+utf8_adv(text,i,tlen);
+        if(j>tlen) j=tlen;
         bpe_piece(text+i,j-i,&ids,&n,&cap);
         i=j;
     }
