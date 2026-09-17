@@ -597,16 +597,18 @@ def env_for_engine(a, arch, plan=None):
                 ram,ctx,devices,vram=resource_request(a,env)
                 plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
                                 kv_slots=requested_kv_slots(a,env))
-            # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
-            # selects a capable build above. Merely asking for auto-tier must not
-            # turn a CPU-only sibling binary into an attempted CUDA launch.
             plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
                                       and (arch == "deepseek_v4"
                                            or env.get("COLI_NO_OMP_TUNE")))
-            env=environment_for_plan(plan,env,
-                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+            gpu_off_by_request = env.get("COLI_CUDA") == "0"
+            cuda_on = plan_cuda_enabled(a, arch, env)
+            env=environment_for_plan(plan,env,cuda_enabled=cuda_on)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
+        # Outside the try on purpose: this only prints, and a display helper
+        # that stumbled inside it would be reported as "invalid resource plan"
+        # and take the launch down with it.
+        if not cuda_on: report_unapplied_vram_tier(plan, gpu_off_by_request)
         if plan_must_not_choose_omp:
             # environment_for_plan supplies the physical-core default used by
             # the other engines. V4 deliberately computes logical CPUs minus
@@ -724,6 +726,73 @@ def requested_kv_slots(a, env):
     value=getattr(a,"kv_slots",None)
     if value is None: value=int(env.get("COLI_KV_SLOTS","1"))
     return value
+
+def plan_cuda_enabled(a, arch, env):
+    """Should --auto-tier apply the VRAM tier that `coli plan` printed?
+
+    Yes exactly when the engine that is about to run was built with a GPU
+    backend, which is the question the GLM path has always asked
+    (`has_cuda=cuda_binary()`), and which is what --auto-tier documents: apply
+    the plan.
+
+    The sibling path used to answer a narrower question -- "did the user pass
+    --gpu or --vram" -- and the comment that guarded it was right at the time:
+    cuda_binary() could only inspect the GLM binary, so a perfectly good qwen36
+    CUDA build looked CPU-only to it and auto-tier had to assume the worst
+    rather than risk launching a CPU-only sibling as a CUDA one. Since #1533
+    the check takes the engine that will actually run, so the thing that
+    contract was protecting against can be TESTED instead of assumed, and
+    assuming it costs the user the tier they were just shown. On the box in
+    #1581 that was 11.8 tok/s against 21, with nothing on screen to explain it.
+
+    A CPU-only build still never gets a CUDA launch: that is what the check
+    below says. `--gpu none` (COLI_CUDA=0) is still the off switch, and an
+    explicit --gpu/--vram has already proved the build before we get here.
+    """
+    value = env.get("COLI_CUDA")
+    if value == "1": return True      # --gpu / --vram validated the build above
+    if value == "0": return False     # --gpu none, or the user set it by hand
+    # DeepSeek V4 links its tier differently on each platform, so it has its own
+    # probe; using cuda_binary() here would reject valid V4 CUDA builds (#1219).
+    if arch == "deepseek_v4": return dsv4_cuda_available(getattr(a, "model", None))
+    return cuda_binary(engine_for_gpu_check(a))
+
+
+def report_unapplied_vram_tier(plan, gpu_off_by_request=False):
+    """Say so when a real VRAM tier from the plan is not going into the launch.
+
+    After plan_cuda_enabled() there are only two ways to get here, and the user
+    can act on exactly one of them, so the notice says which: the GPU was turned
+    off by request, or the engine binary has no GPU backend to turn on.
+
+    Being told matters because `coli plan` and `coli doctor` print the VRAM tier
+    as part of the plan and --auto-tier is documented as applying that plan. In
+    #1581 the tier vanished with nothing on screen connecting the two, and the
+    reporter only found it by watching nvidia-smi.
+
+    The test for "real" is the planner's own: a device qualified to drive
+    placement, and a budget above zero. Anything else was not going to be
+    applied with the GPU on either, and saying so would be noise.
+    """
+    try:
+        from resource_plan import plans_placement, GB
+        vram = plan["tiers"]["vram"]
+        devices = [d for d in vram["devices"] if plans_placement(d)]
+        budget = vram["budget_bytes"]
+    except (ImportError, KeyError, TypeError, AttributeError):
+        return
+    if not devices or budget <= 0:
+        return
+    where = ", ".join(f"{d['index']}:{d.get('name') or 'GPU'}" for d in devices)
+    why = ("--gpu none turns the GPU off, so the tier is not applied. Drop it "
+           "to use the plan as printed."
+           if gpu_off_by_request else
+           "the engine binary has no GPU backend, so there is nothing to apply "
+           "it with. Rebuild the engine with CUDA=1 to use it.")
+    print(f"  {C.yel}[PLAN] the plan's VRAM tier is not being applied{C.r}\n"
+          f"  {C.dim}{budget / GB:.1f} GB on {where} stays unused: {why}{C.r}",
+          file=sys.stderr)
+
 
 def env_for(a):
     explicit_env = set(os.environ)
