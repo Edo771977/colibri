@@ -9,11 +9,26 @@ al codice di questo fork e vanno ricontrollati dopo ogni aggiornamento da upstre
 | Componente | Valore |
 |---|---|
 | CPU | AMD Ryzen 9 7950X, 16 core / 32 thread, AVX-512 (VNNI, BF16) |
-| RAM | 32 GB DDR5 (kit Corsair CMK32GX5M2E6000Z36, 2×16 GB) |
-| Scheda madre | ASUS TUF GAMING X670E-PLUS (4 slot) |
-| GPU | NVIDIA GeForce RTX 4070 Ti SUPER 16 GB (Ada, `sm_89`) |
-| Disco | NVMe PCIe 4 TB |
-| Sistema | Windows 11, build MinGW-w64 (MSYS2 UCRT64) + DLL CUDA con MSVC |
+| RAM | **64 GB DDR5 a 5200 MT/s**: 2×16 Corsair CMK32GX5M2E6000Z36 + 2×16 CMG32GX5M2E6000Z36 (4 banchi: con EXPO restano a 5200, non 6000) |
+| Scheda madre | ASUS TUF GAMING X670E-PLUS, BIOS **3881** (4 slot RAM, 4 slot M.2) |
+| GPU | NVIDIA GeForce RTX 4070 Ti SUPER 16 GB (Ada, `sm_89`), driver 616.64 |
+| Disco | Silicon Power UD90 4 TB in **M.2_3** → `Gen4 x4`. In M.2_2 girava a `Gen3 x2`, cioè un quarto della banda |
+| In arrivo | Crucial T705 4 TB PCIe 5.0 in M.2_1, dedicato ai modelli |
+| Sistema | Windows 11, build MinGW-w64 (MSYS2 UCRT64) + DLL CUDA con MSVC 2022 e CUDA 13.4 |
+
+## Misure (17 settembre 2026, Qwen3.6-35B-A3B int4 gs64)
+
+| | 32 GB a 4800, SSD Gen3 x2 | **64 GB a 5200, SSD Gen4 x4** |
+|---|---|---|
+| Generazione (GPU, cache calda) | 12,1 tok/s (82,9 ms/token) | **17,7 tok/s (56,4 ms/token)** |
+| Prefill, 56 token | ~4,2 s | **~2,3 s** |
+| Picco RAM | 25,3 GB | 30,6 GB |
+| Disco, blocchi da 19 MB, 16 thread | 1,6 GB/s | **5–6 GB/s** |
+| Qwen3.6 su CPU | 1,00 tok/s | 1,24 tok/s |
+
+Dove vanno i 56 ms per token (cache calda): DeltaNet 27,1 (proiezioni su GPU 9,8;
+normalizzazione e uscita su CPU 9,0), MoE 15,0 (shared expert su CPU 9,3),
+attention su CPU 10,5, lm_head su GPU 3,2. **Circa 34 ms su 56 sono ancora su CPU.**
 
 ## 1. Cose da fare subito
 
@@ -22,7 +37,9 @@ al codice di questo fork e vanno ricontrollati dopo ogni aggiornamento da upstre
 | Compilare con `ARCH=native` (e `CUDA_ARCH=sm_89` per la DLL) | Su Windows il default è `x86-64-v3`, solo AVX2: i kernel int8/int4 AVX-512/VNNI del 7950X vengono esclusi. Non usare i binari già pronti. | `c/Makefile:105` |
 | Impostare sempre `COLI_GPU=0` | Senza, su Windows la GPU poteva non essere trovata e il motore restava sulla CPU senza avvisi. Corretto da #1542 (incluso in questo fork), ma impostarla esplicitamente resta la scelta più sicura. | JustVugg/colibri#1542 |
 | `OMP_WAIT_POLICY=active` e `GOMP_SPINCOUNT=200000` **solo senza GPU** | Tengono "caldi" i thread OpenMP tra le tante piccole regioni parallele per esperto. Da questo fork `coli` le imposta su Windows per i motori che girano solo su CPU. **Con CUDA no**: l'attesa attiva compete con la GPU e ha dato forti peggioramenti misurati; con la GPU si prova solo misurando con e senza. | `c/coli` (`env_for_engine`), `docs/tuning.md` (Hybrid CUDA/CPU) |
-| Attivare EXPO nel BIOS | La RAM oggi lavora a 4800 MT/s invece di 6000: +25% di banda di memoria. BIOS (Canc) → Ai Tweaker → Ai Overclock Tuner → EXPO I. Se il PC è instabile tornare su Auto o provare 5600. | — |
+| Con 4 banchi, EXPO più `DRAM Frequency = DDR5-5200` | Il solo EXPO lascia la RAM a 3600 MT/s. Impostata a mano regge 5200; con 2 banchi si arrivava a 6000. BIOS (Canc) → Ai Tweaker. | — |
+| `--auto-tier` accende il tier VRAM anche sui motori non-GLM | Prima lo lasciava spento in silenzio: chi l'ha segnalato è passato da 11,8 a 21 tok/s. | JustVugg/colibri#1582 |
+| `RAM_GB=<n>` se vuoi un tetto alla RAM | Senza, il warmstart carica **tutti** gli esperti in RAM: il picco misurato qui è 30,6 GB. Con `RAM_GB` impostata la cache viene limitata. | cherry-pick di JustVugg/colibri#1564 |
 | Non usare `DSV4_CUDA_TC=1` | Usa l'FP8 a microscaling delle Blackwell (RTX 50): sulla 4070 Ti SUPER fallisce a ogni chiamata e rimanda il lavoro alla CPU. | `c/backend_cuda_dsv4.cu:1704` |
 
 ## 2. Compilazione
@@ -108,17 +125,26 @@ Atteso: la 1) molto più lenta, la 2) vicina alla 3). Se è così, ripetere sul 
 grande (`DIRECT=1`), confrontando `COLI_WIN_SYNC_DIRECT=1` e senza, a parità di prompt e cache
 (stesso ordine alternato, almeno 3 giri): tok/s e tempo disco nella riga `[PROF]`.
 
-## 5. RAM: piano di aggiornamento
+## 5. Aggiornamenti hardware
 
-- Il salto utile è da 32 a 64–96 GB (GLM-5.2 e DeepSeek V4 trovano molti più esperti in RAM).
-- Scelta consigliata: **2×48 GB DDR5-6000 EXPO**, sostituendo il kit attuale (con 4 banchi DDR5 la velocità scende spesso a 4800–5200).
-- Prima di comprare: aggiornare il BIOS e controllare la QVL sulla pagina di supporto ASUS della TUF GAMING X670E-PLUS.
+**Fatti:** BIOS 1813 → 3881; RAM 32 → 64 GB a 5200 (4 banchi, due kit diversi: EXPO da solo
+tornava a 3600, la frequenza va messa a mano); SSD da M.2_2 (`Gen3 x2`) a M.2_3 (`Gen4 x4`),
+cioè da 1,6 a 5–6 GB/s.
+
+**Da fare:**
+- **MemTest86**, almeno un giro completo: 4 banchi di due kit diversi, entro il periodo di reso.
+- **Crucial T705 4 TB in M.2_1** (PCIe 5.0, unico slot Gen5, con dissipatore della scheda madre):
+  solo per i modelli. Serve per GLM-5.2, DeepSeek V4 e Qwen3.8, che leggono gli esperti dal disco.
+- **Oltre i 64 GB**: ha senso solo per i modelli grandi, e ai prezzi attuali della DDR5 conviene
+  aspettare. Con 4 banchi non si va oltre ~5200.
 
 ## 6. Miglioramenti aperti (da misurare su questo PC)
 
 | Tema | Stato |
 |---|---|
-| I/O parallelo su Windows: un solo handle sincrono per file, Windows serializza le `ReadFile` (vedi commento in `c/iobench.c`) | fatto in questo fork (handle diretto OVERLAPPED), **da misurare** con l'A/B della sezione 4 |
-| RAM di Qwen3.6: quantizzazione incrementale al caricamento (idea di #1218) + embedding in int8 | da fare |
-| Copie CPU↔GPU sincrone della parte densa in VRAM (`c/backend_cuda.cu`, `coli_cuda_matmul`) | da fare, collegato a #431 |
-| Due motori (draft esterno) per Qwen3.6: serve un modello piccolo con lo stesso vocabolario da 248.320 token | da valutare, issue #494 |
+| I/O parallelo su Windows (handle diretto `OVERLAPPED`) | **fatto e misurato.** Con l'SSD a Gen3 x2 valeva +8%; ora che il disco fa 5–6 GB/s le tre configurazioni si equivalgono. Tornerà utile col T705 |
+| RAM di Qwen3.6: quantizzazione al caricamento + embedding int8 | **fatto.** RSS dopo il caricamento 9,23 → 4,82 GB. Il picco complessivo resta ~30 GB, perché arriva dal warmstart degli esperti: per quello serve `RAM_GB` |
+| **Uscita DeltaNet e shared expert sulla GPU** | **prossimo passo.** Oggi costano 9,0 + 9,3 ms/token su CPU e occuperebbero ~0,4 GB di VRAM, il 3% degli esperti residenti |
+| Copie CPU↔GPU sincrone della parte densa (`c/backend_cuda.cu`, `coli_cuda_matmul`) | da fare, collegato a #431. Con 64 GB l'attesa GPU è scesa da 11,6 a 2,5 ms/token, quindi ora vale meno di prima |
+| Testa MTP di Qwen3.6 (il "secondo motore" già dentro il checkpoint) | da valutare. Il convertitore la salta apposta (#1326); servono conversione, caricamento e salvataggio dello stato DeltaNet |
+| Due motori con modello esterno | da valutare, issue #494: serve un modello piccolo con lo stesso vocabolario da 248.320 token |

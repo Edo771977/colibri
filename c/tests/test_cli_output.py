@@ -414,6 +414,32 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
             env = self.coli.env_for_engine(self.args(), "olmoe")
         self.assertEqual(env.get("OMP_WAIT_POLICY"), "active")
 
+    def test_no_hot_team_when_auto_tier_turns_the_gpu_on(self):
+        """#1582 lets --auto-tier enable the VRAM tier from the built binary alone,
+        after the --gpu/--vram block. Asking about the accelerator before that ran
+        seeded the spin defaults for a launch that does use the GPU."""
+        args = self.args()
+        args.auto_tier = True
+        args.policy = "balanced"
+        args.no_tune_profile = True
+
+        def plan_env(plan, env, cuda_enabled=False):
+            if cuda_enabled:
+                env["COLI_CUDA"] = "1"
+            return env
+
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(self.coli.sys, "platform", "win32"), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=6), \
+             mock.patch("resource_plan.build_plan", return_value={}), \
+             mock.patch("resource_plan.environment_for_plan", side_effect=plan_env), \
+             mock.patch.object(self.coli, "plan_cuda_enabled", return_value=True), \
+             mock.patch.object(self.coli, "resource_request", return_value=(0, 0, 0, 0)):
+            env = self.coli.env_for_engine(args, "olmoe")
+        self.assertEqual(env.get("COLI_CUDA"), "1")
+        self.assertNotIn("OMP_WAIT_POLICY", env)
+        self.assertNotIn("GOMP_SPINCOUNT", env)
+
     def test_other_engines_hot_team_respects_overrides(self):
         with mock.patch.dict(os.environ, {"OMP_WAIT_POLICY": "passive"}, clear=True), \
              mock.patch.object(self.coli.sys, "platform", "win32"), \

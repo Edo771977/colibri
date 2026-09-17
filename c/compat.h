@@ -112,6 +112,32 @@ static inline int compat_open_direct(const char *path){
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
 #define COMPAT_O_BINARY O_BINARY
 
+/* Evento per thread su cui attendere una ReadFile rimasta pendente. Serve solo ai
+ * handle aperti con FILE_FLAG_OVERLAPPED (compat_open_direct): su quelli ReadFile
+ * puo' tornare ERROR_IO_PENDING, e un OVERLAPPED senza hEvent farebbe attendere
+ * sull'handle stesso, che non e' affidabile con piu' letture concorrenti sullo
+ * stesso file. Manual-reset: ReadFile lo azzera da sola all'avvio dell'I/O.
+ * NULL se CreateEvent fallisce -> GetOverlappedResult attende sull'handle. */
+static inline HANDLE compat_io_event(void){
+    static __thread HANDLE ev = NULL;
+    if(!ev) ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+    return ev;
+}
+
+/* ReadFile a offset esplicito che funziona su handle sincroni e OVERLAPPED:
+ * se la lettura resta pendente, la attende qui. Ritorna TRUE/FALSE come ReadFile,
+ * con *rd valorizzato e GetLastError() significativo in caso di FALSE. */
+static inline BOOL compat_read_at(HANDLE h, void *buf, DWORD len, DWORD *rd, OVERLAPPED *ov){
+    ov->hEvent = compat_io_event();
+    /* ReadFile azzera l'evento all'avvio dell'I/O, ma l'evento e' riusato a ogni
+     * lettura di questo thread: azzerarlo qui rende la cosa indipendente da quel
+     * dettaglio, e costa una chiamata non contesa. */
+    if(ov->hEvent) ResetEvent(ov->hEvent);
+    if(ReadFile(h, buf, len, rd, ov)) return TRUE;
+    if(GetLastError() != ERROR_IO_PENDING) return FALSE;
+    return GetOverlappedResult(h, ov, rd, TRUE);
+}
+
 /* --- posix_fadvise: Windows has no direct equivalent. Semantics:
  *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
  *                   pages resident. Implemented as an overlapped background ReadFile
@@ -150,11 +176,15 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
      * completes — but crucially it populates the standby page cache for this region,
      * so the later synchronous pread on the same offsets faults from RAM not disk. */
     DWORD got=0;
-    /* su un handle OVERLAPPED ReadFile puo' restare pendente: attenderla prima di
-     * liberare il buffer (compat_read_at), altrimenti il kernel scriverebbe in
-     * memoria gia' rilasciata. */
-    if(!ReadFile(h, buf, (DWORD)rdlen, &got, &ov) && GetLastError() == ERROR_IO_PENDING)
-        GetOverlappedResult(h, &ov, &got, TRUE);
+    /* compat_read_at, non una ReadFile diretta: su un handle OVERLAPPED la lettura
+     * puo' restare pendente, e il buffer va liberato solo dopo il completamento.
+     * Con OVERLAPPED.hEvent nullo l'attesa userebbe l'handle del file, che su un fd
+     * condiviso viene segnalato da QUALUNQUE lettura completata: si tornerebbe
+     * mentre questa e' ancora in volo, liberando memoria che il kernel sta ancora
+     * scrivendo. L'evento per thread di compat_read_at chiude la questione senza
+     * dipendere dalla convenzione "WILLNEED solo sul fd bufferizzato".
+     * Con un handle sincrono il comportamento non cambia: ReadFile non va pendente. */
+    compat_read_at(h, buf, (DWORD)rdlen, &got, &ov);
     _aligned_free(buf);
     return 0;
 }
@@ -170,28 +200,6 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
  * dal campo diventa un tirare a indovinare (#307: tre giri di ipotesi tra
  * tre persone perche' il codice vero non compariva da nessuna parte). */
 static __thread DWORD compat_pread_lasterr __attribute__((unused));
-/* Evento per thread su cui attendere una ReadFile rimasta pendente. Serve solo ai
- * handle aperti con FILE_FLAG_OVERLAPPED (compat_open_direct): su quelli ReadFile
- * puo' tornare ERROR_IO_PENDING, e un OVERLAPPED senza hEvent farebbe attendere
- * sull'handle stesso, che non e' affidabile con piu' letture concorrenti sullo
- * stesso file. Manual-reset: ReadFile lo azzera da sola all'avvio dell'I/O.
- * NULL se CreateEvent fallisce -> GetOverlappedResult attende sull'handle. */
-static inline HANDLE compat_io_event(void){
-    static __thread HANDLE ev = NULL;
-    if(!ev) ev = CreateEventA(NULL, TRUE, FALSE, NULL);
-    return ev;
-}
-
-/* ReadFile a offset esplicito che funziona su handle sincroni e OVERLAPPED:
- * se la lettura resta pendente, la attende qui. Ritorna TRUE/FALSE come ReadFile,
- * con *rd valorizzato e GetLastError() significativo in caso di FALSE. */
-static inline BOOL compat_read_at(HANDLE h, void *buf, DWORD len, DWORD *rd, OVERLAPPED *ov){
-    ov->hEvent = compat_io_event();
-    if(ReadFile(h, buf, len, rd, ov)) return TRUE;
-    if(GetLastError() != ERROR_IO_PENDING) return FALSE;
-    return GetOverlappedResult(h, ov, rd, TRUE);
-}
-
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }

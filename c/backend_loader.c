@@ -1527,8 +1527,9 @@ int coli_cuda_device_count(void){
  * itself, exactly as coli_cuda_attention_project_ragged does: gating on
  * g_cuda.available alone answered 0 on every Windows host and the tier fell
  * back to the CPU path unless COLI_GPUS was set (#1577). Optional export:
- * a DLL predating it leaves the pointer NULL and the count falls back to
- * device_count(). */
+ * a DLL predating it leaves the pointer NULL, and the count then says so and
+ * answers 0 rather than reporting initialized contexts as visible devices
+ * (#1542; tests/test_cuda_loader_discovery.py pins that diagnostic). */
 int coli_cuda_available_device_count(void){
     /* The tier probes before init when no device list was supplied. */
     if(!coli_cuda_load()) return 0;
