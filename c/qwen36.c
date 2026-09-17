@@ -3153,7 +3153,19 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
         long nloads = 0;
         for (int pass = 0; pass < 2; pass++) for (int gi = 0; gi < cap_total; gi++) {
             int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
-            if ((pass == 0) != planned[gi] || loads[l] >= m->cache[l].cap) continue;
+            if ((pass == 0) != planned[gi]) continue;
+            if (loads[l] >= m->cache[l].cap) {
+                /* The layer's RAM cache is full. Skipping a PLANNED expert here
+                 * without a word is #1331 again: qt_plan_fill already reserved
+                 * its VRAM bytes, and an expert that is never reported keeps
+                 * that reservation for the life of the process. Report it with
+                 * no weights -- qt_note_planned hands the bytes back and clears
+                 * planned -- so the budget stays honest when RAM_GB pushes the
+                 * cache below what the VRAM plan wanted. */
+                if (pass == 0)
+                    qt_note_planned(l, eidw, NULL, NULL, NULL, NULL, NULL, NULL);
+                continue;
+            }
             Slot *e; expert_get(m, l, eidw, &e); loads[l]++;
             const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
             const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
