@@ -63,6 +63,10 @@ int main(void) {
         self.assertEqual(proc.stdout.splitlines(), ["visible=2", "before=0", "init=1", "after=1"])
 
     def test_old_dll_explains_missing_discovery_but_allows_explicit_init(self):
+        """A DLL without the export answers through device_count() -- the contract
+        tests/test_backend_loader.py pins -- which before init is 0 anyway. What is
+        asserted here is that the loader also SAYS which DLL is too old, instead of
+        leaving the tier on the CPU without a word (#1542)."""
         proc = self.run_probe(discovery=False)
         self.assertEqual(proc.stdout.splitlines(), ["visible=0", "before=0", "init=1", "after=1"])
         self.assertIn("missing symbol coli_cuda_available_device_count", proc.stderr)

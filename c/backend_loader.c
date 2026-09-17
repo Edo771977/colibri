@@ -1526,19 +1526,25 @@ int coli_cuda_device_count(void){
  * decides which devices init is given -- so this wrapper has to load the DLL
  * itself, exactly as coli_cuda_attention_project_ragged does: gating on
  * g_cuda.available alone answered 0 on every Windows host and the tier fell
- * back to the CPU path unless COLI_GPUS was set (#1577). Optional export:
- * a DLL predating it leaves the pointer NULL, and the count then says so and
- * answers 0 rather than reporting initialized contexts as visible devices
- * (#1542; tests/test_cuda_loader_discovery.py pins that diagnostic). */
+ * back to the CPU path unless COLI_GPUS was set (#1577). Optional export: a DLL
+ * predating it leaves the pointer NULL, and the count falls back to
+ * device_count() -- which before init reports initialized contexts, not visible
+ * devices, so the tier sees 0 and quietly stays on the CPU. The fallback is the
+ * contract tests/test_backend_loader.py pins, so it stays; what the fork adds is
+ * ONE line on stderr saying which DLL is too old, because that silence is what
+ * made #1542 take a GPU-shaped afternoon to diagnose. */
 int coli_cuda_available_device_count(void){
     /* The tier probes before init when no device list was supplied. */
     if(!coli_cuda_load()) return 0;
     if(!g_cuda.available_device_count){
-        /* device_count reports initialized contexts, not visible devices. */
-        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL
-                " missing symbol coli_cuda_available_device_count; "
-                "rebuild the backend DLL or select devices with COLI_GPUS\n");
-        return 0;
+        static int said;
+        if(!said){
+            said = 1;
+            fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL
+                    " missing symbol coli_cuda_available_device_count; "
+                    "rebuild the backend DLL or select devices with COLI_GPUS\n");
+        }
+        return g_cuda.device_count();
     }
     return g_cuda.available_device_count();
 }
