@@ -23,7 +23,9 @@
  *                                                      links libgomp and measures the same
  *                                                      thing as gcc)
  *   cl /O2 /openmp:llvm       tests\bench_omp_sync.c                        (libomp, ships
- *                                                      with VS 2022 -- nothing to install)
+ *                                                      with VS 2022 -- nothing to install;
+ *                                                      /openmp works too, and is the older
+ *                                                      VCOMP runtime: a third data point)
  *
  * Run each at the same OMP_NUM_THREADS. The minimum of several samples is
  * printed beside the median: these prices are thread wake-up latency, so one
@@ -43,18 +45,26 @@
 #ifdef _OPENMP
 static volatile long g_sink;
 
+/* Declarations are hoisted and the worksharing index is declared OUTSIDE its
+ * loop on purpose: MSVC's OpenMP front end accepts only the OpenMP 2.0 canonical
+ * `for` form in C, and rejects `for (int i = ...)` with C3015 -- which would
+ * lock out `cl /openmp:llvm`, the one route to a second runtime that installs
+ * nothing. The index of a `for` worksharing construct is implicitly private, so
+ * hoisting it changes no semantics. */
 static double region_us(long reps) {
-    long acc = 0;
-    double t0 = omp_get_wtime();
-    for (long r = 0; r < reps; r++) {
-        #pragma omp parallel for reduction(+ : acc)
-        for (int i = 0; i < 1; i++) acc += i + r;
-    }
-    double par = omp_get_wtime() - t0;
+    long acc = 0, r;
+    int i;
+    double t0, par, seq;
     t0 = omp_get_wtime();
-    for (long r = 0; r < reps; r++)
-        for (int i = 0; i < 1; i++) acc += i + r;
-    double seq = omp_get_wtime() - t0;
+    for (r = 0; r < reps; r++) {
+        #pragma omp parallel for reduction(+ : acc)
+        for (i = 0; i < 1; i++) acc += i + r;
+    }
+    par = omp_get_wtime() - t0;
+    t0 = omp_get_wtime();
+    for (r = 0; r < reps; r++)
+        for (i = 0; i < 1; i++) acc += i + r;
+    seq = omp_get_wtime() - t0;
     g_sink = acc;
     return (par - seq) / (double)reps * 1e6;
 }
@@ -63,7 +73,8 @@ static double barrier_us(long reps) {
     double t0 = omp_get_wtime();
     #pragma omp parallel
     {
-        for (long r = 0; r < reps; r++) {
+        long r;                      /* declared inside the region: private */
+        for (r = 0; r < reps; r++) {
             #pragma omp barrier
         }
     }
@@ -77,8 +88,9 @@ static int cmp_d(const void *a, const void *b) {
 
 static void price(const char *name, double (*fn)(long), long reps, int runs) {
     double *v = (double *)malloc(sizeof(double) * (size_t)runs);
+    int i;
     if (!v) { printf("  %-10s out of memory\n", name); return; }
-    for (int i = 0; i < runs; i++) v[i] = fn(reps);
+    for (i = 0; i < runs; i++) v[i] = fn(reps);
     qsort(v, (size_t)runs, sizeof(double), cmp_d);
     printf("  %-10s %8.2f us   (quietest of %d: %8.2f)\n", name, v[runs / 2], runs, v[0]);
     free(v);
@@ -91,12 +103,13 @@ int main(int argc, char **argv) {
     printf("built without OpenMP -- nothing to measure\n");
     return 0;
 #else
-    int runs = argc > 1 ? atoi(argv[1]) : 7;
-    long reps = argc > 2 ? atol(argv[2]) : 4000;
+    int runs, nthreads = 1;
+    long reps;
+    runs = argc > 1 ? atoi(argv[1]) : 7;
+    reps = argc > 2 ? atol(argv[2]) : 4000;
     if (runs < 1) runs = 1;
     if (reps < 1) reps = 1;
 
-    int nthreads = 1;
     #pragma omp parallel
     {
         #pragma omp master
