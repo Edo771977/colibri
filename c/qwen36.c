@@ -1306,6 +1306,15 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
  * pays only where a region entry is expensive -- a large team, or one parked in
  * a passive wait beside a CUDA context. Measure on the host before enabling:
  * the same benchmark answers it in seconds without a model file. */
+/* The DeltaNet causal conv is ~180 us per layer of serial work (see the loop in
+ * deltanet()). On by default because the arithmetic favours a team at every
+ * region price this project has measured; =0 restores the serial pass. */
+static int conv_omp_on(void){
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN36_CONV_OMP"); v = !(e && *e == '0'); }
+    return v;
+}
+
 static int shared_fuse_on(void){
     static int v = -1;
     if (v < 0) { const char *e = getenv("QWEN36_SHARED_FUSE"); v = (e && *e != '0'); }
@@ -2586,19 +2595,33 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             beta[h] = 1.f / (1.f + expf(-b[h]));
             gg[h] = -expf(l->dn_alog[h]) * softplus_f(a[h] + l->dn_dtbias[h]);
         }
-        /* causal depthwise conv1d (groups=conv_dim, kernel=convk) with carried ring
-         * (serial: ~33k FLOP, an OpenMP fork/join would cost more) */
+        /* Causal depthwise conv1d (groups=conv_dim, kernel=convk) with carried
+         * ring, plus the ring advance, in one pass.
+         *
+         * This was serial, on the reasoning that ~33k FLOP cannot be worth a
+         * fork/join. The FLOP count was the wrong thing to count: with convk=4
+         * the cost is one expf per channel, and the engine's own timer puts the
+         * block at 5.2-5.9 ms/token on the 35B -- 180 us per layer, on ONE core,
+         * while the rest of the token has sixteen. Even on the host with the
+         * worst region price this project has measured (53 us, MinGW libgomp on
+         * a 7950X, tests/bench_qwen36_decode_omp) parallelising is 180 -> ~65 us
+         * per layer; where a region costs single-digit us it is 180 -> ~16.
+         *
+         * Channels are independent (groups=conv_dim), so this is bit-exact: the
+         * same operations in the same order per channel, only spread over
+         * threads. The two loops fuse because a channel's ring is read and then
+         * written within its own iteration, which also halves the passes over
+         * the ring. if(conv_dim >= 256) keeps a tiny model off a team it cannot
+         * fill; QWEN36_CONV_OMP=0 restores the serial pass for an A/B. */
+        #pragma omp parallel for schedule(static) if(conv_omp_on() && conv_dim >= 256)
         for (int cc = 0; cc < conv_dim; cc++) {
             const float *w = l->dn_conv + (int64_t)cc * convk;
-            const float *rg = ring + (int64_t)cc * (convk - 1);
+            float *rg = ring + (int64_t)cc * (convk - 1);
             float acc = 0.f;
             for (int kk = 0; kk < convk - 1; kk++) acc += w[kk] * rg[kk];
             acc += w[convk - 1] * qkv[cc];
             conv_out[cc] = acc / (1.f + expf(-acc));   /* silu */
-        }
-        /* advance ring: drop oldest, append current token's qkv */
-        for (int cc = 0; cc < conv_dim; cc++) {
-            float *rg = ring + (int64_t)cc * (convk - 1);
+            /* advance ring: drop oldest, append this token's qkv */
             for (int kk = 0; kk < convk - 2; kk++) rg[kk] = rg[kk + 1];
             rg[convk - 2] = qkv[cc];
         }

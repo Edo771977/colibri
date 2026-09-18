@@ -505,6 +505,41 @@ jobs:
             fi
             echo "cap=$cap: identical ($(cat fuse_ids_${cap}_1.txt))"
           done
+      - name: The parallel DeltaNet conv is byte-identical to the serial one
+        run: |
+          cd c
+          # conv_dim on qwen36_tiny is 128, below the if(conv_dim >= 256) team
+          # threshold, so that fixture runs the serial pass on BOTH sides of the
+          # switch and would compare the same code with itself. A wider
+          # DeltaNet crosses the threshold: 2*16*8 + 32*8 = 512.
+          python3 tools/make_qwen36_tiny.py --out qwen36_conv --ref-mode full \
+                  --dn-key-heads 16 --dn-value-heads 32 \
+                  --emit-ref qwen36_conv/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen36_conv --out qwen36_conv_c --ebits 8
+          make qwen36
+          ./qwen36 8 8 qwen36_conv/ref_full.json 2>&1 | grep "meta. DeltaNet" || true
+          for cap in 1 8; do
+            for k in 0 1; do
+              QWEN36_CONV_OMP=$k DUMP=conv_logits_${cap}_$k.f32 SNAP=qwen36_conv_c \
+                ./qwen36 "$cap" 8 qwen36_conv/ref_full.json > conv_${cap}_$k.log 2>&1 || true
+              grep -E "^C engine" conv_${cap}_$k.log > conv_ids_${cap}_$k.txt || true
+            done
+            test -s conv_ids_${cap}_1.txt || { echo "FAIL: no ids at cap=$cap"; cat conv_${cap}_1.log; exit 1; }
+            cmp conv_ids_${cap}_0.txt conv_ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; exit 1; }
+            if [ -f conv_logits_${cap}_0.f32 ] || [ -f conv_logits_${cap}_1.f32 ]; then
+              cmp conv_logits_${cap}_0.f32 conv_logits_${cap}_1.f32 || { echo "FAIL: logits differ at cap=$cap"; exit 1; }
+            fi
+            echo "cap=$cap: identical ($(cat conv_ids_${cap}_1.txt))"
+          done
+          # Informative, not a gate: token-exactness against the torch reference
+          # is already gated on qwen36_tiny at caps 1/2/8 above, which exercises
+          # the same DeltaNet. This fixture exists for the identity check, and
+          # its own agreement with the oracle depends on the runner's -march
+          # (float reassociation), which is the kind of thing that turns a job
+          # red on a docs commit.
+          COLI_DENSE_I8=0 SNAP=qwen36_conv_c ./qwen36 8 8 qwen36_conv/ref_full.json > conv_oracle.log 2>&1 || true
+          grep -qE "^C engine" conv_oracle.log || { echo "FAIL: the wide-conv fixture produced no ids"; cat conv_oracle.log; exit 1; }
+          grep -E "Matching tokens" conv_oracle.log || true
       - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
         run: |
           cd c
