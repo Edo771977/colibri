@@ -1323,11 +1323,12 @@ static int qdw_lookup(const float *W, int I, const int8_t **q, const float **sc)
 }
 
 /* Returns 0 when the weights are not int8 and the caller must keep its
- * three-call form. g is the caller's scratch, Ish floats. The switch is read at
+ * three-call form. g and u are the caller's scratch, Ish floats each. The
+ * switch is read at
  * the CALL SITE, not here, so the benchmark and the exactness test can drive
  * this kernel directly. */
 static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
-                                 int D, int Ish, float *g){
+                                 int D, int Ish, float *g, float *u){
     const int8_t *qg, *qu, *qd; const float *sg, *su, *sd;
     if (!qdw_lookup(l->sh_g, D, &qg, &sg)) return 0;
     if (!qdw_lookup(l->sh_u, D, &qu, &su)) return 0;
@@ -1348,16 +1349,24 @@ static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
     }
     #pragma omp parallel
     {
-        /* gate row i, up row i and their combine in one iteration: the thread
-         * that produced both halves is the one that multiplies them, so the
-         * separate combine pass and its barrier disappear with the two extra
-         * region entries. */
-        #pragma omp for schedule(static)
-        for (int i = 0; i < Ish; i++) {
-            float gv = q36_dot_row(qg + (int64_t)i * D, x, D) * sg[i];
-            float uv = q36_dot_row(qu + (int64_t)i * D, x, D) * su[i];
-            g[i] = (gv / (1.f + expf(-gv))) * uv;
-        }
+        /* Hand each thread a CONTIGUOUS range of hidden units and walk the two
+         * matrices one after the other, not row by row. Interleaving them (gate
+         * row i, up row i, gate row i+1, ...) saves the same regions and keeps
+         * two weight streams live per thread instead of one; measured on a
+         * 7950X at 16 threads that cost more than the regions were worth --
+         * 71 GB/s down to 15. Walking them in turn also means the thread that
+         * produced g[i] and u[i] is the thread that multiplies them, so the
+         * combine needs no barrier: one region and one barrier for what was
+         * three of each. */
+        int nt = 1, tid = 0;
+#ifdef _OPENMP
+        nt = omp_get_num_threads(); tid = omp_get_thread_num();
+#endif
+        int i0 = (int)((int64_t)Ish * tid / nt), i1 = (int)((int64_t)Ish * (tid + 1) / nt);
+        for (int i = i0; i < i1; i++) g[i] = q36_dot_row(qg + (int64_t)i * D, x, D) * sg[i];
+        for (int i = i0; i < i1; i++) u[i] = q36_dot_row(qu + (int64_t)i * D, x, D) * su[i];
+        for (int i = i0; i < i1; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+        #pragma omp barrier
         #pragma omp for schedule(static)
         for (int o = 0; o < D; o++)
             out[o] += sgate * (q36_dot_row(qd + (int64_t)o * Ish, g, Ish) * sd[o]);
@@ -2281,7 +2290,7 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
             /* Same row, one OpenMP region instead of three -- see
              * qwen_shared_fused_row. The CUDA-tier block in moe() takes the
              * same switch; this is the CPU-only path of the same decision. */
-            if (shared_fuse_on() && qwen_shared_fused_row(l,xs,os,D,I,g)) continue;
+            if (shared_fuse_on() && qwen_shared_fused_row(l,xs,os,D,I,g,u)) continue;
             matmul_d(g,xs,l->sh_g,1,D,I);
             matmul_d(u,xs,l->sh_u,1,D,I);
             for(int i=0;i<I;i++){float sv=g[i];g[i]=(sv/(1.f+expf(-sv)))*u[i];}
@@ -2467,7 +2476,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
                 float *os = out + (int64_t)s*D;
-                if (!shared_fuse_on() || !qwen_shared_fused_row(l, xs, os, D, Ish, sh)) {
+                if (!shared_fuse_on() || !qwen_shared_fused_row(l, xs, os, D, Ish, sh, shu)) {
                     matmul_d(sh, xs, l->sh_g, 1, D, Ish);
                     matmul_d(shu, xs, l->sh_u, 1, D, Ish);
                     for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }

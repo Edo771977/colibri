@@ -1,40 +1,42 @@
 /* bench_qwen36_decode_omp — where the CPU half of a Qwen3.6 decode token goes.
  *
  * The profile on a 7950X + 4070 Ti SUPER (COLI_TIMERS=1, 128 tokens, warm
- * cache, 56.4 ms/token) charges 12.5 ms to the shared expert and 9.0-10.0 ms to
- * the DeltaNet output projection.  Two readings explain that, and they call for
- * OPPOSITE fixes:
+ * cache, 56.4 ms/token) charges 9.3 ms to the shared expert, 9.0 to the
+ * DeltaNet output projection and 2.7 to the router.  Two readings explain that,
+ * and they call for OPPOSITE fixes:
  *
- *   sync-bound    those kernels are ~126 MB and ~252 MB of int8 per token but
- *                 only ~126 M and ~250 M MACs, and they are cut into 120 and 30
- *                 OpenMP regions per token.  If a region entry costs tens of
- *                 microseconds (a sleeping team, which is what a CUDA build
- *                 gets), the regions ARE the time.  Fix: fewer, bigger regions.
+ *   sync-bound    those kernels are cut into 120, 30 and 40 OpenMP regions per
+ *                 token.  A region entry costs what it costs however small the
+ *                 body is, and at decode these bodies are microseconds.
+ *                 Fix: fewer, bigger regions.
  *
- *   stream-bound  400 MB of weights per token has to cross the memory bus no
- *                 matter how it is cut up.  At 60 GB/s that is 6.7 ms, at
- *                 15 GB/s it is 27 ms.  Fix: read fewer bytes (lower precision,
- *                 or move the matrix to the GPU); region count is irrelevant.
+ *   stream-bound  they are also 126 MB, 252 MB and 21 MB of int8 weights per
+ *                 token, and those bytes have to cross the memory bus however
+ *                 the work is cut up.  Fix: read fewer bytes; region count is
+ *                 irrelevant.
  *
- * A MAC count alone cannot tell these apart -- it ignores memory entirely,
- * which is how "6-15 ms of headroom" was once read off one.  This benchmark
- * measures both ends on the machine in front of it, with no model file:
+ * A MAC count cannot tell them apart -- it does not model memory at all, which
+ * is how a "6-15 ms of headroom" estimate gets written down for a kernel that
+ * might already be at its DRAM floor.  This benchmark measures both ends on the
+ * machine in front of it, with no model file and no GPU:
  *
- *   - the same GEMVs at the shipping shapes, in the engine's own kernels,
- *     cut the way the engine cuts them and cut into one region per layer;
- *   - the achieved GB/s of each, against a plain streaming read of the same
- *     bytes, which is this machine's ceiling for the access pattern;
- *   - the fork/join floor of one empty region, for the team as configured.
+ *   - the shipping shapes through the engine's own kernels, cut the way the
+ *     engine cuts them and cut into one region per layer;
+ *   - the cost of an empty parallel region, and of a barrier INSIDE one, for
+ *     the team as configured -- the two prices region surgery trades between;
+ *   - a streaming read of the same bytes in ONE region, which is this machine's
+ *     ceiling for the access pattern.
  *
- * If fused ~= unfused and both sit near the streaming ceiling, the kernels are
- * stream-bound and no amount of OpenMP surgery will move them.  If fused is
- * well ahead of unfused, or both are far below the ceiling, the regions are.
+ * Each row is then split: regions x the measured floor, and the rest, with the
+ * bandwidth that rest implies.  If the split leaves a sane GB/s the model
+ * holds and the region column is the bill; if the regions account for almost
+ * nothing, the kernels are stream-bound and no OpenMP surgery will pay.
  *
  *   make -C c tests/bench_qwen36_decode_omp ARCH=native
- *   OMP_NUM_THREADS=16 ./c/tests/bench_qwen36_decode_omp
+ *   OMP_NUM_THREADS=<physical cores> ./c/tests/bench_qwen36_decode_omp
  *
- * Run it twice with OMP_WAIT_POLICY unset and set to active to see what a
- * spinning team is worth here before changing the engine for it.
+ * Worth running at several team sizes: the floor is not linear in threads, and
+ * a runtime whose floor is tens of microseconds is itself the finding.
  * Args: [reps] [samples] [layers] [hidden] [shared_inter] [value_dim].
  */
 #define main qwen36_main_unused
@@ -98,8 +100,8 @@ static void shared_three(Layer *l, const float *x, float *out, int D, int Ish,
 
 static volatile long g_sink;
 
-/* One empty region, the team as configured: the cost every #pragma pays before
- * it does any work.  bench_omp_grain.c measures the same floor standalone. */
+/* One empty region, the team as configured: what every #pragma pays before it
+ * does any work. bench_omp_grain.c measures the same floor standalone. */
 static double forkjoin_ns(long reps) {
     long acc = 0;
     double t0 = now_s();
@@ -116,25 +118,49 @@ static double forkjoin_ns(long reps) {
     return (par - seq) / (double)reps * 1e9;
 }
 
-/* What this machine can pull through the same bytes with nothing in the way. */
-static double stream_read(const int8_t **blocks, const size_t *sizes, int n) {
+/* A barrier INSIDE a region that is already open. Fusing three regions into one
+ * trades two region entries for two of these, so it only pays if this is the
+ * cheaper price. Nothing guarantees that it is. */
+static double barrier_ns(long reps) {
     double t0 = now_s();
-    long total = 0;
-    for (int b = 0; b < n; b++) {
-        const int8_t *p = blocks[b];
-        size_t len = sizes[b];
-        long acc = 0;
-        #pragma omp parallel for schedule(static) reduction(+ : acc)
-        for (int64_t i = 0; i < (int64_t)len; i += 64) acc += p[i];
-        total += acc;
+    #pragma omp parallel
+    {
+        for (long r = 0; r < reps; r++) {
+            #pragma omp barrier
+        }
     }
-    g_sink = total;
+    return (now_s() - t0) / (double)reps * 1e9;
+}
+
+typedef struct { const int8_t *p; size_t len; } Chunk;
+
+/* Every byte the three groups read, in ONE region: this machine's ceiling for
+ * the access pattern. Cutting it into one region per matrix would measure the
+ * regions again and call the result a bandwidth ceiling -- which is exactly the
+ * mistake this line exists to avoid. */
+static double stream_read(const Chunk *ch, int n) {
+    long acc = 0;
+    double t0 = now_s();
+    #pragma omp parallel for schedule(static) reduction(+ : acc)
+    for (int c = 0; c < n; c++) {
+        const int8_t *p = ch[c].p;
+        size_t len = ch[c].len;
+        for (size_t i = 0; i < len; i += 64) acc += p[i];
+    }
+    g_sink = acc;
     return now_s() - t0;
 }
 
-static void row(const char *name, double ms, double mb, int regions) {
-    printf("  %-26s %8.2f ms   %7.1f MB   %6.1f GB/s   %5d regions\n",
-           name, ms, mb, mb / 1024.0 / (ms / 1000.0), regions);
+static void row(const char *name, double ms, double mb, int regions, double floor_ms) {
+    double ovh = regions * floor_ms;
+    double work = ms - ovh;
+    if (work < 0.005) {
+        printf("  %-24s %8.2f ms %7.1f MB | %6.2f ms in %4d regions | the regions alone exceed it\n",
+               name, ms, mb, ovh, regions);
+        return;
+    }
+    printf("  %-24s %8.2f ms %7.1f MB | %6.2f ms in %4d regions | %6.2f ms at %6.1f GB/s\n",
+           name, ms, mb, ovh, regions, work, mb / 1024.0 / (work / 1000.0));
 }
 
 int main(int argc, char **argv) {
@@ -154,7 +180,7 @@ int main(int argc, char **argv) {
     int nthreads = 1;
 #ifdef _OPENMP
     #pragma omp parallel
-    { 
+    {
         #pragma omp master
         nthreads = omp_get_num_threads();
     }
@@ -197,7 +223,7 @@ int main(int argc, char **argv) {
     memset(out_b, 0, (size_t)D * sizeof(float));
     for (int i = 0; i < L; i++) shared_three(&ls[i], x, out_a, D, Ish, sh, shu, shd);
     for (int i = 0; i < L; i++)
-        if (!qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh)) {
+        if (!qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh, shu)) {
             fputs("FAIL: the fused shared expert declined int8 weights\n", stderr);
             return 1;
         }
@@ -206,20 +232,35 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* --- the two sync prices, measured before anything is attributed to them --- */
+    double fj_ns = forkjoin_ns(20000);
+    double ba_ns = barrier_ns(20000);
+    double fj_ms = fj_ns / 1e6;
+
+    /* --- every weight byte, cut into ~1 MB chunks for one balanced region --- */
+    int nblocks = g_qdw_n + LDN + L;
+    const int8_t **bp = malloc(sizeof(int8_t *) * (size_t)nblocks);
+    size_t *bl = malloc(sizeof(size_t) * (size_t)nblocks);
+    int nb = 0;
+    for (int i = 0; i < g_qdw_n; i++) { bp[nb] = g_qdw[i].q; bl[nb++] = (size_t)g_qdw[i].I * g_qdw[i].O; }
+    for (int i = 0; i < LDN; i++) { bp[nb] = dnq[i]; bl[nb++] = (size_t)VD * D; }
+    for (int i = 0; i < L;   i++) { bp[nb] = rtq[i]; bl[nb++] = (size_t)D * E; }
+    size_t grain = 1u << 20;
+    int nch = 0;
+    for (int b = 0; b < nb; b++) nch += (int)((bl[b] + grain - 1) / grain);
+    Chunk *ch = malloc(sizeof(Chunk) * (size_t)nch);
+    int k = 0;
+    for (int b = 0; b < nb; b++)
+        for (size_t off = 0; off < bl[b]; off += grain) {
+            size_t len = bl[b] - off; if (len > grain) len = grain;
+            ch[k].p = bp[b] + off; ch[k].len = len; k++;
+        }
+
     double *t3 = malloc(sizeof(double) * (size_t)samples);
     double *t1 = malloc(sizeof(double) * (size_t)samples);
     double *td = malloc(sizeof(double) * (size_t)samples);
     double *tr = malloc(sizeof(double) * (size_t)samples);
-    double *tstream = malloc(sizeof(double) * (size_t)samples);
-
-    const int8_t **blocks = malloc(sizeof(int8_t *) * (size_t)(3 * L + LDN + L));
-    size_t *sizes = malloc(sizeof(size_t) * (size_t)(3 * L + LDN + L));
-    int nb = 0;
-    for (int i = 0; i < g_qdw_n; i++) {
-        blocks[nb] = g_qdw[i].q; sizes[nb++] = (size_t)g_qdw[i].I * g_qdw[i].O;
-    }
-    for (int i = 0; i < LDN; i++) { blocks[nb] = dnq[i]; sizes[nb++] = (size_t)VD * D; }
-    for (int i = 0; i < L;   i++) { blocks[nb] = rtq[i]; sizes[nb++] = (size_t)D * E; }
+    double *ts = malloc(sizeof(double) * (size_t)samples);
 
     for (int s = 0; s < samples; s++) {
         double a = 0, b = 0;
@@ -228,7 +269,7 @@ int main(int argc, char **argv) {
         for (long r = 0; r < reps; r++) {
             if ((s + r) & 1) {
                 double t = now_s();
-                for (int i = 0; i < L; i++) qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh);
+                for (int i = 0; i < L; i++) qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh, shu);
                 b += now_s() - t;
                 t = now_s();
                 for (int i = 0; i < L; i++) shared_three(&ls[i], x, out_a, D, Ish, sh, shu, shd);
@@ -238,7 +279,7 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < L; i++) shared_three(&ls[i], x, out_a, D, Ish, sh, shu, shd);
                 a += now_s() - t;
                 t = now_s();
-                for (int i = 0; i < L; i++) qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh);
+                for (int i = 0; i < L; i++) qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh, shu);
                 b += now_s() - t;
             }
         }
@@ -255,35 +296,38 @@ int main(int argc, char **argv) {
             for (int i = 0; i < L; i++) matmul_q(rty, x, rtq[i], rts[i], D, E);
         tr[s] = (now_s() - t) / (double)reps * 1000.0;
 
-        tstream[s] = stream_read(blocks, sizes, nb) * 1000.0;
+        ts[s] = stream_read(ch, nch) * 1000.0;
     }
 
-    double mb_all = mb_shared + mb_dn + mb_router;
-    printf("  %-26s %11s %13s %13s %13s\n", "", "per token", "weights", "achieved", "OpenMP");
-    row("shared expert, 3 calls", median(t3, samples), mb_shared, 3 * L);
-    row("shared expert, fused",   median(t1, samples), mb_shared, L);
-    row("dn out_proj",            median(td, samples), mb_dn,     LDN);
-    row("router",                 median(tr, samples), mb_router, L);
-    row("all three, streamed",    median(tstream, samples), mb_all, nb);
+    printf("  one empty parallel region: %8.2f us   (team of %d)\n", fj_ns / 1000.0, nthreads);
+    printf("  one barrier inside a region: %6.2f us   %s\n\n", ba_ns / 1000.0,
+           ba_ns < fj_ns * 0.5 ? "<- cheaper: fusing regions can pay"
+                               : "<- not cheaper: fusing regions buys little");
 
-    double fj = forkjoin_ns(20000);
+    double mb_all = mb_shared + mb_dn + mb_router;
+    printf("  %-24s %11s %7s   %22s   %19s\n",
+           "", "per token", "weights", "charged to regions", "left, and its rate");
+    row("shared expert, 3 calls", median(t3, samples), mb_shared, 3 * L, fj_ms);
+    row("shared expert, fused",   median(t1, samples), mb_shared, L,     fj_ms);
+    row("dn out_proj",            median(td, samples), mb_dn,     LDN,   fj_ms);
+    row("router",                 median(tr, samples), mb_router, L,     fj_ms);
+    row("all bytes, one region",  median(ts, samples), mb_all,    1,     fj_ms);
+
     double saved = median(t3, samples) - median(t1, samples);
-    printf("\n  fork/join floor: %.0f ns per region (team of %d)\n", fj, nthreads);
-    printf("  the %d regions the fusion removes, at that floor: %.2f ms/token\n",
-           2 * L, fj * 2.0 * L / 1e6);
+    printf("\n  the %d regions the fusion removes, at the measured floor: %.2f ms/token\n",
+           2 * L, fj_ms * 2.0 * L);
     printf("  measured saving: %.2f ms/token\n", saved);
-    printf("  streaming ceiling says the shared expert cannot go below %.2f ms/token\n",
-           median(tstream, samples) * mb_shared / mb_all);
-    puts("\n  fused ~= 3 calls and both near the streaming line -> stream-bound,");
-    puts("  region surgery will not pay. A large gap -> the regions are the cost.");
+    puts("\n  Read the last two columns, not the GB/s of the raw time: if the rates");
+    puts("  left after the region charge agree with each other and with the one-region");
+    puts("  line, the model holds and the region column is the bill to attack.");
 
     for (int i = 0; i < g_qdw_n; i++) { free(g_qdw[i].q); free(g_qdw[i].sc); }
     g_qdw_n = 0;
     for (int i = 0; i < L; i++) { free(ls[i].sh_g); free(ls[i].sh_u); free(ls[i].sh_d); free(ls[i].sh_gate); }
     for (int i = 0; i < LDN; i++) { free(dnq[i]); free(dns[i]); }
     for (int i = 0; i < L; i++) { free(rtq[i]); free(rts[i]); }
-    free(ls); free(dnq); free(dns); free(rtq); free(rts); free(blocks); free(sizes);
+    free(ls); free(dnq); free(dns); free(rtq); free(rts); free(bp); free(bl); free(ch);
     free(x); free(xv); free(sh); free(shu); free(shd); free(out_a); free(out_b);
-    free(dny); free(rty); free(t3); free(t1); free(td); free(tr); free(tstream);
+    free(dny); free(rty); free(t3); free(t1); free(td); free(tr); free(ts);
     return 0;
 }

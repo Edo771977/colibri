@@ -114,7 +114,7 @@ static void shared_fused_case(int D, int Ish) {
     /* Unregistered weights are still f32: the fused path must decline rather
      * than read an int8 copy that does not exist. */
     memcpy(got,seed,(size_t)D*sizeof(float));
-    CHECK(qwen_shared_fused_row(&l,x,got,D,Ish,sh)==0,
+    CHECK(qwen_shared_fused_row(&l,x,got,D,Ish,sh,shu)==0,
           "D=%d Ish=%d fused path ran on f32 weights",D,Ish);
     CHECK(!memcmp(got,seed,(size_t)D*sizeof(float)),
           "D=%d Ish=%d declined fused path still wrote to out",D,Ish);
@@ -135,7 +135,7 @@ static void shared_fused_case(int D, int Ish) {
     for(int d=0;d<D;d++) ref[d]+=sgate*shd[d];
 
     memcpy(got,seed,(size_t)D*sizeof(float));
-    CHECK(qwen_shared_fused_row(&l,x,got,D,Ish,sh)==1,
+    CHECK(qwen_shared_fused_row(&l,x,got,D,Ish,sh,shu)==1,
           "D=%d Ish=%d fused path declined on int8 weights",D,Ish);
     if(memcmp(ref,got,(size_t)D*sizeof(float))){
         int shown=0,different=0;float worst=0.f;

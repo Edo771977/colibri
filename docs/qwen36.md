@@ -106,22 +106,22 @@ the int8 copy.
 
 ## Is the CPU half sync-bound or stream-bound?
 
-On a CUDA-tier host most of a decode token is CPU, and the two biggest CPU
-entries are the shared expert and the DeltaNet output projection. Measured on a
-Ryzen 9 7950X + RTX 4070 Ti SUPER at 56.4 ms/token: shared expert 12.5 ms,
-DeltaNet `norm+out` 9.0-10.0 ms.
+On a CUDA-tier host most of a decode token is CPU, and the three biggest CPU
+entries are the shared expert, the DeltaNet output projection and the router.
+Measured on a Ryzen 9 7950X + RTX 4070 Ti SUPER at 56.4 ms/token: 9.3, 9.0 and
+2.7 ms.
 
 There are two ways to read that, and they ask for opposite fixes:
 
 | reading | evidence for it | fix |
 |---|---|---|
-| **sync-bound** | the shared expert is 120 OpenMP regions per token (3 per layer x 40) around ~1 MB of work each; a region entry costs the same however small the body is | fewer, bigger regions |
-| **stream-bound** | it is also 126 MB of int8 weights per token that must cross the memory bus, plus 252 MB for `dn_out` — nearly 400 MB per token before anything else | read fewer bytes; region count is irrelevant |
+| **sync-bound** | those are 120, 30 and 40 OpenMP regions per token; a region entry costs the same however small the body is, and at decode these bodies are microseconds | fewer, bigger regions |
+| **stream-bound** | they are also 126 MB, 252 MB and 21 MB of int8 weights per token, and those bytes cross the memory bus however the work is cut up | read fewer bytes; region count is irrelevant |
 
 A MAC count cannot separate them, because it does not model memory at all:
 126 M MACs "should" be 1-2 ms, and that is how a 6-15 ms headroom estimate gets
-written down for a kernel that is actually near its DRAM floor — the same floor
-the expert kernel above is already measured against.
+written down for a kernel that might already be at its DRAM floor — the same
+floor the expert kernel above is measured against.
 
 `tests/bench_qwen36_decode_omp` settles it on the host in front of you, with no
 model file and no GPU, in a few seconds:
@@ -131,23 +131,44 @@ make -C c tests/bench_qwen36_decode_omp ARCH=native
 OMP_NUM_THREADS=<physical cores> ./c/tests/bench_qwen36_decode_omp
 ```
 
-It runs the shipping shapes through the engine's own kernels, both as the
-engine cuts them (three calls) and fused into one region per layer, alongside a
-plain streaming read of the same bytes — this machine's ceiling for the access
-pattern — and the fork/join floor of one empty region.
+It runs the shipping shapes through the engine's own kernels, both as the engine
+cuts them and fused into one region per layer, and measures the two prices that
+region surgery trades between: an empty parallel region, and a barrier inside
+one that is already open. Each row is then split into `regions x floor` and
+what is left, with the bandwidth that remainder implies. **Read the split, not
+the GB/s of the raw time.** If the remainders agree with each other and with the
+one-region streaming line, the model holds and the region column is the bill.
 
-* **fused ~= three calls, and both near the streaming line** — stream-bound. No
-  OpenMP surgery will move it; only fewer bytes will.
-* **a large gap between them, or both far below the ceiling** — the regions are
-  the cost. `QWEN36_SHARED_FUSE=1` collapses the shared expert's three regions
-  per layer into one (bit-exact) and is the first thing to try.
+Two traps this benchmark had to be fixed for, both worth knowing:
+
+- **A "streaming ceiling" measured one region per matrix is not a ceiling.** The
+  first version read the reference bytes in 190 separate regions; on a host with
+  a 54 us floor that is 10 ms of pure fork/join, and the reference came out
+  *slower* than the kernels it was supposed to bound. It reads every byte in one
+  region now.
+- **Fusing regions is not free if it changes the access pattern.** A fused
+  shared expert that computes gate row *i* and up row *i* together keeps two
+  weight streams live per thread instead of one. On the 7950X at 16 threads that
+  cost more than the regions it saved: 71 GB/s down to 15, a net loss of ~2 ms
+  even while removing 80 regions. `qwen_shared_fused_row` therefore gives each
+  thread a contiguous range of hidden units and walks the two matrices in turn,
+  which also means the thread that produced `g[i]` and `u[i]` combines them —
+  one region and one barrier, where the three-call form has three of each.
+
+On that host the empty-region floor measured **54 us on a team of 16**, and it
+did not move with `OMP_WAIT_POLICY=active GOMP_SPINCOUNT=200000`. At that price
+the ~250-300 regions a decode token spends are 13-16 ms of the 56.4 — the single
+largest addressable item, larger than anything SIMD width can reach, and the
+reason [PR #8](https://github.com/Edo771977/colibri/pull/8)'s AVX-512 kernels
+measured no gain. A floor that size is itself a finding: compare several team
+sizes with `make -C c bench-omp-grain` before concluding that the kernels are
+what needs changing.
 
 If the benchmark is fast but the engine is slow at the same shapes, the kernels
-are not the problem: the team is being made to wait somewhere else — a passive
-wait beside a CUDA context, or contention with the I/O pool. Compare a run with
-`OMP_WAIT_POLICY=active GOMP_SPINCOUNT=200000` before changing any code, and
-read [tuning.md](tuning.md) first: a spinning team has cost other engines
-dearly when the token is made of bytes from disk.
+are not the problem either: the team is waiting somewhere else — a passive wait
+beside a CUDA context, or contention with the I/O pool. Read
+[tuning.md](tuning.md) first: a spinning team has cost other engines dearly when
+the token is made of bytes from disk.
 
 ## Which container?
 
