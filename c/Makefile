@@ -125,7 +125,12 @@ WIN_STATIC := $(if $(findstring clang,$(DETECT_CC)),,-static)
 # and nothing else, so an otherwise fine build dies on clock_gettime64 plus
 # every pthread_* the expert tier and the prefetch threads use.
 WIN_PTHREAD := $(if $(findstring clang,$(DETECT_CC)),-lpthread,)
-LDFLAGS = -lm -fopenmp $(WIN_STATIC) -lpsapi $(WIN_PTHREAD) $(EXTRA_LDFLAGS)
+# Reserve the stack explicitly instead of inheriting whatever the linker picked:
+# GNU ld gives a MinGW target 2 MB, lld follows MSVC and gives less, and the
+# difference is the kind of thing that turns a working build into
+# STATUS_STACK_OVERFLOW (0xC00000FD) on a different toolchain. 8 MB of RESERVE
+# costs nothing -- pages commit as they are touched.
+LDFLAGS = -lm -fopenmp $(WIN_STATIC) -lpsapi $(WIN_PTHREAD) -Wl,--stack,8388608 $(EXTRA_LDFLAGS)
 ifeq ($(LTO),1)
 CFLAGS  += -flto
 LDFLAGS += -flto

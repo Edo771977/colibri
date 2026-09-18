@@ -597,10 +597,16 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
         if (g_sock_out >= 0 && g_sock_send) g_sock_send(g_sock_out, done, dl);
         else { fwrite(done, 1, (size_t)dl, stdout); fflush(stdout); }
     } else {
-        char text[1<<16]; decode_range(out, np, np+n_new, text, sizeof text);
-        char esc[1<<16]; json_escape((const unsigned char*)text, (int)strlen(text), esc, sizeof esc);
-        char buf[1<<20];
-        int bl = snprintf(buf, sizeof buf,
+        /* 1.13 MB of locals: text 64K + esc 64K + buf 1M. That fits the 2 MB
+         * stack GNU ld reserves on MinGW and not much else -- lld reserves
+         * less, and a worker thread less still. A frame this size has no
+         * business being automatic. */
+        enum { TEXT_CAP = 1<<16, BUF_CAP = 1<<20 };
+        char *text = malloc(TEXT_CAP), *esc = malloc(TEXT_CAP), *buf = malloc(BUF_CAP);
+        if (!text || !esc || !buf) { free(text); free(esc); free(buf); return; }
+        decode_range(out, np, np+n_new, text, TEXT_CAP);
+        json_escape((const unsigned char*)text, (int)strlen(text), esc, TEXT_CAP);
+        int bl = snprintf(buf, BUF_CAP,
           "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":\"%s\","
           "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
           "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d},"
@@ -608,6 +614,7 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
           g_oa_id, g_oa_created, g_model, esc, np, n_new, np+n_new, g_ttft, tps, total);
         if (g_sock_out >= 0 && g_sock_send) g_sock_send(g_sock_out, buf, bl);
         else { fwrite(buf, 1, (size_t)bl, stdout); fflush(stdout); }
+        free(text); free(esc); free(buf);
     }
 }
 
@@ -2546,6 +2553,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
  *   split conv_out -> q_in/k_in/v_in; repeat_interleave q,k by rep; l2norm
  *   (q scaled by 1/sqrt(kdim)); recurrence S[h]*=exp(g); kv=k@S; delta=(v-kv)*beta;
  *   S+=k (x) delta; out=q@S; per-head Gated RMSNorm (plain weight) -> out_proj. */
+/* 64-byte alignment for each carved sub-buffer (16 floats). */
+#define DN_PAD(n) (((int64_t)(n) + 15) & ~(int64_t)15)
+
+/* The one scratch block deltanet() carves up, grown on demand and never freed:
+ * it is live for as long as the model is. */
+static float *dn_scratch(int64_t need) {
+    static float *p = NULL;
+    static int64_t cap = 0;
+    if (need > cap) { free(p); p = falloc(need); cap = need; }
+    return p;
+}
+
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
@@ -2557,23 +2576,43 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float scale = 1.f / sqrtf((float)kdim);
     int H = c->hidden;
 
+    /* One block for all twelve scratch buffers, carved up below and reused for
+     * every layer and every token.
+     *
+     * These were twelve falloc/free per CALL, which on the 35B's 30 DeltaNet
+     * layers is 360 malloc and 360 free per decode token. That work sits
+     * outside all four dn-sub timers, so it shows up only as a hole between
+     * `deltanet` and the sum of its parts -- and how big the hole is depends on
+     * the C runtime's allocator, not on the model: measured at 11.6 ms/token on
+     * one Windows runtime and at nothing on another. A cost that swings that
+     * far on something the engine does not need to do at all should not exist.
+     *
+     * Safe to share: deltanet() has one call site, in step()'s layer loop, and
+     * the only thread this engine starts is the pilot prefetcher, which never
+     * enters here. Sub-buffers are 64-byte aligned so nothing straddles a cache
+     * line; every kernel that reads them uses unaligned loads anyway. */
+    int64_t need = DN_PAD((int64_t)conv_dim + value_dim) + 4*DN_PAD(vh)
+                 + DN_PAD(conv_dim) + 2*DN_PAD((int64_t)vh * kdim)
+                 + 2*DN_PAD(value_dim);
+    float *sc = dn_scratch(need);
     /* qkv and z live in ONE buffer: the fused GPU projection writes
      * [conv_dim ++ value_dim] in a single GEMV, and the CPU fallback fills the
      * same two regions. Either way the code below reads qkv/z unchanged. */
-    float *qkvz = falloc((int64_t)conv_dim + value_dim);
+    float *qkvz = sc;                       sc += DN_PAD((int64_t)conv_dim + value_dim);
     float *qkv = qkvz;
     float *z   = qkvz + conv_dim;
-    float *b   = falloc(vh);
-    float *a   = falloc(vh);
-    float *beta= falloc(vh);
-    float *gg  = falloc(vh);
-    float *conv_out = falloc(conv_dim);
-    float *q = falloc(vh * kdim);
-    float *k = falloc(vh * kdim);
-    float *outv = falloc(value_dim);
-    float *outr = falloc(value_dim);
-    float *kv = falloc(vdim);
-    float *delta = falloc(vdim);
+    float *b   = sc;                        sc += DN_PAD(vh);
+    float *a   = sc;                        sc += DN_PAD(vh);
+    float *beta= sc;                        sc += DN_PAD(vh);
+    float *gg  = sc;                        sc += DN_PAD(vh);
+    float *conv_out = sc;                   sc += DN_PAD(conv_dim);
+    float *q = sc;                          sc += DN_PAD((int64_t)vh * kdim);
+    float *k = sc;                          sc += DN_PAD((int64_t)vh * kdim);
+    float *outv = sc;                       sc += DN_PAD(value_dim);
+    float *outr = sc;
+    /* kv[] and delta[] used to be allocated here too and were read by nobody:
+     * the gated-delta-rule loop below keeps its own kvl[]/dl[] per thread. Two
+     * more malloc/free per call, 60 per token, for buffers nothing touched. */
 
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
@@ -2717,9 +2756,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             }
         }
     }
-    free(qkvz);   /* qkv and z are regions of this one allocation */
-    free(b); free(a); free(beta); free(gg);
-    free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
+    /* nothing to free: every buffer above is a slice of the shared block. */
 }
 
 static void layers_forward_range(Model *m, float *x, int S, int pos_base,
