@@ -151,16 +151,18 @@ static double stream_read(const Chunk *ch, int n) {
     return now_s() - t0;
 }
 
-static void row(const char *name, double ms, double mb, int regions, double floor_ms) {
-    double ovh = regions * floor_ms;
-    double work = ms - ovh;
-    if (work < 0.005) {
-        printf("  %-24s %8.2f ms %7.1f MB | %6.2f ms in %4d regions | the regions alone exceed it\n",
-               name, ms, mb, ovh, regions);
-        return;
-    }
-    printf("  %-24s %8.2f ms %7.1f MB | %6.2f ms in %4d regions | %6.2f ms at %6.1f GB/s\n",
-           name, ms, mb, ovh, regions, work, mb / 1024.0 / (work / 1000.0));
+/* Charge each row its SYNC POINTS, not just its regions: fusing three regions
+ * into one does not remove the synchronisation, it converts region entries into
+ * barriers, and nothing says a barrier is the cheaper of the two. Then charge
+ * the bytes at the rate the one-region line actually achieved. What is left is
+ * what the model does not explain, and a fused arm whose residual is large is
+ * telling you it broke the access pattern. */
+static void row(const char *name, double ms, double mb, int regions, int barriers,
+                double fj_ms, double ba_ms, double gbs) {
+    double sync = regions * fj_ms + barriers * ba_ms;
+    double dram = gbs > 0 ? mb / 1024.0 / gbs * 1000.0 : 0;
+    printf("  %-22s %7.2f ms %6.1f MB | %6.2f ms sync (%3dr+%3db) | %6.2f ms dram | %+6.2f ms left\n",
+           name, ms, mb, sync, regions, barriers, dram, ms - sync - dram);
 }
 
 int main(int argc, char **argv) {
@@ -299,27 +301,42 @@ int main(int argc, char **argv) {
         ts[s] = stream_read(ch, nch) * 1000.0;
     }
 
-    printf("  one empty parallel region: %8.2f us   (team of %d)\n", fj_ns / 1000.0, nthreads);
-    printf("  one barrier inside a region: %6.2f us   %s\n\n", ba_ns / 1000.0,
-           ba_ns < fj_ns * 0.5 ? "<- cheaper: fusing regions can pay"
-                               : "<- not cheaper: fusing regions buys little");
-
     double mb_all = mb_shared + mb_dn + mb_router;
-    printf("  %-24s %11s %7s   %22s   %19s\n",
-           "", "per token", "weights", "charged to regions", "left, and its rate");
-    row("shared expert, 3 calls", median(t3, samples), mb_shared, 3 * L, fj_ms);
-    row("shared expert, fused",   median(t1, samples), mb_shared, L,     fj_ms);
-    row("dn out_proj",            median(td, samples), mb_dn,     LDN,   fj_ms);
-    row("router",                 median(tr, samples), mb_router, L,     fj_ms);
-    row("all bytes, one region",  median(ts, samples), mb_all,    1,     fj_ms);
+    double ms_stream = median(ts, samples);
+    double gbs = mb_all / 1024.0 / (ms_stream / 1000.0);   /* one region: the real ceiling */
+    double ba_ms = ba_ns / 1e6;
 
-    double saved = median(t3, samples) - median(t1, samples);
-    printf("\n  the %d regions the fusion removes, at the measured floor: %.2f ms/token\n",
-           2 * L, fj_ms * 2.0 * L);
-    printf("  measured saving: %.2f ms/token\n", saved);
-    puts("\n  Read the last two columns, not the GB/s of the raw time: if the rates");
-    puts("  left after the region charge agree with each other and with the one-region");
-    puts("  line, the model holds and the region column is the bill to attack.");
+    printf("  one empty parallel region:   %7.2f us   (team of %d)\n", fj_ns / 1000.0, nthreads);
+    printf("  one barrier inside a region: %7.2f us   %s\n",
+           ba_ns / 1000.0,
+           ba_ns < fj_ns ? "<- cheaper than a region: fusing can pay"
+                         : "<- NOT cheaper than a region: fusing trades down");
+    printf("  streaming read, one region:  %7.2f GB/s\n\n", gbs);
+
+    row("shared expert, 3 calls", median(t3, samples), mb_shared, 3 * L, 0,   fj_ms, ba_ms, gbs);
+    row("shared expert, fused",   median(t1, samples), mb_shared, L,     L,   fj_ms, ba_ms, gbs);
+    row("dn out_proj",            median(td, samples), mb_dn,     LDN,   0,   fj_ms, ba_ms, gbs);
+    row("router",                 median(tr, samples), mb_router, L,     0,   fj_ms, ba_ms, gbs);
+    row("all bytes, one region",  ms_stream,           mb_all,    1,     0,   fj_ms, ba_ms, gbs);
+
+    double sync3 = 3.0 * L * fj_ms, sync1 = L * fj_ms + L * ba_ms;
+    printf("\n  fusing trades %.2f ms of region entries for %.2f ms of barriers: %+.2f ms predicted\n",
+           sync3, sync1, sync1 - sync3);
+    printf("  measured: %+.2f ms/token\n", median(t1, samples) - median(t3, samples));
+
+    if (fj_ns > 10000.0 || ba_ns > 10000.0) {
+        puts("\n  *** The sync prices above are tens of microseconds. A healthy OpenMP");
+        puts("  *** runtime charges single digits, so on this host the RUNTIME is the");
+        puts("  *** dominant cost of a decode token, not any kernel in it. A decode");
+        printf("  *** token crosses roughly 250-300 regions: %.0f-%.0f ms at this floor.\n",
+               250 * fj_ms, 300 * fj_ms);
+        puts("  *** Before reshaping kernels, try another OpenMP runtime (clang/libomp");
+        puts("  *** rather than MinGW libgomp on Windows) and re-run this. No kernel");
+        puts("  *** change can recover what the runtime is spending.");
+    } else {
+        puts("\n  Read the last column: a residual near zero on every row means the model");
+        puts("  holds, and the sync column is then the bill worth attacking.");
+    }
 
     for (int i = 0; i < g_qdw_n; i++) { free(g_qdw[i].q); free(g_qdw[i].sc); }
     g_qdw_n = 0;

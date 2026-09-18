@@ -1367,7 +1367,13 @@ static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
         for (int i = i0; i < i1; i++) u[i] = q36_dot_row(qu + (int64_t)i * D, x, D) * su[i];
         for (int i = i0; i < i1; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
         #pragma omp barrier
-        #pragma omp for schedule(static)
+        /* nowait: the region's own exit join already orders this against the
+         * caller, so the worksharing barrier at the end of the loop is pure
+         * cost. It is not a small one -- on the host this was measured on a
+         * barrier inside an open region costs MORE than an entire parallel
+         * region entry (70 us against 53 on a team of 16), which is what makes
+         * the difference between one sync point here and two. */
+        #pragma omp for schedule(static) nowait
         for (int o = 0; o < D; o++)
             out[o] += sgate * (q36_dot_row(qd + (int64_t)o * Ish, g, Ish) * sd[o]);
     }
