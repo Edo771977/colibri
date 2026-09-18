@@ -155,13 +155,42 @@ token, larger than anything SIMD width can reach, and the reason
 [PR #8](https://github.com/Edo771977/colibri/pull/8)'s AVX-512 kernels measured
 no gain at all.
 
-It is a Windows/MinGW `libgomp` property, not a CPU one: the same build also
-reports `libgomp: Affinity not supported on this configuration`, so
-`OMP_PROC_BIND`/`OMP_PLACES` cannot even be tried, and `OMP_WAIT_POLICY=active
-GOMP_SPINCOUNT=200000` moves neither number. **Before reshaping any kernel on
-such a host, try another OpenMP runtime** (clang with LLVM's `libomp`, which has
-a real Windows implementation) and re-run the benchmark. No kernel change
-recovers what the runtime is spending.
+It is a property of that `libgomp` build, not of the CPU, of Windows, or of
+desktop contention. `tests/bench_omp_sync` prices the same two things with
+nothing else in the way, and three runtimes on the one machine disagree by more
+than an order of magnitude at 16 threads:
+
+| runtime | empty region | barrier in an open region |
+|---|---|---|
+| MinGW `libgomp` (gcc) | 53.5 us | 70.5 us |
+| LLVM `libomp` (`cl /openmp:llvm`) | 8.1 us | 1.5 us |
+| VCOMP (`cl /openmp`) | 1.9 us | 1.1 us |
+
+`libgomp`'s price is also LINEAR in team size — 12/25/34/53 us for a region and
+6.5/20/35/70 for a barrier at 2/4/8/16 threads, about 4.4 us per thread — which
+is what a runtime that wakes its team one thread at a time looks like. That is
+why `OMP_WAIT_POLICY=active GOMP_SPINCOUNT=200000` moves neither number: nothing
+is sleeping, the signalling is serial. Even a two-thread region costs 12 us,
+against 1.35 us for a four-thread one under glibc `libgomp` on Linux. The same
+build also reports `libgomp: Affinity not supported on this configuration`.
+
+**The fix is a link, not a rewrite.** GCC emits calls to the `GOMP_*` entry
+points and LLVM's `libomp` implements them, so the runtime can be swapped
+without touching a line of source:
+
+```sh
+pacman -S mingw-w64-ucrt-x86_64-llvm-openmp        # MSYS2 UCRT64
+make -C c bench-omp-sync OMP_RUNTIME=llvm          # confirm the prices moved
+make -C c qwen36.exe OMP_RUNTIME=llvm CUDA_DLL=1 ARCH=native
+```
+
+`OMP_RUNTIME=llvm` drops `-fopenmp` and `-static` from the link and adds
+`-lomp`; `-fopenmp` stays on the compile, so the generated code is unchanged.
+Verified on Linux against `libomp.so.5`: the engine links, `ldd` shows no
+`libgomp`, the tiny oracle still matches 16/16 and the dumped logits are
+byte-identical to the `libgomp` build. Run `bench-omp-sync` under the knob
+first — if a link silently kept `libgomp` the prices simply will not move, and
+a token/s number taken on that would mean nothing.
 
 ### Two things the benchmark had to be fixed for
 

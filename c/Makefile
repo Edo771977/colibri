@@ -200,6 +200,39 @@ EXE     =
 endif
 endif
 
+# OMP_RUNTIME=llvm links LLVM's libomp instead of the compiler's own OpenMP
+# runtime. GCC emits calls to the GOMP_* entry points and libomp implements
+# them, so this is a link-time swap: no source change, no recompile of anything
+# but the link.
+#
+# On Windows the difference is not academic. Measured on a Ryzen 9 7950X at 16
+# threads with tests/bench_omp_sync.c, which is there to make exactly this
+# comparison:
+#
+#   runtime                     empty region   barrier in an open region
+#   MinGW libgomp (gcc)              53.5 us                     70.5 us
+#   LLVM libomp (cl /openmp:llvm)     8.1 us                      1.5 us
+#   VCOMP (cl /openmp)                1.9 us                      1.1 us
+#
+# libgomp's cost there is LINEAR in team size (2/4/8/16 threads: 12/25/34/53 us
+# for a region, 6.5/20/35/70 for a barrier, about 4.4 us per thread), which is
+# what a runtime that wakes its team one thread at a time looks like. Even a
+# two-thread region costs 12 us, against 1.35 us for a four-thread one under
+# glibc libgomp on Linux. A qwen36 decode token crosses a few hundred regions,
+# so this is 13-16 ms of a 56 ms token spent inside the runtime.
+#
+#   pacman -S mingw-w64-ucrt-x86_64-llvm-openmp     # MSYS2 UCRT64
+#   make qwen36.exe OMP_RUNTIME=llvm CUDA_DLL=1 ARCH=native
+#
+# -static goes with it: libomp ships as a DLL, which must then be on PATH
+# (C:/msys64/ucrt64/bin already is, if that is where pacman put it). Verify the
+# swap took with `make bench-omp-sync OMP_RUNTIME=llvm` before trusting a
+# token/s number to it -- if the link silently kept libgomp, the prices printed
+# will simply not move.
+ifeq ($(OMP_RUNTIME),llvm)
+LDFLAGS := $(filter-out -fopenmp -static,$(LDFLAGS)) -lomp
+endif
+
 # --- install ---
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
