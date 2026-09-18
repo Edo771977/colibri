@@ -120,7 +120,12 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 # act on, so a clang build links them normally and wants
 # C:\msys64\clang64\bin on PATH when it runs.
 WIN_STATIC := $(if $(findstring clang,$(DETECT_CC)),,-static)
-LDFLAGS = -lm -fopenmp $(WIN_STATIC) -lpsapi $(EXTRA_LDFLAGS)
+# MinGW keeps clock_gettime AND the whole pthread surface in libwinpthread.
+# GCC's -fopenmp implies -pthread and pulls it in; clang's -fopenmp links libomp
+# and nothing else, so an otherwise fine build dies on clock_gettime64 plus
+# every pthread_* the expert tier and the prefetch threads use.
+WIN_PTHREAD := $(if $(findstring clang,$(DETECT_CC)),-lpthread,)
+LDFLAGS = -lm -fopenmp $(WIN_STATIC) -lpsapi $(WIN_PTHREAD) $(EXTRA_LDFLAGS)
 ifeq ($(LTO),1)
 CFLAGS  += -flto
 LDFLAGS += -flto
