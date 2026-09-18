@@ -1332,6 +1332,14 @@ static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
     if (!qdw_lookup(l->sh_g, D, &qg, &sg)) return 0;
     if (!qdw_lookup(l->sh_u, D, &qu, &su)) return 0;
     if (!qdw_lookup(l->sh_d, Ish, &qd, &sd)) return 0;
+    /* Say so once: a silently declined switch (f32 weights) looks exactly like
+     * one that engaged and bought nothing. Called outside any parallel region. */
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "[qwen36] shared expert: one OpenMP region per layer "
+                        "(QWEN36_SHARED_FUSE=1); =0 restores three\n");
+    }
     float sgate = 1.f;
     if (l->sh_gate) {
         float s = 0.f; const float *wg = l->sh_gate;
@@ -2269,13 +2277,17 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
     if (B == 1) {
         for (int s=0;s<S;s++) {
             const float *xs=x+(int64_t)s*D;
+            float *os=out+(int64_t)s*D;
+            /* Same row, one OpenMP region instead of three -- see
+             * qwen_shared_fused_row. The CUDA-tier block in moe() takes the
+             * same switch; this is the CPU-only path of the same decision. */
+            if (shared_fuse_on() && qwen_shared_fused_row(l,xs,os,D,I,g)) continue;
             matmul_d(g,xs,l->sh_g,1,D,I);
             matmul_d(u,xs,l->sh_u,1,D,I);
             for(int i=0;i<I;i++){float sv=g[i];g[i]=(sv/(1.f+expf(-sv)))*u[i];}
             matmul_d(hh,g,l->sh_d,1,I,D);
             float sgate=1.f;
             if(l->sh_gate){float sg=0.f;for(int i=0;i<D;i++)sg+=xs[i]*l->sh_gate[i];sgate=1.f/(1.f+expf(-sg));}
-            float *os=out+(int64_t)s*D;
             for(int d=0;d<D;d++)os[d]+=sgate*hh[d];
         }
     } else {
