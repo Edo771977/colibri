@@ -221,8 +221,19 @@ endif
 # glibc libgomp on Linux. A qwen36 decode token crosses a few hundred regions,
 # so this is 13-16 ms of a 56 ms token spent inside the runtime.
 #
-#   pacman -S mingw-w64-ucrt-x86_64-llvm-openmp     # MSYS2 UCRT64
+# The package has to match the MSYS2 environment YOUR gcc comes from, which is
+# not always the one the PATH was meant to select -- `set PATH=%PATH%;...ucrt64`
+# appends, so a mingw64 already on the system PATH wins. Check with `where gcc`
+# (or the path in any error it prints) and install the matching one:
+#
+#   mingw64  ->  pacman -S mingw-w64-x86_64-llvm-openmp
+#   ucrt64   ->  pacman -S mingw-w64-ucrt-x86_64-llvm-openmp
+#   clang64  ->  pacman -S mingw-w64-clang-x86_64-llvm-openmp
+#
 #   make qwen36.exe OMP_RUNTIME=llvm CUDA_DLL=1 ARCH=native
+#
+# `cannot find -lomp` at link means the installed package belongs to a different
+# environment than the compiler doing the link.
 #
 # -static goes with it: libomp ships as a DLL, which must then be on PATH
 # (C:/msys64/ucrt64/bin already is, if that is where pacman put it). Verify the
