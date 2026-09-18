@@ -1082,7 +1082,7 @@ qwen36: qwen36$(EXE)
 endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
+qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h simd_i8f.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
@@ -1868,6 +1868,14 @@ tests/test_mem_available$(EXE): tests/test_mem_available.c compat.h
 
 tests/test_exact_dot$(EXE): tests/test_exact_dot.c exact_dot.h
 	$(CC) $(CFLAGS) tests/test_exact_dot.c -o tests/test_exact_dot$(EXE) $(LDFLAGS)
+
+# The AVX-512 int8 GEMV kernel, verified on every x86 builder and not only where
+# the default -march already carries AVX-512: the flags are added for this one
+# translation unit, and the test itself asks CPUID before executing anything, so
+# the binary still runs (and skips) on a host without the instructions.
+AVX512_CFLAGS = $(if $(X86_64),-mavx512f -mavx512bw,)
+tests/test_i8_acc512$(EXE): tests/test_i8_acc512.c simd_i8f.h
+	$(CC) $(CFLAGS) $(AVX512_CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

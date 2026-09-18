@@ -65,6 +65,7 @@ static int qwen36_max_ctx(void) {
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
+#include "simd_i8f.h"      /* AVX-512 int8 x f32 dot (QWEN36_AVX512) */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -853,7 +854,27 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     return vaddvq_s32(acc);
 }
 #endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The 512-bit GEMV inner loop is a different reduction order from the AVX2 one
+ * (simd_i8f.h), so it is a switch and not a silent replacement: QWEN36_AVX512=0
+ * restores the AVX2 kernels for an A/B on the same binary, and the token-exact
+ * oracle can be run on either side. On a build without AVX-512 the whole branch
+ * compiles out and nothing changes. */
+static int q36_avx512_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN36_AVX512"); v = !(e && *e == '0'); }
+    return v;
+}
+#endif
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (q36_avx512_on()) {
+        #pragma omp parallel for schedule(static) if(O >= 256)
+        for (int o = 0; o < O; o++)
+            y[o] = dot_i8f_avx512(q + (int64_t)o * I, x, I) * scale[o];
+        return;
+    }
+#endif
 #if defined(__ARM_NEON)
     /* IDOT is opt-in, not default-on: this path quantizes the ACTIVATIONS to
      * Q8_0 per 16-element block, which the scalar path does not, so the two are
@@ -929,6 +950,46 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
  * batching changes neither a float bit nor the decode path. */
 static void matmul_q_batch(float *y, const float *x, const int8_t *q,
                            const float *scale, int S, int I, int O) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    /* The contract above holds per ISA: when matmul_q takes the 512-bit loop,
+     * so must this, or prefill and decode disagree in the last bits -- which is
+     * what tests/test_qwen36_dense_batch.c pins, and what KV-prefix reuse
+     * relies on. Each row below is dot_i8f_avx512 spelled out: same two
+     * accumulators fed in the same order, same _mm512_reduce_add_ps, then the
+     * scale; I is 32-aligned here, so there is no tail. The tile still decodes
+     * each weight block once for two rows, which is what makes batching pay. */
+    if (q36_avx512_on() && !(I & 31)) {
+        #pragma omp parallel for schedule(static) if(O >= 256)
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o * I;
+            int row = 0;
+            for (; row + 1 < S; row += 2) {
+                const float *x0 = x + (int64_t)row * I;
+                const float *x1 = x0 + I;
+                __m512 a00 = _mm512_setzero_ps(), a01 = _mm512_setzero_ps();
+                __m512 a10 = _mm512_setzero_ps(), a11 = _mm512_setzero_ps();
+                for (int i = 0; i + 32 <= I; i += 32) {
+                    __m512 w0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                                    _mm_loadu_si128((const __m128i *)(w + i))));
+                    __m512 w1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                                    _mm_loadu_si128((const __m128i *)(w + i + 16))));
+                    a00 = _mm512_fmadd_ps(_mm512_loadu_ps(x0 + i),      w0, a00);
+                    a01 = _mm512_fmadd_ps(_mm512_loadu_ps(x0 + i + 16), w1, a01);
+                    a10 = _mm512_fmadd_ps(_mm512_loadu_ps(x1 + i),      w0, a10);
+                    a11 = _mm512_fmadd_ps(_mm512_loadu_ps(x1 + i + 16), w1, a11);
+                }
+                y[(int64_t)row * O + o] =
+                    _mm512_reduce_add_ps(_mm512_add_ps(a00, a01)) * scale[o];
+                y[(int64_t)(row + 1) * O + o] =
+                    _mm512_reduce_add_ps(_mm512_add_ps(a10, a11)) * scale[o];
+            }
+            if (row < S)
+                y[(int64_t)row * O + o] =
+                    dot_i8f_avx512(w, x + (int64_t)row * I, I) * scale[o];
+        }
+        return;
+    }
+#endif
 #if defined(__AVX2__) && defined(__FMA__)
     /* Every shipping Qwen3.6 dense input width is 32-aligned.  Keep unusual
      * checkpoint shapes on the literal historical kernel instead of trying
@@ -1061,6 +1122,25 @@ static void tier_offer_slot(int layer, int eid, const Slot *s) {
 static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *scale,
                         int I, int O, int gs) {
     int ng = (I + gs - 1) / gs;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    /* Per-group scales: the group is the unit of accumulation on every path, so
+     * the 512-bit kernel slots in one group at a time and the scale is applied
+     * exactly where the AVX2 and scalar versions apply it. */
+    if (q36_avx512_on()) {
+        #pragma omp parallel for schedule(static) if(O >= 256)
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o * I;
+            const float *sc = scale + (int64_t)o * ng;
+            float acc = 0.f;
+            for (int gi = 0; gi < ng; gi++) {
+                int base = gi * gs, end = base + gs; if (end > I) end = I;
+                acc += dot_i8f_avx512(w + base, x + base, end - base) * sc[gi];
+            }
+            y[o] = acc;
+        }
+        return;
+    }
+#endif
 #if defined(__AVX2__) && defined(__FMA__)
     if ((gs & 31) == 0) {
         #pragma omp parallel for schedule(static) if(O >= 256)
