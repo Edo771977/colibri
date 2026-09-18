@@ -1074,7 +1074,15 @@ QWEN36_TIER_SRC =
 QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+# On Windows, EXE=.exe.  Keep a bare qwen36 target so GNU make does not
+# fall through to its implicit %: %.c rule and compile qwen36.c alone.
+ifneq ($(EXE),)
+.PHONY: qwen36
+qwen36: qwen36$(EXE)
+endif
+# Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
+# be reported as up to date despite selecting the Windows CUDA DLL tier.
+qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
@@ -1155,6 +1163,10 @@ tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c expe
 # A byte-counted serving payload may end mid-character; the pre-tokenizer must
 # not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).
 tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# push_id / bpe_piece must refuse loudly, not crash, on a failed realloc during growth.
+tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.

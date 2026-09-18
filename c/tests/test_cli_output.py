@@ -266,6 +266,29 @@ class BannerModelLineTest(unittest.TestCase):
                 line = self.line({"model_type": model_type, "n_routed_experts": 8})
                 self.assertTrue(line.startswith(expected), line)
 
+    def test_qwen_checkpoints_are_named_by_geometry(self):
+        """One model_type, two sizes: the banner must not call a 2.4T a 35B (#1045)."""
+        thirty_five = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 40,
+                       "num_experts": 256, "hidden_size": 2048}
+        two_point_four = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 92,
+                          "num_experts": 512, "hidden_size": 8192}
+        self.assertTrue(self.line(thirty_five).startswith("Qwen3.6-35B-A3B · 35B MoE"),
+                        self.line(thirty_five))
+        line = self.line(two_point_four)
+        self.assertTrue(line.startswith("Qwen3.8-2.4T-A95B · 2.4T MoE"), line)
+        self.assertNotIn("35B", line)
+        # the HF repo nests the text config under text_config; the family
+        # config, not the root, is what carries the geometry
+        wrapped = {"model_type": "qwen3_5_moe", "text_config": two_point_four}
+        self.assertTrue(self.line(wrapped).startswith("Qwen3.8-2.4T-A95B"), self.line(wrapped))
+        # a geometry the registry does not recognise names itself, with its
+        # own numbers -- a tiny fixture is not "Qwen3.6-35B-A3B"
+        tiny = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 8,
+                "num_experts": 8, "hidden_size": 64}
+        line = self.line(tiny)
+        self.assertTrue(line.startswith("qwen3_5_moe_text · 8L x 8E MoE"), line)
+        self.assertNotIn("35B", line)
+
     def test_deepseek_v4_is_not_read_as_glm(self):
         """The regression this exists for: a non-GLM checkpoint said GLM-5.2."""
         line = self.line({"model_type": "deepseek_v4", "n_routed_experts": 256})
@@ -390,6 +413,32 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
              mock.patch("resource_plan.physical_cpu_count", return_value=6):
             env = self.coli.env_for_engine(self.args(), "olmoe")
         self.assertEqual(env.get("OMP_WAIT_POLICY"), "active")
+
+    def test_no_hot_team_when_auto_tier_turns_the_gpu_on(self):
+        """#1582 lets --auto-tier enable the VRAM tier from the built binary alone,
+        after the --gpu/--vram block. Asking about the accelerator before that ran
+        seeded the spin defaults for a launch that does use the GPU."""
+        args = self.args()
+        args.auto_tier = True
+        args.policy = "balanced"
+        args.no_tune_profile = True
+
+        def plan_env(plan, env, cuda_enabled=False):
+            if cuda_enabled:
+                env["COLI_CUDA"] = "1"
+            return env
+
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(self.coli.sys, "platform", "win32"), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=6), \
+             mock.patch("resource_plan.build_plan", return_value={}), \
+             mock.patch("resource_plan.environment_for_plan", side_effect=plan_env), \
+             mock.patch.object(self.coli, "plan_cuda_enabled", return_value=True), \
+             mock.patch.object(self.coli, "resource_request", return_value=(0, 0, 0, 0)):
+            env = self.coli.env_for_engine(args, "olmoe")
+        self.assertEqual(env.get("COLI_CUDA"), "1")
+        self.assertNotIn("OMP_WAIT_POLICY", env)
+        self.assertNotIn("GOMP_SPINCOUNT", env)
 
     def test_other_engines_hot_team_respects_overrides(self):
         with mock.patch.dict(os.environ, {"OMP_WAIT_POLICY": "passive"}, clear=True), \

@@ -69,7 +69,7 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, family_for_config, resolve_model,
+                             display_for, family_by_id, family_for_config, resolve_model,
                              tuning_replay_prompt)
 
 _TUNE_ROTATION_PROMPT = (
@@ -190,9 +190,16 @@ def model_banner_line(model):
     except (OSError, ValueError, TypeError):
         return generic
     kind = (cfg.get("model_type") or "").lower()
+    geometry = cfg
     try:
-        family = resolve_model(model).descriptor
-        name, scale = family.display_name, family.display_scale
+        resolved = resolve_model(model)
+        family = resolved.descriptor
+        # Size-aware: a family's model_type can span checkpoints an order of
+        # magnitude apart (Qwen3.6-35B and Qwen3.8-2.4T both resolve to
+        # qwen36). display_for names the geometry actually on disk, and
+        # falls back to the model_type when it recognises none.
+        name, scale = display_for(resolved)
+        geometry = resolved.family_config
         # display_scale e' la taglia del checkpoint di riferimento. Un REAP ha
         # lo stesso model_type e meno esperti: "284B" su un 150B e' #1367
         # di nuovo. Quando la geometria non e' quella del riferimento si
@@ -206,10 +213,11 @@ def model_banner_line(model):
         scale = ""
 
     bits = [name]
+    experts = geometry.get("n_routed_experts") or geometry.get("num_experts")
     if scale:
-        bits.append(f"{scale} MoE" if cfg.get("n_routed_experts") else scale)
+        bits.append(f"{scale} MoE" if experts else scale)
     else:
-        layers, experts = cfg.get("num_hidden_layers"), cfg.get("n_routed_experts")
+        layers = geometry.get("num_hidden_layers")
         if layers and experts:
             bits.append(f"{layers}L x {experts}E MoE")
         elif layers:
@@ -567,17 +575,6 @@ def env_for_engine(a, arch, plan=None):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
-    if (sys.platform == "win32" and arch != "deepseek_v4"
-            and not env.get("COLI_NO_OMP_TUNE") and not _accelerator_env(env)):
-        # CPU-only sister engines on Windows: the hot-team defaults env_for()
-        # gives GLM. libgomp reads them before main() and no sister engine
-        # re-execs itself to seed them, so they have to come from here.
-        # Not under CUDA/Metal/Vulkan: active spin contends with GPU dispatch
-        # and synchronization (docs/tuning.md, hybrid CUDA/CPU override).
-        for k, v in (("OMP_WAIT_POLICY", "active"),
-                     ("GOMP_SPINCOUNT", "200000"),
-                     ("OMP_DYNAMIC", "FALSE")):
-            env.setdefault(k, v)
     if getattr(a, "auto_tier", False):
         # GLM has historically applied both the resource plan and its measured
         # profile inside env_for().  The sibling launcher returned above that
@@ -589,16 +586,18 @@ def env_for_engine(a, arch, plan=None):
                 ram,ctx,devices,vram=resource_request(a,env)
                 plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
                                 kv_slots=requested_kv_slots(a,env))
-            # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
-            # selects a capable build above. Merely asking for auto-tier must not
-            # turn a CPU-only sibling binary into an attempted CUDA launch.
             plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
                                       and (arch == "deepseek_v4"
                                            or env.get("COLI_NO_OMP_TUNE")))
-            env=environment_for_plan(plan,env,
-                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+            gpu_off_by_request = env.get("COLI_CUDA") == "0"
+            cuda_on = plan_cuda_enabled(a, arch, env)
+            env=environment_for_plan(plan,env,cuda_enabled=cuda_on)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
+        # Outside the try on purpose: this only prints, and a display helper
+        # that stumbled inside it would be reported as "invalid resource plan"
+        # and take the launch down with it.
+        if not cuda_on: report_unapplied_vram_tier(plan, gpu_off_by_request)
         if plan_must_not_choose_omp:
             # environment_for_plan supplies the physical-core default used by
             # the other engines. V4 deliberately computes logical CPUs minus
@@ -616,6 +615,21 @@ def env_for_engine(a, arch, plan=None):
                 gain=100.0*profile["gain"]
                 print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% "
                       f"calibration throughput{C.r}",file=sys.stderr)
+    # LAST, on the finished environment: --auto-tier (#1582) and a measured
+    # profile can both turn the tier on after the --gpu/--vram block, so asking
+    # earlier would seed the hot team for a launch that does use the GPU.
+    #
+    # CPU-only sister engines on Windows: the hot-team defaults env_for() gives
+    # GLM. libgomp reads them before main() and no sister engine re-execs itself
+    # to seed them, so they have to come from here. Not under CUDA/Metal/Vulkan:
+    # active spin contends with GPU dispatch and synchronization
+    # (docs/tuning.md, hybrid CUDA/CPU override).
+    if (sys.platform == "win32" and arch != "deepseek_v4"
+            and not env.get("COLI_NO_OMP_TUNE") and not _accelerator_env(env)):
+        for k, v in (("OMP_WAIT_POLICY", "active"),
+                     ("GOMP_SPINCOUNT", "200000"),
+                     ("OMP_DYNAMIC", "FALSE")):
+            env.setdefault(k, v)
     return env
 
 def dsv4_cuda_available(model=None):
@@ -627,8 +641,11 @@ def dsv4_cuda_available(model=None):
     # not make a CPU engine look GPU-capable.
     eng = engine_for(model) if model else GLM
     if sys.platform == "win32":
-        dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
-        return os.path.exists(dll)
+        # backend_loader_dsv4.c tries the DeepGEMM build first and the generic
+        # one second, so either next to the engine starts the tier (the same
+        # two names `coli doctor` accepts).
+        return any(os.path.exists(os.path.join(os.path.dirname(eng), name))
+                   for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
     if sys.platform == "linux" and os.path.exists(eng):
         try:
             linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
@@ -713,6 +730,73 @@ def requested_kv_slots(a, env):
     value=getattr(a,"kv_slots",None)
     if value is None: value=int(env.get("COLI_KV_SLOTS","1"))
     return value
+
+def plan_cuda_enabled(a, arch, env):
+    """Should --auto-tier apply the VRAM tier that `coli plan` printed?
+
+    Yes exactly when the engine that is about to run was built with a GPU
+    backend, which is the question the GLM path has always asked
+    (`has_cuda=cuda_binary()`), and which is what --auto-tier documents: apply
+    the plan.
+
+    The sibling path used to answer a narrower question -- "did the user pass
+    --gpu or --vram" -- and the comment that guarded it was right at the time:
+    cuda_binary() could only inspect the GLM binary, so a perfectly good qwen36
+    CUDA build looked CPU-only to it and auto-tier had to assume the worst
+    rather than risk launching a CPU-only sibling as a CUDA one. Since #1533
+    the check takes the engine that will actually run, so the thing that
+    contract was protecting against can be TESTED instead of assumed, and
+    assuming it costs the user the tier they were just shown. On the box in
+    #1581 that was 11.8 tok/s against 21, with nothing on screen to explain it.
+
+    A CPU-only build still never gets a CUDA launch: that is what the check
+    below says. `--gpu none` (COLI_CUDA=0) is still the off switch, and an
+    explicit --gpu/--vram has already proved the build before we get here.
+    """
+    value = env.get("COLI_CUDA")
+    if value == "1": return True      # --gpu / --vram validated the build above
+    if value == "0": return False     # --gpu none, or the user set it by hand
+    # DeepSeek V4 links its tier differently on each platform, so it has its own
+    # probe; using cuda_binary() here would reject valid V4 CUDA builds (#1219).
+    if arch == "deepseek_v4": return dsv4_cuda_available(getattr(a, "model", None))
+    return cuda_binary(engine_for_gpu_check(a))
+
+
+def report_unapplied_vram_tier(plan, gpu_off_by_request=False):
+    """Say so when a real VRAM tier from the plan is not going into the launch.
+
+    After plan_cuda_enabled() there are only two ways to get here, and the user
+    can act on exactly one of them, so the notice says which: the GPU was turned
+    off by request, or the engine binary has no GPU backend to turn on.
+
+    Being told matters because `coli plan` and `coli doctor` print the VRAM tier
+    as part of the plan and --auto-tier is documented as applying that plan. In
+    #1581 the tier vanished with nothing on screen connecting the two, and the
+    reporter only found it by watching nvidia-smi.
+
+    The test for "real" is the planner's own: a device qualified to drive
+    placement, and a budget above zero. Anything else was not going to be
+    applied with the GPU on either, and saying so would be noise.
+    """
+    try:
+        from resource_plan import plans_placement, GB
+        vram = plan["tiers"]["vram"]
+        devices = [d for d in vram["devices"] if plans_placement(d)]
+        budget = vram["budget_bytes"]
+    except (ImportError, KeyError, TypeError, AttributeError):
+        return
+    if not devices or budget <= 0:
+        return
+    where = ", ".join(f"{d['index']}:{d.get('name') or 'GPU'}" for d in devices)
+    why = ("--gpu none turns the GPU off, so the tier is not applied. Drop it "
+           "to use the plan as printed."
+           if gpu_off_by_request else
+           "the engine binary has no GPU backend, so there is nothing to apply "
+           "it with. Rebuild the engine with CUDA=1 to use it.")
+    print(f"  {C.yel}[PLAN] the plan's VRAM tier is not being applied{C.r}\n"
+          f"  {C.dim}{budget / GB:.1f} GB on {where} stays unused: {why}{C.r}",
+          file=sys.stderr)
+
 
 def env_for(a):
     explicit_env = set(os.environ)
@@ -1352,9 +1436,13 @@ def cmd_run(a):
         # emits the answer and exits cleanly. No reason to spin up the gateway
         # for a single non-interactive prompt.
         e=env_for_engine(a,arch)
+        # The engine tokenizes the bytes it reads as UTF-8. A text-mode pipe
+        # would encode the prompt in the locale's code page instead: a
+        # UnicodeEncodeError on cp949/cp932 or the C locale, garbled bytes on
+        # cp1252. Hand it the bytes, like the V4 path's UTF-8 prompt file.
         result=subprocess.run(
             [engine, str(cap_for_launch(a.cap,e,16)), "8"],
-            input=prompt+"\n", text=True, env=e, check=False)
+            input=(prompt+"\n").encode("utf-8"), env=e, check=False)
         sys.exit(result.returncode)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
