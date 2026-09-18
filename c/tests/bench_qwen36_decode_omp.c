@@ -102,7 +102,7 @@ static volatile long g_sink;
 
 /* One empty region, the team as configured: what every #pragma pays before it
  * does any work. bench_omp_grain.c measures the same floor standalone. */
-static double forkjoin_ns(long reps) {
+static double forkjoin_once(long reps) {
     long acc = 0;
     double t0 = now_s();
     for (long r = 0; r < reps; r++) {
@@ -119,9 +119,9 @@ static double forkjoin_ns(long reps) {
 }
 
 /* A barrier INSIDE a region that is already open. Fusing three regions into one
- * trades two region entries for two of these, so it only pays if this is the
- * cheaper price. Nothing guarantees that it is. */
-static double barrier_ns(long reps) {
+ * trades region entries for these, so it only pays if this is the cheaper
+ * price. Nothing guarantees that it is. */
+static double barrier_once(long reps) {
     double t0 = now_s();
     #pragma omp parallel
     {
@@ -130,6 +130,20 @@ static double barrier_ns(long reps) {
         }
     }
     return (now_s() - t0) / (double)reps * 1e9;
+}
+
+/* Both prices are the latency of waking N threads, which is the most
+ * contention-sensitive thing this file measures: one team member descheduled by
+ * a browser tab and the whole team waits for it. Bandwidth barely notices that;
+ * these numbers can double. So take several samples and report the MINIMUM
+ * beside the median -- the minimum is the closest this machine got to being
+ * quiet, and a minimum far below the median means it never was. */
+static void sync_price(double (*fn)(long), long reps, int runs, double *lo, double *med) {
+    double *v = malloc(sizeof(double) * (size_t)runs);
+    for (int i = 0; i < runs; i++) v[i] = fn(reps);
+    qsort(v, (size_t)runs, sizeof(double), cmp_d);
+    *lo = v[0]; *med = v[runs / 2];
+    free(v);
 }
 
 typedef struct { const int8_t *p; size_t len; } Chunk;
@@ -235,8 +249,9 @@ int main(int argc, char **argv) {
     }
 
     /* --- the two sync prices, measured before anything is attributed to them --- */
-    double fj_ns = forkjoin_ns(20000);
-    double ba_ns = barrier_ns(20000);
+    double fj_lo, fj_ns, ba_lo, ba_ns;
+    sync_price(forkjoin_once, 4000, 7, &fj_lo, &fj_ns);
+    sync_price(barrier_once,  4000, 7, &ba_lo, &ba_ns);
     double fj_ms = fj_ns / 1e6;
 
     /* --- every weight byte, cut into ~1 MB chunks for one balanced region --- */
@@ -306,12 +321,19 @@ int main(int argc, char **argv) {
     double gbs = mb_all / 1024.0 / (ms_stream / 1000.0);   /* one region: the real ceiling */
     double ba_ms = ba_ns / 1e6;
 
-    printf("  one empty parallel region:   %7.2f us   (team of %d)\n", fj_ns / 1000.0, nthreads);
-    printf("  one barrier inside a region: %7.2f us   %s\n",
-           ba_ns / 1000.0,
-           ba_ns < fj_ns ? "<- cheaper than a region: fusing can pay"
-                         : "<- NOT cheaper than a region: fusing trades down");
-    printf("  streaming read, one region:  %7.2f GB/s\n\n", gbs);
+    printf("  one empty parallel region:   %7.2f us   (quietest of 7: %6.2f)  team of %d\n",
+           fj_ns / 1000.0, fj_lo / 1000.0, nthreads);
+    printf("  one barrier inside a region: %7.2f us   (quietest of 7: %6.2f)  %s\n",
+           ba_ns / 1000.0, ba_lo / 1000.0,
+           ba_ns < fj_ns ? "<- cheaper than a region"
+                         : "<- NOT cheaper than a region");
+    printf("  streaming read, one region:  %7.2f GB/s\n", gbs);
+    if (fj_lo < fj_ns * 0.6 || ba_lo < ba_ns * 0.6)
+        puts("  !! quietest sample is far below the median: something else is using this\n"
+             "  !! machine. Close it and re-run -- these two prices are thread wake-up\n"
+             "  !! latency and one descheduled team member inflates them. The GB/s and\n"
+             "  !! the kernel rows are far less sensitive and can be trusted meanwhile.");
+    putchar('\n');
 
     row("shared expert, 3 calls", median(t3, samples), mb_shared, 3 * L, 0,   fj_ms, ba_ms, gbs);
     row("shared expert, fused",   median(t1, samples), mb_shared, L,     L,   fj_ms, ba_ms, gbs);
@@ -324,8 +346,8 @@ int main(int argc, char **argv) {
            sync3, sync1, sync1 - sync3);
     printf("  measured: %+.2f ms/token\n", median(t1, samples) - median(t3, samples));
 
-    if (fj_ns > 10000.0 || ba_ns > 10000.0) {
-        puts("\n  *** The sync prices above are tens of microseconds. A healthy OpenMP");
+    if (fj_lo > 10000.0 || ba_lo > 10000.0) {
+        puts("\n  *** Even the quietest samples are tens of microseconds. A healthy OpenMP");
         puts("  *** runtime charges single digits, so on this host the RUNTIME is the");
         puts("  *** dominant cost of a decode token, not any kernel in it. A decode");
         printf("  *** token crosses roughly 250-300 regions: %.0f-%.0f ms at this floor.\n",

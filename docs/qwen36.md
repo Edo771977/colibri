@@ -137,6 +137,14 @@ row means the model holds.
 | barrier inside a region | 35.2 us | 69.6 us |
 | streaming read, one region | 52.2 GB/s | 54.6 GB/s |
 
+Both sync prices are the latency of waking N threads, which is the most
+contention-sensitive number here: one team member descheduled by a browser tab
+and the whole team waits for it. The figures above were taken on a desktop with
+other applications open, so treat them as an upper bound until they are
+reproduced on a quiet machine — the benchmark now prints the quietest of seven
+samples beside the median and says so when the two diverge. Bandwidth barely
+notices that kind of load, and the kernel rows much less than the sync prices.
+
 The bandwidth is exactly what dual-channel DDR5-5200 should give, and every
 kernel's residual lands on it. **The host is not stream-bound: it is paying tens
 of microseconds per synchronisation.** A healthy OpenMP runtime charges single
