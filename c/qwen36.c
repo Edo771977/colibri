@@ -1314,31 +1314,6 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
     matmul(y, x, W, S, I, O);
 }
 
-/* ---- The decode shared expert, in ONE OpenMP region.
- *
- * Three matmul_d calls per layer are three parallel regions per layer: 120
- * region entries per token on a 40-layer model, one per 1 MB of weights. A
- * region entry costs the same whether the body is a microsecond or a second
- * (tests/bench_omp_grain.c measures that floor), and at decode these bodies are
- * microseconds. gate row i, up row i and their silu combine become ONE
- * iteration -- the thread that produced both halves multiplies them, so the
- * combine needs no pass of its own -- and the down GEMV plus the accumulate
- * into `out` follow behind a single barrier INSIDE the same region. Three
- * region entries per layer become one: 120 per token become 40.
- *
- * Bit-exact by construction, not by luck: every output element is still
- * q36_dot_row on the same weight row times the same scale, the combine is
- * elementwise, and `out[o] += sgate * (dot * sd[o])` is the expression the
- * three-call form already evaluated. Only the row-to-thread mapping moves, and
- * that never entered the arithmetic. tests/test_qwen36_dense_batch.c pins it.
- *
- * It is OFF by default and QWEN36_SHARED_FUSE=1 turns it on, because nobody has
- * yet shown it WINS anything: on a 4-core box with 26 GB/s of streaming read
- * these GEMVs are already at the memory ceiling and the 80 removed regions are
- * worth 0.05 ms/token, inside the noise (tests/bench_qwen36_decode_omp.c). It
- * pays only where a region entry is expensive -- a large team, or one parked in
- * a passive wait beside a CUDA context. Measure on the host before enabling:
- * the same benchmark answers it in seconds without a model file. */
 /* The DeltaNet causal conv is ~180 us per layer of serial work (see the loop in
  * deltanet()). On by default because the arithmetic favours a team at every
  * region price this project has measured; =0 restores the serial pass. */
@@ -1346,81 +1321,6 @@ static int conv_omp_on(void){
     static int v = -1;
     if (v < 0) { const char *e = getenv("QWEN36_CONV_OMP"); v = !(e && *e == '0'); }
     return v;
-}
-
-static int shared_fuse_on(void){
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("QWEN36_SHARED_FUSE"); v = (e && *e != '0'); }
-    return v;
-}
-
-/* The int8 copy matmul_d would have dispatched to, or 0 if this matrix is still
- * f32 (COLI_DENSE_I8=0, or a shape qdw_register declined). */
-static int qdw_lookup(const float *W, int I, const int8_t **q, const float **sc){
-    if (!W) return 0;
-    for (int i = 0; i < g_qdw_n; i++) if (g_qdw[i].w == W && g_qdw[i].I == I) {
-        *q = g_qdw[i].q; *sc = g_qdw[i].sc; return 1;
-    }
-    return 0;
-}
-
-/* Returns 0 when the weights are not int8 and the caller must keep its
- * three-call form. g and u are the caller's scratch, Ish floats each. The
- * switch is read at
- * the CALL SITE, not here, so the benchmark and the exactness test can drive
- * this kernel directly. */
-static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
-                                 int D, int Ish, float *g, float *u){
-    const int8_t *qg, *qu, *qd; const float *sg, *su, *sd;
-    if (!qdw_lookup(l->sh_g, D, &qg, &sg)) return 0;
-    if (!qdw_lookup(l->sh_u, D, &qu, &su)) return 0;
-    if (!qdw_lookup(l->sh_d, Ish, &qd, &sd)) return 0;
-    /* Say so once: a silently declined switch (f32 weights) looks exactly like
-     * one that engaged and bought nothing. Called outside any parallel region. */
-    static int announced = 0;
-    if (!announced) {
-        announced = 1;
-        fprintf(stderr, "[qwen36] shared expert: one OpenMP region per layer "
-                        "(QWEN36_SHARED_FUSE=1); =0 restores three\n");
-    }
-    float sgate = 1.f;
-    if (l->sh_gate) {
-        float s = 0.f; const float *wg = l->sh_gate;
-        for (int i = 0; i < D; i++) s += x[i] * wg[i];
-        sgate = 1.f / (1.f + expf(-s));
-    }
-    const int a512 = q36_avx512_on();          /* resolved before the team forks */
-    #pragma omp parallel
-    {
-        /* Hand each thread a CONTIGUOUS range of hidden units and walk the two
-         * matrices one after the other, not row by row. Interleaving them (gate
-         * row i, up row i, gate row i+1, ...) saves the same regions and keeps
-         * two weight streams live per thread instead of one; measured on a
-         * 7950X at 16 threads that cost more than the regions were worth --
-         * 71 GB/s down to 15. Walking them in turn also means the thread that
-         * produced g[i] and u[i] is the thread that multiplies them, so the
-         * combine needs no barrier: one region and one barrier for what was
-         * three of each. */
-        int nt = 1, tid = 0;
-#ifdef _OPENMP
-        nt = omp_get_num_threads(); tid = omp_get_thread_num();
-#endif
-        int i0 = (int)((int64_t)Ish * tid / nt), i1 = (int)((int64_t)Ish * (tid + 1) / nt);
-        for (int i = i0; i < i1; i++) g[i] = q36_dot_row(qg + (int64_t)i * D, x, D, a512) * sg[i];
-        for (int i = i0; i < i1; i++) u[i] = q36_dot_row(qu + (int64_t)i * D, x, D, a512) * su[i];
-        for (int i = i0; i < i1; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-        #pragma omp barrier
-        /* nowait: the region's own exit join already orders this against the
-         * caller, so the worksharing barrier at the end of the loop is pure
-         * cost. It is not a small one -- on the host this was measured on a
-         * barrier inside an open region costs MORE than an entire parallel
-         * region entry (70 us against 53 on a team of 16), which is what makes
-         * the difference between one sync point here and two. */
-        #pragma omp for schedule(static) nowait
-        for (int o = 0; o < D; o++)
-            out[o] += sgate * (q36_dot_row(qd + (int64_t)o * Ish, g, Ish, a512) * sd[o]);
-    }
-    return 1;
 }
 
 /* rmsnorm over a row of length D (in-place capable: out may == x).
@@ -2364,10 +2264,6 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
         for (int s=0;s<S;s++) {
             const float *xs=x+(int64_t)s*D;
             float *os=out+(int64_t)s*D;
-            /* Same row, one OpenMP region instead of three -- see
-             * qwen_shared_fused_row. The CUDA-tier block in moe() takes the
-             * same switch; this is the CPU-only path of the same decision. */
-            if (shared_fuse_on() && qwen_shared_fused_row(l,xs,os,D,I,g,u)) continue;
             matmul_d(g,xs,l->sh_g,1,D,I);
             matmul_d(u,xs,l->sh_u,1,D,I);
             for(int i=0;i<I;i++){float sv=g[i];g[i]=(sv/(1.f+expf(-sv)))*u[i];}
@@ -2560,19 +2456,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
                 float *os = out + (int64_t)s*D;
-                if (!shared_fuse_on() || !qwen_shared_fused_row(l, xs, os, D, Ish, sh, shu)) {
-                    matmul_d(sh, xs, l->sh_g, 1, D, Ish);
-                    matmul_d(shu, xs, l->sh_u, 1, D, Ish);
-                    for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
-                    matmul_d(shd, sh, l->sh_d, 1, Ish, D);
-                    float sgate = 1.f;
-                    if (l->sh_gate) {
-                        float sg = 0.f; const float *wg = l->sh_gate;
-                        for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
-                        sgate = 1.f / (1.f + expf(-sg));
-                    }
-                    for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
+                matmul_d(sh, xs, l->sh_g, 1, D, Ish);
+                matmul_d(shu, xs, l->sh_u, 1, D, Ish);
+                for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
+                matmul_d(shd, sh, l->sh_d, 1, Ish, D);
+                float sgate = 1.f;
+                if (l->sh_gate) {
+                    float sg = 0.f; const float *wg = l->sh_gate;
+                    for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
+                    sgate = 1.f / (1.f + expf(-sg));
                 }
+                for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
