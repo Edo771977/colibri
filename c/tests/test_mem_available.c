@@ -11,6 +11,7 @@
  * numero stia dentro la RAM fisica, e -- dove il sistema espone il proprio
  * MemAvailable -- che coincida con quello. Il terzo vincolo e' quello che
  * impedisce di "passare" restituendo una costante. */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "../compat.h"
@@ -31,10 +32,24 @@ static double total_gb(void){
 
 int main(void){
     double avail = compat_mem_available_gb();
-    /* compat_mem_available_gb() e' ora un wrapper su compat_meminfo_gb(): le
-     * due devono dare lo stesso numero, o il wrapper ha perso qualcosa. */
+    /* compat_mem_available_gb() e' un wrapper su compat_meminfo_gb(), e il
+     * wrapper non deve perdere niente per strada. Ma le due chiamate NON
+     * leggono lo stesso numero: compat_meminfo_gb() non tiene niente in cache,
+     * riapre e ripercorre /proc/meminfo ogni volta, e MemAvailable si muove fra
+     * una lettura e l'altra su una macchina che sta lavorando. L'uguaglianza
+     * esatta fra due letture di un contatore vivo e' una proprieta' della quiete
+     * dell'host, non del wrapper: su un runner condiviso basta un kilobyte di
+     * scostamento -- /proc/meminfo e' in kB -- e il test fallisce senza che
+     * niente si sia rotto (job Sanitizers della CI, rosso due volte di fila).
+     *
+     * Quello che il wrapper puo' davvero sbagliare e' perdere il numero o
+     * riscalarlo, e quegli errori non sono piccoli: la confusione kB/KiB per cui
+     * questo test e' nato (#1375) vale 2,4%, restituire il totale invece della
+     * disponibile o uno zero valgono molto di piu'. L'1% li prende tutti e
+     * lascia passare il movimento del contatore. */
     { double t2 = 0, a2 = 0; compat_meminfo_gb(&t2, &a2);
-      check(a2 == avail, "compat_meminfo_gb e compat_mem_available_gb non concordano"); }
+      double rel = avail > 0.0 ? fabs(a2 - avail) / avail : (a2 == avail ? 0.0 : 1.0);
+      check(rel < 0.01, "compat_meminfo_gb e compat_mem_available_gb non concordano"); }
     printf("  disponibile: %.2f GB\n", avail);
     check(avail > 0.0, "la misura vale 0: la piattaforma non e' coperta (era il bug di Windows)");
     double total = total_gb();
