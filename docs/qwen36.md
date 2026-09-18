@@ -104,6 +104,51 @@ overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
 keeps its own path: it uploads the pair-layout int4 and computes misses from
 the int8 copy.
 
+## Is the CPU half sync-bound or stream-bound?
+
+On a CUDA-tier host most of a decode token is CPU, and the two biggest CPU
+entries are the shared expert and the DeltaNet output projection. Measured on a
+Ryzen 9 7950X + RTX 4070 Ti SUPER at 56.4 ms/token: shared expert 12.5 ms,
+DeltaNet `norm+out` 9.0-10.0 ms.
+
+There are two ways to read that, and they ask for opposite fixes:
+
+| reading | evidence for it | fix |
+|---|---|---|
+| **sync-bound** | the shared expert is 120 OpenMP regions per token (3 per layer x 40) around ~1 MB of work each; a region entry costs the same however small the body is | fewer, bigger regions |
+| **stream-bound** | it is also 126 MB of int8 weights per token that must cross the memory bus, plus 252 MB for `dn_out` — nearly 400 MB per token before anything else | read fewer bytes; region count is irrelevant |
+
+A MAC count cannot separate them, because it does not model memory at all:
+126 M MACs "should" be 1-2 ms, and that is how a 6-15 ms headroom estimate gets
+written down for a kernel that is actually near its DRAM floor — the same floor
+the expert kernel above is already measured against.
+
+`tests/bench_qwen36_decode_omp` settles it on the host in front of you, with no
+model file and no GPU, in a few seconds:
+
+```sh
+make -C c tests/bench_qwen36_decode_omp ARCH=native
+OMP_NUM_THREADS=<physical cores> ./c/tests/bench_qwen36_decode_omp
+```
+
+It runs the shipping shapes through the engine's own kernels, both as the
+engine cuts them (three calls) and fused into one region per layer, alongside a
+plain streaming read of the same bytes — this machine's ceiling for the access
+pattern — and the fork/join floor of one empty region.
+
+* **fused ~= three calls, and both near the streaming line** — stream-bound. No
+  OpenMP surgery will move it; only fewer bytes will.
+* **a large gap between them, or both far below the ceiling** — the regions are
+  the cost. `QWEN36_SHARED_FUSE=1` collapses the shared expert's three regions
+  per layer into one (bit-exact) and is the first thing to try.
+
+If the benchmark is fast but the engine is slow at the same shapes, the kernels
+are not the problem: the team is being made to wait somewhere else — a passive
+wait beside a CUDA context, or contention with the I/O pool. Compare a run with
+`OMP_WAIT_POLICY=active GOMP_SPINCOUNT=200000` before changing any code, and
+read [tuning.md](tuning.md) first: a spinning team has cost other engines
+dearly when the token is made of bytes from disk.
+
 ## Which container?
 
 The gs64 container carries one scale per 64-weight group instead of one per
