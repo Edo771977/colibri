@@ -866,15 +866,46 @@ static int q36_avx512_on(void) {
     return v;
 }
 #endif
-static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+/* One int8 weight row times the activation row, in exactly the operation order
+ * matmul_q's OpenMP loop has always used -- this IS that loop body, lifted out
+ * unchanged. Which thread computes which row never changed a float: every
+ * output element is one call of this function on one weight row. That is what
+ * lets a caller cut the row space differently (two matrices in one region, a
+ * whole shared expert in one region) and still land on the same bits as the
+ * historical one-region-per-GEMV shape. */
+static inline float q36_dot_row(const int8_t *w, const float *x, int I) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-    if (q36_avx512_on()) {
-        #pragma omp parallel for schedule(static) if(O >= 256)
-        for (int o = 0; o < O; o++)
-            y[o] = dot_i8f_avx512(q + (int64_t)o * I, x, I) * scale[o];
-        return;
-    }
+    if (q36_avx512_on()) return dot_i8f_avx512(w, x, I);
 #endif
+#if defined(__AVX2__) && defined(__FMA__)
+    /* Hand-vectorized int8->f32 GEMV (gcc does not auto-vectorize the
+     * convert+accumulate chain). 32 weights per iteration, FMA accumulate. */
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 32 <= I; i += 32) {
+        __m128i b0 = _mm_loadu_si128((const __m128i*)(w + i));
+        __m128i b1 = _mm_loadu_si128((const __m128i*)(w + i + 16));
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i),    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b0,8))), a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+16), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)), a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+24), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b1,8))), a3);
+    }
+    a0 = _mm256_add_ps(_mm256_add_ps(a0,a1), _mm256_add_ps(a2,a3));
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s,s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s,s,1));
+    float acc = _mm_cvtss_f32(s);
+    for (; i < I; i++) acc += x[i] * (float)w[i];
+    return acc;
+#else
+    float acc = 0.f;
+    for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
+    return acc;
+#endif
+}
+
+static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(__ARM_NEON)
     /* IDOT is opt-in, not default-on: this path quantizes the ACTIVATIONS to
      * Q8_0 per 16-element block, which the scalar path does not, so the two are
@@ -903,40 +934,11 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
         return;
     }
 #endif
-#if defined(__AVX2__) && defined(__FMA__)
-    /* Hand-vectorized int8->f32 GEMV (gcc does not auto-vectorize the
-     * convert+accumulate chain). 32 weights per iteration, FMA accumulate. */
+    /* if(O >= 256) on every path, including the scalar one: below that a
+     * decode-shaped GEMV is not worth a team. */
     #pragma omp parallel for schedule(static) if(O >= 256)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-        int i = 0;
-        for (; i + 32 <= I; i += 32) {
-            __m128i b0 = _mm_loadu_si128((const __m128i*)(w + i));
-            __m128i b1 = _mm_loadu_si128((const __m128i*)(w + i + 16));
-            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i),    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)), a0);
-            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b0,8))), a1);
-            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+16), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)), a2);
-            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+24), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b1,8))), a3);
-        }
-        a0 = _mm256_add_ps(_mm256_add_ps(a0,a1), _mm256_add_ps(a2,a3));
-        __m128 s = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
-        s = _mm_add_ps(s, _mm_movehl_ps(s,s));
-        s = _mm_add_ss(s, _mm_shuffle_ps(s,s,1));
-        float acc = _mm_cvtss_f32(s);
-        for (; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
-#else
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        float acc = 0.f;
-        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
-#endif
+    for (int o = 0; o < O; o++)
+        y[o] = q36_dot_row(q + (int64_t)o * I, x, I) * scale[o];
 }
 
 /* Multi-row dense-int8 prefill kernel.  matmul_q() above is deliberately kept
@@ -1277,6 +1279,82 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
         return;
     }
     matmul(y, x, W, S, I, O);
+}
+
+/* ---- The decode shared expert, in ONE OpenMP region.
+ *
+ * Three matmul_d calls per layer are three parallel regions per layer: 120
+ * region entries per token on a 40-layer model, one per 1 MB of weights. A
+ * region entry costs the same whether the body is a microsecond or a second
+ * (tests/bench_omp_grain.c measures that floor), and at decode these bodies are
+ * microseconds. gate row i, up row i and their silu combine become ONE
+ * iteration -- the thread that produced both halves multiplies them, so the
+ * combine needs no pass of its own -- and the down GEMV plus the accumulate
+ * into `out` follow behind a single barrier INSIDE the same region. Three
+ * region entries per layer become one: 120 per token become 40.
+ *
+ * Bit-exact by construction, not by luck: every output element is still
+ * q36_dot_row on the same weight row times the same scale, the combine is
+ * elementwise, and `out[o] += sgate * (dot * sd[o])` is the expression the
+ * three-call form already evaluated. Only the row-to-thread mapping moves, and
+ * that never entered the arithmetic. tests/test_qwen36_dense_batch.c pins it.
+ *
+ * It is OFF by default and QWEN36_SHARED_FUSE=1 turns it on, because nobody has
+ * yet shown it WINS anything: on a 4-core box with 26 GB/s of streaming read
+ * these GEMVs are already at the memory ceiling and the 80 removed regions are
+ * worth 0.05 ms/token, inside the noise (tests/bench_qwen36_decode_omp.c). It
+ * pays only where a region entry is expensive -- a large team, or one parked in
+ * a passive wait beside a CUDA context. Measure on the host before enabling:
+ * the same benchmark answers it in seconds without a model file. */
+static int shared_fuse_on(void){
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN36_SHARED_FUSE"); v = (e && *e != '0'); }
+    return v;
+}
+
+/* The int8 copy matmul_d would have dispatched to, or 0 if this matrix is still
+ * f32 (COLI_DENSE_I8=0, or a shape qdw_register declined). */
+static int qdw_lookup(const float *W, int I, const int8_t **q, const float **sc){
+    if (!W) return 0;
+    for (int i = 0; i < g_qdw_n; i++) if (g_qdw[i].w == W && g_qdw[i].I == I) {
+        *q = g_qdw[i].q; *sc = g_qdw[i].sc; return 1;
+    }
+    return 0;
+}
+
+/* Returns 0 when the weights are not int8 and the caller must keep its
+ * three-call form. g is the caller's scratch, Ish floats. The switch is read at
+ * the CALL SITE, not here, so the benchmark and the exactness test can drive
+ * this kernel directly. */
+static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
+                                 int D, int Ish, float *g){
+    const int8_t *qg, *qu, *qd; const float *sg, *su, *sd;
+    if (!qdw_lookup(l->sh_g, D, &qg, &sg)) return 0;
+    if (!qdw_lookup(l->sh_u, D, &qu, &su)) return 0;
+    if (!qdw_lookup(l->sh_d, Ish, &qd, &sd)) return 0;
+    float sgate = 1.f;
+    if (l->sh_gate) {
+        float s = 0.f; const float *wg = l->sh_gate;
+        for (int i = 0; i < D; i++) s += x[i] * wg[i];
+        sgate = 1.f / (1.f + expf(-s));
+    }
+    #pragma omp parallel
+    {
+        /* gate row i, up row i and their combine in one iteration: the thread
+         * that produced both halves is the one that multiplies them, so the
+         * separate combine pass and its barrier disappear with the two extra
+         * region entries. */
+        #pragma omp for schedule(static)
+        for (int i = 0; i < Ish; i++) {
+            float gv = q36_dot_row(qg + (int64_t)i * D, x, D) * sg[i];
+            float uv = q36_dot_row(qu + (int64_t)i * D, x, D) * su[i];
+            g[i] = (gv / (1.f + expf(-gv))) * uv;
+        }
+        #pragma omp for schedule(static)
+        for (int o = 0; o < D; o++)
+            out[o] += sgate * (q36_dot_row(qd + (int64_t)o * Ish, g, Ish) * sd[o]);
+    }
+    return 1;
 }
 
 /* rmsnorm over a row of length D (in-place capable: out may == x).
@@ -2281,7 +2359,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
     memset(out, 0, (int64_t)S*D*sizeof(float));
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
-    float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
+    /* The shared expert's hidden width is its own (shared_inter), not the
+     * routed expert's: sizing its scratch with I overflows the moment a
+     * checkpoint ships shared_inter > moe_inter. Qwen3.6 has 512 == 512, so
+     * this changes nothing there and keeps an architecture-identical
+     * checkpoint with a wider shared expert from writing past the block. */
+    int Ish_max = c->shared_inter > I ? c->shared_inter : I;
+    float *sh = falloc(Ish_max), *shu = falloc(Ish_max), *shd = falloc(D);
     int use_qt = qt_ready();
     int use_xf = !use_qt && xf_mode(m);
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
@@ -2370,18 +2454,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
-                matmul_d(sh, xs, l->sh_g, 1, D, Ish);
-                matmul_d(shu, xs, l->sh_u, 1, D, Ish);
-                for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
-                matmul_d(shd, sh, l->sh_d, 1, Ish, D);
-                float sgate = 1.f;
-                if (l->sh_gate) {
-                    float sg = 0.f; const float *wg = l->sh_gate;
-                    for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
-                    sgate = 1.f / (1.f + expf(-sg));
-                }
                 float *os = out + (int64_t)s*D;
-                for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
+                if (!shared_fuse_on() || !qwen_shared_fused_row(l, xs, os, D, Ish, sh)) {
+                    matmul_d(sh, xs, l->sh_g, 1, D, Ish);
+                    matmul_d(shu, xs, l->sh_u, 1, D, Ish);
+                    for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
+                    matmul_d(shd, sh, l->sh_d, 1, Ish, D);
+                    float sgate = 1.f;
+                    if (l->sh_gate) {
+                        float sg = 0.f; const float *wg = l->sh_gate;
+                        for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
+                        sgate = 1.f / (1.f + expf(-sg));
+                    }
+                    for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
+                }
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
