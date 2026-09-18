@@ -112,11 +112,28 @@ int main(int argc, char **argv) {
 
     #pragma omp parallel
     {
-        #pragma omp master
-        nthreads = omp_get_num_threads();
+        /* Plain assignment from thread 0 rather than `omp master`, which gcc 16
+         * deprecates (OpenMP 5.1) and which buys nothing here. */
+        if (omp_get_thread_num() == 0) nthreads = omp_get_num_threads();
     }
 
     printf("bench_omp_sync: team of %d, %d samples of %ld\n", nthreads, runs, reps);
+    /* TWO OpenMP runtimes in one process answer different questions and the
+     * result is not obviously wrong -- it is quietly meaningless. It happens
+     * when a link pulls in both: gcc's driver adds -lgomp whenever -fopenmp is
+     * on a command line that also links, so adding -lomp beside it links both,
+     * libgomp runs the regions and libomp answers omp_get_num_threads() from
+     * outside any team of its own. The tell is a team of one where a team was
+     * asked for, with prices that did not move. */
+    if (nthreads != omp_get_max_threads()) {
+        printf("\n  !! omp_get_num_threads() inside a region says %d, but\n"
+               "  !! omp_get_max_threads() outside says %d. Two OpenMP runtimes are\n"
+               "  !! linked into this binary: one is running the regions and the other\n"
+               "  !! is answering the queries. The numbers below measure nothing.\n"
+               "  !! Link exactly one -- with gcc that means not putting -lomp on a\n"
+               "  !! command line that also carries -fopenmp.\n\n",
+               nthreads, omp_get_max_threads());
+    }
     price("region", region_us, reps, runs);
     price("barrier", barrier_us, reps, runs);
     printf("\n  single-digit us: synchronisation is free, look at the kernels.\n");

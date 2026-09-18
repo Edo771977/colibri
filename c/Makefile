@@ -201,46 +201,53 @@ endif
 endif
 
 # OMP_RUNTIME=llvm links LLVM's libomp instead of the compiler's own OpenMP
-# runtime. GCC emits calls to the GOMP_* entry points and libomp implements
-# them, so this is a link-time swap: no source change, no recompile of anything
-# but the link.
-#
-# On Windows the difference is not academic. Measured on a Ryzen 9 7950X at 16
-# threads with tests/bench_omp_sync.c, which is there to make exactly this
-# comparison:
+# runtime. Worth caring about: measured on a Ryzen 9 7950X at 16 threads with
+# tests/bench_omp_sync.c, which exists to make exactly this comparison --
 #
 #   runtime                     empty region   barrier in an open region
 #   MinGW libgomp (gcc)              53.5 us                     70.5 us
 #   LLVM libomp (cl /openmp:llvm)     8.1 us                      1.5 us
 #   VCOMP (cl /openmp)                1.9 us                      1.1 us
 #
-# libgomp's cost there is LINEAR in team size (2/4/8/16 threads: 12/25/34/53 us
-# for a region, 6.5/20/35/70 for a barrier, about 4.4 us per thread), which is
-# what a runtime that wakes its team one thread at a time looks like. Even a
-# two-thread region costs 12 us, against 1.35 us for a four-thread one under
-# glibc libgomp on Linux. A qwen36 decode token crosses a few hundred regions,
-# so this is 13-16 ms of a 56 ms token spent inside the runtime.
+# -- and libgomp's price there is LINEAR in team size (12/25/34/53 us for a
+# region at 2/4/8/16 threads, 6.5/20/35/70 for a barrier, about 4.4 us per
+# thread), which is a runtime waking its team one thread at a time. That is why
+# OMP_WAIT_POLICY=active moves neither number. A qwen36 decode token crosses a
+# few hundred regions, so it is 13-16 ms of a 56 ms token.
 #
-# The package has to match the MSYS2 environment YOUR gcc comes from, which is
+# WHEN THIS KNOB WORKS. GCC emits calls to the GOMP_* entry points, so it can
+# only run on libomp where libomp was built with the GOMP compatibility layer.
+# That is the case on Linux -- verified: the engine links, ldd shows no libgomp,
+# the tiny oracle still matches 16/16 and the dumped logits are byte-identical.
+# It is NOT the case for MSYS2's libomp on Windows: the GOMP symbols are not
+# exported, ld quietly satisfies them from libgomp instead, and the binary ends
+# up with BOTH runtimes -- libgomp running the regions, libomp answering
+# omp_get_num_threads() from outside any team of its own. The tell is
+# `team of 1` with prices that did not move; bench_omp_sync now says so outright.
+#
+#   linux:   make -C c qwen36 OMP_RUNTIME=llvm          (needs libomp-dev)
+#
+# ON WINDOWS, USE CLANG INSTEAD. clang emits libomp's own ABI, so it needs no
+# knob at all -- plain -fopenmp links the right runtime:
+#
+#   pacman -S mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-llvm-openmp
+#   set PATH=C:\msys64\clang64\bin;%PATH%
+#   make bench-omp-sync CC=clang                        # confirm the prices moved
+#   make qwen36.exe CC=clang CUDA_DLL=1 ARCH=native
+#
+# The package must match the MSYS2 environment the compiler comes from, which is
 # not always the one the PATH was meant to select -- `set PATH=%PATH%;...ucrt64`
-# appends, so a mingw64 already on the system PATH wins. Check with `where gcc`
-# (or the path in any error it prints) and install the matching one:
-#
-#   mingw64  ->  pacman -S mingw-w64-x86_64-llvm-openmp
-#   ucrt64   ->  pacman -S mingw-w64-ucrt-x86_64-llvm-openmp
-#   clang64  ->  pacman -S mingw-w64-clang-x86_64-llvm-openmp
-#
-#   make qwen36.exe OMP_RUNTIME=llvm CUDA_DLL=1 ARCH=native
-#
-# `cannot find -lomp` at link means the installed package belongs to a different
-# environment than the compiler doing the link.
-#
-# -static goes with it: libomp ships as a DLL, which must then be on PATH
-# (C:/msys64/ucrt64/bin already is, if that is where pacman put it). Verify the
-# swap took with `make bench-omp-sync OMP_RUNTIME=llvm` before trusting a
-# token/s number to it -- if the link silently kept libgomp, the prices printed
-# will simply not move.
+# APPENDS, so a mingw64 already on the system PATH answers instead. Check with
+# `where gcc` / `where clang`. `cannot find -lomp` means the installed package
+# belongs to a different environment than the compiler doing the link.
 ifeq ($(OMP_RUNTIME),llvm)
+ifeq (,$(findstring clang,$(CC)))
+ifneq ($(IS_WIN),)
+$(warning OMP_RUNTIME=llvm with a GCC driver on Windows links BOTH OpenMP runtimes)
+$(warning (-fopenmp makes the driver add -lgomp to this same command line), and)
+$(warning MSYS2 libomp exports no GOMP_* symbols. Build with CC=clang instead.)
+endif
+endif
 LDFLAGS := $(filter-out -fopenmp -static,$(LDFLAGS)) -lomp
 endif
 

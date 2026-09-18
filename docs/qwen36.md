@@ -174,23 +174,40 @@ is sleeping, the signalling is serial. Even a two-thread region costs 12 us,
 against 1.35 us for a four-thread one under glibc `libgomp` on Linux. The same
 build also reports `libgomp: Affinity not supported on this configuration`.
 
-**The fix is a link, not a rewrite.** GCC emits calls to the `GOMP_*` entry
-points and LLVM's `libomp` implements them, so the runtime can be swapped
-without touching a line of source:
+**The fix is the toolchain, not a rewrite.** No kernel change recovers what the
+runtime is spending, and nothing in the engine has to change to spend less.
+
+On Linux it is purely a link. GCC emits calls to the `GOMP_*` entry points and
+LLVM's `libomp` implements them, so `OMP_RUNTIME=llvm` drops `-fopenmp` from the
+link line and adds `-lomp`, leaving `-fopenmp` on the compile so the generated
+code is identical. Verified against `libomp.so.5`: the engine links, `ldd` shows
+no `libgomp`, the tiny oracle still matches 16/16 and the dumped logits are
+byte-identical.
+
+**On Windows that link does not work, and fails quietly.** MSYS2's `libomp` does
+not export the `GOMP_*` compatibility symbols, so `ld` satisfies them from
+`libgomp` instead — and because `-fopenmp` is on a command line that also links,
+the GCC driver has already added `-lgomp` itself. The binary ends up carrying
+BOTH runtimes: `libgomp` runs the regions, `libomp` answers
+`omp_get_num_threads()` from outside any team of its own. The tell is `team of 1`
+with prices that did not move, and `bench_omp_sync` now says so outright rather
+than printing numbers that measure nothing.
+
+Use clang there instead. It emits `libomp`'s own ABI, so plain `-fopenmp` links
+the right runtime and no knob is involved:
 
 ```sh
-pacman -S mingw-w64-ucrt-x86_64-llvm-openmp        # MSYS2 UCRT64
-make -C c bench-omp-sync OMP_RUNTIME=llvm          # confirm the prices moved
-make -C c qwen36.exe OMP_RUNTIME=llvm CUDA_DLL=1 ARCH=native
+pacman -S mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-llvm-openmp
+set PATH=C:\msys64\clang64\bin;%PATH%
+make -C c bench-omp-sync CC=clang            # confirm the prices moved
+make -C c qwen36.exe CC=clang CUDA_DLL=1 ARCH=native
 ```
 
-`OMP_RUNTIME=llvm` drops `-fopenmp` and `-static` from the link and adds
-`-lomp`; `-fopenmp` stays on the compile, so the generated code is unchanged.
-Verified on Linux against `libomp.so.5`: the engine links, `ldd` shows no
-`libgomp`, the tiny oracle still matches 16/16 and the dumped logits are
-byte-identical to the `libgomp` build. Run `bench-omp-sync` under the knob
-first — if a link silently kept `libgomp` the prices simply will not move, and
-a token/s number taken on that would mean nothing.
+The package has to match the MSYS2 environment the compiler comes from, which is
+not always the one the `PATH` line was meant to select: `set PATH=%PATH%;...`
+appends, so an environment already on the system `PATH` answers first. Check with
+`where gcc` / `where clang`; `cannot find -lomp` means the installed package
+belongs to a different environment than the compiler doing the link.
 
 ### Two things the benchmark had to be fixed for
 

@@ -197,8 +197,7 @@ int main(int argc, char **argv) {
 #ifdef _OPENMP
     #pragma omp parallel
     {
-        #pragma omp master
-        nthreads = omp_get_num_threads();
+        if (omp_get_thread_num() == 0) nthreads = omp_get_num_threads();
     }
 #endif
 
