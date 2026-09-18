@@ -12,10 +12,16 @@ DETECT_CC := $(if $(filter default,$(origin CC)),gcc,$(CC))
 TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 
 MINGW  := $(findstring mingw,$(TRIPLET))
+# LLVM spells the same MinGW target x86_64-w64-windows-gnu, with no "mingw" in
+# it, so a clang build was falling through to the generic branch: no -lpsapi, no
+# EXE suffix, and `make qwen36.exe CC=clang` answering "nothing to be done"
+# because the target was called qwen36. MSYS2 CLANG64 is the supported way to
+# get LLVM's OpenMP runtime on Windows, which makes this path worth having.
+WINGNU := $(findstring windows,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
-IS_WIN := $(MINGW)$(CYGWIN)
+IS_WIN := $(MINGW)$(WINGNU)$(CYGWIN)
 
 # Appended to every platform's flags, so a caller can add to the build without
 # replacing it. Overriding CFLAGS= on the command line would drop that
@@ -108,7 +114,13 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
-LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
+# -static is a GCC-toolchain habit here: it makes the exe self-contained. MSYS2
+# CLANG64 ships its runtime pieces (compiler-rt, libc++, libomp) as DLLs, where
+# a fully static link is at best unusual and at worst a link error nobody can
+# act on, so a clang build links them normally and wants
+# C:\msys64\clang64\bin on PATH when it runs.
+WIN_STATIC := $(if $(findstring clang,$(DETECT_CC)),,-static)
+LDFLAGS = -lm -fopenmp $(WIN_STATIC) -lpsapi $(EXTRA_LDFLAGS)
 ifeq ($(LTO),1)
 CFLAGS  += -flto
 LDFLAGS += -flto
