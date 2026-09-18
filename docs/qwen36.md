@@ -133,20 +133,18 @@ row means the model holds.
 
 | | team of 8 | team of 16 |
 |---|---|---|
-| empty parallel region | 32.7 us | 53.5 us |
-| barrier inside a region | 35.2 us | 69.6 us |
-| streaming read, one region | 52.2 GB/s | 54.6 GB/s |
+| empty parallel region | 32.7 us | 53.5 us (quietest of 7: 52.6) |
+| barrier inside a region | 35.2 us | 69.6 us (quietest of 7: 69.6) |
+| streaming read, one region | 52.2 GB/s | 52.5 GB/s |
 
 Both sync prices are the latency of waking N threads, which is the most
 contention-sensitive number here: one team member descheduled by a browser tab
-and the whole team waits for it. The figures above were taken on a desktop with
-other applications open, so treat them as an upper bound until they are
-reproduced on a quiet machine — the benchmark now prints the quietest of seven
-samples beside the median and says so when the two diverge. Bandwidth barely
-notices that kind of load, and the kernel rows much less than the sync prices.
+and the whole team waits for it. So the benchmark prints the quietest of seven
+samples beside the median. Here they agree to within 0.8%, on a desktop with
+other applications open: this is the runtime's own price, not contention.
 
 The bandwidth is exactly what dual-channel DDR5-5200 should give, and every
-kernel's residual lands on it. **The host is not stream-bound: it is paying tens
+kernel's residual lands on it (-0.23, -0.33, +0.16, -0.10 ms on the four rows). **The host is not stream-bound: it is paying tens
 of microseconds per synchronisation.** A healthy OpenMP runtime charges single
 digits — the same benchmark on a 4-core Linux box measures 2.8 us and 0.8 us. A
 decode token crosses roughly 250-300 regions, so at this floor the *runtime*
@@ -208,6 +206,48 @@ not always the one the `PATH` line was meant to select: `set PATH=%PATH%;...`
 appends, so an environment already on the system `PATH` answers first. Check with
 `where gcc` / `where clang`; `cannot find -lomp` means the installed package
 belongs to a different environment than the compiler doing the link.
+
+### What it was worth, end to end
+
+Same commit, same session, the two builds alternated so that a machine drifting
+mid-run could not hand the win to whichever went first — the clang build ran
+LAST and posted the highest number of the four. 128 tokens, warm cache, CUDA
+expert tier, `OMP_NUM_THREADS` unset:
+
+| ms/token | gcc + libgomp | clang + libomp |
+|---|---|---|
+| deltanet | 23.7 | **14.4** |
+| &nbsp;&nbsp;in_proj (GPU) | 10.4 | 6.3 |
+| &nbsp;&nbsp;causal conv | 1.9 | 0.5 |
+| &nbsp;&nbsp;l2norm + recurrence | 2.9 | 2.0 |
+| &nbsp;&nbsp;gated norm + out_proj | 8.5 | 5.5 |
+| attention | 8.8 | **6.5** |
+| MoE total | 13.9 | **8.2** |
+| &nbsp;&nbsp;shared expert | 8.7 | 4.0 |
+| &nbsp;&nbsp;router | 2.7 | 0.6 |
+| lm_head (GPU) | 3.5 | 2.9 |
+| **total** | **50.2** | **32.2** |
+| **tok/s** | **13.4** | **20.7** |
+
+The three CPU rows the runtime was predicted to own moved as predicted (~2.5,
+~0.5, ~5 against 4.0, 0.6, 5.5). The two GPU rows moved as well, which was not
+predicted: those are ~30 synchronous round-trips per token whose measured time
+includes the CPU-side wait, and a team of 16 churning at 53 us per region was
+competing with the driver's own threads for cores. That is a hypothesis, not a
+measurement — but if it holds, part of what looked like a GPU ceiling was not.
+
+Four changes got this engine from 56.4 ms/token to 32.2 on that host, and none
+of them touches the arithmetic:
+
+| | ms/token | evidence |
+|---|---|---|
+| parallel causal conv | -3.2 | the conv sub-timer, 5.9 -> 2.0 |
+| deltanet's per-call allocations | -11.6 | closed a hole between `deltanet` and the sum of its own sub-timers |
+| attention's and moe's | -4.5 | 54.5 -> 50.2 on the same compiler |
+| clang + libomp | -18.0 | the table above |
+
+The first three keep the logits byte-identical; the fourth is a compiler change,
+so it cannot, and its gate is token-exactness against the torch oracle instead.
 
 ### Two things the benchmark had to be fixed for
 
