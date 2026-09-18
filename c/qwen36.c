@@ -2195,6 +2195,30 @@ static void rope_head_partial(float *x, int pos, int rope_dim, int head_dim, flo
  *  - partial RoPE on the first rotary_dim dims of each head (text: mRoPE == standard).
  *  - scale = head_dim^-0.5; GQA repeat_kv.
  *  - attn_out = attn_out * sigmoid(gate), then o_proj (input dim = q_heads*head_dim). */
+/* 64-byte alignment for each carved sub-buffer (16 floats). */
+#define DN_PAD(n) (((int64_t)(n) + 15) & ~(int64_t)15)
+
+/* A scratch block for a function called once per layer per token. Grown on
+ * demand, never freed: it is live for as long as the model is.
+ *
+ * deltanet(), attention() and moe() each used to malloc and free their working
+ * buffers on every call. On the 35B that is 360 + 70 + 280 malloc/free per
+ * DECODE TOKEN, for buffers whose sizes never change between calls. What that
+ * costs is a property of the C runtime's allocator rather than of the model:
+ * moving deltanet's twelve off the heap took an 11.6 ms/token hole out of its
+ * timer on one Windows runtime, and nothing at all on another. A cost that
+ * swings that far on work the engine does not need to do should not exist.
+ *
+ * One block per function is safe because each has a single call site in
+ * step()'s layer loop, and the only thread this engine starts is the pilot
+ * prefetcher, which calls none of them. */
+typedef struct { float *p; int64_t cap; } Scratch;
+static float *scratch_get(Scratch *s, int64_t need) {
+    if (need > s->cap) { free(s->p); s->p = falloc(need); s->cap = need; }
+    return s->p;
+}
+static Scratch g_dn_scratch, g_attn_scratch, g_moe_scratch;
+
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, D = c->hidden;
@@ -2208,15 +2232,21 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
      * regardless of the attn_output_gate config flag -- so split whenever the
      * q per-head dim exceeds the (k/v) head dim. */
     int gate_dim = (qdim > hd) ? (qdim - hd) : 0;
-    float *q = falloc((int64_t)S*q_out);
-    float *k = falloc((int64_t)S*kv_out);
-    float *vv= falloc((int64_t)S*kv_out);
+    /* One block for all seven buffers, reused across layers and tokens: see
+     * scratch_get. Sizes depend only on S and the config. */
+    int64_t need = DN_PAD((int64_t)S*q_out) + 2*DN_PAD((int64_t)S*kv_out)
+                 + 2*DN_PAD((int64_t)S*H*hd) + DN_PAD((int64_t)S*H*gate_dim)
+                 + DN_PAD((int64_t)S*H*hd);
+    float *sc = scratch_get(&g_attn_scratch, need);
+    float *q  = sc;                         sc += DN_PAD((int64_t)S*q_out);
+    float *k  = sc;                         sc += DN_PAD((int64_t)S*kv_out);
+    float *vv = sc;                         sc += DN_PAD((int64_t)S*kv_out);
     matmul_d(q, x, l->q, S, D, q_out);
     matmul_d(k, x, l->k, S, D, kv_out);
     matmul_d(vv, x, l->v, S, D, kv_out);
     /* split q into query (first hd) and gate (next gate_dim), both per head */
-    float *query = falloc((int64_t)S*H*hd);
-    float *gate  = falloc((int64_t)S*H*gate_dim);
+    float *query = sc;                      sc += DN_PAD((int64_t)S*H*hd);
+    float *gate  = sc;                      sc += DN_PAD((int64_t)S*H*gate_dim);
     for (int s = 0; s < S; s++) {
         for (int hh = 0; hh < H; hh++) {
             const float *qs = q + (int64_t)s*q_out + hh*qdim;
@@ -2242,7 +2272,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         memcpy(m->V[layer] + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
     }
     float scale = 1.f / sqrtf((float)hd);
-    float *ctx = falloc((int64_t)S*H*hd);
+    float *ctx = sc;                        sc += DN_PAD((int64_t)S*H*hd);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
@@ -2269,14 +2299,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     /* apply attn_output_gate: attn_out *= sigmoid(gate) */
-    float *ag = falloc((int64_t)S*H*hd);
+    float *ag = sc;
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
         int o = ((int64_t)s*H + hh)*hd + dd;
         float g = gate_dim ? gate[o] : 0.f;
         ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
     }
     matmul_d(out, ag, l->o, S, H*hd, D);
-    free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
+    /* nothing to free: every buffer above is a slice of the shared block. */
 }
 
 /* Batch the CPU shared expert across prompt rows.  The three resident matrices
@@ -2393,7 +2423,16 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
-    float *logits = falloc((int64_t)S*E);
+    /* One block for the router logits and the expert/shared scratch, reused
+     * across layers and tokens: see scratch_get. The shared expert's hidden
+     * width is its own (shared_inter), not the routed expert's -- sizing its
+     * buffers with I overflows the moment a checkpoint ships shared_inter >
+     * moe_inter. Qwen3.6 has 512 == 512, so this changes nothing there. */
+    int Ish_max = c->shared_inter > I ? c->shared_inter : I;
+    int64_t need = DN_PAD((int64_t)S*E) + 2*DN_PAD(I) + 2*DN_PAD(D)
+                 + 2*DN_PAD(Ish_max);
+    float *msc = scratch_get(&g_moe_scratch, need);
+    float *logits = msc;                    msc += DN_PAD((int64_t)S*E);
     double _tr = tm_now();
     matmul_d(logits, x, l->gate, S, D, E);
     tm_add(S, 4, tm_now()-_tr);
@@ -2401,14 +2440,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int s = 0; s < S; s++) { float *pr = logits + (int64_t)s*E; for (int e = 0; e < E; e++) pr[e] += l->gate_bias[e]; }
     }
     memset(out, 0, (int64_t)S*D*sizeof(float));
-    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
-    /* The shared expert's hidden width is its own (shared_inter), not the
-     * routed expert's: sizing its scratch with I overflows the moment a
-     * checkpoint ships shared_inter > moe_inter. Qwen3.6 has 512 == 512, so
-     * this changes nothing there and keeps an architecture-identical
-     * checkpoint with a wider shared expert from writing past the block. */
-    int Ish_max = c->shared_inter > I ? c->shared_inter : I;
-    float *sh = falloc(Ish_max), *shu = falloc(Ish_max), *shd = falloc(D);
+    float *g = msc;                         msc += DN_PAD(I);
+    float *u = msc;                         msc += DN_PAD(I);
+    float *hh = msc;                        msc += DN_PAD(D);
+    float *sh = msc;                        msc += DN_PAD(Ish_max);
+    float *shu = msc;                       msc += DN_PAD(Ish_max);
+    float *shd = msc;
     int use_qt = qt_ready();
     int use_xf = !use_qt && xf_mode(m);
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
@@ -2538,7 +2575,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
     if (!use_qt) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
-    free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
+    /* nothing to free: every buffer above is a slice of the shared block. */
 }
 
 /* Gated DeltaNet (linear_attention) forward — recurrent gated-delta-rule.
@@ -2553,17 +2590,6 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
  *   split conv_out -> q_in/k_in/v_in; repeat_interleave q,k by rep; l2norm
  *   (q scaled by 1/sqrt(kdim)); recurrence S[h]*=exp(g); kv=k@S; delta=(v-kv)*beta;
  *   S+=k (x) delta; out=q@S; per-head Gated RMSNorm (plain weight) -> out_proj. */
-/* 64-byte alignment for each carved sub-buffer (16 floats). */
-#define DN_PAD(n) (((int64_t)(n) + 15) & ~(int64_t)15)
-
-/* The one scratch block deltanet() carves up, grown on demand and never freed:
- * it is live for as long as the model is. */
-static float *dn_scratch(int64_t need) {
-    static float *p = NULL;
-    static int64_t cap = 0;
-    if (need > cap) { free(p); p = falloc(need); cap = need; }
-    return p;
-}
 
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
@@ -2594,7 +2620,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     int64_t need = DN_PAD((int64_t)conv_dim + value_dim) + 4*DN_PAD(vh)
                  + DN_PAD(conv_dim) + 2*DN_PAD((int64_t)vh * kdim)
                  + 2*DN_PAD(value_dim);
-    float *sc = dn_scratch(need);
+    float *sc = scratch_get(&g_dn_scratch, need);
     /* qkv and z live in ONE buffer: the fused GPU projection writes
      * [conv_dim ++ value_dim] in a single GEMV, and the CPU fallback fills the
      * same two regions. Either way the code below reads qkv/z unchanged. */
