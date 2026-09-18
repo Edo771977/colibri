@@ -2019,6 +2019,13 @@ bench-omp-grain: tests/bench_omp_grain.c
 	$(CC) $(CFLAGS) $< -o tests/bench_omp_grain $(LDFLAGS)
 	./tests/bench_omp_grain
 
+# The two sync prices alone, portable enough to build with gcc, clang and MSVC
+# so that different OpenMP runtimes can be compared on one machine. See the
+# header for the three command lines.
+bench-omp-sync: tests/bench_omp_sync.c
+	$(CC) $(CFLAGS) $< -o tests/bench_omp_sync$(EXE) $(LDFLAGS)
+	./tests/bench_omp_sync$(EXE)
+
 # --- sanitizers ---------------------------------------------------------
 # The whole C test suite under AddressSanitizer + UndefinedBehaviorSanitizer.
 # Until this target the only sanitized code in the tree was fuzz-rans, which
@@ -2098,7 +2105,7 @@ bench: iobench$(EXE)
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
-.PHONY: bench-omp-grain
+.PHONY: bench-omp-grain bench-omp-sync
 .PHONY: test-asan
 .PHONY: dsv4-cuda-test cuda-dsv4-dll cuda-dsv4-dg-dll dsv4-cuda-loader-test
 
