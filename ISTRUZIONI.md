@@ -77,8 +77,8 @@ nvcc+MSVC e viene caricata a runtime.
 
 Tre avvertenze:
 
-- `del backend_loader.o` prima di cambiare compilatore, o `make` riusa l'oggetto
-  prodotto dall'altro.
+- Cambiare compilatore non richiede `make clean`: `.build-config` include `$(CC)`
+  e gli oggetti ci dipendono, quindi si ricompilano da soli (verificato).
 - La build clang non e' `-static`: vuole `C:\msys64\clang64\bin` nel `PATH`
   anche quando la ESEGUI, per `libomp.dll` e `libwinpthread-1.dll`.
 - gcc e clang non producono gli stessi ultimi bit (vettorizzano diversamente le

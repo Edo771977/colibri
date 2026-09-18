@@ -525,6 +525,12 @@ jobs:
               grep -E "^C engine" conv_${cap}_$k.log > conv_ids_${cap}_$k.txt || true
             done
             test -s conv_ids_${cap}_1.txt || { echo "FAIL: no ids at cap=$cap"; cat conv_${cap}_1.log; exit 1; }
+            # Without this the step compares the serial pass with itself the
+            # moment the switch or the threshold breaks, and passes while
+            # testing nothing -- which is exactly what the wider fixture above
+            # exists to avoid.
+            grep -q "conv: across threads" conv_${cap}_1.log || { echo "FAIL: the parallel conv never engaged at cap=$cap"; cat conv_${cap}_1.log; exit 1; }
+            if grep -q "conv: across threads" conv_${cap}_0.log; then echo "FAIL: QWEN36_CONV_OMP=0 still used a team"; exit 1; fi
             cmp conv_ids_${cap}_0.txt conv_ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; exit 1; }
             if [ -f conv_logits_${cap}_0.f32 ] || [ -f conv_logits_${cap}_1.f32 ]; then
               cmp conv_logits_${cap}_0.f32 conv_logits_${cap}_1.f32 || { echo "FAIL: logits differ at cap=$cap"; exit 1; }

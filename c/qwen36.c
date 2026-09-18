@@ -618,6 +618,11 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
     }
 }
 
+/* A growable scratch block for a function called once per layer per token, so
+ * that it does not malloc and free its working buffers on every call. Carved up
+ * by its owner; see scratch_get and the note in deltanet(). */
+typedef struct { float *p; int64_t cap; } Scratch;
+
 /* ---------- config ---------- */
 typedef struct {
     int hidden, n_layers, n_active;
@@ -694,6 +699,14 @@ typedef struct {
     int resident_collecting;   /* prefill in progress, collecting routed experts */
     int first_step;            /* the first step() call is the prefill */
     int ram_cap_enabled;
+    /* Per-call scratch for deltanet/attention/moe, carved out of one growable
+     * block each (see scratch_get). In the Model and not in a file static:
+     * COLI_SEGMENT_ADAPTER gives every Qwen36SegmentEngine its own Model and
+     * its own run_lock, so two engines can be inside these functions on two
+     * threads at once, each holding only its OWN lock. Process-wide blocks
+     * would let them interleave activations, and a resize in one would free
+     * memory the other is reading. */
+    Scratch dn_scratch, attn_scratch, moe_scratch;
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -872,6 +885,8 @@ static int q36_avx512_on(void) {
     if (v < 0) { const char *e = getenv("QWEN36_AVX512"); v = !(e && *e == '0'); }
     return v;
 }
+#else
+static int q36_avx512_on(void) { return 0; }
 #endif
 /* One int8 weight row times the activation row, in exactly the operation order
  * matmul_q's OpenMP loop has always used -- this IS that loop body, lifted out
@@ -879,10 +894,20 @@ static int q36_avx512_on(void) {
  * output element is one call of this function on one weight row. That is what
  * lets a caller cut the row space differently (two matrices in one region, a
  * whole shared expert in one region) and still land on the same bits as the
- * historical one-region-per-GEMV shape. */
-static inline float q36_dot_row(const int8_t *w, const float *x, int I) {
+ * historical one-region-per-GEMV shape.
+ *
+ * use512 is a PARAMETER, not a call to q36_avx512_on() in here. This function
+ * runs inside the team, and q36_avx512_on() caches its answer in a function
+ * static on first use: reading it from every thread would be an unsynchronised
+ * read-modify-write plus a concurrent getenv(), which is a data race even where
+ * it happens to be harmless. Every caller resolves it once, serially, before
+ * opening its region -- which is what the code did before the body moved
+ * here. */
+static inline float q36_dot_row(const int8_t *w, const float *x, int I, int use512) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-    if (q36_avx512_on()) return dot_i8f_avx512(w, x, I);
+    if (use512) return dot_i8f_avx512(w, x, I);
+#else
+    (void)use512;
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
     /* Hand-vectorized int8->f32 GEMV (gcc does not auto-vectorize the
@@ -943,9 +968,10 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
 #endif
     /* if(O >= 256) on every path, including the scalar one: below that a
      * decode-shaped GEMV is not worth a team. */
+    const int a512 = q36_avx512_on();          /* resolved before the team forks */
     #pragma omp parallel for schedule(static) if(O >= 256)
     for (int o = 0; o < O; o++)
-        y[o] = q36_dot_row(q + (int64_t)o * I, x, I) * scale[o];
+        y[o] = q36_dot_row(q + (int64_t)o * I, x, I, a512) * scale[o];
 }
 
 /* Multi-row dense-int8 prefill kernel.  matmul_q() above is deliberately kept
@@ -1363,6 +1389,7 @@ static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
         for (int i = 0; i < D; i++) s += x[i] * wg[i];
         sgate = 1.f / (1.f + expf(-s));
     }
+    const int a512 = q36_avx512_on();          /* resolved before the team forks */
     #pragma omp parallel
     {
         /* Hand each thread a CONTIGUOUS range of hidden units and walk the two
@@ -1379,8 +1406,8 @@ static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
         nt = omp_get_num_threads(); tid = omp_get_thread_num();
 #endif
         int i0 = (int)((int64_t)Ish * tid / nt), i1 = (int)((int64_t)Ish * (tid + 1) / nt);
-        for (int i = i0; i < i1; i++) g[i] = q36_dot_row(qg + (int64_t)i * D, x, D) * sg[i];
-        for (int i = i0; i < i1; i++) u[i] = q36_dot_row(qu + (int64_t)i * D, x, D) * su[i];
+        for (int i = i0; i < i1; i++) g[i] = q36_dot_row(qg + (int64_t)i * D, x, D, a512) * sg[i];
+        for (int i = i0; i < i1; i++) u[i] = q36_dot_row(qu + (int64_t)i * D, x, D, a512) * su[i];
         for (int i = i0; i < i1; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
         #pragma omp barrier
         /* nowait: the region's own exit join already orders this against the
@@ -1391,7 +1418,7 @@ static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
          * the difference between one sync point here and two. */
         #pragma omp for schedule(static) nowait
         for (int o = 0; o < D; o++)
-            out[o] += sgate * (q36_dot_row(qd + (int64_t)o * Ish, g, Ish) * sd[o]);
+            out[o] += sgate * (q36_dot_row(qd + (int64_t)o * Ish, g, Ish, a512) * sd[o]);
     }
     return 1;
 }
@@ -2212,12 +2239,10 @@ static void rope_head_partial(float *x, int pos, int rope_dim, int head_dim, flo
  * One block per function is safe because each has a single call site in
  * step()'s layer loop, and the only thread this engine starts is the pilot
  * prefetcher, which calls none of them. */
-typedef struct { float *p; int64_t cap; } Scratch;
 static float *scratch_get(Scratch *s, int64_t need) {
     if (need > s->cap) { free(s->p); s->p = falloc(need); s->cap = need; }
     return s->p;
 }
-static Scratch g_dn_scratch, g_attn_scratch, g_moe_scratch;
 
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
@@ -2237,7 +2262,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int64_t need = DN_PAD((int64_t)S*q_out) + 2*DN_PAD((int64_t)S*kv_out)
                  + 2*DN_PAD((int64_t)S*H*hd) + DN_PAD((int64_t)S*H*gate_dim)
                  + DN_PAD((int64_t)S*H*hd);
-    float *sc = scratch_get(&g_attn_scratch, need);
+    float *sc = scratch_get(&m->attn_scratch, need);
     float *q  = sc;                         sc += DN_PAD((int64_t)S*q_out);
     float *k  = sc;                         sc += DN_PAD((int64_t)S*kv_out);
     float *vv = sc;                         sc += DN_PAD((int64_t)S*kv_out);
@@ -2431,7 +2456,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int Ish_max = c->shared_inter > I ? c->shared_inter : I;
     int64_t need = DN_PAD((int64_t)S*E) + 2*DN_PAD(I) + 2*DN_PAD(D)
                  + 2*DN_PAD(Ish_max);
-    float *msc = scratch_get(&g_moe_scratch, need);
+    float *msc = scratch_get(&m->moe_scratch, need);
     float *logits = msc;                    msc += DN_PAD((int64_t)S*E);
     double _tr = tm_now();
     matmul_d(logits, x, l->gate, S, D, E);
@@ -2620,7 +2645,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     int64_t need = DN_PAD((int64_t)conv_dim + value_dim) + 4*DN_PAD(vh)
                  + DN_PAD(conv_dim) + 2*DN_PAD((int64_t)vh * kdim)
                  + 2*DN_PAD(value_dim);
-    float *sc = scratch_get(&g_dn_scratch, need);
+    float *sc = scratch_get(&m->dn_scratch, need);
     /* qkv and z live in ONE buffer: the fused GPU projection writes
      * [conv_dim ++ value_dim] in a single GEMV, and the CPU fallback fills the
      * same two regions. Either way the code below reads qkv/z unchanged. */
@@ -2678,6 +2703,20 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
          * written within its own iteration, which also halves the passes over
          * the ring. if(conv_dim >= 256) keeps a tiny model off a team it cannot
          * fill; QWEN36_CONV_OMP=0 restores the serial pass for an A/B. */
+        /* Say once that the team was actually used. Without it an A/B of
+         * QWEN36_CONV_OMP compares the serial pass with itself the moment
+         * anything breaks the switch or the threshold -- on a fixture below
+         * conv_dim 256 that is the NORMAL case, and the comparison would pass
+         * while testing nothing. A duplicated line if two engines race here is
+         * harmless; a missing gate is not. */
+        if (conv_omp_on() && conv_dim >= 256) {
+            static int conv_said = 0;
+            if (!conv_said) {
+                conv_said = 1;
+                fprintf(stderr, "[qwen36] DeltaNet conv: across threads "
+                                "(QWEN36_CONV_OMP=0 restores the serial pass)\n");
+            }
+        }
         #pragma omp parallel for schedule(static) if(conv_omp_on() && conv_dim >= 256)
         for (int cc = 0; cc < conv_dim; cc++) {
             const float *w = l->dn_conv + (int64_t)cc * convk;
@@ -3866,6 +3905,9 @@ static void qwen36_segment_layer_free(Layer *layer) {
 static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
     if (!engine) return;
     Model *model = &engine->model;
+    free(model->dn_scratch.p);   model->dn_scratch.p = NULL;   model->dn_scratch.cap = 0;
+    free(model->attn_scratch.p); model->attn_scratch.p = NULL; model->attn_scratch.cap = 0;
+    free(model->moe_scratch.p);  model->moe_scratch.p = NULL;  model->moe_scratch.cap = 0;
     for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
          layer++) {
         qwen36_segment_layer_free(&model->L[layer]);

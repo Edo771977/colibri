@@ -263,6 +263,11 @@ endif
 # `where gcc` / `where clang`. `cannot find -lomp` means the installed package
 # belongs to a different environment than the compiler doing the link.
 ifeq ($(OMP_RUNTIME),llvm)
+ifneq (,$(DARWIN))
+$(error OMP_RUNTIME=llvm is not for macOS: that branch already links Homebrew's \
+libomp through OMPDIR when it finds one, so this would either duplicate it or, \
+with no Homebrew libomp present, append a bare -lomp that has no -L to find)
+endif
 ifeq (,$(findstring clang,$(CC)))
 ifneq ($(IS_WIN),)
 $(warning OMP_RUNTIME=llvm with a GCC driver on Windows links BOTH OpenMP runtimes)

@@ -146,7 +146,9 @@ other applications open: this is the runtime's own price, not contention.
 The bandwidth is exactly what dual-channel DDR5-5200 should give, and every
 kernel's residual lands on it (-0.23, -0.33, +0.16, -0.10 ms on the four rows). **The host is not stream-bound: it is paying tens
 of microseconds per synchronisation.** A healthy OpenMP runtime charges single
-digits — the same benchmark on a 4-core Linux box measures 2.8 us and 0.8 us. A
+digits — the same benchmark on a shared 4-core Linux VM measures 1.3-2.8 us and
+0.4-0.9 us depending on how busy the host is, an order of magnitude below either
+figure above. A
 decode token crosses roughly 250-300 regions, so at this floor the *runtime*
 spends 13-16 ms of the 56.4. That is the single largest addressable item in the
 token, larger than anything SIMD width can reach, and the reason

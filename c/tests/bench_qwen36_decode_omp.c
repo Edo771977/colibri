@@ -330,8 +330,9 @@ int main(int argc, char **argv) {
     if (fj_lo < fj_ns * 0.6 || ba_lo < ba_ns * 0.6)
         puts("  !! quietest sample is far below the median: something else is using this\n"
              "  !! machine. Close it and re-run -- these two prices are thread wake-up\n"
-             "  !! latency and one descheduled team member inflates them. The GB/s and\n"
-             "  !! the kernel rows are far less sensitive and can be trusted meanwhile.");
+             "  !! latency and one descheduled team member inflates them. The per-row\n"
+             "  !! ms and GB/s below survive that; the sync/left split and the fusion\n"
+             "  !! prediction do NOT -- they are computed from the medians flagged here.");
     putchar('\n');
 
     row("shared expert, 3 calls", median(t3, samples), mb_shared, 3 * L, 0,   fj_ms, ba_ms, gbs);

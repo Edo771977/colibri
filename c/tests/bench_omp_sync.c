@@ -9,8 +9,9 @@
  * At single-digit microseconds they are free; at tens of microseconds they are
  * the largest single item in the token, ahead of any kernel in it. Measured on
  * a Ryzen 9 7950X: 53 us and 70 us with MinGW libgomp at 16 threads, against
- * 1.3 us and 0.4 us for the same two prices under Linux glibc libgomp on a
- * 4-core VM -- a difference in the RUNTIME, not in the hardware.
+ * 1.3-2.8 us and 0.4-0.9 us for the same two prices under Linux glibc libgomp
+ * on a shared 4-core VM (the spread is that VM's own load) -- an order of
+ * magnitude either way, and a difference in the RUNTIME, not in the hardware.
  *
  * This file exists to compare runtimes, so it is deliberately portable: omp.h
  * and stdio, omp_get_wtime() rather than clock_gettime(), nothing from the
