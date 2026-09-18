@@ -950,6 +950,46 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
  * batching changes neither a float bit nor the decode path. */
 static void matmul_q_batch(float *y, const float *x, const int8_t *q,
                            const float *scale, int S, int I, int O) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    /* The contract above holds per ISA: when matmul_q takes the 512-bit loop,
+     * so must this, or prefill and decode disagree in the last bits -- which is
+     * what tests/test_qwen36_dense_batch.c pins, and what KV-prefix reuse
+     * relies on. Each row below is dot_i8f_avx512 spelled out: same two
+     * accumulators fed in the same order, same _mm512_reduce_add_ps, then the
+     * scale; I is 32-aligned here, so there is no tail. The tile still decodes
+     * each weight block once for two rows, which is what makes batching pay. */
+    if (q36_avx512_on() && !(I & 31)) {
+        #pragma omp parallel for schedule(static) if(O >= 256)
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o * I;
+            int row = 0;
+            for (; row + 1 < S; row += 2) {
+                const float *x0 = x + (int64_t)row * I;
+                const float *x1 = x0 + I;
+                __m512 a00 = _mm512_setzero_ps(), a01 = _mm512_setzero_ps();
+                __m512 a10 = _mm512_setzero_ps(), a11 = _mm512_setzero_ps();
+                for (int i = 0; i + 32 <= I; i += 32) {
+                    __m512 w0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                                    _mm_loadu_si128((const __m128i *)(w + i))));
+                    __m512 w1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                                    _mm_loadu_si128((const __m128i *)(w + i + 16))));
+                    a00 = _mm512_fmadd_ps(_mm512_loadu_ps(x0 + i),      w0, a00);
+                    a01 = _mm512_fmadd_ps(_mm512_loadu_ps(x0 + i + 16), w1, a01);
+                    a10 = _mm512_fmadd_ps(_mm512_loadu_ps(x1 + i),      w0, a10);
+                    a11 = _mm512_fmadd_ps(_mm512_loadu_ps(x1 + i + 16), w1, a11);
+                }
+                y[(int64_t)row * O + o] =
+                    _mm512_reduce_add_ps(_mm512_add_ps(a00, a01)) * scale[o];
+                y[(int64_t)(row + 1) * O + o] =
+                    _mm512_reduce_add_ps(_mm512_add_ps(a10, a11)) * scale[o];
+            }
+            if (row < S)
+                y[(int64_t)row * O + o] =
+                    dot_i8f_avx512(w, x + (int64_t)row * I, I) * scale[o];
+        }
+        return;
+    }
+#endif
 #if defined(__AVX2__) && defined(__FMA__)
     /* Every shipping Qwen3.6 dense input width is 32-aligned.  Keep unusual
      * checkpoint shapes on the literal historical kernel instead of trying
