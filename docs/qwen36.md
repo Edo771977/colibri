@@ -157,14 +157,18 @@ no gain at all.
 
 It is a property of that `libgomp` build, not of the CPU, of Windows, or of
 desktop contention. `tests/bench_omp_sync` prices the same two things with
-nothing else in the way, and three runtimes on the one machine disagree by more
+nothing else in the way, and four runtimes on the one machine disagree by more
 than an order of magnitude at 16 threads:
 
 | runtime | empty region | barrier in an open region |
 |---|---|---|
 | MinGW `libgomp` (gcc) | 53.5 us | 70.5 us |
 | LLVM `libomp` (`cl /openmp:llvm`) | 8.1 us | 1.5 us |
+| LLVM `libomp` (clang64, **what the engine ships on**) | 3.7 us | 1.4 us |
 | VCOMP (`cl /openmp`) | 1.9 us | 1.1 us |
+
+The two `libomp` rows are the same library reached by two drivers and they do
+not agree: quote the one that matches the build being discussed, not "libomp".
 
 `libgomp`'s price is also LINEAR in team size — 12/25/34/53 us for a region and
 6.5/20/35/70 for a barrier at 2/4/8/16 threads, about 4.4 us per thread — which
@@ -263,23 +267,41 @@ so it cannot, and its gate is token-exactness against the torch oracle instead.
   barrier costs MORE than a whole region entry. The benchmark prices both and
   charges each row for what it actually spends.
 
-### What that means for `QWEN36_SHARED_FUSE`
+### A fused shared expert was tried, and removed
 
-The fused shared expert is one region and one barrier per layer against three
-regions: worth having where a barrier is the cheaper price, close to a wash
-where it is not. It is opt-in for exactly that reason. Two things it must not
-do, both learned the hard way:
+The obvious next move once the regions are priced is to cut fewer of them. The
+shared expert is three `matmul_d` calls per layer — 120 regions per token — and
+it can be written as one region plus one barrier, bit-exact, since which thread
+computes which row never entered the arithmetic. That kernel existed behind
+`QWEN36_SHARED_FUSE` and is gone. It is worth saying why, because the reasoning
+that produced it looks sound and is not.
 
-- **Keep one weight stream per thread.** A fused kernel that computes gate row
-  *i* and up row *i* together keeps two streams live per thread; on the 7950X at
-  16 threads that took the same 120 MB from 71 GB/s to 15 and lost 1.9 ms while
-  removing 80 regions worth 4.3. `qwen_shared_fused_row` hands each thread a
-  contiguous range of hidden units and walks the two matrices in turn — which
-  also lets the thread that produced `g[i]` and `u[i]` combine them, with no
-  barrier.
-- **Do not pay for a barrier the region exit already provides.** The final
-  worksharing loop carries `nowait`; at 70 us a redundant barrier is 2.8 ms per
-  token on a 40-layer model.
+**It lost twice, for two unrelated reasons.**
+
+The first version computed gate row *i* and up row *i* in the same iteration, so
+the thread that produced both halves could combine them without a barrier.
+Fewer regions AND fewer barriers — and on the 7950X at 16 threads it was 1.9 ms
+per token SLOWER while removing 80 regions worth 4.3. Interleaving the two
+matrices keeps two weight streams live per thread instead of one, and the memory
+system charged more for that than the regions were worth: the same 120 MB went
+from 71 GB/s to 15. Rewritten to hand each thread a contiguous range of hidden
+units and walk the two matrices in turn, it recovered the bandwidth and turned a
+1.6 ms/token win.
+
+Then the OpenMP runtime changed, and that win evaporated. Fusing does not remove
+synchronisation, it converts region entries into barriers, and the trade only
+pays where a barrier is the cheaper price. Under MinGW `libgomp` a barrier cost
+70 us against a region's 54 — it was never cheaper there either, and the 1.6 ms
+came from removing the *second* barrier with `nowait`, not from the fusion.
+Under the clang64 `libomp` the engine ships on a barrier costs 1.4 us and a
+region 3.7, so the trade saves `2*3.7 - 1.4` us on each of 40 layers: 0.24
+ms/token, on a phase that now costs 4.0 and a token that costs 32.2.
+
+What is left is a kernel duplicating the shared expert's arithmetic, with a
+bit-exactness contract to maintain and a CI gate to run, in exchange for
+something inside the noise. `tests/bench_qwen36_decode_omp` still prints what
+the trade would cost at this host's two prices, so anyone tempted to write it
+again can see the answer before writing it.
 
 ## Which container?
 

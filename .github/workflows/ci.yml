@@ -477,34 +477,6 @@ jobs:
           grep -q "\[embed-i8\]" emb.log || { echo "FAIL: embed int8 did not engage"; cat emb.log; exit 1; }
           grep -qE "^C engine" emb.log || { echo "FAIL: embed int8 run produced no ids"; cat emb.log; exit 1; }
           grep -E "\[embed-i8\]|^C engine|Matching tokens" emb.log || true
-      - name: One shared-expert OpenMP region per layer is byte-identical to three
-        run: |
-          cd c
-          make qwen36
-          # QWEN36_SHARED_FUSE only changes which thread computes which row: the
-          # gate/up/down GEMVs keep their weight rows, their scales and their
-          # reduction order, so ids AND last logits must be byte-identical. It
-          # needs dense int8 (the fused kernel reads the registry), hence no
-          # COLI_DENSE_I8=0 here. cap=1 evicts on every routed expert, cap=8
-          # never does: the shared expert runs either way.
-          for cap in 1 8; do
-            for f in 0 1; do
-              QWEN36_SHARED_FUSE=$f DUMP=fuse_logits_${cap}_$f.f32 SNAP=qwen36_tiny_c \
-                ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json > fuse_${cap}_$f.log 2>&1 || true
-              grep -E "^C engine" fuse_${cap}_$f.log > fuse_ids_${cap}_$f.txt || true
-            done
-            test -s fuse_ids_${cap}_1.txt || { echo "FAIL: no ids at cap=$cap"; cat fuse_${cap}_1.log; exit 1; }
-            # A switch that declined silently (f32 weights, a shape the registry
-            # refused) would pass every comparison below without running the
-            # kernel at all.
-            grep -q "one OpenMP region per layer" fuse_${cap}_1.log || { echo "FAIL: the fused shared expert never engaged"; cat fuse_${cap}_1.log; exit 1; }
-            if grep -q "one OpenMP region per layer" fuse_${cap}_0.log; then echo "FAIL: QWEN36_SHARED_FUSE=0 still fused"; exit 1; fi
-            cmp fuse_ids_${cap}_0.txt fuse_ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; exit 1; }
-            if [ -f fuse_logits_${cap}_0.f32 ] || [ -f fuse_logits_${cap}_1.f32 ]; then
-              cmp fuse_logits_${cap}_0.f32 fuse_logits_${cap}_1.f32 || { echo "FAIL: logits differ at cap=$cap"; exit 1; }
-            fi
-            echo "cap=$cap: identical ($(cat fuse_ids_${cap}_1.txt))"
-          done
       - name: The parallel DeltaNet conv is byte-identical to the serial one
         run: |
           cd c
@@ -607,18 +579,15 @@ jobs:
             fi
             echo "sanitizers clean ($fx):"; grep -E "Matching tokens" san.log || true
           done
-          # Dense int8 on (quantize-at-load + its realloc'd registry keys), the
-          # opt-in int8 embedding, and the fused shared expert -- which reads
-          # that same registry from inside an OpenMP region: same memory-safety
-          # assertion, no extra run.
+          # Dense int8 on (quantize-at-load + its realloc'd registry keys) and
+          # the opt-in int8 embedding: same memory-safety assertion.
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
-            QWEN36_EMBED_I8=1 QWEN36_SHARED_FUSE=1 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
+            QWEN36_EMBED_I8=1 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
             ./qwen36 1 8 qwen36_tiny/ref_full.json > san_i8.log 2>&1 || true
           if grep -qE "ERROR: AddressSanitizer|runtime error:" san_i8.log; then
             echo "FAIL: sanitizer diagnostic with dense int8 at load"; cat san_i8.log; exit 1
           fi
           grep -q "at load: the f32 trunk" san_i8.log || { echo "FAIL: quantize-at-load did not engage under sanitizers"; cat san_i8.log; exit 1; }
-          grep -q "one OpenMP region per layer" san_i8.log || { echo "FAIL: the fused shared expert did not engage under sanitizers"; cat san_i8.log; exit 1; }
           echo "sanitizers clean (dense int8 at load, embed int8):"; grep -E "Matching tokens" san_i8.log || true
       - name: KV prefix reuse is token-identical (serve, several turns)
         run: |

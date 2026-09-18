@@ -21,7 +21,7 @@
  * machine in front of it, with no model file and no GPU:
  *
  *   - the shipping shapes through the engine's own kernels, cut the way the
- *     engine cuts them and cut into one region per layer;
+ *     engine cuts them;
  *   - the cost of an empty parallel region, and of a barrier INSIDE one, for
  *     the team as configured -- the two prices region surgery trades between;
  *   - a streaming read of the same bytes in ONE region, which is this machine's
@@ -165,12 +165,11 @@ static double stream_read(const Chunk *ch, int n) {
     return now_s() - t0;
 }
 
-/* Charge each row its SYNC POINTS, not just its regions: fusing three regions
- * into one does not remove the synchronisation, it converts region entries into
- * barriers, and nothing says a barrier is the cheaper of the two. Then charge
- * the bytes at the rate the one-region line actually achieved. What is left is
- * what the model does not explain, and a fused arm whose residual is large is
- * telling you it broke the access pattern. */
+/* Charge each row its SYNC POINTS -- regions AND barriers, because restructuring
+ * a kernel does not remove synchronisation, it converts one kind into the other
+ * and nothing says which is cheaper here. Then charge the bytes at the rate the
+ * one-region line actually achieved. What is left is what the model does not
+ * explain. */
 static void row(const char *name, double ms, double mb, int regions, int barriers,
                 double fj_ms, double ba_ms, double gbs) {
     double sync = regions * fj_ms + barriers * ba_ms;
@@ -181,7 +180,6 @@ static void row(const char *name, double ms, double mb, int regions, int barrier
 
 int main(int argc, char **argv) {
     unsetenv("COLI_DENSE_I8");
-    unsetenv("QWEN36_SHARED_FUSE");
     long reps   = argc > 1 ? atol(argv[1]) : 8;
     int samples = argc > 2 ? atoi(argv[2]) : 5;
     int L       = argc > 3 ? atoi(argv[3]) : 40;    /* layers (all carry an MoE block) */
@@ -230,22 +228,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < D; i++)  x[i]  = wvalue(i, 6);
     for (int i = 0; i < VD; i++) xv[i] = wvalue(i, 7);
     float *sh = falloc(Ish), *shu = falloc(Ish), *shd = falloc(D);
-    float *out_a = falloc(D), *out_b = falloc(D);
+    float *out_a = falloc(D);
     float *dny = falloc(D), *rty = falloc(E);
-
-    /* --- the two shapes must agree to the bit before either is timed --- */
-    memset(out_a, 0, (size_t)D * sizeof(float));
-    memset(out_b, 0, (size_t)D * sizeof(float));
-    for (int i = 0; i < L; i++) shared_three(&ls[i], x, out_a, D, Ish, sh, shu, shd);
-    for (int i = 0; i < L; i++)
-        if (!qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh, shu)) {
-            fputs("FAIL: the fused shared expert declined int8 weights\n", stderr);
-            return 1;
-        }
-    if (memcmp(out_a, out_b, (size_t)D * sizeof(float))) {
-        fputs("FAIL: fused and three-call shared expert differ\n", stderr);
-        return 1;
-    }
 
     /* --- the two sync prices, measured before anything is attributed to them --- */
     double fj_lo, fj_ns, ba_lo, ba_ns;
@@ -273,34 +257,18 @@ int main(int argc, char **argv) {
         }
 
     double *t3 = malloc(sizeof(double) * (size_t)samples);
-    double *t1 = malloc(sizeof(double) * (size_t)samples);
     double *td = malloc(sizeof(double) * (size_t)samples);
     double *tr = malloc(sizeof(double) * (size_t)samples);
     double *ts = malloc(sizeof(double) * (size_t)samples);
 
     for (int s = 0; s < samples; s++) {
-        double a = 0, b = 0;
-        /* alternate the order every sample: a machine that drifts mid-run must
-         * not be able to hand the win to whichever arm ran first. */
+        double a = 0;
         for (long r = 0; r < reps; r++) {
-            if ((s + r) & 1) {
-                double t = now_s();
-                for (int i = 0; i < L; i++) qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh, shu);
-                b += now_s() - t;
-                t = now_s();
-                for (int i = 0; i < L; i++) shared_three(&ls[i], x, out_a, D, Ish, sh, shu, shd);
-                a += now_s() - t;
-            } else {
-                double t = now_s();
-                for (int i = 0; i < L; i++) shared_three(&ls[i], x, out_a, D, Ish, sh, shu, shd);
-                a += now_s() - t;
-                t = now_s();
-                for (int i = 0; i < L; i++) qwen_shared_fused_row(&ls[i], x, out_b, D, Ish, sh, shu);
-                b += now_s() - t;
-            }
+            double t = now_s();
+            for (int i = 0; i < L; i++) shared_three(&ls[i], x, out_a, D, Ish, sh, shu, shd);
+            a += now_s() - t;
         }
         t3[s] = a / (double)reps * 1000.0;
-        t1[s] = b / (double)reps * 1000.0;
 
         double t = now_s();
         for (long r = 0; r < reps; r++)
@@ -335,16 +303,25 @@ int main(int argc, char **argv) {
              "  !! prediction do NOT -- they are computed from the medians flagged here.");
     putchar('\n');
 
-    row("shared expert, 3 calls", median(t3, samples), mb_shared, 3 * L, 0,   fj_ms, ba_ms, gbs);
-    row("shared expert, fused",   median(t1, samples), mb_shared, L,     L,   fj_ms, ba_ms, gbs);
+    row("shared expert", median(t3, samples), mb_shared, 3 * L, 0, fj_ms, ba_ms, gbs);
     row("dn out_proj",            median(td, samples), mb_dn,     LDN,   0,   fj_ms, ba_ms, gbs);
     row("router",                 median(tr, samples), mb_router, L,     0,   fj_ms, ba_ms, gbs);
     row("all bytes, one region",  ms_stream,           mb_all,    1,     0,   fj_ms, ba_ms, gbs);
 
-    double sync3 = 3.0 * L * fj_ms, sync1 = L * fj_ms + L * ba_ms;
-    printf("\n  fusing trades %.2f ms of region entries for %.2f ms of barriers: %+.2f ms predicted\n",
-           sync3, sync1, sync1 - sync3);
-    printf("  measured: %+.2f ms/token\n", median(t1, samples) - median(t3, samples));
+    /* What a restructuring COULD buy, before anyone writes one: the shared
+     * expert's three regions per layer would become one region plus N
+     * barriers, so the trade is only worth making where a barrier is the
+     * cheaper price. On the host this file was written for it is not.
+     *
+     * A kernel that fused them was tried and removed. It was bit-exact and it
+     * still lost, twice over: on a 7950X at 16 threads a barrier cost MORE than
+     * a whole region entry (70 us against 53), and a first version that walked
+     * the gate and up matrices row by row kept two weight streams live per
+     * thread instead of one and took the same 120 MB from 71 GB/s to 15. Fewer
+     * regions is not automatically less time. */
+    printf("\n  three regions per layer cost %.2f ms/token here;\n", 3.0 * L * fj_ms);
+    printf("  one region plus one barrier per layer would cost %.2f ms/token\n",
+           L * fj_ms + L * ba_ms);
 
     if (fj_lo > 10000.0 || ba_lo > 10000.0) {
         puts("\n  *** Even the quietest samples are tens of microseconds. A healthy OpenMP");
@@ -366,7 +343,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < LDN; i++) { free(dnq[i]); free(dns[i]); }
     for (int i = 0; i < L; i++) { free(rtq[i]); free(rts[i]); }
     free(ls); free(dnq); free(dns); free(rtq); free(rts); free(bp); free(bl); free(ch);
-    free(x); free(xv); free(sh); free(shu); free(shd); free(out_a); free(out_b);
-    free(dny); free(rty); free(t3); free(t1); free(td); free(tr); free(ts);
+    free(x); free(xv); free(sh); free(shu); free(shd); free(out_a);
+    free(dny); free(rty); free(t3); free(td); free(tr); free(ts);
     return 0;
 }
