@@ -1,0 +1,155 @@
+Raw per-run engine output for the Qwen3.6 OpenMP-runtime experiment, filtered to
+the lines the record rests on. Every run is `misure.ps1` on the same machine, the
+same container and the same script-generated prompt, 128 generated tokens with
+COLI_TIMERS=1 and the CUDA expert tier active. Each invocation produces two
+samples: gpu_1_fredda (first run of the invocation) and gpu_2_calda (second).
+
+Both binaries were built from commit 4bc62322b01cb0dcf33e1938701037858296decc
+and kept side by side on disk; the arms were alternated across invocations so a
+machine drifting mid-session could not hand the win to whichever ran first.
+
+  baseline arm  qwen36_gcc.exe    make qwen36.exe CUDA_DLL=1 ARCH=native
+                                  (ucrt64 gcc 16.2, -static, MinGW libgomp)
+  trial arm     qwen36_clang.exe  make qwen36.exe CC=clang CUDA_DLL=1 ARCH=native
+                                  (MSYS2 CLANG64 clang 22.1.8, LLVM libomp)
+
+Order in wall-clock time: clang-1 (19:04), gcc-2 (19:16), clang-2 (19:18),
+gcc-3 (20:35). The highest single sample of the whole record (21.12) is the
+clang arm's SECOND run of an invocation that started after a gcc invocation.
+
+--- baseline: gcc + MinGW libgomp ---
+
+[gcc-2 / gpu_1_fredda]
+gpu_1_fredda: 13.83 tok/s | picco RAM 30.67 GB
+   [timers]   deltanet      3006.6 ms     23.67 ms/token
+   [timers]   attention     1114.6 ms      8.78 ms/token
+   [timers]   moe_total     1764.6 ms     13.89 ms/token
+   [timers]   (shared)      1099.4 ms      8.66 ms/token
+   [timers]   (router)       339.1 ms      2.67 ms/token
+   [timers]   lm_head        446.1 ms      3.51 ms/token
+   [timers]   TOTAL         6331.8 ms     49.86 ms/token
+   [timers]   dn-sub: proj 10.4 | conv 1.9 | l2n+rec 2.9 | norm+out 8.5 ms/token
+
+[gcc-2 / gpu_2_calda]
+gpu_2_calda: 12.93 tok/s | picco RAM 30.67 GB
+   [timers]   deltanet      3022.8 ms     23.80 ms/token
+   [timers]   attention     1113.6 ms      8.77 ms/token
+   [timers]   moe_total     1793.1 ms     14.12 ms/token
+   [timers]   (shared)      1082.5 ms      8.52 ms/token
+   [timers]   (router)       335.6 ms      2.64 ms/token
+   [timers]   lm_head        482.8 ms      3.80 ms/token
+   [timers]   TOTAL         6412.4 ms     50.49 ms/token
+   [timers]   dn-sub: proj 10.8 | conv 1.9 | l2n+rec 2.8 | norm+out 8.2 ms/token
+
+[gcc-3 / gpu_1_fredda]
+gpu_1_fredda: 14.51 tok/s | picco RAM 30.67 GB
+   [timers]   deltanet      2963.7 ms     23.34 ms/token
+   [timers]   attention     1095.7 ms      8.63 ms/token
+   [timers]   moe_total     1732.6 ms     13.64 ms/token
+   [timers]   (shared)      1064.8 ms      8.38 ms/token
+   [timers]   (router)       333.3 ms      2.62 ms/token
+   [timers]   lm_head        488.5 ms      3.85 ms/token
+   [timers]   TOTAL         6280.5 ms     49.45 ms/token
+   [timers]   dn-sub: proj 10.6 | conv 1.9 | l2n+rec 2.8 | norm+out 8.1 ms/token
+
+[gcc-3 / gpu_2_calda]
+gpu_2_calda: 12.17 tok/s | picco RAM 30.66 GB
+   [timers]   deltanet      3216.2 ms     25.32 ms/token
+   [timers]   attention     1159.1 ms      9.13 ms/token
+   [timers]   moe_total     1963.5 ms     15.46 ms/token
+   [timers]   (shared)      1179.8 ms      9.29 ms/token
+   [timers]   (router)       359.6 ms      2.83 ms/token
+   [timers]   lm_head        499.2 ms      3.93 ms/token
+   [timers]   TOTAL         6837.9 ms     53.84 ms/token
+   [timers]   dn-sub: proj 11.3 | conv 2.1 | l2n+rec 3.1 | norm+out 8.7 ms/token
+
+--- trial: clang + LLVM libomp ---
+
+[clang-1 / gpu_1_fredda]
+gpu_1_fredda: 20.50 tok/s | picco RAM 30.67 GB
+   [timers]   deltanet      1813.0 ms     14.28 ms/token
+   [timers]   attention      820.9 ms      6.46 ms/token
+   [timers]   moe_total     1030.7 ms      8.12 ms/token
+   [timers]   (shared)       502.0 ms      3.95 ms/token
+   [timers]   (router)        74.8 ms      0.59 ms/token
+   [timers]   lm_head        356.8 ms      2.81 ms/token
+   [timers]   TOTAL         4021.4 ms     31.66 ms/token
+   [timers]   dn-sub: proj 6.2 | conv 0.5 | l2n+rec 2.0 | norm+out 5.5 ms/token
+
+[clang-1 / gpu_2_calda]
+gpu_2_calda: 19.02 tok/s | picco RAM 30.66 GB
+   [timers]   deltanet      1880.1 ms     14.80 ms/token
+   [timers]   attention      815.9 ms      6.42 ms/token
+   [timers]   moe_total     1108.4 ms      8.73 ms/token
+   [timers]   (shared)       499.0 ms      3.93 ms/token
+   [timers]   (router)        76.7 ms      0.60 ms/token
+   [timers]   lm_head        392.4 ms      3.09 ms/token
+   [timers]   TOTAL         4196.9 ms     33.05 ms/token
+   [timers]   dn-sub: proj 6.7 | conv 0.5 | l2n+rec 2.0 | norm+out 5.5 ms/token
+
+[clang-2 / gpu_1_fredda]
+gpu_1_fredda: 20.32 tok/s | picco RAM 30.67 GB
+   [timers]   deltanet      1829.5 ms     14.41 ms/token
+   [timers]   attention      822.0 ms      6.47 ms/token
+   [timers]   moe_total     1043.1 ms      8.21 ms/token
+   [timers]   (shared)       512.2 ms      4.03 ms/token
+   [timers]   (router)        76.8 ms      0.60 ms/token
+   [timers]   lm_head        363.2 ms      2.86 ms/token
+   [timers]   TOTAL         4057.8 ms     31.95 ms/token
+   [timers]   dn-sub: proj 6.3 | conv 0.5 | l2n+rec 2.0 | norm+out 5.5 ms/token
+
+[clang-2 / gpu_2_calda]
+gpu_2_calda: 21.12 tok/s | picco RAM 30.67 GB
+   [timers]   deltanet      1838.2 ms     14.47 ms/token
+   [timers]   attention      819.1 ms      6.45 ms/token
+   [timers]   moe_total     1058.9 ms      8.34 ms/token
+   [timers]   (shared)       490.2 ms      3.86 ms/token
+   [timers]   (router)        76.4 ms      0.60 ms/token
+   [timers]   lm_head        372.0 ms      2.93 ms/token
+   [timers]   TOTAL         4088.2 ms     32.19 ms/token
+   [timers]   dn-sub: proj 6.4 | conv 0.5 | l2n+rec 2.1 | norm+out 5.5 ms/token
+
+--- the mechanism, measured directly: c/tests/bench_omp_sync.c, same machine ---
+
+Empty parallel region and a barrier inside an already-open region, median of 7
+samples with the quietest sample beside it. Same source file built by each
+toolchain; OMP_NUM_THREADS=16 throughout.
+
+[gcc, MinGW libgomp]
+bench_omp_sync: team of 16, 7 samples of 4000
+  region        54.00 us   (quietest of 7:    53.25)
+  barrier       69.50 us   (quietest of 7:    68.75)
+
+[clang, LLVM libomp]
+bench_omp_sync: team of 16, 7 samples of 4000
+  region         3.66 us   (quietest of 7:     3.37)
+  barrier        1.37 us   (quietest of 7:     1.32)
+
+[MSVC cl /openmp:llvm, LLVM libomp, third toolchain for reference]
+  region         8.14 us   (quietest of 7:     6.39)
+  barrier        1.48 us   (quietest of 7:     1.44)
+
+[MSVC cl /openmp, VCOMP, fourth toolchain for reference]
+  region         1.88 us   (quietest of 7:     1.70)
+  barrier        1.06 us   (quietest of 7:     0.99)
+
+libgomp's price is linear in team size on this host -- region 12.0 / 25.0 / 34.0
+/ 53.5 us and barrier 6.5 / 20.0 / 35.5 / 70.5 us at 2 / 4 / 8 / 16 threads,
+about 4.4 us per thread. That is a runtime waking its team one thread at a time,
+and it is why OMP_WAIT_POLICY=active GOMP_SPINCOUNT=200000 moves neither number:
+nothing is sleeping.
+
+--- quality gates on this commit ---
+
+Tiny Qwen3.6-shaped fixture against the torch oracle, both toolchains: 16/16.
+ids and last logits byte-identical across QWEN36_SHARED_FUSE=0/1 and
+QWEN36_CONV_OMP=0/1 at cache caps 1 and 8.
+ASan + UBSan on both tiny fixtures: zero diagnostics.
+Clang arm, real 35B container, 200 generated tokens read by hand: coherent
+Italian, no degradation toward the end. That run used the CPU expert path
+(COLI_CUDA unset), not the CUDA tier.
+
+The two arms are NOT comparable byte for byte: gcc and clang vectorise the
+scalar code outside the intrinsic kernels differently, so last-bit equality is
+not available across compilers and token-exactness against the oracle is the
+gate instead.

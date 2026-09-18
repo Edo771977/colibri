@@ -597,10 +597,16 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
         if (g_sock_out >= 0 && g_sock_send) g_sock_send(g_sock_out, done, dl);
         else { fwrite(done, 1, (size_t)dl, stdout); fflush(stdout); }
     } else {
-        char text[1<<16]; decode_range(out, np, np+n_new, text, sizeof text);
-        char esc[1<<16]; json_escape((const unsigned char*)text, (int)strlen(text), esc, sizeof esc);
-        char buf[1<<20];
-        int bl = snprintf(buf, sizeof buf,
+        /* 1.13 MB of locals: text 64K + esc 64K + buf 1M. That fits the 2 MB
+         * stack GNU ld reserves on MinGW and not much else -- lld reserves
+         * less, and a worker thread less still. A frame this size has no
+         * business being automatic. */
+        enum { TEXT_CAP = 1<<16, BUF_CAP = 1<<20 };
+        char *text = malloc(TEXT_CAP), *esc = malloc(TEXT_CAP), *buf = malloc(BUF_CAP);
+        if (!text || !esc || !buf) { free(text); free(esc); free(buf); return; }
+        decode_range(out, np, np+n_new, text, TEXT_CAP);
+        json_escape((const unsigned char*)text, (int)strlen(text), esc, TEXT_CAP);
+        int bl = snprintf(buf, BUF_CAP,
           "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":\"%s\","
           "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
           "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d},"
@@ -608,8 +614,14 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
           g_oa_id, g_oa_created, g_model, esc, np, n_new, np+n_new, g_ttft, tps, total);
         if (g_sock_out >= 0 && g_sock_send) g_sock_send(g_sock_out, buf, bl);
         else { fwrite(buf, 1, (size_t)bl, stdout); fflush(stdout); }
+        free(text); free(esc); free(buf);
     }
 }
+
+/* A growable scratch block for a function called once per layer per token, so
+ * that it does not malloc and free its working buffers on every call. Carved up
+ * by its owner; see scratch_get and the note in deltanet(). */
+typedef struct { float *p; int64_t cap; } Scratch;
 
 /* ---------- config ---------- */
 typedef struct {
@@ -687,6 +699,14 @@ typedef struct {
     int resident_collecting;   /* prefill in progress, collecting routed experts */
     int first_step;            /* the first step() call is the prefill */
     int ram_cap_enabled;
+    /* Per-call scratch for deltanet/attention/moe, carved out of one growable
+     * block each (see scratch_get). In the Model and not in a file static:
+     * COLI_SEGMENT_ADAPTER gives every Qwen36SegmentEngine its own Model and
+     * its own run_lock, so two engines can be inside these functions on two
+     * threads at once, each holding only its OWN lock. Process-wide blocks
+     * would let them interleave activations, and a resize in one would free
+     * memory the other is reading. */
+    Scratch dn_scratch, attn_scratch, moe_scratch;
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -865,16 +885,59 @@ static int q36_avx512_on(void) {
     if (v < 0) { const char *e = getenv("QWEN36_AVX512"); v = !(e && *e == '0'); }
     return v;
 }
+#else
+static int q36_avx512_on(void) { return 0; }
 #endif
-static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+/* One int8 weight row times the activation row, in exactly the operation order
+ * matmul_q's OpenMP loop has always used -- this IS that loop body, lifted out
+ * unchanged. Which thread computes which row never changed a float: every
+ * output element is one call of this function on one weight row. That is what
+ * lets a caller cut the row space differently (two matrices in one region, a
+ * whole shared expert in one region) and still land on the same bits as the
+ * historical one-region-per-GEMV shape.
+ *
+ * use512 is a PARAMETER, not a call to q36_avx512_on() in here. This function
+ * runs inside the team, and q36_avx512_on() caches its answer in a function
+ * static on first use: reading it from every thread would be an unsynchronised
+ * read-modify-write plus a concurrent getenv(), which is a data race even where
+ * it happens to be harmless. Every caller resolves it once, serially, before
+ * opening its region -- which is what the code did before the body moved
+ * here. */
+static inline float q36_dot_row(const int8_t *w, const float *x, int I, int use512) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-    if (q36_avx512_on()) {
-        #pragma omp parallel for schedule(static) if(O >= 256)
-        for (int o = 0; o < O; o++)
-            y[o] = dot_i8f_avx512(q + (int64_t)o * I, x, I) * scale[o];
-        return;
-    }
+    if (use512) return dot_i8f_avx512(w, x, I);
+#else
+    (void)use512;
 #endif
+#if defined(__AVX2__) && defined(__FMA__)
+    /* Hand-vectorized int8->f32 GEMV (gcc does not auto-vectorize the
+     * convert+accumulate chain). 32 weights per iteration, FMA accumulate. */
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 32 <= I; i += 32) {
+        __m128i b0 = _mm_loadu_si128((const __m128i*)(w + i));
+        __m128i b1 = _mm_loadu_si128((const __m128i*)(w + i + 16));
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i),    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b0,8))), a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+16), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)), a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+24), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b1,8))), a3);
+    }
+    a0 = _mm256_add_ps(_mm256_add_ps(a0,a1), _mm256_add_ps(a2,a3));
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s,s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s,s,1));
+    float acc = _mm_cvtss_f32(s);
+    for (; i < I; i++) acc += x[i] * (float)w[i];
+    return acc;
+#else
+    float acc = 0.f;
+    for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
+    return acc;
+#endif
+}
+
+static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(__ARM_NEON)
     /* IDOT is opt-in, not default-on: this path quantizes the ACTIVATIONS to
      * Q8_0 per 16-element block, which the scalar path does not, so the two are
@@ -903,40 +966,12 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
         return;
     }
 #endif
-#if defined(__AVX2__) && defined(__FMA__)
-    /* Hand-vectorized int8->f32 GEMV (gcc does not auto-vectorize the
-     * convert+accumulate chain). 32 weights per iteration, FMA accumulate. */
+    /* if(O >= 256) on every path, including the scalar one: below that a
+     * decode-shaped GEMV is not worth a team. */
+    const int a512 = q36_avx512_on();          /* resolved before the team forks */
     #pragma omp parallel for schedule(static) if(O >= 256)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-        int i = 0;
-        for (; i + 32 <= I; i += 32) {
-            __m128i b0 = _mm_loadu_si128((const __m128i*)(w + i));
-            __m128i b1 = _mm_loadu_si128((const __m128i*)(w + i + 16));
-            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i),    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)), a0);
-            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b0,8))), a1);
-            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+16), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)), a2);
-            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+24), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b1,8))), a3);
-        }
-        a0 = _mm256_add_ps(_mm256_add_ps(a0,a1), _mm256_add_ps(a2,a3));
-        __m128 s = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
-        s = _mm_add_ps(s, _mm_movehl_ps(s,s));
-        s = _mm_add_ss(s, _mm_shuffle_ps(s,s,1));
-        float acc = _mm_cvtss_f32(s);
-        for (; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
-#else
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        float acc = 0.f;
-        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
-#endif
+    for (int o = 0; o < O; o++)
+        y[o] = q36_dot_row(q + (int64_t)o * I, x, I, a512) * scale[o];
 }
 
 /* Multi-row dense-int8 prefill kernel.  matmul_q() above is deliberately kept
@@ -1277,6 +1312,115 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
         return;
     }
     matmul(y, x, W, S, I, O);
+}
+
+/* ---- The decode shared expert, in ONE OpenMP region.
+ *
+ * Three matmul_d calls per layer are three parallel regions per layer: 120
+ * region entries per token on a 40-layer model, one per 1 MB of weights. A
+ * region entry costs the same whether the body is a microsecond or a second
+ * (tests/bench_omp_grain.c measures that floor), and at decode these bodies are
+ * microseconds. gate row i, up row i and their silu combine become ONE
+ * iteration -- the thread that produced both halves multiplies them, so the
+ * combine needs no pass of its own -- and the down GEMV plus the accumulate
+ * into `out` follow behind a single barrier INSIDE the same region. Three
+ * region entries per layer become one: 120 per token become 40.
+ *
+ * Bit-exact by construction, not by luck: every output element is still
+ * q36_dot_row on the same weight row times the same scale, the combine is
+ * elementwise, and `out[o] += sgate * (dot * sd[o])` is the expression the
+ * three-call form already evaluated. Only the row-to-thread mapping moves, and
+ * that never entered the arithmetic. tests/test_qwen36_dense_batch.c pins it.
+ *
+ * It is OFF by default and QWEN36_SHARED_FUSE=1 turns it on, because nobody has
+ * yet shown it WINS anything: on a 4-core box with 26 GB/s of streaming read
+ * these GEMVs are already at the memory ceiling and the 80 removed regions are
+ * worth 0.05 ms/token, inside the noise (tests/bench_qwen36_decode_omp.c). It
+ * pays only where a region entry is expensive -- a large team, or one parked in
+ * a passive wait beside a CUDA context. Measure on the host before enabling:
+ * the same benchmark answers it in seconds without a model file. */
+/* The DeltaNet causal conv is ~180 us per layer of serial work (see the loop in
+ * deltanet()). On by default because the arithmetic favours a team at every
+ * region price this project has measured; =0 restores the serial pass. */
+static int conv_omp_on(void){
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN36_CONV_OMP"); v = !(e && *e == '0'); }
+    return v;
+}
+
+static int shared_fuse_on(void){
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN36_SHARED_FUSE"); v = (e && *e != '0'); }
+    return v;
+}
+
+/* The int8 copy matmul_d would have dispatched to, or 0 if this matrix is still
+ * f32 (COLI_DENSE_I8=0, or a shape qdw_register declined). */
+static int qdw_lookup(const float *W, int I, const int8_t **q, const float **sc){
+    if (!W) return 0;
+    for (int i = 0; i < g_qdw_n; i++) if (g_qdw[i].w == W && g_qdw[i].I == I) {
+        *q = g_qdw[i].q; *sc = g_qdw[i].sc; return 1;
+    }
+    return 0;
+}
+
+/* Returns 0 when the weights are not int8 and the caller must keep its
+ * three-call form. g and u are the caller's scratch, Ish floats each. The
+ * switch is read at
+ * the CALL SITE, not here, so the benchmark and the exactness test can drive
+ * this kernel directly. */
+static int qwen_shared_fused_row(Layer *l, const float *x, float *out,
+                                 int D, int Ish, float *g, float *u){
+    const int8_t *qg, *qu, *qd; const float *sg, *su, *sd;
+    if (!qdw_lookup(l->sh_g, D, &qg, &sg)) return 0;
+    if (!qdw_lookup(l->sh_u, D, &qu, &su)) return 0;
+    if (!qdw_lookup(l->sh_d, Ish, &qd, &sd)) return 0;
+    /* Say so once: a silently declined switch (f32 weights) looks exactly like
+     * one that engaged and bought nothing. Called outside any parallel region. */
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "[qwen36] shared expert: one OpenMP region per layer "
+                        "(QWEN36_SHARED_FUSE=1); =0 restores three\n");
+    }
+    float sgate = 1.f;
+    if (l->sh_gate) {
+        float s = 0.f; const float *wg = l->sh_gate;
+        for (int i = 0; i < D; i++) s += x[i] * wg[i];
+        sgate = 1.f / (1.f + expf(-s));
+    }
+    const int a512 = q36_avx512_on();          /* resolved before the team forks */
+    #pragma omp parallel
+    {
+        /* Hand each thread a CONTIGUOUS range of hidden units and walk the two
+         * matrices one after the other, not row by row. Interleaving them (gate
+         * row i, up row i, gate row i+1, ...) saves the same regions and keeps
+         * two weight streams live per thread instead of one; measured on a
+         * 7950X at 16 threads that cost more than the regions were worth --
+         * 71 GB/s down to 15. Walking them in turn also means the thread that
+         * produced g[i] and u[i] is the thread that multiplies them, so the
+         * combine needs no barrier: one region and one barrier for what was
+         * three of each. */
+        int nt = 1, tid = 0;
+#ifdef _OPENMP
+        nt = omp_get_num_threads(); tid = omp_get_thread_num();
+#endif
+        int i0 = (int)((int64_t)Ish * tid / nt), i1 = (int)((int64_t)Ish * (tid + 1) / nt);
+        for (int i = i0; i < i1; i++) g[i] = q36_dot_row(qg + (int64_t)i * D, x, D, a512) * sg[i];
+        for (int i = i0; i < i1; i++) u[i] = q36_dot_row(qu + (int64_t)i * D, x, D, a512) * su[i];
+        for (int i = i0; i < i1; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+        #pragma omp barrier
+        /* nowait: the region's own exit join already orders this against the
+         * caller, so the worksharing barrier at the end of the loop is pure
+         * cost. It is not a small one -- on the host this was measured on a
+         * barrier inside an open region costs MORE than an entire parallel
+         * region entry (70 us against 53 on a team of 16), which is what makes
+         * the difference between one sync point here and two. */
+        #pragma omp for schedule(static) nowait
+        for (int o = 0; o < D; o++)
+            out[o] += sgate * (q36_dot_row(qd + (int64_t)o * Ish, g, Ish, a512) * sd[o]);
+    }
+    return 1;
 }
 
 /* rmsnorm over a row of length D (in-place capable: out may == x).
@@ -2078,6 +2222,28 @@ static void rope_head_partial(float *x, int pos, int rope_dim, int head_dim, flo
  *  - partial RoPE on the first rotary_dim dims of each head (text: mRoPE == standard).
  *  - scale = head_dim^-0.5; GQA repeat_kv.
  *  - attn_out = attn_out * sigmoid(gate), then o_proj (input dim = q_heads*head_dim). */
+/* 64-byte alignment for each carved sub-buffer (16 floats). */
+#define DN_PAD(n) (((int64_t)(n) + 15) & ~(int64_t)15)
+
+/* A scratch block for a function called once per layer per token. Grown on
+ * demand, never freed: it is live for as long as the model is.
+ *
+ * deltanet(), attention() and moe() each used to malloc and free their working
+ * buffers on every call. On the 35B that is 360 + 70 + 280 malloc/free per
+ * DECODE TOKEN, for buffers whose sizes never change between calls. What that
+ * costs is a property of the C runtime's allocator rather than of the model:
+ * moving deltanet's twelve off the heap took an 11.6 ms/token hole out of its
+ * timer on one Windows runtime, and nothing at all on another. A cost that
+ * swings that far on work the engine does not need to do should not exist.
+ *
+ * One block per function is safe because each has a single call site in
+ * step()'s layer loop, and the only thread this engine starts is the pilot
+ * prefetcher, which calls none of them. */
+static float *scratch_get(Scratch *s, int64_t need) {
+    if (need > s->cap) { free(s->p); s->p = falloc(need); s->cap = need; }
+    return s->p;
+}
+
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, D = c->hidden;
@@ -2091,15 +2257,21 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
      * regardless of the attn_output_gate config flag -- so split whenever the
      * q per-head dim exceeds the (k/v) head dim. */
     int gate_dim = (qdim > hd) ? (qdim - hd) : 0;
-    float *q = falloc((int64_t)S*q_out);
-    float *k = falloc((int64_t)S*kv_out);
-    float *vv= falloc((int64_t)S*kv_out);
+    /* One block for all seven buffers, reused across layers and tokens: see
+     * scratch_get. Sizes depend only on S and the config. */
+    int64_t need = DN_PAD((int64_t)S*q_out) + 2*DN_PAD((int64_t)S*kv_out)
+                 + 2*DN_PAD((int64_t)S*H*hd) + DN_PAD((int64_t)S*H*gate_dim)
+                 + DN_PAD((int64_t)S*H*hd);
+    float *sc = scratch_get(&m->attn_scratch, need);
+    float *q  = sc;                         sc += DN_PAD((int64_t)S*q_out);
+    float *k  = sc;                         sc += DN_PAD((int64_t)S*kv_out);
+    float *vv = sc;                         sc += DN_PAD((int64_t)S*kv_out);
     matmul_d(q, x, l->q, S, D, q_out);
     matmul_d(k, x, l->k, S, D, kv_out);
     matmul_d(vv, x, l->v, S, D, kv_out);
     /* split q into query (first hd) and gate (next gate_dim), both per head */
-    float *query = falloc((int64_t)S*H*hd);
-    float *gate  = falloc((int64_t)S*H*gate_dim);
+    float *query = sc;                      sc += DN_PAD((int64_t)S*H*hd);
+    float *gate  = sc;                      sc += DN_PAD((int64_t)S*H*gate_dim);
     for (int s = 0; s < S; s++) {
         for (int hh = 0; hh < H; hh++) {
             const float *qs = q + (int64_t)s*q_out + hh*qdim;
@@ -2125,7 +2297,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         memcpy(m->V[layer] + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
     }
     float scale = 1.f / sqrtf((float)hd);
-    float *ctx = falloc((int64_t)S*H*hd);
+    float *ctx = sc;                        sc += DN_PAD((int64_t)S*H*hd);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
@@ -2152,14 +2324,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     /* apply attn_output_gate: attn_out *= sigmoid(gate) */
-    float *ag = falloc((int64_t)S*H*hd);
+    float *ag = sc;
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
         int o = ((int64_t)s*H + hh)*hd + dd;
         float g = gate_dim ? gate[o] : 0.f;
         ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
     }
     matmul_d(out, ag, l->o, S, H*hd, D);
-    free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
+    /* nothing to free: every buffer above is a slice of the shared block. */
 }
 
 /* Batch the CPU shared expert across prompt rows.  The three resident matrices
@@ -2191,13 +2363,17 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
     if (B == 1) {
         for (int s=0;s<S;s++) {
             const float *xs=x+(int64_t)s*D;
+            float *os=out+(int64_t)s*D;
+            /* Same row, one OpenMP region instead of three -- see
+             * qwen_shared_fused_row. The CUDA-tier block in moe() takes the
+             * same switch; this is the CPU-only path of the same decision. */
+            if (shared_fuse_on() && qwen_shared_fused_row(l,xs,os,D,I,g,u)) continue;
             matmul_d(g,xs,l->sh_g,1,D,I);
             matmul_d(u,xs,l->sh_u,1,D,I);
             for(int i=0;i<I;i++){float sv=g[i];g[i]=(sv/(1.f+expf(-sv)))*u[i];}
             matmul_d(hh,g,l->sh_d,1,I,D);
             float sgate=1.f;
             if(l->sh_gate){float sg=0.f;for(int i=0;i<D;i++)sg+=xs[i]*l->sh_gate[i];sgate=1.f/(1.f+expf(-sg));}
-            float *os=out+(int64_t)s*D;
             for(int d=0;d<D;d++)os[d]+=sgate*hh[d];
         }
     } else {
@@ -2272,7 +2448,16 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
-    float *logits = falloc((int64_t)S*E);
+    /* One block for the router logits and the expert/shared scratch, reused
+     * across layers and tokens: see scratch_get. The shared expert's hidden
+     * width is its own (shared_inter), not the routed expert's -- sizing its
+     * buffers with I overflows the moment a checkpoint ships shared_inter >
+     * moe_inter. Qwen3.6 has 512 == 512, so this changes nothing there. */
+    int Ish_max = c->shared_inter > I ? c->shared_inter : I;
+    int64_t need = DN_PAD((int64_t)S*E) + 2*DN_PAD(I) + 2*DN_PAD(D)
+                 + 2*DN_PAD(Ish_max);
+    float *msc = scratch_get(&m->moe_scratch, need);
+    float *logits = msc;                    msc += DN_PAD((int64_t)S*E);
     double _tr = tm_now();
     matmul_d(logits, x, l->gate, S, D, E);
     tm_add(S, 4, tm_now()-_tr);
@@ -2280,8 +2465,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int s = 0; s < S; s++) { float *pr = logits + (int64_t)s*E; for (int e = 0; e < E; e++) pr[e] += l->gate_bias[e]; }
     }
     memset(out, 0, (int64_t)S*D*sizeof(float));
-    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
-    float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
+    float *g = msc;                         msc += DN_PAD(I);
+    float *u = msc;                         msc += DN_PAD(I);
+    float *hh = msc;                        msc += DN_PAD(D);
+    float *sh = msc;                        msc += DN_PAD(Ish_max);
+    float *shu = msc;                       msc += DN_PAD(Ish_max);
+    float *shd = msc;
     int use_qt = qt_ready();
     int use_xf = !use_qt && xf_mode(m);
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
@@ -2370,18 +2559,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
-                matmul_d(sh, xs, l->sh_g, 1, D, Ish);
-                matmul_d(shu, xs, l->sh_u, 1, D, Ish);
-                for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
-                matmul_d(shd, sh, l->sh_d, 1, Ish, D);
-                float sgate = 1.f;
-                if (l->sh_gate) {
-                    float sg = 0.f; const float *wg = l->sh_gate;
-                    for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
-                    sgate = 1.f / (1.f + expf(-sg));
-                }
                 float *os = out + (int64_t)s*D;
-                for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
+                if (!shared_fuse_on() || !qwen_shared_fused_row(l, xs, os, D, Ish, sh, shu)) {
+                    matmul_d(sh, xs, l->sh_g, 1, D, Ish);
+                    matmul_d(shu, xs, l->sh_u, 1, D, Ish);
+                    for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
+                    matmul_d(shd, sh, l->sh_d, 1, Ish, D);
+                    float sgate = 1.f;
+                    if (l->sh_gate) {
+                        float sg = 0.f; const float *wg = l->sh_gate;
+                        for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
+                        sgate = 1.f / (1.f + expf(-sg));
+                    }
+                    for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
+                }
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
@@ -2409,7 +2600,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
     if (!use_qt) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
-    free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
+    /* nothing to free: every buffer above is a slice of the shared block. */
 }
 
 /* Gated DeltaNet (linear_attention) forward — recurrent gated-delta-rule.
@@ -2424,6 +2615,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
  *   split conv_out -> q_in/k_in/v_in; repeat_interleave q,k by rep; l2norm
  *   (q scaled by 1/sqrt(kdim)); recurrence S[h]*=exp(g); kv=k@S; delta=(v-kv)*beta;
  *   S+=k (x) delta; out=q@S; per-head Gated RMSNorm (plain weight) -> out_proj. */
+
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
@@ -2435,23 +2627,43 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float scale = 1.f / sqrtf((float)kdim);
     int H = c->hidden;
 
+    /* One block for all twelve scratch buffers, carved up below and reused for
+     * every layer and every token.
+     *
+     * These were twelve falloc/free per CALL, which on the 35B's 30 DeltaNet
+     * layers is 360 malloc and 360 free per decode token. That work sits
+     * outside all four dn-sub timers, so it shows up only as a hole between
+     * `deltanet` and the sum of its parts -- and how big the hole is depends on
+     * the C runtime's allocator, not on the model: measured at 11.6 ms/token on
+     * one Windows runtime and at nothing on another. A cost that swings that
+     * far on something the engine does not need to do at all should not exist.
+     *
+     * Safe to share: deltanet() has one call site, in step()'s layer loop, and
+     * the only thread this engine starts is the pilot prefetcher, which never
+     * enters here. Sub-buffers are 64-byte aligned so nothing straddles a cache
+     * line; every kernel that reads them uses unaligned loads anyway. */
+    int64_t need = DN_PAD((int64_t)conv_dim + value_dim) + 4*DN_PAD(vh)
+                 + DN_PAD(conv_dim) + 2*DN_PAD((int64_t)vh * kdim)
+                 + 2*DN_PAD(value_dim);
+    float *sc = scratch_get(&m->dn_scratch, need);
     /* qkv and z live in ONE buffer: the fused GPU projection writes
      * [conv_dim ++ value_dim] in a single GEMV, and the CPU fallback fills the
      * same two regions. Either way the code below reads qkv/z unchanged. */
-    float *qkvz = falloc((int64_t)conv_dim + value_dim);
+    float *qkvz = sc;                       sc += DN_PAD((int64_t)conv_dim + value_dim);
     float *qkv = qkvz;
     float *z   = qkvz + conv_dim;
-    float *b   = falloc(vh);
-    float *a   = falloc(vh);
-    float *beta= falloc(vh);
-    float *gg  = falloc(vh);
-    float *conv_out = falloc(conv_dim);
-    float *q = falloc(vh * kdim);
-    float *k = falloc(vh * kdim);
-    float *outv = falloc(value_dim);
-    float *outr = falloc(value_dim);
-    float *kv = falloc(vdim);
-    float *delta = falloc(vdim);
+    float *b   = sc;                        sc += DN_PAD(vh);
+    float *a   = sc;                        sc += DN_PAD(vh);
+    float *beta= sc;                        sc += DN_PAD(vh);
+    float *gg  = sc;                        sc += DN_PAD(vh);
+    float *conv_out = sc;                   sc += DN_PAD(conv_dim);
+    float *q = sc;                          sc += DN_PAD((int64_t)vh * kdim);
+    float *k = sc;                          sc += DN_PAD((int64_t)vh * kdim);
+    float *outv = sc;                       sc += DN_PAD(value_dim);
+    float *outr = sc;
+    /* kv[] and delta[] used to be allocated here too and were read by nobody:
+     * the gated-delta-rule loop below keeps its own kvl[]/dl[] per thread. Two
+     * more malloc/free per call, 60 per token, for buffers nothing touched. */
 
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
@@ -2473,19 +2685,47 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             beta[h] = 1.f / (1.f + expf(-b[h]));
             gg[h] = -expf(l->dn_alog[h]) * softplus_f(a[h] + l->dn_dtbias[h]);
         }
-        /* causal depthwise conv1d (groups=conv_dim, kernel=convk) with carried ring
-         * (serial: ~33k FLOP, an OpenMP fork/join would cost more) */
+        /* Causal depthwise conv1d (groups=conv_dim, kernel=convk) with carried
+         * ring, plus the ring advance, in one pass.
+         *
+         * This was serial, on the reasoning that ~33k FLOP cannot be worth a
+         * fork/join. The FLOP count was the wrong thing to count: with convk=4
+         * the cost is one expf per channel, and the engine's own timer puts the
+         * block at 5.2-5.9 ms/token on the 35B -- 180 us per layer, on ONE core,
+         * while the rest of the token has sixteen. Even on the host with the
+         * worst region price this project has measured (53 us, MinGW libgomp on
+         * a 7950X, tests/bench_qwen36_decode_omp) parallelising is 180 -> ~65 us
+         * per layer; where a region costs single-digit us it is 180 -> ~16.
+         *
+         * Channels are independent (groups=conv_dim), so this is bit-exact: the
+         * same operations in the same order per channel, only spread over
+         * threads. The two loops fuse because a channel's ring is read and then
+         * written within its own iteration, which also halves the passes over
+         * the ring. if(conv_dim >= 256) keeps a tiny model off a team it cannot
+         * fill; QWEN36_CONV_OMP=0 restores the serial pass for an A/B. */
+        /* Say once that the team was actually used. Without it an A/B of
+         * QWEN36_CONV_OMP compares the serial pass with itself the moment
+         * anything breaks the switch or the threshold -- on a fixture below
+         * conv_dim 256 that is the NORMAL case, and the comparison would pass
+         * while testing nothing. A duplicated line if two engines race here is
+         * harmless; a missing gate is not. */
+        if (conv_omp_on() && conv_dim >= 256) {
+            static int conv_said = 0;
+            if (!conv_said) {
+                conv_said = 1;
+                fprintf(stderr, "[qwen36] DeltaNet conv: across threads "
+                                "(QWEN36_CONV_OMP=0 restores the serial pass)\n");
+            }
+        }
+        #pragma omp parallel for schedule(static) if(conv_omp_on() && conv_dim >= 256)
         for (int cc = 0; cc < conv_dim; cc++) {
             const float *w = l->dn_conv + (int64_t)cc * convk;
-            const float *rg = ring + (int64_t)cc * (convk - 1);
+            float *rg = ring + (int64_t)cc * (convk - 1);
             float acc = 0.f;
             for (int kk = 0; kk < convk - 1; kk++) acc += w[kk] * rg[kk];
             acc += w[convk - 1] * qkv[cc];
             conv_out[cc] = acc / (1.f + expf(-acc));   /* silu */
-        }
-        /* advance ring: drop oldest, append current token's qkv */
-        for (int cc = 0; cc < conv_dim; cc++) {
-            float *rg = ring + (int64_t)cc * (convk - 1);
+            /* advance ring: drop oldest, append this token's qkv */
             for (int kk = 0; kk < convk - 2; kk++) rg[kk] = rg[kk + 1];
             rg[convk - 2] = qkv[cc];
         }
@@ -2581,9 +2821,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             }
         }
     }
-    free(qkvz);   /* qkv and z are regions of this one allocation */
-    free(b); free(a); free(beta); free(gg);
-    free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
+    /* nothing to free: every buffer above is a slice of the shared block. */
 }
 
 static void layers_forward_range(Model *m, float *x, int S, int pos_base,
@@ -3667,6 +3905,9 @@ static void qwen36_segment_layer_free(Layer *layer) {
 static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
     if (!engine) return;
     Model *model = &engine->model;
+    free(model->dn_scratch.p);   model->dn_scratch.p = NULL;   model->dn_scratch.cap = 0;
+    free(model->attn_scratch.p); model->attn_scratch.p = NULL; model->attn_scratch.cap = 0;
+    free(model->moe_scratch.p);  model->moe_scratch.p = NULL;  model->moe_scratch.cap = 0;
     for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
          layer++) {
         qwen36_segment_layer_free(&model->L[layer]);

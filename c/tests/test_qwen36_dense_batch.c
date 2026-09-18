@@ -92,6 +92,69 @@ static void shared_case(const char *format,int quantized) {
     free(x);free(seed);free(ref);free(got);free(g);free(u);free(hh);
 }
 
+/* The decode shared expert has two shapes on the same binary: three matmul_d
+ * calls, which is three OpenMP regions, and qwen_shared_fused_row, which is
+ * one. Only the row-to-thread mapping differs, so they must agree to the BIT --
+ * the token-exact oracle and KV-prefix reuse both read these floats. Shapes
+ * below and above the if(O >= 256) team threshold, a scalar tail, and a shared
+ * expert wider than the hidden size. */
+static void shared_fused_case(int D, int Ish) {
+    Model m; memset(&m,0,sizeof(m)); m.c.hidden=D; m.c.shared_inter=Ish;
+    Layer l; memset(&l,0,sizeof(l));
+    l.sh_g=falloc((int64_t)Ish*D); l.sh_u=falloc((int64_t)Ish*D);
+    l.sh_d=falloc((int64_t)D*Ish); l.sh_gate=falloc(D);
+    for(int64_t i=0;i<(int64_t)Ish*D;i++){l.sh_g[i]=input_value(i,2);l.sh_u[i]=input_value(i,3);}
+    for(int64_t i=0;i<(int64_t)D*Ish;i++)l.sh_d[i]=input_value(i,4);
+    for(int i=0;i<D;i++)l.sh_gate[i]=input_value(i,5);
+
+    float *x=falloc(D),*seed=falloc(D),*ref=falloc(D),*got=falloc(D);
+    float *sh=falloc(Ish),*shu=falloc(Ish),*shd=falloc(D);
+    for(int i=0;i<D;i++){x[i]=input_value(i,6);seed[i]=input_value(i,7);}
+
+    /* Unregistered weights are still f32: the fused path must decline rather
+     * than read an int8 copy that does not exist. */
+    memcpy(got,seed,(size_t)D*sizeof(float));
+    CHECK(qwen_shared_fused_row(&l,x,got,D,Ish,sh,shu)==0,
+          "D=%d Ish=%d fused path ran on f32 weights",D,Ish);
+    CHECK(!memcmp(got,seed,(size_t)D*sizeof(float)),
+          "D=%d Ish=%d declined fused path still wrote to out",D,Ish);
+
+    qdw_register(l.sh_g,D,Ish); qdw_register(l.sh_u,D,Ish); qdw_register(l.sh_d,Ish,D);
+    CHECK(g_qdw_n==3,"D=%d Ish=%d expected three int8 copies, got %d",D,Ish,g_qdw_n);
+
+    /* The three-call form, exactly as moe() spells it. */
+    memcpy(ref,seed,(size_t)D*sizeof(float));
+    matmul_d(sh,x,l.sh_g,1,D,Ish);
+    matmul_d(shu,x,l.sh_u,1,D,Ish);
+    for(int i=0;i<Ish;i++){float sv=sh[i];sh[i]=(sv/(1.f+expf(-sv)))*shu[i];}
+    matmul_d(shd,sh,l.sh_d,1,Ish,D);
+    float sgate=1.f;
+    {   float sg=0.f; const float *wg=l.sh_gate;
+        for(int i=0;i<D;i++) sg+=x[i]*wg[i];
+        sgate=1.f/(1.f+expf(-sg)); }
+    for(int d=0;d<D;d++) ref[d]+=sgate*shd[d];
+
+    memcpy(got,seed,(size_t)D*sizeof(float));
+    CHECK(qwen_shared_fused_row(&l,x,got,D,Ish,sh,shu)==1,
+          "D=%d Ish=%d fused path declined on int8 weights",D,Ish);
+    if(memcmp(ref,got,(size_t)D*sizeof(float))){
+        int shown=0,different=0;float worst=0.f;
+        for(int d=0;d<D;d++) if(ref[d]!=got[d]){
+            float e=fabsf(ref[d]-got[d]); if(e>worst)worst=e;
+            if(shown++<4)fprintf(stderr,"diff[%d] three-call=%a fused=%a delta=%g\n",
+                                 d,ref[d],got[d],e);
+            different++;
+        }
+        CHECK(0,"D=%d Ish=%d fused shared expert differs at %d values, worst=%g",
+              D,Ish,different,worst);
+    }
+    printf("qwen shared fused exact: D=%d Ish=%d (3 regions -> 1)\n",D,Ish);
+
+    clear_qdw();
+    free(l.sh_g);free(l.sh_u);free(l.sh_d);free(l.sh_gate);
+    free(x);free(seed);free(ref);free(got);free(sh);free(shu);free(shd);
+}
+
 int main(void) {
     /* This gate owns the dense-int8 mode regardless of the caller's shell. */
     unsetenv("COLI_DENSE_I8");
@@ -101,6 +164,9 @@ int main(void) {
     one_shape(5, 67, 259);      /* odd prompt + scalar tail + parallel clause */
     shared_case("f32",0);
     shared_case("int8",1);
+    shared_fused_case(64,32);        /* both loops below the team threshold */
+    shared_fused_case(2048,512);     /* the shipping Qwen3.6 shared expert */
+    shared_fused_case(288,320);      /* scalar tail, shared wider than hidden */
     unsetenv("QWEN_SHARED_BATCH");unsetenv("QWEN_DENSE_BATCH");
     if(failures){fprintf(stderr,"qwen dense batch: %d failure(s)\n",failures);return 1;}
     puts("qwen dense batch: ok");return 0;

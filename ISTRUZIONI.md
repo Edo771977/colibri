@@ -14,7 +14,7 @@ al codice di questo fork e vanno ricontrollati dopo ogni aggiornamento da upstre
 | GPU | NVIDIA GeForce RTX 4070 Ti SUPER 16 GB (Ada, `sm_89`), driver 616.64 |
 | Disco | Silicon Power UD90 4 TB in **M.2_3** → `Gen4 x4`. In M.2_2 girava a `Gen3 x2`, cioè un quarto della banda |
 | In arrivo | Crucial T705 4 TB PCIe 5.0 in M.2_1, dedicato ai modelli |
-| Sistema | Windows 11, build MinGW-w64 (MSYS2 UCRT64) + DLL CUDA con MSVC 2022 e CUDA 13.4 |
+| Sistema | Windows 11; qwen36 compilato con clang (MSYS2 CLANG64, vedi sotto), gli altri motori con MinGW-w64; DLL CUDA con MSVC 2022 e CUDA 13.4 |
 
 ## Misure (17 settembre 2026, Qwen3.6-35B-A3B int4 gs64)
 
@@ -55,6 +55,35 @@ make qwen36.exe CUDA_DLL=1 ARCH=native
 make qwen38.exe CUDA_DLL=1 ARCH=native
 make iobench.exe
 ```
+
+### Per qwen36, compila con clang (misurato: +54% di token/s)
+
+Il runtime OpenMP di MinGW e' il costo piu' grande di un token di decode su
+questa macchina: 53 us per entrare in una regione parallela e 70 per una
+barriera, a 16 thread, contro 3,7 e 1,4 con `libomp` di LLVM
+(`make bench-omp-sync`, e `docs/qwen36.md` per il ragionamento). Un token ne
+attraversa qualche centinaio.
+
+```bat
+pacman -S --needed mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-llvm-openmp
+set PATH=C:\msys64\clang64\bin;%PATH%
+del backend_loader.o
+make qwen36.exe CC=clang CUDA_DLL=1 ARCH=native
+```
+
+Misurato qui, stesso commit, build alternate: **50,2 -> 32,2 ms/token, 13,4 ->
+20,7 tok/s**. La `coli_cuda.dll` non c'entra e non va ricompilata: resta
+nvcc+MSVC e viene caricata a runtime.
+
+Tre avvertenze:
+
+- Cambiare compilatore non richiede `make clean`: `.build-config` include `$(CC)`
+  e gli oggetti ci dipendono, quindi si ricompilano da soli (verificato).
+- La build clang non e' `-static`: vuole `C:\msys64\clang64\bin` nel `PATH`
+  anche quando la ESEGUI, per `libomp.dll` e `libwinpthread-1.dll`.
+- gcc e clang non producono gli stessi ultimi bit (vettorizzano diversamente le
+  parti scalari fuori dai kernel con intrinsics). I token contro l'oracolo
+  restano identici, ma due build diverse non si confrontano byte a byte.
 
 Controllo: all'avvio `colibri.exe` (motore GLM) stampa `idot: <kernel>` nel banner
 (`c/colibri.c`, riga `== GLM C engine`). Se il kernel è solo AVX2, la build non ha usato `ARCH=native`.

@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "hypothesis": "On this Windows host the OpenMP runtime, not any kernel, is the largest single cost of a Qwen3.6 decode token: MinGW libgomp charges 54 us to enter an empty parallel region and 70 us for a barrier on a team of 16, and a decode token crosses a few hundred regions. Building the same source with a toolchain that links LLVM's libomp should therefore cut the phases that are made of many small parallel regions -- shared expert, router, DeltaNet gated norm + out_proj -- while leaving the phases that are not.",
+  "commit": "4bc62322b01cb0dcf33e1938701037858296decc",
+  "model": "Qwen/Qwen3.6-35B-A3B converted to the Colibri int4 gs64 container (C:\\modelli\\qwen36_i4_gs64), routed experts int4 packed, dense trunk int8 at load",
+  "command": "powershell -ExecutionPolicy Bypass -File .\\misure.ps1 -Model C:\\modelli\\qwen36_i4_gs64 -Etichetta <label> -SaltaDisco -SaltaRam (128 generated tokens, 56-token prompt, COLI_TIMERS=1, CUDA expert tier active, cache cap 256/layer, OMP_NUM_THREADS unset so the engine's physical-core sizing applies). Each invocation emits two samples, gpu_1_fredda and gpu_2_calda. Arms alternated across invocations: clang-1, gcc-2, clang-2, gcc-3.",
+  "prompt_hash": "not recorded: misure.ps1 builds its own prompt and is not in the repository, so no digest exists to cite. The same script, model and invocation produced every sample in this record, and the engine reports the same 56 prompt tokens in all eight runs, which is the strongest cross-run pin available here",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 7950X, 16 cores / 32 threads, 2 CCDs, AVX-512",
+    "ram": "64 GB DDR5 at 5200 MT/s, 4 DIMMs; 52.5 GB/s measured streaming read (c/tests/bench_qwen36_decode_omp)",
+    "storage": "Silicon Power UD90 4 TB NVMe in M.2_3 (PCIe 4.0 x4), NTFS; container read at 5-6 GB/s",
+    "os": "Windows 11, ASUS TUF GAMING X670E-PLUS BIOS 3881, NVIDIA RTX 4070 Ti SUPER 16 GB driver 616.64 CUDA 13.4. Baseline built with MSYS2 UCRT64 gcc 16.2 (-O3 -march=native -fopenmp -static, MinGW libgomp); trial built with MSYS2 CLANG64 clang 22.1.8 (-O3 -march=native -fopenmp, LLVM libomp 22.1.8). coli_cuda.dll is the same nvcc+MSVC build for both arms and is loaded at runtime."
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "TOOLCHAIN_AND_OPENMP_RUNTIME"
+  ],
+  "baseline": {
+    "config": {
+      "TOOLCHAIN_AND_OPENMP_RUNTIME": "MSYS2 UCRT64 gcc 16.2 + MinGW libgomp (make qwen36.exe CUDA_DLL=1 ARCH=native)"
+    },
+    "samples": {
+      "tok_s": [
+        13.83,
+        12.93,
+        14.51,
+        12.17
+      ]
+    },
+    "median_tok_s": 13.38,
+    "quality": {
+      "method": "The 35B has no oracle, so three gates stand in for one. On this commit the tiny Qwen3.6-shaped fixture is token-exact against the torch reference (16/16) for this toolchain; ids and last logits are byte-identical across QWEN36_SHARED_FUSE=0/1 and QWEN36_CONV_OMP=0/1 at cache caps 1 and 8; ASan + UBSan report zero diagnostics on both tiny fixtures. Every one of the four samples exited 0 and produced 128 tokens. Across the two arms only token-level agreement is available, never byte-level: two compilers vectorise the scalar code outside the intrinsic kernels differently.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-openmp-runtime-2026-09-18-raw.txt, section 'baseline: gcc + MinGW libgomp'",
+      "sha256": "b00ce7c7dcf9884734aec0057f4cf468d401d4c5ff7a244943c0f50249e32cd5"
+    }
+  },
+  "trial": {
+    "config": {
+      "TOOLCHAIN_AND_OPENMP_RUNTIME": "MSYS2 CLANG64 clang 22.1.8 + LLVM libomp (make qwen36.exe CC=clang CUDA_DLL=1 ARCH=native)"
+    },
+    "samples": {
+      "tok_s": [
+        20.50,
+        19.02,
+        20.32,
+        21.12
+      ]
+    },
+    "median_tok_s": 20.41,
+    "quality": {
+      "method": "Same three gates as the baseline on the same commit: tiny fixture token-exact 16/16 against the torch reference for this toolchain, both switches byte-identical at caps 1 and 8, ASan + UBSan clean. Additionally 200 tokens generated from the real 35B container and read by hand: coherent Italian, no degradation toward the end (that read used the CPU expert path, COLI_CUDA unset, not the CUDA tier). Every one of the four samples exited 0 and produced 128 tokens.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-openmp-runtime-2026-09-18-raw.txt, section 'trial: clang + LLVM libomp'",
+      "sha256": "b00ce7c7dcf9884734aec0057f4cf468d401d4c5ff7a244943c0f50249e32cd5"
+    }
+  },
+  "outcome": "improvement"
+}

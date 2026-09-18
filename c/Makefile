@@ -12,10 +12,16 @@ DETECT_CC := $(if $(filter default,$(origin CC)),gcc,$(CC))
 TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 
 MINGW  := $(findstring mingw,$(TRIPLET))
+# LLVM spells the same MinGW target x86_64-w64-windows-gnu, with no "mingw" in
+# it, so a clang build was falling through to the generic branch: no -lpsapi, no
+# EXE suffix, and `make qwen36.exe CC=clang` answering "nothing to be done"
+# because the target was called qwen36. MSYS2 CLANG64 is the supported way to
+# get LLVM's OpenMP runtime on Windows, which makes this path worth having.
+WINGNU := $(findstring windows,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
-IS_WIN := $(MINGW)$(CYGWIN)
+IS_WIN := $(MINGW)$(WINGNU)$(CYGWIN)
 
 # Appended to every platform's flags, so a caller can add to the build without
 # replacing it. Overriding CFLAGS= on the command line would drop that
@@ -108,7 +114,23 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
-LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
+# -static is a GCC-toolchain habit here: it makes the exe self-contained. MSYS2
+# CLANG64 ships its runtime pieces (compiler-rt, libc++, libomp) as DLLs, where
+# a fully static link is at best unusual and at worst a link error nobody can
+# act on, so a clang build links them normally and wants
+# C:\msys64\clang64\bin on PATH when it runs.
+WIN_STATIC := $(if $(findstring clang,$(DETECT_CC)),,-static)
+# MinGW keeps clock_gettime AND the whole pthread surface in libwinpthread.
+# GCC's -fopenmp implies -pthread and pulls it in; clang's -fopenmp links libomp
+# and nothing else, so an otherwise fine build dies on clock_gettime64 plus
+# every pthread_* the expert tier and the prefetch threads use.
+WIN_PTHREAD := $(if $(findstring clang,$(DETECT_CC)),-lpthread,)
+# Reserve the stack explicitly instead of inheriting whatever the linker picked:
+# GNU ld gives a MinGW target 2 MB, lld follows MSVC and gives less, and the
+# difference is the kind of thing that turns a working build into
+# STATUS_STACK_OVERFLOW (0xC00000FD) on a different toolchain. 8 MB of RESERVE
+# costs nothing -- pages commit as they are touched.
+LDFLAGS = -lm -fopenmp $(WIN_STATIC) -lpsapi $(WIN_PTHREAD) -Wl,--stack,8388608 $(EXTRA_LDFLAGS)
 ifeq ($(LTO),1)
 CFLAGS  += -flto
 LDFLAGS += -flto
@@ -198,6 +220,62 @@ LDFLAGS += -flto
 endif
 EXE     =
 endif
+endif
+
+# OMP_RUNTIME=llvm links LLVM's libomp instead of the compiler's own OpenMP
+# runtime. Worth caring about: measured on a Ryzen 9 7950X at 16 threads with
+# tests/bench_omp_sync.c, which exists to make exactly this comparison --
+#
+#   runtime                     empty region   barrier in an open region
+#   MinGW libgomp (gcc)              53.5 us                     70.5 us
+#   LLVM libomp (cl /openmp:llvm)     8.1 us                      1.5 us
+#   VCOMP (cl /openmp)                1.9 us                      1.1 us
+#
+# -- and libgomp's price there is LINEAR in team size (12/25/34/53 us for a
+# region at 2/4/8/16 threads, 6.5/20/35/70 for a barrier, about 4.4 us per
+# thread), which is a runtime waking its team one thread at a time. That is why
+# OMP_WAIT_POLICY=active moves neither number. A qwen36 decode token crosses a
+# few hundred regions, so it is 13-16 ms of a 56 ms token.
+#
+# WHEN THIS KNOB WORKS. GCC emits calls to the GOMP_* entry points, so it can
+# only run on libomp where libomp was built with the GOMP compatibility layer.
+# That is the case on Linux -- verified: the engine links, ldd shows no libgomp,
+# the tiny oracle still matches 16/16 and the dumped logits are byte-identical.
+# It is NOT the case for MSYS2's libomp on Windows: the GOMP symbols are not
+# exported, ld quietly satisfies them from libgomp instead, and the binary ends
+# up with BOTH runtimes -- libgomp running the regions, libomp answering
+# omp_get_num_threads() from outside any team of its own. The tell is
+# `team of 1` with prices that did not move; bench_omp_sync now says so outright.
+#
+#   linux:   make -C c qwen36 OMP_RUNTIME=llvm          (needs libomp-dev)
+#
+# ON WINDOWS, USE CLANG INSTEAD. clang emits libomp's own ABI, so it needs no
+# knob at all -- plain -fopenmp links the right runtime:
+#
+#   pacman -S mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-llvm-openmp
+#   set PATH=C:\msys64\clang64\bin;%PATH%
+#   make bench-omp-sync CC=clang                        # confirm the prices moved
+#   make qwen36.exe CC=clang CUDA_DLL=1 ARCH=native
+#
+# The package must match the MSYS2 environment the compiler comes from, which is
+# not always the one the PATH was meant to select -- `set PATH=%PATH%;...ucrt64`
+# APPENDS, so a mingw64 already on the system PATH answers instead. Check with
+# `where gcc` / `where clang`. `cannot find -lomp` means the installed package
+# belongs to a different environment than the compiler doing the link.
+ifeq ($(OMP_RUNTIME),llvm)
+ifneq (,$(DARWIN))
+$(error OMP_RUNTIME=llvm is not for macOS: that branch already links Homebrew's \
+libomp through OMPDIR when it finds one, so this would either duplicate it or, \
+with no Homebrew libomp present, append a bare -lomp that has no -L to find)
+endif
+ifeq (,$(findstring clang,$(CC)))
+ifneq ($(IS_WIN),)
+$(warning OMP_RUNTIME=llvm with a GCC driver on Windows links BOTH OpenMP runtimes)
+$(warning (-fopenmp makes the driver add -lgomp to this same command line), and)
+$(warning MSYS2 libomp exports no GOMP_* symbols. Build with CC=clang instead.)
+endif
+endif
+LDFLAGS := $(filter-out -fopenmp -static,$(LDFLAGS)) -lomp
 endif
 
 # --- install ---
@@ -1173,6 +1251,12 @@ tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c expe
 tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# Is the CPU half of a decode token bound by OpenMP regions or by memory
+# bandwidth?  Model-free, ~450 MB of working set, seconds to run.  Local
+# evidence like the bench above, not a CI gate.
+tests/bench_qwen36_decode_omp$(EXE): tests/bench_qwen36_decode_omp.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 inkling$(EXE): inkling.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda_ink.h backend_metal.h edge_adapters.h edge_runtime.h edge_tok_internal.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
@@ -2013,6 +2097,13 @@ bench-omp-grain: tests/bench_omp_grain.c
 	$(CC) $(CFLAGS) $< -o tests/bench_omp_grain $(LDFLAGS)
 	./tests/bench_omp_grain
 
+# The two sync prices alone, portable enough to build with gcc, clang and MSVC
+# so that different OpenMP runtimes can be compared on one machine. See the
+# header for the three command lines.
+bench-omp-sync: tests/bench_omp_sync.c
+	$(CC) $(CFLAGS) $< -o tests/bench_omp_sync$(EXE) $(LDFLAGS)
+	./tests/bench_omp_sync$(EXE)
+
 # --- sanitizers ---------------------------------------------------------
 # The whole C test suite under AddressSanitizer + UndefinedBehaviorSanitizer.
 # Until this target the only sanitized code in the tree was fuzz-rans, which
@@ -2092,7 +2183,7 @@ bench: iobench$(EXE)
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
-.PHONY: bench-omp-grain
+.PHONY: bench-omp-grain bench-omp-sync
 .PHONY: test-asan
 .PHONY: dsv4-cuda-test cuda-dsv4-dll cuda-dsv4-dg-dll dsv4-cuda-loader-test
 
