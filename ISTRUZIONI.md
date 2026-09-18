@@ -144,7 +144,9 @@ cioè da 1,6 a 5–6 GB/s.
 |---|---|
 | I/O parallelo su Windows (handle diretto `OVERLAPPED`) | **fatto e misurato.** Con l'SSD a Gen3 x2 valeva +8%; ora che il disco fa 5–6 GB/s le tre configurazioni si equivalgono. Tornerà utile col T705 |
 | RAM di Qwen3.6: quantizzazione al caricamento + embedding int8 | **fatto.** RSS dopo il caricamento 9,23 → 4,82 GB. Il picco complessivo resta ~30 GB, perché arriva dal warmstart degli esperti: per quello serve `RAM_GB` |
-| **Uscita DeltaNet e shared expert sulla GPU** | **prossimo passo.** Oggi costano 9,0 + 9,3 ms/token su CPU e occuperebbero ~0,4 GB di VRAM, il 3% degli esperti residenti |
+| **Kernel int8 AVX-512** | **fatto, da misurare.** I kernel caldi (proiezioni dense e esperti) avevano solo la versione AVX2: metà registro e metà FMA sul 7950X. `QWEN36_AVX512=0` torna ad AVX2 per il confronto |
+| **Uscita DeltaNet e shared expert sulla GPU** | da fare, ma **dopo** aver ridotto le chiamate GPU: da sole aggiungerebbero ~30 viaggi sincroni per token, più o meno quanto risparmiano |
+| Copia int8 degli esperti non residenti in VRAM (~9 GB di RAM) e riserva KV contata su 40 layer invece di 10 | da fare |
 | Copie CPU↔GPU sincrone della parte densa (`c/backend_cuda.cu`, `coli_cuda_matmul`) | da fare, collegato a #431. Con 64 GB l'attesa GPU è scesa da 11,6 a 2,5 ms/token, quindi ora vale meno di prima |
 | Testa MTP di Qwen3.6 (il "secondo motore" già dentro il checkpoint) | da valutare. Il convertitore la salta apposta (#1326); servono conversione, caricamento e salvataggio dello stato DeltaNet |
 | Due motori con modello esterno | da valutare, issue #494: serve un modello piccolo con lo stesso vocabolario da 248.320 token |

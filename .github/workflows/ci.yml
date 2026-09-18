@@ -636,6 +636,31 @@ jobs:
           SNAP=qwen36_tiny_c4 ./qwen36 1 4 qwen36_tiny/ref_full.json 2> probe4.log >/dev/null || true
           grep -q 'expert format on disk: int4' probe4.log || { echo "FAIL: int4 container probed as"; grep 'expert format' probe4.log; exit 1; }
           echo "probe: int8 -> fmt=1, int4 -> fmt=4"
+      - name: AVX-512 int8 GEMV compiles, self-tests, and holds the oracle where the runner has it
+        run: |
+          cd c
+          # The engine's default -march has no AVX-512, so without this step the
+          # 512-bit branches of matmul_q / matmul_q_gs are never compiled by any
+          # job and a typo inside them would ship green. Build the engine with the
+          # instructions enabled; the kernel's own self-test runs everywhere
+          # (it asks CPUID first and skips on a host without them).
+          make clean >/dev/null 2>&1 || true
+          make qwen36 EXTRA_CFLAGS="-mavx512f -mavx512bw"
+          make tests/test_i8_acc512 && ./tests/test_i8_acc512
+          if grep -qm1 avx512f /proc/cpuinfo; then
+            # This runner can execute them: hold the 512-bit path to the same
+            # token-exact gate as the default path, and keep the AVX2 arm as the
+            # control on the same binary (QWEN36_AVX512=0).
+            echo "runner has AVX-512: running both arms against the oracle"
+            for q in 1 0; do
+              echo "::group::QWEN36_AVX512=$q"
+              QWEN36_AVX512=$q COLI_DENSE_I8=0 SNAP=qwen36_tiny_c \
+                ./qwen36 8 8 qwen36_tiny/ref_full.json
+              echo "::endgroup::"
+            done
+          else
+            echo "runner has no AVX-512: build and self-test only"
+          fi
 
   olmoe-tiny-check:
     name: OLMoE tiny oracle (token-exact + dashboard HITS)
