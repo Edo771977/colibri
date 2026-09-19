@@ -1319,6 +1319,26 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
     matmul(y, x, W, S, I, O);
 }
 
+/* The int8 copy of W, but only when the registry holds it at the shape the
+ * forward will call with. The tier uploads once and the backend then
+ * multiplies the cached weights by whatever dimensions the CALL carries, so an
+ * init that disagreed with its call site would not fail -- it would answer.
+ * matmul_d matches the same way (`w == W && I == I`), which is why a
+ * disagreement here would also have silently dropped the CPU int8 path back to
+ * f32. Shared by the offer and the placement below: if they could disagree
+ * about what is placeable, the offer would charge the expert budget for bytes
+ * that never arrive. */
+static const int8_t *qdw_int8(const float *W, int I, int O, const float **scales)
+{
+    for (int j = 0; j < g_qdw_n; j++)
+        if (g_qdw[j].w == W) {
+            if (g_qdw[j].I != I || g_qdw[j].O != O) return NULL;
+            *scales = g_qdw[j].sc;
+            return g_qdw[j].q;
+        }
+    return NULL;                          /* dense-i8 off: the CPU path stands */
+}
+
 /* ---- the two OUTPUT projections, placed like the input ones ---------------
  * qwen36_tier.h has carried `dnout` in its COLI_PLACE example since the
  * placement table was written, but the engine only ever asked qt_place_of()
@@ -1327,12 +1347,12 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
  * DeltaNet out_proj on the DeltaNet layers, and `attnout` (a name the header
  * did not have) for attention o_proj on the rest.
  *
- * Deliberately NOT offered to the automatic placer (qt_trunk_offer). An offer
- * lets auto_place() move these on its own, which would change what a default
- * run does before anyone has measured whether it pays -- and each placed
- * matrix adds a driver round-trip to the layer chain, the very cost under
- * investigation. Explicit COLI_PLACE needs no offer (qt_place_of parses the
- * variable directly when auto is off), so this is an A/B you ask for.
+ * They were explicit-only when first added, because nothing had measured
+ * whether a placed matrix pays for the driver round-trip it adds to the layer
+ * chain. It has now been measured (docs/qwen36-cuda-tier.md, 19 September:
+ * -7.77 ms/token, four runs a side, spread 2.1) so they are offered to the
+ * automatic placer like every other trunk component, and it prices them
+ * against the experts they displace.
  *
  * Its own function rather than more lines inside main() because main() is not
  * callable from a test; tests/test_qwen36_trunk_place.c drives this. */
@@ -1348,21 +1368,9 @@ static void trunk_place_out(Model *m)
         if (!W || I <= 0 || O <= 0) continue;
         int dev = qt_place_of(attn ? "attnout" : "dnout", i);
         if (dev == QT_PLACE_CPU) continue;
-        const int8_t *q = NULL; const float *sc = NULL;
-        for (int j = 0; j < g_qdw_n; j++)
-            if (g_qdw[j].w == W) {
-                /* Take the shape from the registry, and only when it is the
-                 * shape the forward will call with. The tier uploads once and
-                 * the backend then multiplies the cached weights by whatever
-                 * dimensions the CALL carries, so an init that disagreed with
-                 * the call site would not fail -- it would answer. matmul_d
-                 * matches the same way (`w == W && I == I`), which is why a
-                 * disagreement here would also have silently dropped the CPU
-                 * int8 path back to f32. */
-                if (g_qdw[j].I == I && g_qdw[j].O == O) { q = g_qdw[j].q; sc = g_qdw[j].sc; }
-                break;
-            }
-        if (!q || !sc) continue;          /* dense-i8 off: the CPU path stands */
+        const float *sc = NULL;
+        const int8_t *q = qdw_int8(W, I, O, &sc);
+        if (!q) continue;
         int h = qt_dense_init(q, sc, I, O, dev, 0);
         if (h < 0) continue;              /* out of VRAM: this layer stays put */
         if (attn) { l->h_attnout = h + 1; n_attn++; } else { l->h_dnout = h + 1; n_dn++; }
@@ -1373,21 +1381,19 @@ static void trunk_place_out(Model *m)
                 n_attn, n_dn, bytes / 1073741824.0);
 }
 
-/* Declare the bytes BEFORE qt_init sizes the expert budget, but only for the
- * layers an explicit COLI_PLACE has already sent to a device.
+/* Offer the bytes BEFORE qt_init sizes the expert budget.
  *
- * qt_init computes each device's expert budget as its allowance minus the
- * trunk that landed there, and it sums that trunk over the OFFERS
- * (qwen36_tier.c:696). A matrix placed without an offer is uploaded anyway
- * and charged to nobody: tier_warmstart then fills experts up to a budget
- * that no longer exists. That is the R4 regression the comment above that
- * loop describes, fixed once for dnproj; not offering these would have
- * reintroduced it under two new names.
+ * Two things hang on this call. qt_init computes each device's expert budget
+ * as its allowance minus the trunk that landed there, summed over the OFFERS
+ * (qwen36_tier.c:696): a matrix placed without one is uploaded anyway and
+ * charged to nobody, and tier_warmstart then fills experts into VRAM that is
+ * already spoken for -- the R4 regression that loop exists to prevent. And in
+ * auto mode the offer IS the decision: auto_place() walks this table and
+ * prices each entry against the experts it would displace.
  *
- * Offering only what COLI_PLACE already decided keeps auto untouched, which
- * is the whole point: before qt_init, qt_place_of parses the variable
- * directly (G_auto_on is still 0), so an unset or `auto` run answers CPU
- * here, offers nothing, and auto_place never sees these names. */
+ * Unconditional, now that the measurement exists. The first version offered
+ * only what an explicit COLI_PLACE had already named, which kept auto's
+ * behaviour frozen while the question was open; it no longer is. */
 static void trunk_offer_out(Model *m)
 {
     for (int i = 0; i < m->c.n_layers; i++) {
@@ -1397,7 +1403,11 @@ static void trunk_offer_out(Model *m)
         int I = attn ? m->c.o_in : m->c.dn_vheads * m->c.dn_vdim;
         int O = m->c.hidden;
         if (!W || I <= 0 || O <= 0) continue;
-        if (qt_place_of(name, i) == QT_PLACE_CPU) continue;
+        /* Offer only what can actually be placed. An offer for a matrix the
+         * registry does not hold (COLI_DENSE_I8=0) would take VRAM out of the
+         * expert budget for bytes that never arrive. */
+        const float *sc = NULL;
+        if (!qdw_int8(W, I, O, &sc)) continue;
         qt_trunk_offer(name, i, (size_t)O * I + (size_t)O * sizeof(float));
     }
 }

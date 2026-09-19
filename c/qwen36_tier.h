@@ -46,9 +46,11 @@ int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
  * The names are whatever the engine asks qt_place_of() about, and a name
  * nothing asks about is a setting that parses and does nothing. qwen36 asks
  * about: experts, lmhead, dnproj (DeltaNet in_proj, qkv ++ z fused), dnout
- * (DeltaNet out_proj) and attnout (attention o_proj). The attention INPUT
- * projections are not among them yet -- q/k/v want fusing and a split of
- * the result, which is its own patch.
+ * (DeltaNet out_proj) and attnout (attention o_proj). All five are offered to
+ * the automatic placer, so an unset COLI_PLACE lets it decide; `off` is the
+ * way back to experts only. The attention INPUT projections are not among
+ * them yet -- q/k/v want fusing and a split of the result, which is its own
+ * patch.
  *
  * Target is `cpu` or a CUDA ordinal. A component may also be split across
  * cards by layer count, joined with '+' so it cannot be confused with the
