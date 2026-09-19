@@ -3289,6 +3289,148 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+/* CONSIST=1: the engine against itself at two batch sizes. Arm A pushes the
+ * whole sequence through one step() call; arm B prefills a prefix and walks
+ * the rest one token at a time; the logits of the same final position must
+ * agree. Ported from colibri.c's run_consist, and it needs no oracle and no
+ * reference implementation, so it runs on any model, quantization and backend.
+ *
+ * WHAT IT ACTUALLY CHECKS, which is narrower than the first version of this
+ * comment claimed. deltanet() is ONE loop over s (c/qwen36.c's `for (int s =
+ * 0; s < S; s++)`) that advances the conv ring and the recurrent state token
+ * by token, and those buffers persist in m->DN_conv/rec across step() calls.
+ * There is no separate batched convolution to disagree with the recurrence --
+ * the zero-padded conv lives in tools/_ref_dn_stream.py as a REFERENCE, not as
+ * a second path in this engine. attention() is the same story: the KV cache is
+ * written position by position and the causal softmax reads t <= qpos whatever
+ * S is. So S=21 in one call performs the same operations in the same order as
+ * 21 calls of S=1, and the two arms agreeing is a property of the structure.
+ *
+ * What is left is worth a gate anyway, and it is exactly where this engine has
+ * been changing: the code that BRANCHES on S. Every placement added in
+ * #18..#20 is an `if (!(S == 1 && trunk_out_matmul(...)))`, decode-only by
+ * construction, so a placed matrix that answered differently from the three
+ * CPU matmuls it replaced would show up here and nowhere else. A reviewer
+ * confirmed the gate bites on that class: skipping the recurrent state update
+ * only when S == 1 gives a 0.25-0.30 relative gap, and a RoPE off-by-one only
+ * for S == 1 gives 0.04-0.06. Both FAIL.
+ *
+ * WHAT IT CANNOT SEE, and this is the honest limit: anything the two arms
+ * share. The same reviewer filled the conv ring with 0.37 instead of zeroing
+ * it -- a real defect that would move every output away from the reference --
+ * and CONSIST reported 0.000e+00 on all four arms, because consist_reset()
+ * applies the same corruption to both sides. A shared bug is invisible here by
+ * construction. That is what the tiny-model oracle is for; this is the other
+ * half.
+ *
+ * SHAPE, different from colibri's because qwen36 has no step_all(): step()
+ * returns the logits of the LAST position only, so there is no batched row to
+ * compare position by position. Instead one arm A is compared against several
+ * arm Bs reaching the same final position after a different number of decode
+ * steps.
+ *
+ * The gate is the largest RELATIVE logit gap: reordered f32 accumulation over
+ * the hidden dim lands near D*eps (2.4e-4 at hidden 2048), a wrong mask or a
+ * misaddressed KV row lands at O(1). The 1e-2 default sits between them, with
+ * the caveat that an error confined to one layer can dilute through the
+ * residual stream and the lm_head before it is measured. Argmax flips are
+ * reported but NOT gated -- a flip requires the top two within 2*gap by
+ * construction, so gating them would be an assertion that cannot fail. */
+
+/* Per-REQUEST state, matching serve_one()'s reset -- the fullest one in this
+ * file -- not generate()'s, which clears only the recurrent state and kv_len.
+ * Both arms must start from the same state or they are not comparable and the
+ * difference reads as an engine defect.
+ *
+ * Deliberately NOT reset: the expert LRU. Arm A warms it for the arms that
+ * follow, which changes I/O and not arithmetic -- an expert returns the same
+ * numbers however hot its slot is, and the cap 1/2/8 runs beside this one are
+ * what exercise the eviction bookkeeping. Worth knowing if the gap ever stops
+ * being zero at small cap only. */
+static void consist_reset(Model *m) {
+    reset_recurrent(m);
+    m->kv_len = 0;
+    m->first_step = 1;
+    if (m->seen) memset(m->seen, 0, (size_t)m->c.n_layers * m->c.n_experts);
+    if (m->momentum_logits)
+        memset(m->momentum_logits, 0,
+               (size_t)m->c.n_layers * m->c.n_experts * sizeof(float));
+}
+
+static void run_consist(Model *m, const int *full, int nfull) {
+    Cfg *c = &m->c; int V = c->vocab;
+    if (nfull < 4) {
+        fprintf(stderr, "CONSIST needs at least 4 tokens, got %d\n", nfull); return; }
+    if (nfull > QWEN36_ATTN_MAX_CTX) {
+        fprintf(stderr, "CONSIST: %d tokens exceed the %d-token ceiling\n",
+                nfull, QWEN36_ATTN_MAX_CTX); return; }
+
+    m->max_t = nfull + 2;
+    ensure_kv(m);
+
+    consist_reset(m);
+    float *A = step(m, full, nfull, 0);       /* arm A: one batched prefill */
+    if (!A) { fprintf(stderr, "CONSIST: prefill returned no logits\n"); return; }
+
+    /* Split points, coarse to fine in decode steps: 1, a quarter, a half, and
+     * as many as the sequence allows. Deduplicated, and a prefix shorter than
+     * 2 tokens is not a prefill -- so short sequences really do run fewer than
+     * four arms (nfull 4 or 5 collapse to two), and the printed count is the
+     * number that ran, never a promise of four. */
+    int want[4] = { nfull - 1, nfull - nfull/4, nfull/2, 2 };
+    double tol = getenv("CONSIST_TOL") ? atof(getenv("CONSIST_TOL")) : 1e-2;
+    double worst = 0; int worst_np = -1, arms = 0, fails = 0;
+
+    /* Say the cost up front, and count it rather than estimate it: the fan
+     * below works out to about 1.75*n single-token decode steps, which on a
+     * real model is the difference between a diagnostic and an afternoon.
+     * (The first version of this comment guessed 2.5x and was 43% high.) */
+    { int steps = 0;
+      for (int wi = 0; wi < 4; wi++) {
+          int np = want[wi]; if (np < 2 || np >= nfull) continue;
+          int dup = 0; for (int k = 0; k < wi; k++) if (want[k] == np) dup = 1;
+          if (!dup) steps += nfull - np; }
+      printf("CONSIST prefill vs decode: %d tokens, tol %.1e | %d decode steps to run\n",
+             nfull, tol, steps); }
+    for (int wi = 0; wi < 4; wi++) {
+        int np = want[wi];
+        if (np < 2 || np >= nfull) continue;
+        int dup = 0; for (int k = 0; k < wi; k++) if (want[k] == np) dup = 1;
+        if (dup) continue;
+
+        consist_reset(m);
+        float *lo = step(m, full, np, 0);
+        for (int i = np; i < nfull; i++) { free(lo); lo = step(m, &full[i], 1, i); }
+        if (!lo) { fprintf(stderr, "CONSIST: decode returned no logits\n"); break; }
+
+        double gap = 0, scale = 0; int ia = 0, ib = 0;
+        for (int v = 0; v < V; v++) {
+            double d = fabs((double)A[v] - (double)lo[v]); if (d > gap) gap = d;
+            double sc = fabs((double)A[v]);                if (sc > scale) scale = sc;
+            if (A[v]  > A[ia])  ia = v;
+            if (lo[v] > lo[ib]) ib = v;
+        }
+        double rel = scale > 0 ? gap / scale : gap;
+        if (rel > worst) { worst = rel; worst_np = np; }
+        arms++; if (rel > tol) fails++;
+        printf("  prefix %5d + %5d decode steps | relative gap %.3e (abs %.3e)%s%s\n",
+               np, nfull - np, rel, gap,
+               ia != ib ? " | argmax flip" : "",
+               rel > tol ? "  <-- over tol" : "");
+        free(lo);
+    }
+    free(A);
+
+    if (!arms) { fprintf(stderr, "CONSIST: no usable split point\n"); return; }
+    if (fails) {
+        fprintf(stderr, "CONSIST FAIL: worst relative gap %.3e at prefix %d exceeds tol %.1e -- "
+                        "prefill and decode do not agree on the same position\n",
+                worst, worst_np, tol);
+        exit(1);
+    }
+    printf("CONSIST OK: %d arms, worst relative gap %.3e\n", arms, worst);
+}
+
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
     Cfg *c = &m->c;
     if (nfull > QWEN36_ATTN_MAX_CTX) {
@@ -3932,6 +4074,14 @@ int main(int argc, char **argv) {
         if (!g_tok) { fprintf(stderr, "[serve] tokenizer.json required (put in SNAP or set TOK)\n"); return 1; }
         serve_loop(&m);
         return 0;
+    }
+
+    /* CONSIST takes whatever token sequence this run already has: the ref
+     * file's full_ids when there is one, the encoded prompt otherwise. It
+     * needs no continuation of its own -- both arms replay the same tokens. */
+    if (getenv("CONSIST") && atoi(getenv("CONSIST")) == 1) {
+        run_consist(&m, is_ref ? full : prompt, is_ref ? nfull : np);
+        free(buf); free(arena); return 0;
     }
 
     if (is_ref && getenv("PPL") && atoi(getenv("PPL")) == 1) {

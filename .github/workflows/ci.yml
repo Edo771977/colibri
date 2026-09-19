@@ -446,6 +446,39 @@ jobs:
               ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: Prefill and decode agree on the same position (CONSIST)
+        run: |
+          cd c
+          make qwen36
+          # The engine against itself at two batch sizes: arm A pushes the whole
+          # sequence through one step() call, arm B prefills a prefix and walks
+          # the rest one token at a time.
+          #
+          # What it guards is the code that BRANCHES on S. deltanet() is one
+          # loop over s carrying the conv ring and recurrent state across
+          # step() calls, so S=21 once and S=1 twenty-one times run the same
+          # operations in the same order -- there is no separate batched
+          # convolution to disagree with. What differs is the decode-only fast
+          # paths: every placement in #18..#20 is an
+          # `if (!(S == 1 && trunk_out_matmul(...)))`, never taken by a batch.
+          # A placed matrix answering differently from the CPU matmuls it
+          # replaced shows up here and nowhere else.
+          #
+          # cap=1 evicts on every routed expert, for the same reason the run
+          # above uses it. The engine exits non-zero when the gap exceeds
+          # CONSIST_TOL.
+          for cap in 1 8; do
+            echo "::group::CONSIST cap=$cap (dense f32)"
+            COLI_DENSE_I8=0 CONSIST=1 SNAP=qwen36_tiny_c \
+              ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+          # And once on the default dense int8 path, which the runs above never
+          # enter: both arms quantize identically, so the agreement must hold
+          # there too, and a placement that broke only one arm would show here.
+          echo "::group::CONSIST cap=8 (dense int8, the default)"
+          CONSIST=1 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json
+          echo "::endgroup::"
       - name: Quantize-at-load is bit-identical to quantize-after-load (dense int8 on)
         run: |
           cd c
