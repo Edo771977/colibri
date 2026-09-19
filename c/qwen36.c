@@ -654,7 +654,7 @@ typedef struct {
      * puts them there. Biased by one so that calloc's zero means "on the
      * CPU": qt_dense_init hands back 0 for the first matrix it takes, and a
      * Layer is calloc'd long before any placement runs. */
-    int h_attnout, h_dnout;
+    int h_attnout, h_dnout, h_attnproj;
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -1424,6 +1424,96 @@ static void trunk_offer_out(Model *m)
         if (!qdw_int8(W, I, O, &sc)) continue;
         qt_trunk_offer(name, i, (size_t)O * I + (size_t)O * sizeof(float));
     }
+}
+
+/* ---- the attention INPUT projections, q ++ k ++ v fused --------------------
+ * Three matrices over the same x, so one concatenation along O makes them one
+ * GEMV: 10 driver calls a token on this model instead of 30, for the 189 MB
+ * they read. dnproj plays the same trick with qkv ++ z.
+ *
+ * EXPLICIT ONLY for now, unlike dnout/attnout next door. Those are offered to
+ * the automatic placer because an A/B measured them (-7.77 ms/token); this has
+ * not been measured, and #18's whole argument was that a default does not move
+ * on a prediction. The offer therefore goes in only for the layers an explicit
+ * COLI_PLACE already named -- which is still enough for qt_init to charge the
+ * bytes to that device's expert budget, the thing that must not be skipped.
+ *
+ * Returns the fused [q_out + 2*kv_out][hidden] int8 block, or NULL. The caller
+ * frees it; the tier copies during upload. */
+static int8_t *attnproj_fuse(Model *m, int layer, int I, int O, float **scales)
+{
+    Layer *l = &m->L[layer];
+    *scales = NULL;                       /* set on every path, as qdw_int8 does */
+    int q_out = m->c.q_heads * m->c.q_head_dim;
+    int kv_out = m->c.kv_heads * m->c.k_head_dim;
+    const float *sq = NULL, *sk = NULL, *sv = NULL;
+    const int8_t *qq = qdw_int8(l->q, I, q_out,  &sq);
+    const int8_t *qk = qdw_int8(l->k, I, kv_out, &sk);
+    const int8_t *qv = qdw_int8(l->v, I, kv_out, &sv);
+    if (!qq || !qk || !qv) return NULL;   /* dense-i8 off: the CPU path stands */
+    if (q_out + 2 * kv_out != O) return NULL;
+    int8_t *w = malloc((size_t)O * I);
+    float  *s = malloc((size_t)O * sizeof(float));
+    if (!w || !s) { free(w); free(s); return NULL; }
+    memcpy(w,                                   qq, (size_t)q_out  * I);
+    memcpy(w + (size_t)q_out * I,               qk, (size_t)kv_out * I);
+    memcpy(w + (size_t)(q_out + kv_out) * I,    qv, (size_t)kv_out * I);
+    memcpy(s,                   sq, (size_t)q_out  * sizeof(float));
+    memcpy(s + q_out,           sk, (size_t)kv_out * sizeof(float));
+    memcpy(s + q_out + kv_out,  sv, (size_t)kv_out * sizeof(float));
+    *scales = s;
+    return w;
+}
+
+/* Sizes of the fused block, or 0 when this layer has no attention weights. */
+static size_t attnproj_bytes(Model *m, int layer, int *I_out, int *O_out)
+{
+    if (!m->c.is_attn || !m->c.is_attn[layer]) return 0;
+    Layer *l = &m->L[layer];
+    if (!l->q || !l->k || !l->v) return 0;
+    int I = m->c.hidden;
+    int O = m->c.q_heads * m->c.q_head_dim + 2 * m->c.kv_heads * m->c.k_head_dim;
+    if (I <= 0 || O <= 0) return 0;
+    if (I_out) *I_out = I;
+    if (O_out) *O_out = O;
+    return (size_t)O * I + (size_t)O * sizeof(float);
+}
+
+static void trunk_offer_attnproj(Model *m)
+{
+    for (int i = 0; i < m->c.n_layers; i++) {
+        size_t b = attnproj_bytes(m, i, NULL, NULL);
+        if (!b) continue;
+        /* Before qt_init, qt_place_of parses COLI_PLACE directly (G_auto_on is
+         * still 0), so an unset or `auto` run answers CPU here and offers
+         * nothing: auto_place never sees this name until it is measured. */
+        if (qt_place_of("attnproj", i) == QT_PLACE_CPU) continue;
+        qt_trunk_offer("attnproj", i, b);
+    }
+}
+
+static void trunk_place_attnproj(Model *m)
+{
+    int placed = 0, n_fail = 0; double bytes = 0;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        int I = 0, O = 0;
+        if (!attnproj_bytes(m, i, &I, &O)) continue;
+        int dev = qt_place_of("attnproj", i);
+        if (dev == QT_PLACE_CPU) continue;
+        float *sc = NULL;
+        int8_t *w = attnproj_fuse(m, i, I, O, &sc);
+        if (!w) continue;
+        int h = qt_dense_init(w, sc, I, O, dev, 0);
+        free(w); free(sc);                /* the tier copied during upload */
+        if (h < 0) { n_fail++; continue; }
+        m->L[i].h_attnproj = h + 1; placed++; bytes += (double)I * O;
+    }
+    if (placed)
+        fprintf(stderr, "[place] %d attnproj (q++k++v fused) on GPU (%.2f GB VRAM)\n",
+                placed, bytes / 1073741824.0);
+    if (n_fail)
+        fprintf(stderr, "[place] %d attnproj could not be uploaded: on the CPU, "
+                        "but their bytes stay charged to the trunk budget\n", n_fail);
 }
 
 /* h is the Layer field: 0 means CPU, otherwise the handle plus one. */
@@ -2278,15 +2368,30 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* One block for all seven buffers, reused across layers and tokens: see
      * scratch_get. Sizes depend only on S and the config. */
     int64_t need = DN_PAD((int64_t)S*q_out) + 2*DN_PAD((int64_t)S*kv_out)
+                 + DN_PAD((int64_t)(q_out + 2*kv_out))   /* fused qkv landing row */
                  + 2*DN_PAD((int64_t)S*H*hd) + DN_PAD((int64_t)S*H*gate_dim)
                  + DN_PAD((int64_t)S*H*hd);
     float *sc = scratch_get(&m->attn_scratch, need);
     float *q  = sc;                         sc += DN_PAD((int64_t)S*q_out);
     float *k  = sc;                         sc += DN_PAD((int64_t)S*kv_out);
     float *vv = sc;                         sc += DN_PAD((int64_t)S*kv_out);
-    matmul_d(q, x, l->q, S, D, q_out);
-    matmul_d(k, x, l->k, S, D, kv_out);
-    matmul_d(vv, x, l->v, S, D, kv_out);
+    /* qkv fused into ONE resident GEMV when attnproj is placed. The three
+     * matrices take the same x, so fusing them is a concatenation along O --
+     * the same trick dnproj plays with qkv ++ z. Unlike dnproj, the engine's
+     * q/k/vv slices are DN_PAD'd individually and are therefore NOT
+     * contiguous, so the result lands in a scratch row and is split with
+     * three memcpy: ~36 KB a layer against the 18.9 MB the GEMV reads.
+     * Decode only, like every other placed matrix here. */
+    float *qkv = sc;                        sc += DN_PAD((int64_t)(q_out + 2*kv_out));
+    if (!(S == 1 && trunk_out_matmul(l->h_attnproj, qkv, x, D, q_out + 2*kv_out))) {
+        matmul_d(q, x, l->q, S, D, q_out);
+        matmul_d(k, x, l->k, S, D, kv_out);
+        matmul_d(vv, x, l->v, S, D, kv_out);
+    } else {
+        memcpy(q,  qkv,                   (size_t)q_out  * sizeof(float));
+        memcpy(k,  qkv + q_out,           (size_t)kv_out * sizeof(float));
+        memcpy(vv, qkv + q_out + kv_out,  (size_t)kv_out * sizeof(float));
+    }
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = sc;                      sc += DN_PAD((int64_t)S*H*hd);
     float *gate  = sc;                      sc += DN_PAD((int64_t)S*H*gate_dim);
@@ -3751,6 +3856,7 @@ int main(int argc, char **argv) {
         }
     }
     trunk_offer_out(&m);
+    trunk_offer_attnproj(&m);
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
@@ -3799,6 +3905,7 @@ int main(int argc, char **argv) {
                         placed, vram / 1073741824.0);
         }
         trunk_place_out(&m);
+        trunk_place_attnproj(&m);
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
          * slots along the way. */

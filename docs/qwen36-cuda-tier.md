@@ -202,10 +202,42 @@ The A/B is unaffected either way: same session, same binary in both arms,
 alternated, frozen residency, spread 2.1 ms. The **ratio** is the result
 here; the absolute numbers belong to that session.
 
-The attention *input* projections (`q`/`k`/`v`) are deliberately not included:
-three separate matrices would be three round-trips, and fusing them the way
-`dnproj` fuses qkv ++ z needs a split of the result because the engine's q/k/v
-scratch slices are individually padded. That is its own patch.
+### The attention input projections (`attnproj`)
+
+`q`, `k` and `v` read the same `x`, so concatenating them along `O` makes one
+GEMV out of three — the trick `dnproj` already plays with qkv ++ z. On this
+model that is 8192 + 512 + 512 rows of 2048, **18.9 MB a layer over 10
+attention layers, 189 MB/token**: more than twice what `attnout` moves, for
+**10 driver calls a token instead of 30**.
+
+Unlike `dnproj`, the engine's `q`/`k`/`vv` scratch slices are `DN_PAD`'d
+individually and so are not contiguous. The fused result therefore lands in a
+scratch row and is split with three `memcpy` — about 36 KB a layer against the
+18.9 MB the GEMV reads.
+
+**Explicit only**, and that is the point: `dnout` and `attnout` are offered to
+the automatic placer because an A/B measured them, and this has not been
+measured. Name it or it stays on the CPU:
+
+```
+COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"              # A
+COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0,attnproj=0"   # B
+```
+
+**No speed number is claimed here.** The fused block is proven to return
+exactly what the three separate CPU matmuls return, in order, against the fake
+CUDA backend — not that it returns them sooner. The byte model says 189 MB at
+55.03 GB/s is 3.4 ms of CPU bus, of which the GPU will take some back.
+
+One thing the measurement of `dnout`/`attnout` already settled, and that
+bounds what is left: the **shared expert is not worth moving**. It is the
+largest CPU item left at 10.09 ms/token, and `COLI_CUDA_PROFILE` says the
+expert kernels it overlaps with take 9.91 ms/token of GPU time while `take`
+waits 0.36. The two halves are balanced; moving the shared expert onto a GPU
+that is already busy for 9.9 ms would lengthen the wait by more than it saves.
+The way to unlock it is to make the expert kernels faster — 247.7 us per group
+call for 25M MACs is a small fraction of what the card can do — not to add
+work to them.
 
 First calibration, one Quadro RTX 4000 (8 GB), per-row int4 container, 200-token
 decode, same prompt, output bit-identical in all four runs:
