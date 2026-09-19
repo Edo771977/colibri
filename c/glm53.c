@@ -2161,7 +2161,8 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         if (given && strstr(given, ".spv")) snprintf(spv, sizeof(spv), "%s", given);
         else snprintf(spv, sizeof(spv), "%s/qmatmul.spv", given ? given : "shaders");
         g_vk_ready = coli_vk_init(spv) && coli_vk_available();
-        fprintf(stderr, g_vk_ready
+        if (g_vk_ready) coli_vk_set_swiglu_limit(m->c.swiglu_limit);
+        fprintf(stderr, g_vk_ready)
                 ? "Vulkan: active for resident matrices\n"
                 : "Vulkan: no usable device (%s), falling back to CPU\n", spv);
     }
