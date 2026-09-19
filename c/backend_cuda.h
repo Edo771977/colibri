@@ -69,9 +69,12 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *expert
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
 /* Resident dense GEMVs (coli_cuda_matmul): lm_head, dnproj, dnout, attnout,
  * attnproj. Filled only under COLI_CUDA_PROFILE, and zero otherwise.
- * wall_ms is CPU time around the whole call, so wall minus the three GPU
- * phases prices the round-trip. Optional symbol: a DLL predating it leaves
- * the wrapper reporting zeros rather than taking the backend down. */
+ * wall_ms is the H2D -> D2H window, not the whole function -- the tensor
+ * upload and the buffer reserve sit before it, so a first call does not poison
+ * the average -- and wall minus the three GPU phases prices the round-trip.
+ * weight_bytes counts weights and scales, the traffic the kernel actually
+ * reads. Optional symbol: a DLL predating it leaves the wrapper reporting
+ * zeros rather than taking the backend down. */
 COLI_CUDA_DLLEXPORT void coli_cuda_dense_stats(uint64_t *calls, uint64_t *weight_bytes,
                            double *h2d_ms, double *kernel_ms,
                            double *d2h_ms, double *wall_ms);

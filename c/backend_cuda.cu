@@ -133,11 +133,16 @@ static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
  * attnproj. Measured separately from the expert groups because the question is
  * different -- the groups are about launch overhead on 40 calls a token, these
  * are about whether a 24 MB GEMV runs anywhere near the card's bandwidth.
- * wall_ms is CPU time around the whole call, so wall minus the three GPU
- * phases is what the round-trip costs. */
+ *
+ * wall_ms is the H2D -> D2H window, NOT the whole function: the tensor upload,
+ * find_ctx/select_ctx and the dx/dy reserve all sit before it. That is
+ * deliberate rather than lazy -- the upload is a one-off that moves the entire
+ * matrix, and folding it in would poison every average with the first call.
+ * What is left is the steady-state round-trip, which is the thing in question:
+ * wall minus the three GPU phases is what the CPU spends not computing. */
 static uint64_t g_dense_calls;
 static double g_dense_h2d_ms, g_dense_kernel_ms, g_dense_d2h_ms, g_dense_wall_ms;
-static uint64_t g_dense_bytes;            /* weight bytes the kernels read */
+static uint64_t g_dense_bytes;            /* weights AND scales the kernel reads */
 static uint64_t g_device_group_calls[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_experts[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_rows[COLI_CUDA_MAX_DEVICES];
@@ -1775,7 +1780,14 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
         g_dense_calls++;
         g_dense_h2d_ms += a; g_dense_kernel_ms += b; g_dense_d2h_ms += c;
         g_dense_wall_ms += wall;
-        g_dense_bytes += rb * (size_t)O;
+        /* Weights AND scales. qwen36_tier.c's qt_dense_init already sizes a
+         * resident matrix as I*O + O*ng*4 and this counter feeds a GB/s, so
+         * dropping the scale term would understate the traffic and make the
+         * kernel look further from peak than it is -- the wrong direction for
+         * the one question this exists to answer. ng is 1 for per-row scales,
+         * ceil(I/gs) for grouped ones; the dense trunk is int8/int4 with f32
+         * scales, which is what sizeof(float) assumes. */
+        g_dense_bytes += rb * (size_t)O + (size_t)O * (size_t)t->ng * sizeof(float);
     }
     return 1;
 }

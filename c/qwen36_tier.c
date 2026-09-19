@@ -1160,12 +1160,20 @@ void qt_stats(void){
       coli_cuda_dense_stats(&dcalls,&dbytes,&dh2d,&dker,&dd2h,&dwall);
       if(dcalls && dwall>0){
           double gb = (double)dbytes/1073741824.0;
-          fprintf(stderr,"[qtier] dense_stats: %llu calls, %.2f GB read | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms, wall %.0f ms\n",
+          double rt = 100.0*(dwall-dh2d-dker-dd2h)/dwall;
+          fprintf(stderr,"[qtier] dense_stats: %llu calls, %.2f GB (weights+scales) | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms, wall %.0f ms\n",
               (unsigned long long)dcalls, gb, dh2d, dker, dd2h, dwall);
-          fprintf(stderr,"[qtier]   kernel %.0f GB/s | wall %.0f GB/s | round-trip %.0f %% of wall\n",
-              dker>0 ? gb/(dker/1000.0) : 0.0,
-              gb/(dwall/1000.0),
-              100.0*(dwall-dh2d-dker-dd2h)/dwall);
+          /* A negative round-trip share means the CPU clock and the GPU
+           * timeline disagreed by more than the gap -- possible on very short
+           * calls summed over many. Say that instead of printing a percentage
+           * below zero, which reads as a defect in the engine rather than in
+           * the measurement. */
+          if(rt < 0)
+              fprintf(stderr,"[qtier]   kernel %.0f GB/s | wall %.0f GB/s | round-trip below clock resolution\n",
+                  dker>0 ? gb/(dker/1000.0) : 0.0, gb/(dwall/1000.0));
+          else
+              fprintf(stderr,"[qtier]   kernel %.0f GB/s | wall %.0f GB/s | round-trip %.0f %% of wall\n",
+                  dker>0 ? gb/(dker/1000.0) : 0.0, gb/(dwall/1000.0), rt);
       } }
 }
 
