@@ -80,7 +80,17 @@ static void build_model(Model *m) {
         float **dst[3] = { &m->L[i].q, &m->L[i].k, &m->L[i].v };
         for (int t = 0; t < 3; t++) {
             float *M = malloc((size_t)D * outs[t] * sizeof(float));
-            for (int64_t e = 0; e < (int64_t)D * outs[t]; e++) M[e] = wval(i * 3 + t + 1, e);
+            /* The amplitude differs per component, and that is not decoration.
+             * wval has period 15 over rows of D = 32, so every row already
+             * spans -7..7 and qdw_register's per-row max-abs would be exactly
+             * 7 for q, k and v alike -- identical scales, and swapping the k
+             * and v SCALE rows inside the fused block would change no number
+             * and pass this test. A reviewer demonstrated exactly that. With
+             * x7, x14, x21 the three scales differ and the swap is fatal.
+             * Still small integers, so every product and partial sum stays
+             * exact in f32 and the comparison below stays an equality. */
+            for (int64_t e = 0; e < (int64_t)D * outs[t]; e++)
+                M[e] = wval(i * 3 + t + 1, e) * (float)(t + 1);
             *dst[t] = M;
             qdw_register(M, D, outs[t]);
         }

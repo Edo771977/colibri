@@ -231,13 +231,26 @@ CUDA backend — not that it returns them sooner. The byte model says 189 MB at
 
 One thing the measurement of `dnout`/`attnout` already settled, and that
 bounds what is left: the **shared expert is not worth moving**. It is the
-largest CPU item left at 10.09 ms/token, and `COLI_CUDA_PROFILE` says the
-expert kernels it overlaps with take 9.91 ms/token of GPU time while `take`
-waits 0.36. The two halves are balanced; moving the shared expert onto a GPU
-that is already busy for 9.9 ms would lengthen the wait by more than it saves.
-The way to unlock it is to make the expert kernels faster — 247.7 us per group
-call for 25M MACs is a small fraction of what the card can do — not to add
-work to them.
+largest CPU item left at 10.09 ms/token, and it is computed deliberately
+between `issue` and `take` so it overlaps the GPU's expert groups.
+
+The evidence is **`take` = 0.36 ms/token, from a run with profiling off**:
+across 40 layers that is 9 us a layer, so the GPU finishes essentially the
+moment the CPU arrives. The two halves are balanced, and moving the shared
+expert onto that GPU would turn a 0.36 ms wait into the whole of its work.
+
+`COLI_CUDA_PROFILE` corroborates with 9.91 ms/token of expert-kernel time
+(1506 ms over 152 token positions) against the CPU's 10.09 — but that figure
+comes from a profiled run, and `backend_cuda.cu` says in as many words that
+four `cudaEventRecord` per call at 40 calls a token add launch overhead to the
+path whose launch overhead is the question. The event interval is genuine GPU
+timeline, yet a slower dispatch can widen the gaps inside it, so treat 9.91 as
+an **upper bound** on how busy the card really is. The unprofiled `take` is
+the number the conclusion rests on.
+
+The way to unlock the shared expert is to make the expert kernels faster —
+247.7 us per group call for 25M MACs is a small fraction of what the card can
+do — not to add work to them.
 
 First calibration, one Quadro RTX 4000 (8 GB), per-row int4 container, 200-token
 decode, same prompt, output bit-identical in all four runs:

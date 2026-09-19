@@ -1472,8 +1472,20 @@ static size_t attnproj_bytes(Model *m, int layer, int *I_out, int *O_out)
     Layer *l = &m->L[layer];
     if (!l->q || !l->k || !l->v) return 0;
     int I = m->c.hidden;
-    int O = m->c.q_heads * m->c.q_head_dim + 2 * m->c.kv_heads * m->c.k_head_dim;
-    if (I <= 0 || O <= 0) return 0;
+    int q_out = m->c.q_heads * m->c.q_head_dim;
+    int kv_out = m->c.kv_heads * m->c.k_head_dim;
+    int O = q_out + 2 * kv_out;
+    if (I <= 0 || q_out <= 0 || kv_out <= 0) return 0;
+    /* The f32 pointers are not the question: the fused block is built from the
+     * int8 REGISTRY, and an offer for something the registry does not hold
+     * (COLI_DENSE_I8=0, or QDW_MAX reached on a very deep model) would take
+     * VRAM out of the expert budget for bytes that never arrive. trunk_offer_out
+     * learned this in #19; the same filter belongs here, or the R4 regression
+     * comes back under a third name. */
+    const float *sq = NULL, *sk = NULL, *sv = NULL;
+    if (!qdw_int8(l->q, I, q_out,  &sq) ||
+        !qdw_int8(l->k, I, kv_out, &sk) ||
+        !qdw_int8(l->v, I, kv_out, &sv)) return 0;
     if (I_out) *I_out = I;
     if (O_out) *O_out = O;
     return (size_t)O * I + (size_t)O * sizeof(float);
@@ -1502,7 +1514,7 @@ static void trunk_place_attnproj(Model *m)
         if (dev == QT_PLACE_CPU) continue;
         float *sc = NULL;
         int8_t *w = attnproj_fuse(m, i, I, O, &sc);
-        if (!w) continue;
+        if (!w) { n_fail++; continue; }   /* offered, so its bytes are charged */
         int h = qt_dense_init(w, sc, I, O, dev, 0);
         free(w); free(sc);                /* the tier copied during upload */
         if (h < 0) { n_fail++; continue; }
@@ -1512,7 +1524,7 @@ static void trunk_place_attnproj(Model *m)
         fprintf(stderr, "[place] %d attnproj (q++k++v fused) on GPU (%.2f GB VRAM)\n",
                 placed, bytes / 1073741824.0);
     if (n_fail)
-        fprintf(stderr, "[place] %d attnproj could not be uploaded: on the CPU, "
+        fprintf(stderr, "[place] %d attnproj could not be fused or uploaded: on the CPU, "
                         "but their bytes stay charged to the trunk budget\n", n_fail);
 }
 
