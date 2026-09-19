@@ -104,6 +104,43 @@ of that device's expert budget, and each decision prints as a `[place]` line.
 | unset or `auto` | automatic, as above |
 | `off` | nothing placed: experts only (the behaviour before this) |
 | `lmhead=0,dnproj=0:20+1:20,experts=0` | hand-written list (the measurement tool); obeyed as written, trunk bytes still charged to the budget |
+| `lmhead=0,dnproj=0:20+1:20,dnout=0,attnout=0,experts=0` | the same, now including the two **output** projections |
+
+### The output projections (`dnout`, `attnout`)
+
+Of the 1.8 GB the trunk reads per token, `auto` can move `lm_head` and the
+fused DeltaNet input projection — 1.17 GB on the calibration above. The rest
+is attention, the shared expert, the router and the two out_proj matrices,
+and until now none of it had a knob: `qt_place_of()` has always answered for
+any name, but the engine asked about `lmhead` and `dnproj` only, so
+`COLI_PLACE="dnout=0"` parsed, stored a device, and moved nothing.
+
+`dnout` (DeltaNet `out_proj`) and `attnout` (attention `o_proj`) are now real.
+They are **explicit-only**: they are offered to the tier — so their bytes come
+out of that device's expert budget like every other placed component — but
+*only for the layers an explicit `COLI_PLACE` has already sent to a device.
+An `auto` or unset run offers neither, and so places exactly what it placed
+before. That is deliberate — every
+matrix moved to the GPU adds a driver round-trip to the serial layer chain,
+and on this engine the per-call driver cost is itself under investigation, so
+whether these pay is a measurement, not a prediction. Ask for them and
+measure:
+
+```
+COLI_PLACE="experts=0,lmhead=0,dnproj=0"                    # A
+COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"  # B
+```
+
+Both arms print a `[place]` line saying what went where. **No speed number is
+claimed here**: the code exists so the A/B can be run, and it has only been
+exercised against the fake CUDA backend, which proves the placed matrix
+returns the same numbers as the CPU int8 path it replaced — not that it
+returns them sooner.
+
+The attention *input* projections (`q`/`k`/`v`) are deliberately not included:
+three separate matrices would be three round-trips, and fusing them the way
+`dnproj` fuses qkv ++ z needs a split of the result because the engine's q/k/v
+scratch slices are individually padded. That is its own patch.
 
 First calibration, one Quadro RTX 4000 (8 GB), per-row int4 container, 200-token
 decode, same prompt, output bit-identical in all four runs:
