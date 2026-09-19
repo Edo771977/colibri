@@ -1373,6 +1373,35 @@ static void trunk_place_out(Model *m)
                 n_attn, n_dn, bytes / 1073741824.0);
 }
 
+/* Declare the bytes BEFORE qt_init sizes the expert budget, but only for the
+ * layers an explicit COLI_PLACE has already sent to a device.
+ *
+ * qt_init computes each device's expert budget as its allowance minus the
+ * trunk that landed there, and it sums that trunk over the OFFERS
+ * (qwen36_tier.c:696). A matrix placed without an offer is uploaded anyway
+ * and charged to nobody: tier_warmstart then fills experts up to a budget
+ * that no longer exists. That is the R4 regression the comment above that
+ * loop describes, fixed once for dnproj; not offering these would have
+ * reintroduced it under two new names.
+ *
+ * Offering only what COLI_PLACE already decided keeps auto untouched, which
+ * is the whole point: before qt_init, qt_place_of parses the variable
+ * directly (G_auto_on is still 0), so an unset or `auto` run answers CPU
+ * here, offers nothing, and auto_place never sees these names. */
+static void trunk_offer_out(Model *m)
+{
+    for (int i = 0; i < m->c.n_layers; i++) {
+        int attn = m->c.is_attn && m->c.is_attn[i];
+        const char *name = attn ? "attnout" : "dnout";
+        const float *W = attn ? m->L[i].o : m->L[i].dn_out;
+        int I = attn ? m->c.o_in : m->c.dn_vheads * m->c.dn_vdim;
+        int O = m->c.hidden;
+        if (!W || I <= 0 || O <= 0) continue;
+        if (qt_place_of(name, i) == QT_PLACE_CPU) continue;
+        qt_trunk_offer(name, i, (size_t)O * I + (size_t)O * sizeof(float));
+    }
+}
+
 /* h is the Layer field: 0 means CPU, otherwise the handle plus one. */
 static int trunk_out_matmul(int h, float *y, const float *x, int I, int O)
 {
@@ -3697,6 +3726,7 @@ int main(int argc, char **argv) {
                 qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
         }
     }
+    trunk_offer_out(&m);
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");

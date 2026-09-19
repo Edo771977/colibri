@@ -71,6 +71,11 @@ static void build_model(Model *m) {
 static void free_model(Model *m) {
     for (int i = 0; i < NL; i++) free(KIND[i] ? m->L[i].o : m->L[i].dn_out);
     free(m->L); free(m->c.is_attn);
+    /* qdw_register malloc'd an int8 copy and a scale row per matrix; the
+     * engine keeps them for the process lifetime, a test between two arms
+     * must not. */
+    for (int j = 0; j < g_qdw_n; j++) { free(g_qdw[j].q); free(g_qdw[j].sc); }
+    g_qdw_n = 0;
 }
 
 static void tier_up(const char *place) {
@@ -79,27 +84,62 @@ static void tier_up(const char *place) {
     setenv("COLI_PLACE", place, 1);
     setenv("CUDA_EXPERT_GB", "1", 1);
     fake_ndev = 1; fake_dense_compute = 1;
+    /* Three process-lifetime statics the engine sets once and never revisits:
+     * the offer table, and COLI_PLACE's cached parse. qt_shutdown clears
+     * neither, correctly -- one process, one placement. An arm here that
+     * inherited them would read the PREVIOUS arm's COLI_PLACE: that is what
+     * arm 4 did on the first run of this file, watching the automatic placer
+     * place components that arm 1 had named and it had not. */
+    G_offer_n = 0;
+    G_place_n = 0; G_place_done = 0; G_auto_on = 0;
+}
+
+static size_t attn_bytes(void) { return (size_t)D * O_IN      + (size_t)D * sizeof(float); }
+static size_t dn_bytes(void)   { return (size_t)D * VALUE_DIM + (size_t)D * sizeof(float); }
+
+/* One arm: bring the tier up under `place`, offer, init, place. */
+static void run_arm(Model *m, const char *place, const char *what) {
+    tier_up(place);
+    build_model(m);
+    trunk_offer_out(m);               /* as main() does, before qt_init */
+    ck(qt_init(NL, NE, D, IH, NE, TOPK, 0, 1), what);
+    trunk_place_out(m);
 }
 
 int main(void) {
     Model m;
 
-    printf(" 1. explicit COLI_PLACE moves both output projections\n");
-    /* experts=0, not experts=cpu: the engine only reaches trunk_place_out()
-     * inside the `if (qt_init(...))` that brings the expert tier up, so a
-     * test that placed the trunk with the tier off would be exercising a
-     * path the engine never takes. */
-    tier_up("experts=0,attnout=0,dnout=0");
-    build_model(&m);
-    ck(qt_init(NL, NE, D, IH, NE, TOPK, 0, 1), "tier starts");
-    trunk_place_out(&m);
+    /* The two names must be asked SEPARATELY, so give them different answers.
+     * With both on device 0 the assertions below pass even when the names are
+     * swapped inside trunk_place_out -- they would only be testing that a
+     * handle lands in the field matching is_attn[], which is the one thing
+     * that cannot go wrong. Asymmetric targets make a swap fatal. */
+    printf(" 1. attnout=0, dnout=cpu -- only the attention layers move\n");
+    run_arm(&m, "experts=0,attnout=0,dnout=cpu", "tier starts");
     ck(m.L[0].h_attnout > 0 && m.L[2].h_attnout > 0, "attnout placed on both attention layers");
-    ck(m.L[1].h_dnout   > 0 && m.L[3].h_dnout   > 0, "dnout placed on both DeltaNet layers");
+    ck(m.L[1].h_dnout == 0 && m.L[3].h_dnout == 0, "dnout=cpu leaves the DeltaNet layers alone");
     ck(m.L[0].h_dnout == 0 && m.L[2].h_dnout == 0, "no dnout handle on an attention layer");
     ck(m.L[1].h_attnout == 0 && m.L[3].h_attnout == 0, "no attnout handle on a DeltaNet layer");
-    ck(qt_dense_count() == NL, "one resident matrix per layer, no more");
+    ck(qt_dense_count() == 2, "two resident matrices, not four");
+    ck(G_trunk_bytes[0] == 2 * attn_bytes(), "only the attnout bytes charged to the trunk");
+    qt_shutdown(); free_model(&m);
 
-    printf(" 2. a placed matrix answers what the CPU int8 path answered\n");
+    printf(" 2. attnout=cpu, dnout=0 -- and the mirror image\n");
+    run_arm(&m, "experts=0,attnout=cpu,dnout=0", "tier starts");
+    ck(m.L[1].h_dnout > 0 && m.L[3].h_dnout > 0, "dnout placed on both DeltaNet layers");
+    ck(m.L[0].h_attnout == 0 && m.L[2].h_attnout == 0, "attnout=cpu leaves the attention layers alone");
+    ck(qt_dense_count() == 2, "two resident matrices, not four");
+    ck(G_trunk_bytes[0] == 2 * dn_bytes(), "only the dnout bytes charged to the trunk");
+    qt_shutdown(); free_model(&m);
+
+    printf(" 3. both placed: the bytes are charged, and the numbers survive\n");
+    run_arm(&m, "experts=0,attnout=0,dnout=0", "tier starts");
+    /* The expert budget is the allowance minus the trunk that landed on the
+     * device, summed over the OFFERS. A matrix placed without one is uploaded
+     * and charged to nobody, and the warmstart then fills experts into VRAM
+     * that is already spoken for -- the R4 regression, under a new name. */
+    ck(G_trunk_bytes[0] == 2 * attn_bytes() + 2 * dn_bytes(),
+       "the placed bytes are charged to the device's trunk, not to nobody");
     {
         float x[XMAX], cpu[D], gpu[D];
         for (int i = 0; i < XMAX; i++) x[i] = xval(i);
@@ -113,30 +153,23 @@ int main(void) {
             ck(memcmp(cpu, gpu, sizeof cpu) == 0, "identical to the CPU int8 result");
         }
     }
-
-    printf(" 3. handle zero is the CPU, not the first matrix\n");
     {
         float x[O_IN], y[D];
         for (int i = 0; i < O_IN; i++) x[i] = xval(i);
         for (int i = 0; i < D; i++) y[i] = 1234.f;
-        ck(!trunk_out_matmul(0, y, x, O_IN, D), "a calloc'd Layer does not reach the tier");
+        ck(!trunk_out_matmul(0, y, x, O_IN, D), "handle zero does not reach the tier");
         ck(y[0] == 1234.f, "and writes nothing");
     }
-    qt_shutdown();
-    free_model(&m);
-    g_qdw_n = 0;                          /* the next arm registers its own */
+    qt_shutdown(); free_model(&m);
 
     printf(" 4. without COLI_PLACE the automatic placer moves neither\n");
-    tier_up("");                          /* "" == unset == auto */
-    build_model(&m);
-    ck(qt_init(NL, NE, D, IH, NE, TOPK, 0, 1), "tier starts in auto mode");
-    trunk_place_out(&m);
+    run_arm(&m, "", "tier starts in auto mode");     /* "" == unset == auto */
     for (int i = 0; i < NL; i++)
         ck(m.L[i].h_attnout == 0 && m.L[i].h_dnout == 0,
-           "auto places no output projection (they are never offered to it)");
+           "auto places no output projection (nothing offers them to it)");
     ck(qt_dense_count() == 0, "no resident matrix taken");
-    qt_shutdown();
-    free_model(&m);
+    ck(G_trunk_bytes[0] == 0, "and no trunk bytes charged");
+    qt_shutdown(); free_model(&m);
 
     printf(fails ? "FAILED\n" : "OK\n");
     return fails != 0;

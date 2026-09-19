@@ -116,8 +116,11 @@ any name, but the engine asked about `lmhead` and `dnproj` only, so
 `COLI_PLACE="dnout=0"` parsed, stored a device, and moved nothing.
 
 `dnout` (DeltaNet `out_proj`) and `attnout` (attention `o_proj`) are now real.
-They are **explicit-only**: nothing offers them to `auto`, so an `auto` or
-unset run places exactly what it placed before. That is deliberate — every
+They are **explicit-only**: they are offered to the tier — so their bytes come
+out of that device's expert budget like every other placed component — but
+*only for the layers an explicit `COLI_PLACE` has already sent to a device.
+An `auto` or unset run offers neither, and so places exactly what it placed
+before. That is deliberate — every
 matrix moved to the GPU adds a driver round-trip to the serial layer chain,
 and on this engine the per-call driver cost is itself under investigation, so
 whether these pay is a measurement, not a prediction. Ask for them and
