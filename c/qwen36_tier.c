@@ -1137,8 +1137,18 @@ void qt_stats(void){
             tot>0? 100.0*hits/tot : 0.0, (unsigned long long)G.swaps);
     { uint64_t calls=0,ex=0,rows=0; double h2d=0,kms=0,d2h=0;
       coli_cuda_group_stats(&calls,&ex,&rows,&h2d,&kms,&d2h);
-      if(calls) fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms\n",
-              (unsigned long long)calls,(unsigned long long)ex,h2d,kms,d2h); }
+      /* Three zeros used to print as if they were measurements. They are not:
+       * the async decode path records nothing unless COLI_CUDA_PROFILE is set,
+       * so "h2d 0 ms, kernel 0 ms, d2h 0 ms" said "not instrumented" in the
+       * dialect of "instantaneous", and was read as the latter. Say which --
+       * and name both reasons, since setting the flag does not instrument
+       * mixed-format groups, whose fallback counts calls and times nothing. */
+      if(calls && (h2d>0 || kms>0 || d2h>0))
+          fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms\n",
+              (unsigned long long)calls,(unsigned long long)ex,h2d,kms,d2h);
+      else if(calls)
+          fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | timings not recorded (set COLI_CUDA_PROFILE=1; mixed-format groups never record)\n",
+              (unsigned long long)calls,(unsigned long long)ex); }
 }
 
 static void dense_free_all(void){
