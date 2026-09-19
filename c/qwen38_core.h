@@ -1391,6 +1391,8 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
         int workers=job_count;
 #ifdef _OPENMP
         int thread_limit=omp_get_max_threads();if(workers>thread_limit)workers=thread_limit;
+#else
+        (void)workers;   /* only the pragma below reads it, and that is gone without OpenMP */
 #endif
         double started=now_s();
         #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)

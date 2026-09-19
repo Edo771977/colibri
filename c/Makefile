@@ -57,6 +57,11 @@ ifneq (,$(DARWIN))
 # (brew install libomp), altrimenti compila single-thread (i pragma omp sono ignorati).
 # Niente -march: su arm64 NEON e' baseline (i kernel __ARM_NEON si attivano da soli).
 CC      = clang
+# An OMPDIR from the command line survives the assignments below; one from the
+# environment would be overwritten by them. Both are the user's choice: record
+# that first, and probe nothing for it.
+OMP_EXPLICIT := $(filter command line environment,$(origin OMPDIR))
+ifeq ($(OMP_EXPLICIT),)
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
 # CLT-only Macs routinely have Homebrew installed but off the non-interactive
 # PATH (`make` from scripts, SSH, CI), which turned this probe into a silent
@@ -65,13 +70,28 @@ OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
 ifeq ($(OMPDIR),)
 OMPDIR := $(firstword $(wildcard /opt/homebrew/opt/libomp /usr/local/opt/libomp))
 endif
+endif
 # `brew --prefix libomp` can print the formula's prospective path even when it
 # is not installed, so verify both artifacts before adding unusable flags.
 ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
-OMPC    = -Xclang -fopenmp -I$(OMPDIR)/include
-OMPL    = -L$(OMPDIR)/lib -lomp
+OMPINC := $(OMPDIR)/include
+OMPLIB := $(OMPDIR)/lib
+# MacPorts (`port install libomp`) nests both artifacts one level deeper than
+# Homebrew -- include/libomp/omp.h and lib/libomp/libomp.dylib -- so no single
+# prefix can pass the check above: probe its two directories directly. Not
+# when OMPDIR was the user's choice: one that holds no libomp means
+# single-threaded (tests/test_makefile_platform.py pins that).
+else ifeq ($(OMP_EXPLICIT),)
+ifneq ($(and $(wildcard /opt/local/include/libomp/omp.h),$(wildcard /opt/local/lib/libomp/libomp.*)),)
+OMPINC := /opt/local/include/libomp
+OMPLIB := /opt/local/lib/libomp
+endif
+endif
+ifneq ($(OMPINC),)
+OMPC    = -Xclang -fopenmp -I$(OMPINC)
+OMPL    = -L$(OMPLIB) -lomp
 else
-$(warning libomp not found: building single-threaded. For multithreading: brew install libomp)
+$(warning libomp not found: building single-threaded. For multithreading: brew install libomp (or port install libomp))
 OMPC    =
 OMPL    =
 endif
