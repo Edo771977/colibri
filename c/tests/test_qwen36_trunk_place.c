@@ -162,11 +162,29 @@ int main(void) {
     }
     qt_shutdown(); free_model(&m);
 
-    printf(" 4. without COLI_PLACE the automatic placer moves neither\n");
+    printf(" 4. the automatic placer sees them and, with room, takes them\n");
+    /* This assertion used to read the other way: the first version of this
+     * patch withheld the offers so that a default run could not change while
+     * nobody had measured whether a placed matrix pays for the driver
+     * round-trip it adds. It has been measured (-7.77 ms/token, four runs a
+     * side, spread 2.1 -- docs/qwen36-cuda-tier.md), so the offers go in and
+     * auto decides. `off` below is what withholding them now means. */
     run_arm(&m, "", "tier starts in auto mode");     /* "" == unset == auto */
+    ck(m.L[0].h_attnout > 0 && m.L[2].h_attnout > 0, "auto takes attnout on the attention layers");
+    ck(m.L[1].h_dnout   > 0 && m.L[3].h_dnout   > 0, "auto takes dnout on the DeltaNet layers");
+    ck(qt_dense_count() == NL, "one resident matrix per layer");
+    ck(G_trunk_bytes[0] == 2 * attn_bytes() + 2 * dn_bytes(),
+       "auto charges the same bytes an explicit placement charges");
+    qt_shutdown(); free_model(&m);
+
+    printf(" 5. COLI_PLACE=off is the escape hatch, and still empties the trunk\n");
+    /* With the offers unconditional, `off` is the only way back to experts
+     * only -- so it has to keep working, or the documented escape hatch is a
+     * word in a table. */
+    run_arm(&m, "off", "tier starts with COLI_PLACE=off");
     for (int i = 0; i < NL; i++)
         ck(m.L[i].h_attnout == 0 && m.L[i].h_dnout == 0,
-           "auto places no output projection (nothing offers them to it)");
+           "off places no output projection");
     ck(qt_dense_count() == 0, "no resident matrix taken");
     ck(G_trunk_bytes[0] == 0, "and no trunk bytes charged");
     qt_shutdown(); free_model(&m);

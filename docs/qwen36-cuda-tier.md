@@ -108,34 +108,99 @@ of that device's expert budget, and each decision prints as a `[place]` line.
 
 ### The output projections (`dnout`, `attnout`)
 
-Of the 1.8 GB the trunk reads per token, `auto` can move `lm_head` and the
-fused DeltaNet input projection — 1.17 GB on the calibration above. The rest
-is attention, the shared expert, the router and the two out_proj matrices,
-and until now none of it had a knob: `qt_place_of()` has always answered for
+Of the 1.8 GB the trunk reads per token, `auto` used to move `lm_head` and the
+fused DeltaNet input projection only — 1.17 GB on the calibration above. The
+rest is attention, the shared expert, the router and the two out_proj
+matrices, and none of it had a knob: `qt_place_of()` has always answered for
 any name, but the engine asked about `lmhead` and `dnproj` only, so
 `COLI_PLACE="dnout=0"` parsed, stored a device, and moved nothing.
 
-`dnout` (DeltaNet `out_proj`) and `attnout` (attention `o_proj`) are now real.
-They are **explicit-only**: they are offered to the tier — so their bytes come
-out of that device's expert budget like every other placed component — but
-*only for the layers an explicit `COLI_PLACE` has already sent to a device.
-An `auto` or unset run offers neither, and so places exactly what it placed
-before. That is deliberate — every
-matrix moved to the GPU adds a driver round-trip to the serial layer chain,
-and on this engine the per-call driver cost is itself under investigation, so
-whether these pay is a measurement, not a prediction. Ask for them and
-measure:
+`dnout` (DeltaNet `out_proj`) and `attnout` (attention `o_proj`) are now
+offered to the placer like everything else, so `auto` takes them when they
+beat the experts they displace, and their bytes come out of that device's
+expert budget. `COLI_PLACE="off"` is the way back to experts only.
+
+**What the measurement below does not cover**: it is a 16 GB card with a heat
+table warmed on the prompt, i.e. the favourable end. On a small card with no
+`HEAT_FILE`, `auto_displaced_value` prices every expert at the flat
+`topk / n_experts` (0.06 per byte on the 35B) against the trunk's 1.0, so the
+trunk wins under pressure and now takes 0.31 GB more than it did. The `off`
+/ `auto` calibration further down is a precedent for `lm_head` and `dnproj`
+holding up on an 8 GB card, not a measurement for these two.
+
+They landed explicit-only first, because nothing had measured whether a placed
+matrix pays for the driver round-trip it adds to the serial layer chain. Then
+it was measured.
+
+#### Measurement, 19 September 2026
+
+RTX 4070 Ti SUPER (16 GB) + Ryzen 9 7950X, 64 GB at 5200 MT/s,
+Qwen3.6-35B-A3B int4 gs64, 25-token prompt, 128 generated, **four runs a
+side, alternated A B A B**, heat table warmed on this prompt and then frozen
+so every run starts from the same residency. Both arms at **100 % VRAM hit
+rate, `miss(CPU)` 0**.
 
 ```
-COLI_PLACE="experts=0,lmhead=0,dnproj=0"                    # A
-COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"  # B
+A  COLI_PLACE="experts=0,lmhead=0,dnproj=0"                     (what auto did before)
+B  COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"
 ```
 
-Both arms print a `[place]` line saying what went where. **No speed number is
-claimed here**: the code exists so the A/B can be run, and it has only been
-exercised against the fake CUDA backend, which proves the placed matrix
-returns the same numbers as the CPU int8 path it replaced — not that it
-returns them sooner.
+| ms/token | A (min–max) | B (min–max) | Δ |
+|---|---:|---:|---:|
+| **`step() total`** | **59.75** (58.7–60.8) | **51.98** (51.4–53.0) | **−7.77** |
+| `norm+out` → `dnout` | 9.45 | 5.43 | −4.02 |
+| `dn-sub proj` | 11.95 | 10.75 | −1.20 |
+| attention → `attnout` | 11.02 | 10.09 | −0.93 |
+| lm_head | 4.18 | 3.50 | −0.68 |
+| take | 0.93 | 0.36 | −0.57 |
+| issue | 2.15 | 1.83 | −0.32 |
+| shared / router / cpu-miss | 10.18 / 2.88 / 10.19 | 10.09 / 2.89 / 10.10 | ≈0 |
+
+**16.74 → 19.24 tok/s**: −13.0 % of the time per token, which is +14.9 % of
+throughput. For 0.31 GB of VRAM and 177 experts (7136 → 6959), hit rate
+unchanged at 100 %. The effect is 7.77 ms against a worst-case within-arm
+spread of 2.1 ms.
+
+The table is **not a partition and does not sum to the total**: `norm+out` and
+`dn-sub proj` are sub-timers inside `deltanet`, and `shared`, `router`,
+`issue` and `take` sit inside `moe_total`, which is not listed. Only
+`step() total` is the whole token.
+
+The rows that should not move do not: `shared` −0.09, `router` +0.01,
+`cpu-miss` −0.09. That is the strongest part of the result — the saving is
+where the change is and nowhere else.
+
+**Two thirds of it are the bytes; one third is not.** The matrices are
+`dn_out` 2048×4096 over 30 layers plus `o_proj` 2048×4096 over 10, i.e.
+335.5 MB of int8 weights read per token — what the engine's `[place]` line
+counts as `0.31 GB`; the offer charges 336.2 MB because it includes the
+per-row scales — worth 6.1 ms at this machine's measured 55.03 GB/s. The direct rows account for −4.95, the
+shortfall being GPU time that is not free. But `dn-sub proj`, `lm_head`,
+`take` and `issue` improve by a further −2.77 ms while **already residing on
+the GPU in both arms**. The likely mechanism is contention: 335 MB/token less
+CPU traffic leaves the staging copies and driver calls of the already-placed
+matrices more bus to work with. That is a hypothesis, not a measurement.
+
+**Honest caveat on the absolute level.** Arm A reads 59.75 ms/token where an
+`auto` run on 18 September read 32.1, both at 100 % hit rate. Everything is
+about 2× — deltanet 13.68→27.27, shared 3.69→10.18, router 0.57→2.88 — and
+the cause is **not established**. Two candidates, and they are not equally
+vague:
+
+- *The prompt.* 25 tokens here against 56 on 18 September, so a different
+  completion and different routing. Free to test: run the 56-token prompt on
+  the current build.
+- *The build.* `git diff 8e58948 main -- c/qwen36.c` says the only change to
+  the decode path between the two runs is the pair of
+  `if (!(S == 1 && trunk_out_matmul(...)))` branches, plus two `int` at the
+  end of `Layer`. With nothing placed the branch short-circuits on a calloc'd
+  zero, so the mechanism is implausible for a 2× — and it cannot touch the
+  router or the shared expert at all, which slowed down just as much. Not
+  excluded, but it has to explain those two rows to be the answer.
+
+The A/B is unaffected either way: same session, same binary in both arms,
+alternated, frozen residency, spread 2.1 ms. The **ratio** is the result
+here; the absolute numbers belong to that session.
 
 The attention *input* projections (`q`/`k`/`v`) are deliberately not included:
 three separate matrices would be three round-trips, and fusing them the way
