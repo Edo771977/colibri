@@ -318,30 +318,66 @@ Same run, the two lines nobody had read:
 [timers]   qtier: issue 1.95 | cpu-miss 3.69 | take 1.37 ms/token
 ```
 
-- **`cpu-miss`, 3.7 ms/token (11% of the token).** Experts that were not in the
-  VRAM tier and fell back to CPU. It moves between runs — 3.69 cold, 3.21 warm —
-  so it is cache policy, not a floor. The tier reported budget for ~7136 experts
-  and still missed; why is the open question.
-- **`issue` + `take`, 3.3 ms/token (10%).** Pure round-trip with the GPU, the
-  ~30 synchronous hops. This is what CUDA graphs exist for: capture the token's
-  GPU work once, replay it with one launch, patch pointers with
-  `cudaGraphExecUpdate` instead of re-recording.
+**`cpu-miss` is not what its name says, and reading it as such cost this
+document a wrong conclusion.** An earlier revision of this section called it
+"experts that were not in the VRAM tier and fell back to CPU", made it the
+engine's largest single target at 3.7 ms/token, and built a plan on it. The
+name is the only thing that supports that reading. The code does not
+(`c/qwen36.c`, the MoE decode block):
 
-Seven milliseconds out of 32, in two lines the engine was already printing. More
-than any single kernel change has returned so far — **and more than the 5.0 ms
-that separates this engine from llama.cpp's curve.** The deficit is not spread
-thin across a hundred kernels waiting to be shaved; it is concentrated in two
-named, measured causes:
+```c
+double _q1 = tm_now();
+for (kk...) { if (qmask & (1u<<kk)) continue;   /* the experts the GPU declined */
+              ... }
+/* Compute the shared expert NOW so it overlaps with the GPU groups */
+{ double _ts2 = tm_now(); ... shared expert ... tm_add(S, 3, tm_now()-_ts2); }
+double _q2 = tm_now();
+g_qt_cpu += _q2 - _q1;
+```
 
-| | ms/token | tok/s | against their 27.0 ms |
-|---|---|---|---|
-| today | 32.0 | 31.2 | −5.0 |
-| `cpu-miss` removed | 28.3 | 35.3 | −1.3 |
-| `issue`+`take` removed | 28.7 | 34.8 | −1.7 |
-| both | **25.0** | **40.0** | **+2.0** |
+`g_qt_cpu` is the whole CPU-side overlap window, and the shared expert is
+computed inside it deliberately, to cover the GPU's latency. So it counts work
+that is neither a miss nor waste, and that the `(shared)` row already reports.
+Subtracting the two says how much of it really was misses:
 
-Neither line is a law of physics: `cpu-miss` moves between runs, and the
-round-trips are what CUDA graphs exist to remove.
+| | `cpu-miss` | `(shared)` | difference |
+|---|---:|---:|---:|
+| cold | 3.69 | 3.69 | **0.00** |
+| warm | 3.21 | 3.20 | **0.01** |
+
+**Routed experts missing the VRAM tier cost this configuration nothing
+measurable.** The tier hits essentially every time, which `[qtier] VRAM hit
+rate` states directly and which this arithmetic corroborates. A lever that
+re-routes toward resident experts — `CACHE_ROUTE` — has nothing to recover
+here; it is for a configuration whose hit rate is not already ~100%.
+
+What is left is smaller and better understood:
+
+- **`issue`, 1.95 ms/token.** CPU time spent *launching*, not waiting. Per MoE
+  layer `coli_cuda_expert_group_issue` submits two `cudaMemcpyAsync` and two or
+  three kernels: about five driver calls, times 40 layers, is ~200 per token.
+  `1.95 ms / 200 ≈ 9.8 us` a call, which is what WDDM costs on Windows against
+  2-3 us on Linux. This is what CUDA graphs exist for, and the shape here suits
+  them: the chosen experts travel as *data* in `GroupDesc[]`, uploaded to a
+  device buffer the kernel reads, so the graph topology does not depend on
+  routing. Only `count` (how many of the 8 were resident) enters the grid dims,
+  so eight pre-instantiated graphs cover every case with no re-capture — and at
+  a ~100% hit rate, `count` is almost always 8.
+- **`take`, 1.37 ms/token.** NOT a round-trip cost and NOT something a graph
+  removes: `coli_cuda_expert_group_take` is `cudaStreamSynchronize`. It is the
+  CPU standing still because the GPU has not finished. It shrinks by giving the
+  CPU more to overlap, or by making the GPU faster — never by launching less.
+
+So the bill is 3.3 ms, not 7.0, and only 1.9 of it is the kind a graph collects.
+`[qtier] group_stats` already prints h2d / kernel / d2h milliseconds, which says
+whether the `take` wait is transfer or arithmetic; nobody has read that line
+either.
+
+One lossless saving found while reading this path: `qt_issue` copies the same
+`x` once per expert (`memcpy(xr + j*G.D, x, ...)`), so 8 KB becomes 64 KB per
+layer and ~2.6 MB per token of host copies and H2D traffic for one vector that
+never changes. `GroupDesc` already carries an `offset`; pointing every expert at
+offset 0 removes both.
 
 The three CPU rows the runtime was predicted to own moved as predicted (~2.5,
 ~0.5, ~5 against 4.0, 0.6, 5.5). The two GPU rows moved as well, which was not
