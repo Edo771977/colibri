@@ -232,8 +232,116 @@ expert tier, `OMP_NUM_THREADS` unset:
 | &nbsp;&nbsp;shared expert | 8.7 | 4.0 |
 | &nbsp;&nbsp;router | 2.7 | 0.6 |
 | lm_head (GPU) | 3.5 | 2.9 |
-| **total** | **50.2** | **32.2** |
-| **tok/s** | **13.4** | **20.7** |
+| **phase sum** | **50.2** | **32.2** |
+| **tok/s reported by `Speed:`** | **13.4** | **20.7** |
+
+Those last two rows are NOT reciprocals of each other and never were. `1/32.2 ms`
+is 31.1 tok/s, not 20.7. They are different quantities that ended up in one
+column, which is a trap; the section below says what each one is.
+
+### Three different numbers here call themselves speed
+
+A decode token has three costs on this engine and they differ by 50%. Quoting
+the wrong one at a stranger's benchmark is how a comparison gets decided before
+it is run.
+
+| what | where it comes from | measured 18 Sep |
+|---|---|---|
+| phase sum | the rows above, added up | 30.5 ms/token |
+| `step() total` | `[timers]`, the real cost of one generated token | 32.0 ms/token -> **31.3 tok/s** |
+| `Speed:` | `n_new / dt` at `c/qwen36.c` | **21.2 tok/s** |
+
+`Speed:` is the odd one. Its `dt` wraps `generate()`, which **prefills the prompt
+and then generates**, while its numerator counts only the generated tokens. On a
+56-token prompt that is about 1.9 s of prefill charged to 128 decode tokens, and
+it drags a 31.3 tok/s engine down to a reported 21.2. The number is not wrong —
+it answers "how long did the whole request take" — but it is not the number any
+other engine's `tok/s` means, and `TTFT:` and `[timers] prefill:` are printed
+right beside it so the split is always available.
+
+The gap between the phase sum and `step() total` is printed too, as `outside the
+phases`, and on this host it is **1.3-1.5 ms/token**. That is the honest answer
+to "is something hiding between the timers": no. Prefill was the whole
+discrepancy.
+
+### Against llama.cpp, on the same machine
+
+llama.cpp loads this model family as `qwen35moe` and `llama-bench`'s `tg128` is
+generation only, so it lines up with `step() total` and not with `Speed:`.
+b11042, same host, same evening, Q8_0 GGUF of the same model:
+
+| `-ngl 99 -ncmoe 99` | container | tg128 | ms/token |
+|---|---|---|---|
+| llama.cpp Q8_0 | 34.36 GiB | 26.27 ± 1.63 | 38.07 |
+| llama.cpp Q4_K_M | 20.60 GiB | 37.97 ± 0.13 | 26.34 |
+| **Colibri**, int4 gs64 experts + int8 trunk | **21.4 GiB** | **31.3** | **32.0** |
+
+and, for the same Q8_0 file, llama.cpp's other placements: `-ngl 99` alone
+11.46 ± 0.07, `-ngl 0` 10.62 ± 0.19.
+
+**At the same container size llama.cpp decodes this model faster than Colibri
+does.** The two containers are within 4% of each other — 21.4 GiB against 20.60
+— and llama.cpp takes 26.34 ms/token where this engine takes 32.0. That is
+**+3.9% of bytes for +21.5% of time**, near enough a direct comparison that no
+model is needed to read it.
+
+Normalising the small size difference through llama.cpp's own two points,
+`ms/token = 8.78 + 0.852 x GiB` (8.8 ms that is not weight streaming, 0.85 ms
+per GiB that is), their curve predicts 27.0 ms at 21.4 GiB against our measured
+32.0: **5.0 ms/token behind, 18%.**
+
+Raising this against the Q8_0 row alone would have read as Colibri 19% ahead.
+That row is the one where llama.cpp carries 60% more bytes than we do, and
+quoting it was the first version of this section.
+
+What does survive the ambiguity:
+
+**The split this engine is built around is worth 2.3x in llama.cpp too.**
+`-ncmoe` keeps the MoE expert weights on CPU and leaves the dense trunk on the
+GPU — the same division Colibri makes — and it beats llama.cpp's own default by
+26.27 against 11.46 on the identical file. The default fills VRAM with whole
+layers, experts included, and what does not fit crosses PCIe every token; it
+barely beats all-CPU. That is an independent engine agreeing with the
+architecture, on hardware where the choice is free to be wrong.
+
+This comparison is deliberately NOT written as a validated one-variable manifest:
+engine, quantisation and codebase all change together, so there is no single
+declared variable for `c/experiment_manifest.py` to check. It is a narrative
+record in `docs/experiments/qwen36-vs-llamacpp-2026-09-18.md` with the raw
+output beside it.
+
+### What the timers say to attack next
+
+Same run, the two lines nobody had read:
+
+```
+[timers]   qtier: issue 1.95 | cpu-miss 3.69 | take 1.37 ms/token
+```
+
+- **`cpu-miss`, 3.7 ms/token (11% of the token).** Experts that were not in the
+  VRAM tier and fell back to CPU. It moves between runs — 3.69 cold, 3.21 warm —
+  so it is cache policy, not a floor. The tier reported budget for ~7136 experts
+  and still missed; why is the open question.
+- **`issue` + `take`, 3.3 ms/token (10%).** Pure round-trip with the GPU, the
+  ~30 synchronous hops. This is what CUDA graphs exist for: capture the token's
+  GPU work once, replay it with one launch, patch pointers with
+  `cudaGraphExecUpdate` instead of re-recording.
+
+Seven milliseconds out of 32, in two lines the engine was already printing. More
+than any single kernel change has returned so far — **and more than the 5.0 ms
+that separates this engine from llama.cpp's curve.** The deficit is not spread
+thin across a hundred kernels waiting to be shaved; it is concentrated in two
+named, measured causes:
+
+| | ms/token | tok/s | against their 27.0 ms |
+|---|---|---|---|
+| today | 32.0 | 31.2 | −5.0 |
+| `cpu-miss` removed | 28.3 | 35.3 | −1.3 |
+| `issue`+`take` removed | 28.7 | 34.8 | −1.7 |
+| both | **25.0** | **40.0** | **+2.0** |
+
+Neither line is a law of physics: `cpu-miss` moves between runs, and the
+round-trips are what CUDA graphs exist to remove.
 
 The three CPU rows the runtime was predicted to own moved as predicted (~2.5,
 ~0.5, ~5 against 4.0, 0.6, 5.5). The two GPU rows moved as well, which was not
