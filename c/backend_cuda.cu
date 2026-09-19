@@ -105,6 +105,8 @@ typedef struct {
      * because "not yet" and "won't work" must not share a value here: the
      * events are persistent, so retrying would overwrite live handles. */
     cudaEvent_t ev_grp[4]; int ev_grp_ok, group_timed;
+    /* Same tri-state as ev_grp, for the resident dense GEMV path. */
+    cudaEvent_t ev_dm[4]; int ev_dm_ok;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
@@ -127,6 +129,38 @@ static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
+/* Resident dense GEMVs (coli_cuda_matmul): lm_head, dnproj, dnout, attnout,
+ * attnproj. Measured separately from the expert groups because the question is
+ * different -- the groups are about launch overhead on 40 calls a token, these
+ * are about whether a 24 MB GEMV runs anywhere near the card's bandwidth.
+ *
+ * That question came from dividing the engine's existing timers by their byte
+ * counts, and one of those two timers is not the clean divisor it looks like:
+ * g_dn_sub[0] (qwen36.c) closes after dn_b and dn_a as well as the fused
+ * projection, two CPU-only matmuls whose bytes are in nobody's numerator. They
+ * are a low single-digit share of the work at these shapes, so the ~67 GB/s
+ * that motivated this patch is a FLOOR on the dnproj kernel, not a reading of
+ * it. Which is the whole point of measuring here instead: these counters time
+ * the GEMV and nothing else.
+ *
+ * wall_ms is the H2D -> D2H window, NOT the whole function: the tensor upload,
+ * find_ctx/select_ctx and the dx/dy reserve all sit before it. That is
+ * deliberate rather than lazy -- the upload is a one-off that moves the entire
+ * matrix, and folding it in would poison every average with the first call.
+ * What is left is the steady-state round-trip, which is the thing in question:
+ * wall minus the three GPU phases is what the CPU spends not computing. */
+static uint64_t g_dense_calls;
+static double g_dense_h2d_ms, g_dense_kernel_ms, g_dense_d2h_ms, g_dense_wall_ms;
+static uint64_t g_dense_bytes;            /* weights AND scales the kernel reads */
+/* Per device as well as in total, for the reason coli_cuda_group_stats already
+ * has a _device form: auto_place splits the trunk across cards by budget, so on
+ * the mixed pair docs/qwen36-cuda-tier.md measures (4070 Ti + Quadro RTX 4000)
+ * a single blended GB/s describes neither of them. Aggregating is the caller's
+ * choice here, not this counter's. */
+static uint64_t g_dev_dense_calls[COLI_CUDA_MAX_DEVICES];
+static double g_dev_dense_h2d_ms[COLI_CUDA_MAX_DEVICES], g_dev_dense_kernel_ms[COLI_CUDA_MAX_DEVICES];
+static double g_dev_dense_d2h_ms[COLI_CUDA_MAX_DEVICES], g_dev_dense_wall_ms[COLI_CUDA_MAX_DEVICES];
+static uint64_t g_dev_dense_bytes[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_calls[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_experts[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_rows[COLI_CUDA_MAX_DEVICES];
@@ -1320,6 +1354,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
         if (ctx->ev_grp_ok>0) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_grp[e]); }
         ctx->ev_grp_ok=0;
+        if (ctx->ev_dm_ok>0) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_dm[e]); }
+        ctx->ev_dm_ok=0;
         ctx->group_timed=0;
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
@@ -1720,11 +1756,86 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t rb = row_bytes(fmt, I);
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+
+    /* Opt-in for the same reason the group path's is: four cudaEventRecord on
+     * a call this short are not free. Off, this is one cached int. */
+    static int dprof = -1;
+    if (dprof < 0) { const char *e = getenv("COLI_CUDA_PROFILE"); dprof = e && atoi(e); }
+    if (dprof && ctx->ev_dm_ok == 0) {
+        int ok = 1;
+        for (int i = 0; i < 4; i++)
+            if (!cuda_ok(cudaEventCreate(&ctx->ev_dm[i]), "dense profile event create")) {
+                for (int j = 0; j < i; j++) cudaEventDestroy(ctx->ev_dm[j]);   /* (#B8) */
+                ok = 0; break; }
+        ctx->ev_dm_ok = ok ? 1 : -1;      /* latched: retrying overwrites live handles */
+    }
+    /* Stream 0 explicitly: quant_matmul_launch takes no stream, so the kernel
+     * and both cudaMemcpy run on the default one and the events must too. */
+    int timed = dprof && ctx->ev_dm_ok > 0;
+    std::chrono::steady_clock::time_point t0;
+    if (timed) { t0 = std::chrono::steady_clock::now(); cudaEventRecord(ctx->ev_dm[0], 0); }
+
     if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
+    if (timed) cudaEventRecord(ctx->ev_dm[1], 0);
     quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    if (timed) cudaEventRecord(ctx->ev_dm[2], 0);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+
+    if (timed) {
+        cudaEventRecord(ctx->ev_dm[3], 0);
+        /* Wall BEFORE the sync, or the sync's own cost lands in the number that
+         * exists to price the round-trip. The D2H above is synchronous, so the
+         * work is already done and this sync only waits for the record. */
+        double wall = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+        cudaEventSynchronize(ctx->ev_dm[3]);
+        float a = 0, b = 0, c = 0;
+        cudaEventElapsedTime(&a, ctx->ev_dm[0], ctx->ev_dm[1]);
+        cudaEventElapsedTime(&b, ctx->ev_dm[1], ctx->ev_dm[2]);
+        cudaEventElapsedTime(&c, ctx->ev_dm[2], ctx->ev_dm[3]);
+        std::lock_guard<std::mutex> lock(g_group_stats_mu);
+        int index = (int)(ctx - g_ctx);
+        g_dense_calls++;
+        g_dense_h2d_ms += a; g_dense_kernel_ms += b; g_dense_d2h_ms += c;
+        g_dense_wall_ms += wall;
+        g_dev_dense_calls[index]++;
+        g_dev_dense_h2d_ms[index] += a; g_dev_dense_kernel_ms[index] += b;
+        g_dev_dense_d2h_ms[index] += c; g_dev_dense_wall_ms[index] += wall;
+        /* Weights AND scales. qwen36_tier.c's qt_dense_init already sizes a
+         * resident matrix as I*O + O*ng*4 and this counter feeds a GB/s, so
+         * dropping the scale term would understate the traffic and make the
+         * kernel look further from peak than it is -- the wrong direction for
+         * the one question this exists to answer. ng is 1 for per-row scales,
+         * ceil(I/gs) for grouped ones; the dense trunk is int8/int4 with f32
+         * scales, which is what sizeof(float) assumes. */
+        size_t traffic = rb * (size_t)O + (size_t)O * (size_t)t->ng * sizeof(float);
+        g_dense_bytes += traffic;
+        g_dev_dense_bytes[index] += traffic;
+    }
     return 1;
+}
+
+extern "C" void coli_cuda_dense_stats(int device, uint64_t *calls, uint64_t *weight_bytes,
+                                      double *h2d_ms, double *kernel_ms,
+                                      double *d2h_ms, double *wall_ms) {
+    std::lock_guard<std::mutex> lock(g_group_stats_mu);
+    /* device < 0 is every card summed; a device with no context reports zeros
+     * rather than the totals, so a typo in COLI_GPUS cannot read as a result. */
+    int index = -1;
+    if (device >= 0) { for (int i = 0; i < g_nctx; i++) if (g_ctx[i].device == device) { index = i; break; } }
+    if (device >= 0 && index < 0) {
+        if (calls) *calls = 0; if (weight_bytes) *weight_bytes = 0;
+        if (h2d_ms) *h2d_ms = 0; if (kernel_ms) *kernel_ms = 0;
+        if (d2h_ms) *d2h_ms = 0; if (wall_ms) *wall_ms = 0;
+        return;
+    }
+    if (calls)        *calls        = index < 0 ? g_dense_calls     : g_dev_dense_calls[index];
+    if (weight_bytes) *weight_bytes = index < 0 ? g_dense_bytes     : g_dev_dense_bytes[index];
+    if (h2d_ms)       *h2d_ms       = index < 0 ? g_dense_h2d_ms    : g_dev_dense_h2d_ms[index];
+    if (kernel_ms)    *kernel_ms    = index < 0 ? g_dense_kernel_ms : g_dev_dense_kernel_ms[index];
+    if (d2h_ms)       *d2h_ms       = index < 0 ? g_dense_d2h_ms    : g_dev_dense_d2h_ms[index];
+    if (wall_ms)      *wall_ms      = index < 0 ? g_dense_wall_ms   : g_dev_dense_wall_ms[index];
 }
 
 /* MXFP4 matmul, stateless. Separate from coli_cuda_matmul on purpose: that one
