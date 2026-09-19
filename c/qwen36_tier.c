@@ -1140,12 +1140,14 @@ void qt_stats(void){
       /* Three zeros used to print as if they were measurements. They are not:
        * the async decode path records nothing unless COLI_CUDA_PROFILE is set,
        * so "h2d 0 ms, kernel 0 ms, d2h 0 ms" said "not instrumented" in the
-       * dialect of "instantaneous", and was read as the latter. Say which. */
+       * dialect of "instantaneous", and was read as the latter. Say which --
+       * and name both reasons, since setting the flag does not instrument
+       * mixed-format groups, whose fallback counts calls and times nothing. */
       if(calls && (h2d>0 || kms>0 || d2h>0))
           fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms\n",
               (unsigned long long)calls,(unsigned long long)ex,h2d,kms,d2h);
       else if(calls)
-          fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | timings not recorded (COLI_CUDA_PROFILE=1)\n",
+          fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | timings not recorded (set COLI_CUDA_PROFILE=1; mixed-format groups never record)\n",
               (unsigned long long)calls,(unsigned long long)ex); }
 }
 

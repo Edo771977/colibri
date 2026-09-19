@@ -2151,11 +2151,16 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         ctx->ev_grp_ok=ok?1:-1;
     }
     ctx->group_timed=gprof&&ctx->ev_grp_ok>0;
-    if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[0],ctx->stream);
     if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                 cudaMemcpyHostToDevice,ctx->stream),
-                "expert group issue descriptors")||
-       !cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                "expert group issue descriptors")) return 0;
+    /* ev_grp[0] goes AFTER the descriptor copy because expert_group_impl puts
+     * ev[0] after its own: "h2d" is already a defined quantity in this file,
+     * and both paths add into the same counter. Widening it here would make
+     * the printed total the sum of two different measurements -- which is the
+     * failure this instrumentation exists to end, not to repeat. */
+    if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[0],ctx->stream);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                 "expert group issue upload")) return 0;
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[1],ctx->stream);
     if(all_e8){
