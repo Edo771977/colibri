@@ -67,6 +67,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_device_integrated(int device);
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
+/* Resident dense GEMVs (coli_cuda_matmul): lm_head, dnproj, dnout, attnout,
+ * attnproj. Filled only under COLI_CUDA_PROFILE, and zero otherwise.
+ * wall_ms is CPU time around the whole call, so wall minus the three GPU
+ * phases prices the round-trip. Optional symbol: a DLL predating it leaves
+ * the wrapper reporting zeros rather than taking the backend down. */
+COLI_CUDA_DLLEXPORT void coli_cuda_dense_stats(uint64_t *calls, uint64_t *weight_bytes,
+                           double *h2d_ms, double *kernel_ms,
+                           double *d2h_ms, double *wall_ms);
 /* Per-device form of coli_cuda_group_stats; unknown devices return zeros. */
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats_device(
     int device, uint64_t *calls, uint64_t *experts, uint64_t *rows,

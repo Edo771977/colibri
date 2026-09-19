@@ -105,6 +105,8 @@ typedef struct {
      * because "not yet" and "won't work" must not share a value here: the
      * events are persistent, so retrying would overwrite live handles. */
     cudaEvent_t ev_grp[4]; int ev_grp_ok, group_timed;
+    /* Same tri-state as ev_grp, for the resident dense GEMV path. */
+    cudaEvent_t ev_dm[4]; int ev_dm_ok;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
@@ -127,6 +129,15 @@ static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
+/* Resident dense GEMVs (coli_cuda_matmul): lm_head, dnproj, dnout, attnout,
+ * attnproj. Measured separately from the expert groups because the question is
+ * different -- the groups are about launch overhead on 40 calls a token, these
+ * are about whether a 24 MB GEMV runs anywhere near the card's bandwidth.
+ * wall_ms is CPU time around the whole call, so wall minus the three GPU
+ * phases is what the round-trip costs. */
+static uint64_t g_dense_calls;
+static double g_dense_h2d_ms, g_dense_kernel_ms, g_dense_d2h_ms, g_dense_wall_ms;
+static uint64_t g_dense_bytes;            /* weight bytes the kernels read */
 static uint64_t g_device_group_calls[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_experts[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_rows[COLI_CUDA_MAX_DEVICES];
@@ -1320,6 +1331,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
         if (ctx->ev_grp_ok>0) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_grp[e]); }
         ctx->ev_grp_ok=0;
+        if (ctx->ev_dm_ok>0) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_dm[e]); }
+        ctx->ev_dm_ok=0;
         ctx->group_timed=0;
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
@@ -1720,11 +1733,63 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t rb = row_bytes(fmt, I);
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+
+    /* Opt-in for the same reason the group path's is: four cudaEventRecord on
+     * a call this short are not free. Off, this is one cached int. */
+    static int dprof = -1;
+    if (dprof < 0) { const char *e = getenv("COLI_CUDA_PROFILE"); dprof = e && atoi(e); }
+    if (dprof && ctx->ev_dm_ok == 0) {
+        int ok = 1;
+        for (int i = 0; i < 4; i++)
+            if (!cuda_ok(cudaEventCreate(&ctx->ev_dm[i]), "dense profile event create")) {
+                for (int j = 0; j < i; j++) cudaEventDestroy(ctx->ev_dm[j]);   /* (#B8) */
+                ok = 0; break; }
+        ctx->ev_dm_ok = ok ? 1 : -1;      /* latched: retrying overwrites live handles */
+    }
+    /* Stream 0 explicitly: quant_matmul_launch takes no stream, so the kernel
+     * and both cudaMemcpy run on the default one and the events must too. */
+    int timed = dprof && ctx->ev_dm_ok > 0;
+    std::chrono::steady_clock::time_point t0;
+    if (timed) { t0 = std::chrono::steady_clock::now(); cudaEventRecord(ctx->ev_dm[0], 0); }
+
     if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
+    if (timed) cudaEventRecord(ctx->ev_dm[1], 0);
     quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    if (timed) cudaEventRecord(ctx->ev_dm[2], 0);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+
+    if (timed) {
+        cudaEventRecord(ctx->ev_dm[3], 0);
+        /* Wall BEFORE the sync, or the sync's own cost lands in the number that
+         * exists to price the round-trip. The D2H above is synchronous, so the
+         * work is already done and this sync only waits for the record. */
+        double wall = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+        cudaEventSynchronize(ctx->ev_dm[3]);
+        float a = 0, b = 0, c = 0;
+        cudaEventElapsedTime(&a, ctx->ev_dm[0], ctx->ev_dm[1]);
+        cudaEventElapsedTime(&b, ctx->ev_dm[1], ctx->ev_dm[2]);
+        cudaEventElapsedTime(&c, ctx->ev_dm[2], ctx->ev_dm[3]);
+        std::lock_guard<std::mutex> lock(g_group_stats_mu);
+        g_dense_calls++;
+        g_dense_h2d_ms += a; g_dense_kernel_ms += b; g_dense_d2h_ms += c;
+        g_dense_wall_ms += wall;
+        g_dense_bytes += rb * (size_t)O;
+    }
     return 1;
+}
+
+extern "C" void coli_cuda_dense_stats(uint64_t *calls, uint64_t *weight_bytes,
+                                      double *h2d_ms, double *kernel_ms,
+                                      double *d2h_ms, double *wall_ms) {
+    std::lock_guard<std::mutex> lock(g_group_stats_mu);
+    if (calls)        *calls        = g_dense_calls;
+    if (weight_bytes) *weight_bytes = g_dense_bytes;
+    if (h2d_ms)       *h2d_ms       = g_dense_h2d_ms;
+    if (kernel_ms)    *kernel_ms    = g_dense_kernel_ms;
+    if (d2h_ms)       *d2h_ms       = g_dense_d2h_ms;
+    if (wall_ms)      *wall_ms      = g_dense_wall_ms;
 }
 
 /* MXFP4 matmul, stateless. Separate from coli_cuda_matmul on purpose: that one

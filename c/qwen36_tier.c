@@ -1149,6 +1149,24 @@ void qt_stats(void){
       else if(calls)
           fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | timings not recorded (set COLI_CUDA_PROFILE=1; mixed-format groups never record)\n",
               (unsigned long long)calls,(unsigned long long)ex); }
+    /* The resident dense GEMVs -- lm_head, dnproj, dnout, attnout, attnproj --
+     * priced the only way that answers the question they raise. A 24 MB GEMV
+     * has one job, streaming its weights, so bytes over kernel time IS the
+     * kernel's bandwidth; bytes over WALL time is what the caller actually
+     * gets, and the two diverging is the round-trip. Printing the milliseconds
+     * without the GB/s would leave everyone to do this division by hand and
+     * some of them to skip it. */
+    { uint64_t dcalls=0, dbytes=0; double dh2d=0, dker=0, dd2h=0, dwall=0;
+      coli_cuda_dense_stats(&dcalls,&dbytes,&dh2d,&dker,&dd2h,&dwall);
+      if(dcalls && dwall>0){
+          double gb = (double)dbytes/1073741824.0;
+          fprintf(stderr,"[qtier] dense_stats: %llu calls, %.2f GB read | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms, wall %.0f ms\n",
+              (unsigned long long)dcalls, gb, dh2d, dker, dd2h, dwall);
+          fprintf(stderr,"[qtier]   kernel %.0f GB/s | wall %.0f GB/s | round-trip %.0f %% of wall\n",
+              dker>0 ? gb/(dker/1000.0) : 0.0,
+              gb/(dwall/1000.0),
+              100.0*(dwall-dh2d-dker-dd2h)/dwall);
+      } }
 }
 
 static void dense_free_all(void){
