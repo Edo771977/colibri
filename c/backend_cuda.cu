@@ -100,7 +100,10 @@ typedef struct {
      * destroys four events per call; this one runs once per MoE layer per
      * token, so its events are created once and kept. `group_timed` says
      * whether the call now in flight recorded them, because take() reads the
-     * elapsed times and must not read stale ones from an untimed call. */
+     * elapsed times and must not read stale ones from an untimed call.
+     * ev_grp_ok is tri-state -- 0 untried, 1 ready, -1 creation failed --
+     * because "not yet" and "won't work" must not share a value here: the
+     * events are persistent, so retrying would overwrite live handles. */
     cudaEvent_t ev_grp[4]; int ev_grp_ok, group_timed;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -1315,7 +1318,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
-        if (ctx->ev_grp_ok) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_grp[e]); ctx->ev_grp_ok=0; }
+        if (ctx->ev_grp_ok>0) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_grp[e]); }
+        ctx->ev_grp_ok=0;
         ctx->group_timed=0;
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
@@ -2135,13 +2139,18 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
      * one already-read getenv and nothing reaches the driver. */
     static int gprof=-1;   /* read once: 40 calls a token is no place for getenv */
     if(gprof<0){ const char *e=getenv("COLI_CUDA_PROFILE"); gprof=e&&atoi(e); }
-    if(gprof&&!ctx->ev_grp_ok){
+    if(gprof&&ctx->ev_grp_ok==0){
         int ok=1;
         for(int i=0;i<4;i++)
-            if(!cuda_ok(cudaEventCreate(&ctx->ev_grp[i]),"group profile event create")){ok=0;break;}
-        ctx->ev_grp_ok=ok;
+            if(!cuda_ok(cudaEventCreate(&ctx->ev_grp[i]),"group profile event create")){
+                /* (#B8) don't leak the events already created -- and latch the
+                 * failure, or the next call re-enters this loop and overwrites
+                 * whatever handles it did manage to allocate. */
+                for(int j=0;j<i;j++) cudaEventDestroy(ctx->ev_grp[j]);
+                ok=0; break; }
+        ctx->ev_grp_ok=ok?1:-1;
     }
-    ctx->group_timed=gprof&&ctx->ev_grp_ok;
+    ctx->group_timed=gprof&&ctx->ev_grp_ok>0;
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[0],ctx->stream);
     if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                 cudaMemcpyHostToDevice,ctx->stream),
