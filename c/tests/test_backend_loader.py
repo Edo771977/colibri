@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 8 optional, parsed from backend_loader.c.
+        """47 mandatory + 9 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,8 +929,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 8)   # +matmul_mxfp4 (kimi_k3 via the DLL, #1405), +available_device_count (qwen36 tier, #1533)
-        self.assertEqual(len(f.exports), 55)
+        self.assertEqual(len(f.optional), 9)   # +matmul_mxfp4 (kimi_k3 via the DLL, #1405), +available_device_count (qwen36 tier, #1533), +dense_stats (resident dense GEMV bandwidth under COLI_CUDA_PROFILE)
+        self.assertEqual(len(f.exports), 56)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
@@ -938,6 +938,12 @@ class LoaderStubFixtureTest(unittest.TestCase):
         self.assertIn("coli_cuda_attention_project_ragged", f.mandatory)
         # fp8_set_lut: fmt=8 e4m3 dense/expert kernels (#817).
         self.assertIn("coli_cuda_fp8_set_lut", f.optional)
+        # dense_stats: h2d/kernel/d2h and CPU wall for the resident dense
+        # GEMVs, so their effective bandwidth can be read instead of guessed.
+        # OPTIONAL on purpose: a coli_cuda.dll built before it exists would
+        # otherwise fail to load entirely, taking the whole GPU backend down
+        # over one diagnostic counter.
+        self.assertIn("coli_cuda_dense_stats", f.optional)
         # expert_group_pinned: old DLLs remain usable outside SPEC_PIN (#689).
         self.assertIn("coli_cuda_expert_group_pinned", f.optional)
         # tensor_vram / alloc_footprint: allocator padding in the expert-tier
