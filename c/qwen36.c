@@ -1325,11 +1325,17 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
  * init that disagreed with its call site would not fail -- it would answer.
  * matmul_d matches the same way (`w == W && I == I`), which is why a
  * disagreement here would also have silently dropped the CPU int8 path back to
- * f32. Shared by the offer and the placement below: if they could disagree
- * about what is placeable, the offer would charge the expert budget for bytes
- * that never arrive. */
+ * f32. Shared by the offer and the placement below so the two cannot disagree
+ * about what is placeable -- an offer for a matrix the registry does not hold
+ * would charge the expert budget for bytes that never arrive. That covers the
+ * registry only: an upload that fails later, after qt_init has already read
+ * the offer, charges the budget just the same, and trunk_place_out says so. */
 static const int8_t *qdw_int8(const float *W, int I, int O, const float **scales)
 {
+    *scales = NULL;                       /* set on every path, including the
+                                           * failures: a caller that forgot to
+                                           * initialise it must not read one
+                                           * matrix's scales for another's */
     for (int j = 0; j < g_qdw_n; j++)
         if (g_qdw[j].w == W) {
             if (g_qdw[j].I != I || g_qdw[j].O != O) return NULL;
@@ -1358,7 +1364,7 @@ static const int8_t *qdw_int8(const float *W, int I, int O, const float **scales
  * callable from a test; tests/test_qwen36_trunk_place.c drives this. */
 static void trunk_place_out(Model *m)
 {
-    int n_attn = 0, n_dn = 0; double bytes = 0;
+    int n_attn = 0, n_dn = 0, n_fail = 0; double bytes = 0;
     for (int i = 0; i < m->c.n_layers; i++) {
         Layer *l = &m->L[i];
         int attn = m->c.is_attn && m->c.is_attn[i];
@@ -1372,13 +1378,21 @@ static void trunk_place_out(Model *m)
         const int8_t *q = qdw_int8(W, I, O, &sc);
         if (!q) continue;
         int h = qt_dense_init(q, sc, I, O, dev, 0);
-        if (h < 0) continue;              /* out of VRAM: this layer stays put */
+        if (h < 0) { n_fail++; continue; }
         if (attn) { l->h_attnout = h + 1; n_attn++; } else { l->h_dnout = h + 1; n_dn++; }
         bytes += (double)I * O;
     }
     if (n_attn || n_dn)
         fprintf(stderr, "[place] %d attnout + %d dnout on GPU (%.2f GB VRAM)\n",
                 n_attn, n_dn, bytes / 1073741824.0);
+    /* An upload that fails here is not free and must not be silent: qt_init
+     * already took these bytes out of the device's expert budget when it read
+     * the offer, and nothing gives them back, so the warmstart fills fewer
+     * experts for a matrix that stayed on the CPU. Pre-existing for lmhead and
+     * dnproj, which are placed the same way; at least say it happened. */
+    if (n_fail)
+        fprintf(stderr, "[place] %d output projection(s) could not be uploaded: "
+                        "on the CPU, but their bytes stay charged to the trunk budget\n", n_fail);
 }
 
 /* Offer the bytes BEFORE qt_init sizes the expert budget.
