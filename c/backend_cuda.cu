@@ -96,6 +96,12 @@ typedef struct {
     float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
     cudaEvent_t ev_done; int ev_done_ok;        /* resident-group issue completion (#431 PR-C0) */
+    /* COLI_CUDA_PROFILE on the ASYNC group path. The sync path creates and
+     * destroys four events per call; this one runs once per MoE layer per
+     * token, so its events are created once and kept. `group_timed` says
+     * whether the call now in flight recorded them, because take() reads the
+     * elapsed times and must not read stale ones from an untimed call. */
+    cudaEvent_t ev_grp[4]; int ev_grp_ok, group_timed;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
@@ -1309,6 +1315,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
+        if (ctx->ev_grp_ok) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_grp[e]); ctx->ev_grp_ok=0; }
+        ctx->group_timed=0;
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
 #ifdef COLI_ANS
@@ -2121,11 +2129,26 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
        !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)) return 0;
     std::memcpy(ctx->host_x,x,xb);
+    /* Timing is opt-in because measuring it changes it: four cudaEventRecord
+     * per call, 40 calls a token, is launch overhead added to the path whose
+     * launch overhead is the thing in question. Off by default the branch is
+     * one already-read getenv and nothing reaches the driver. */
+    static int gprof=-1;   /* read once: 40 calls a token is no place for getenv */
+    if(gprof<0){ const char *e=getenv("COLI_CUDA_PROFILE"); gprof=e&&atoi(e); }
+    if(gprof&&!ctx->ev_grp_ok){
+        int ok=1;
+        for(int i=0;i<4;i++)
+            if(!cuda_ok(cudaEventCreate(&ctx->ev_grp[i]),"group profile event create")){ok=0;break;}
+        ctx->ev_grp_ok=ok;
+    }
+    ctx->group_timed=gprof&&ctx->ev_grp_ok;
+    if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[0],ctx->stream);
     if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                 cudaMemcpyHostToDevice,ctx->stream),
                 "expert group issue descriptors")||
        !cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                 "expert group issue upload")) return 0;
+    if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[1],ctx->stream);
     if(all_e8){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
@@ -2183,9 +2206,11 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
             host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),0,1);
     }}
+    if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[2],ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                 "expert group issue download")) return 0;
+    if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[3],ctx->stream);
     ctx->group_pending=1; ctx->group_pending_bytes=xb;
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       int index=(int)(ctx-g_ctx);
@@ -2201,6 +2226,21 @@ extern "C" const float *coli_cuda_expert_group_take(int device) {
     ctx->group_pending=0;
     if(!select_ctx(ctx)) return nullptr;
     if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group take")) return nullptr;
+    /* The stream is drained, so all four events have completed and no extra
+     * synchronisation is needed to read them. */
+    if(ctx->group_timed){
+        float a=0,b=0,c=0;
+        cudaEventElapsedTime(&a,ctx->ev_grp[0],ctx->ev_grp[1]);
+        cudaEventElapsedTime(&b,ctx->ev_grp[1],ctx->ev_grp[2]);
+        cudaEventElapsedTime(&c,ctx->ev_grp[2],ctx->ev_grp[3]);
+        { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+          int index=(int)(ctx-g_ctx);
+          g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c;
+          g_device_group_h2d_ms[index]+=a;
+          g_device_group_kernel_ms[index]+=b;
+          g_device_group_d2h_ms[index]+=c; }
+        ctx->group_timed=0;
+    }
     return ctx->host_y;
 }
 
