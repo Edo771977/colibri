@@ -1,0 +1,99 @@
+Qwen3.6-35B-A3B decode: what the 2x between 18 and 19 September was.
+19 September 2026.
+
+The 19 September placement A/B (docs/qwen36-cuda-tier.md) read 59.75 ms/token
+on its arm A where an 18 September run read 32.1, both at a 100 % VRAM hit
+rate. Two variables had changed together -- the prompt (25 vs 56 tokens) and
+the build -- so neither could be blamed. This is the 2x2 that separates them.
+
+Host
+  CPU   AMD Ryzen 9 7950X, 16C/32T, AVX-512
+  RAM   64 GB DDR5 5200 MT/s
+  GPU   NVIDIA GeForce RTX 4070 Ti SUPER, 16 GB, CUDA 13.4
+  OS    Windows 11
+  Model Qwen/Qwen3.6-35B-A3B, Colibri int4 gs64 container
+
+Method
+  Factorial 2x2: {gcc, clang} x {25-token prompt, 56-token prompt}.
+  One session, one checkout, four arms alternated G25 C25 G56 C56, four
+  repetitions each. Both binaries built from the SAME commit with `make -B`
+  (not `make clean`, which deletes coli_cuda.dll and silently drops every run
+  to a CPU-only path). Heat table warmed on both prompts, then frozen and
+  restored before every run so residency is identical. Placement held at the
+  A/B's arm A: COLI_PLACE="experts=0,lmhead=0,dnproj=0". COLI_GPUS=0.
+  Prompt token counts are the engine's own `[enc] prompt tokens:` line, not
+  the script's intent: 25 and 56 exactly.
+
+  gcc   C:\msys64\mingw64\bin\gcc.exe   14.2.0   [x86_64-w64-mingw32]
+  clang C:\msys64\clang64\bin\clang.exe 22.1.8   [x86_64-w64-windows-gnu]
+
+  The gcc here is mingw64 14.2; the 18 September record used ucrt64 16.2.
+  They agree row for row, which is what makes this about the OpenMP runtime
+  (MinGW libgomp vs LLVM libomp) rather than a compiler version.
+
+--- per-run ----------------------------------------------------------------
+
+  G25 rip 1  step  59,50 | router  2,81 | shared  9,77 | hit 98,1 %
+  C25 rip 1  step  32,70 | router  0,61 | shared  3,93 | hit 98,1 %
+  G56 rip 1  step  55,70 | router  2,70 | shared  9,38 | hit 99,1 %
+  C56 rip 1  step  32,60 | router  0,61 | shared  4,02 | hit 99,1 %
+  G25 rip 2  step  57,90 | router  2,75 | shared  9,52 | hit 98,1 %
+  C25 rip 2  step  32,80 | router  0,61 | shared  3,95 | hit 98,1 %
+  G56 rip 2  step  53,10 | router  2,59 | shared  8,89 | hit 99,1 %
+  C56 rip 2  step  32,40 | router  0,60 | shared  3,98 | hit 99,1 %
+  G25 rip 3  step  56,70 | router  2,69 | shared  9,33 | hit 98,1 %
+  C25 rip 3  step  32,80 | router  0,59 | shared  4,01 | hit 98,1 %
+  G56 rip 3  step  54,80 | router  2,59 | shared  8,95 | hit 99,1 %
+  C56 rip 3  step  32,80 | router  0,61 | shared  4,00 | hit 99,1 %
+  G25 rip 4  step  56,70 | router  2,70 | shared  9,33 | hit 98,1 %
+  C25 rip 4  step  32,60 | router  0,61 | shared  3,87 | hit 98,1 %
+  G56 rip 4  step  56,50 | router  2,69 | shared  9,29 | hit 99,1 %
+  C56 rip 4  step  32,60 | router  0,60 | shared  3,99 | hit 99,1 %
+
+--- means (min-max), ms/token ----------------------------------------------
+
+riga                       G25                 C25                 G56                 C56
+step         57,70 (56,7-59,5)   32,73 (32,6-32,8)   55,03 (53,1-56,5)   32,60 (32,4-32,8)
+deltanet     25,67 (25,3-26,4)   14,09 (14,0-14,2)   24,84 (24,0-25,5)   14,15 (14,1-14,2)
+attention    10,47 (10,3-10,7)      6,41 (6,4-6,4)   10,30 (10,1-10,5)      6,43 (6,4-6,5)
+shared          9,49 (9,3-9,8)      3,94 (3,9-4,0)      9,13 (8,9-9,4)      4,00 (4,0-4,0)
+router          2,74 (2,7-2,8)      0,61 (0,6-0,6)      2,64 (2,6-2,7)      0,61 (0,6-0,6)
+lm_head         3,92 (3,9-4,0)      2,65 (2,6-2,7)      3,90 (3,6-4,2)      2,66 (2,6-2,7)
+TOTAL        57,12 (56,1-58,9)   31,54 (31,4-31,7)   54,51 (52,6-56,0)   31,39 (31,3-31,5)
+
+  effetto TOOLCHAIN (G25-C25):  24,98 ms/token  [spread max 2,80]
+  effetto PROMPT   (C56-C25):  -0,13 ms/token
+
+--- reading ----------------------------------------------------------------
+
+The toolchain effect is 24.98 ms/token against a worst-case within-arm spread
+of 2.80: nine times the noise. The prompt effect is -0.13, indistinguishable
+from zero, and it keeps that sign on the gcc side too (G56-G25 = -2.67, inside
+that arm's own 2.8 spread).
+
+C25 = 32.73 reproduces the 18 September 32.1 within 2 %, on a 25-token prompt
+where 18 September used 56. So the 19 September arm A's 59.75 was a gcc build,
+and the prompt never mattered.
+
+Row for row against the 18 September OpenMP-runtime record
+(qwen36-openmp-runtime-2026-09-18-raw.txt), which measured the same two
+runtimes on the same host:
+
+  ms/token    clang here   gcc here   clang 18 Sep   gcc 18 Sep
+  deltanet         14.09      25.67          13.68        23.67
+  attention         6.41      10.47           6.18         8.78
+  shared            3.94       9.49           3.69         8.66
+  router            0.61       2.74           0.57         2.67
+  lm_head           2.65       3.92           2.79         3.51
+
+Every row lands on its own band. `router` is the cleanest discriminant: 0.6
+against 2.7, fixed dense per-token work that neither the prompt nor the
+placement can touch.
+
+One row deserves separate notice. `lm_head` is placed ON THE GPU in every arm
+here, and still moves 2.65 -> 3.92 when only the HOST compiler changes. A
+timer that is supposed to price a GPU GEMV carries 1.27 ms of toolchain-
+sensitive CPU time. That is consistent with the contention hypothesis this
+repo's OpenMP record already raised -- a spinning 16-thread team competing
+with the driver's own threads for cores -- and it means the bandwidth figures
+derived by dividing bytes by these timers are floors, not readings.

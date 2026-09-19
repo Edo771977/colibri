@@ -63,6 +63,23 @@ set CUDA_EXPERT_GB=auto
 qwen36.exe <same arguments as the CPU build>
 ```
 
+**Build the engine with clang, not gcc.** Measured on this host, same commit,
+same container, same placement: **57.70 ms/token under MinGW libgomp against
+32.73 under LLVM libomp** — 1.8×, and it is the OpenMP runtime, not the
+compiler version (`qwen36-toolchain-2x-2026-09-19-raw.txt`). `deltanet`,
+`shared` and `router` all roughly halve. The engine builds and answers
+correctly either way, which is exactly why this is easy to lose:
+
+```cmd
+pacman -S mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-openmp
+make qwen36.exe CC=C:/msys64/clang64/bin/clang.exe CUDA_DLL=1 ARCH=native
+```
+
+The resulting `qwen36.exe` links `libomp.dll` dynamically, so `clang64\bin`
+must be reachable at run time (on `PATH`, or copy the DLL next to the exe).
+`make clean` deletes `coli_cuda.dll` (`tools/clean.py`); use `make -B` when
+rebuilding the engine with a different compiler, or rebuild the DLL after.
+
 Keep `coli_cuda.dll` next to `qwen36.exe`, built from the same checkout, and
 the CUDA toolkit's `bin` directory on `PATH` for `cudart`. A startup line
 `[gpu] MoE experts -> CUDA VRAM tier` confirms the tier is active; without it
@@ -138,7 +155,9 @@ RTX 4070 Ti SUPER (16 GB) + Ryzen 9 7950X, 64 GB at 5200 MT/s,
 Qwen3.6-35B-A3B int4 gs64, 25-token prompt, 128 generated, **four runs a
 side, alternated A B A B**, heat table warmed on this prompt and then frozen
 so every run starts from the same residency. Both arms at **100 % VRAM hit
-rate, `miss(CPU)` 0**.
+rate, `miss(CPU)` 0**. Both arms on a **gcc/MinGW-libgomp binary** — see the
+note on the absolute level below, which is why every ms here is about 1.8×
+what the same code does under clang.
 
 ```
 A  COLI_PLACE="experts=0,lmhead=0,dnproj=0"                     (what auto did before)
@@ -181,26 +200,50 @@ the GPU in both arms**. The likely mechanism is contention: 335 MB/token less
 CPU traffic leaves the staging copies and driver calls of the already-placed
 matrices more bus to work with. That is a hypothesis, not a measurement.
 
-**Honest caveat on the absolute level.** Arm A reads 59.75 ms/token where an
-`auto` run on 18 September read 32.1, both at 100 % hit rate. Everything is
-about 2× — deltanet 13.68→27.27, shared 3.69→10.18, router 0.57→2.88 — and
-the cause is **not established**. Two candidates, and they are not equally
-vague:
+**The absolute level: this arm was a gcc build.** Arm A reads 59.75 ms/token
+where an `auto` run on 18 September read 32.1, both at 100 % hit rate, and the
+gap was left open here as "not established", with the prompt (25 tokens vs 56)
+as the leading suspect. It was measured: a 2×2 of {gcc, clang} × {25, 56
+tokens}, one session, four runs an arm, same commit, same placement, same
+frozen residency — `qwen36-toolchain-2x-2026-09-19-raw.txt`.
 
-- *The prompt.* 25 tokens here against 56 on 18 September, so a different
-  completion and different routing. Free to test: run the 56-token prompt on
-  the current build.
-- *The build.* `git diff 8e58948 main -- c/qwen36.c` says the only change to
-  the decode path between the two runs is the pair of
-  `if (!(S == 1 && trunk_out_matmul(...)))` branches, plus two `int` at the
-  end of `Layer`. With nothing placed the branch short-circuits on a calloc'd
-  zero, so the mechanism is implausible for a 2× — and it cannot touch the
-  router or the shared expert at all, which slowed down just as much. Not
-  excluded, but it has to explain those two rows to be the answer.
+```
+toolchain (gcc − clang, 25-token prompt):  −24.98 ms/token   [spread max 2.80]
+prompt    (56 − 25 tokens, clang):          −0.13 ms/token
+```
 
-The A/B is unaffected either way: same session, same binary in both arms,
-alternated, frozen residency, spread 2.1 ms. The **ratio** is the result
-here; the absolute numbers belong to that session.
+The prompt does nothing. The toolchain is nine times the noise, and the clang
+arm reads 32.73 — the 18 September number, on the 25-token prompt. Row for row
+the two arms land on the two bands the repo's own OpenMP record already
+measured (`qwen36-openmp-runtime-2026-09-18.md`): `router` 0.61 against 2.74,
+`shared` 3.94 against 9.49. So the 2× is **MinGW libgomp against LLVM libomp**,
+not the prompt and not the `trunk_out_matmul` branches.
+
+Inferred from the timings, not from a recorded build command: the 19 September
+session did not log which compiler produced its binary. Every row of arm A
+sits on the gcc band and none on the clang band, which is as close to a
+recorded fact as this gets.
+
+**What survives and what does not.** The A/B is a within-session ratio — same
+binary in both arms, alternated, frozen residency, spread 2.1 ms — so `dnout`
+and `attnout` are still worth placing. What does not survive is the absolute
+level: 59.75 ms/token is a build nobody should ship, and **−7.77 ms is very
+likely an overestimate for a clang build**. Placement pays by removing CPU
+reads, and libgomp makes those reads cost about twice what libomp charges, so
+the same 335 MB/token buys less on a sane build. Re-measuring on clang is
+outstanding.
+
+The same caveat reaches the bytes-to-time arithmetic two paragraphs up: the
+55.03 GB/s that turns 335.5 MB into 6.1 ms is this machine under libgomp, not
+this machine.
+
+**A row that should not have moved.** `lm_head` is on the GPU in every arm of
+the 2×2, and still goes 2.65 → 3.92 ms when only the *host* compiler changes.
+A timer meant to price a GPU GEMV is carrying 1.27 ms of toolchain-sensitive
+CPU time — consistent with the contention hypothesis in the OpenMP record (a
+spinning 16-thread team against the driver's own threads) and a reason to read
+every bytes-over-timer bandwidth in this document as a floor. `COLI_CUDA_PROFILE`
+times the GEMV itself and is the way to settle it.
 
 ### The attention input projections (`attnproj`)
 
