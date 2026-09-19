@@ -128,32 +128,56 @@ Two lines from the same run, previously unread:
 [timers]   qtier: issue 1.95 | cpu-miss 3.69 | take 1.37 ms/token
 ```
 
-- **`cpu-miss` 3.7 ms/token, 11% of the token.** Routed experts absent from the
-  VRAM tier, computed on CPU instead. 3.69 cold against 3.21 warm, so it is
-  cache policy rather than a floor. The tier reported room for ~7136 experts and
-  missed anyway.
-- **`issue` + `take` 3.3 ms/token, 10%.** Round-trip cost with the GPU across
-  ~30 synchronous hops per token. llama.cpp answers this with CUDA graphs
-  (`ggml-cuda.cu:2558-2660`): capture once, replay with a single launch, patch
-  pointers via `cudaGraphExecUpdate` rather than re-recording.
+### Correction: `cpu-miss` is not a miss counter
 
-7 ms of 32, in two lines the engine was already printing — **against a 5.0 ms
-deficit.** The gap to llama.cpp is not spread thin across kernels waiting to be
-shaved; it is smaller than the sum of two named, measured, already-instrumented
-causes:
+The first version of this section read that line as two targets worth 7 ms and
+said the deficit was "smaller than the sum of two named causes". One of the two
+does not exist. `g_qt_cpu` is not the cost of experts missing the VRAM tier; it
+is the whole CPU-side overlap window, and `c/qwen36.c` puts the shared expert
+inside it on purpose, to cover the GPU's latency:
 
-| | ms/token | tok/s | vs their 27.0 ms |
-|---|---|---|---|
-| today | 32.0 | 31.2 | −5.0 |
-| `cpu-miss` removed | 28.3 | 35.3 | −1.3 |
-| `issue`+`take` removed | 28.7 | 34.8 | −1.7 |
-| both | **25.0** | **40.0** | **+2.0** |
+```c
+double _q1 = tm_now();
+for (kk...) { if (qmask & (1u<<kk)) continue;   /* the experts the GPU declined */
+              ... }
+/* Compute the shared expert NOW so it overlaps with the GPU groups */
+{ double _ts2 = tm_now(); ... shared expert ... tm_add(S, 3, tm_now()-_ts2); }
+double _q2 = tm_now();
+g_qt_cpu += _q2 - _q1;
+```
 
-Neither is a floor. `cpu-miss` already moves 3.69 → 3.21 between a cold and a
-warm run of the same binary, and the round-trips are exactly what CUDA graphs
-remove. Losing by 18% to a mature engine while holding the receipts for 7 ms of
-self-inflicted cost is a better position than the 19% "win" this record briefly
-claimed.
+The `(shared)` row of the same report already counts that work, so subtracting
+gives what the misses actually cost:
+
+| | `cpu-miss` | `(shared)` | difference |
+|---|---:|---:|---:|
+| cold | 3.69 | 3.69 | **0.00** |
+| warm | 3.21 | 3.20 | **0.01** |
+
+Zero. The VRAM tier hits essentially every time on this configuration, and the
+3.7 ms is the shared expert doing useful work in the shadow of the GPU.
+
+What survives:
+
+- **`issue`, 1.95 ms.** CPU time spent launching. Per MoE layer, two
+  `cudaMemcpyAsync` plus two or three kernels — about five driver calls, ~200
+  per token over 40 layers, `1.95 / 200 ≈ 9.8 us` each, which is WDDM's price on
+  Windows against 2-3 us on Linux. This is the part CUDA graphs collect
+  (`ggml-cuda.cu:2558-2660` is llama.cpp's version), and the shape suits them:
+  the chosen experts travel as data in `GroupDesc[]`, read by the kernel from a
+  device buffer, so graph topology does not follow routing.
+- **`take`, 1.37 ms.** `coli_cuda_expert_group_take` is `cudaStreamSynchronize`.
+  It is the CPU waiting on the GPU, not a launch cost, and **no graph removes
+  it.**
+
+So 3.3 ms, of which 1.9 is graph-shaped — against a 4.98 ms deficit. The gap is
+no longer smaller than its named causes, which is the honest position: part of
+it is still unaccounted for.
+
+Two things left unread in the same output, both free: `[qtier] VRAM hit rate`,
+which states the hit rate directly instead of inferring it, and
+`[qtier] group_stats`, which splits the GPU's time into h2d / kernel / d2h and
+so says whether the `take` wait is transfer or arithmetic.
 
 ## A discarded measurement, kept
 
