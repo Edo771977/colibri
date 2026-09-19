@@ -41,6 +41,11 @@ static void ck(int ok, const char *what) {
  * hidden: a swapped dimension is then a wrong answer, not a lucky one. */
 enum { NL = 4, NE = 4, D = 32, IH = 16, TOPK = 2, VH = 2, VD = 6, O_IN = 24 };
 enum { VALUE_DIM = VH * VD };
+/* attention input projections: q_out and kv_out differ, and differ from
+ * each other, so a fused block assembled at the wrong offset is a wrong
+ * answer rather than a lucky one. */
+enum { QH = 2, QHD = 8, KVH = 1, KHD = 4 };
+enum { Q_OUT = QH * QHD, KV_OUT = KVH * KHD, QKV_OUT = Q_OUT + 2 * KV_OUT };
 /* widest input either projection takes, for the one scratch row below */
 #define XMAX ((int)O_IN > (int)VALUE_DIM ? (int)O_IN : (int)VALUE_DIM)
 static const uint8_t KIND[NL] = { 1, 0, 1, 0 };   /* 1 = attention, 0 = DeltaNet */
@@ -56,6 +61,8 @@ static void build_model(Model *m) {
     m->c.n_layers = NL; m->c.n_experts = NE; m->c.topk = TOPK;
     m->c.hidden = D; m->c.inter = IH; m->c.expert_gs = 0;
     m->c.o_in = O_IN; m->c.dn_vheads = VH; m->c.dn_vdim = VD;
+    m->c.q_heads = QH; m->c.q_head_dim = QHD;
+    m->c.kv_heads = KVH; m->c.k_head_dim = KHD;
     m->c.is_attn = malloc(NL);
     memcpy(m->c.is_attn, KIND, NL);
     m->L = calloc(NL, sizeof(Layer));     /* the engine's own zeroing */
@@ -65,11 +72,36 @@ static void build_model(Model *m) {
         for (int64_t e = 0; e < (int64_t)I * D; e++) W[e] = wval(i, e);
         if (KIND[i]) m->L[i].o = W; else m->L[i].dn_out = W;
         qdw_register(W, I, D);            /* the int8 copy the CPU path uses */
+        if (!KIND[i]) continue;
+        /* q, k and v for the attention layers. Distinct generators so a fused
+         * block that concatenated them in the wrong order, or carried the
+         * wrong scale row, cannot still match. */
+        int outs[3] = { Q_OUT, KV_OUT, KV_OUT };
+        float **dst[3] = { &m->L[i].q, &m->L[i].k, &m->L[i].v };
+        for (int t = 0; t < 3; t++) {
+            float *M = malloc((size_t)D * outs[t] * sizeof(float));
+            /* The amplitude differs per component, and that is not decoration.
+             * wval has period 15 over rows of D = 32, so every row already
+             * spans -7..7 and qdw_register's per-row max-abs would be exactly
+             * 7 for q, k and v alike -- identical scales, and swapping the k
+             * and v SCALE rows inside the fused block would change no number
+             * and pass this test. A reviewer demonstrated exactly that. With
+             * x7, x14, x21 the three scales differ and the swap is fatal.
+             * Still small integers, so every product and partial sum stays
+             * exact in f32 and the comparison below stays an equality. */
+            for (int64_t e = 0; e < (int64_t)D * outs[t]; e++)
+                M[e] = wval(i * 3 + t + 1, e) * (float)(t + 1);
+            *dst[t] = M;
+            qdw_register(M, D, outs[t]);
+        }
     }
 }
 
 static void free_model(Model *m) {
-    for (int i = 0; i < NL; i++) free(KIND[i] ? m->L[i].o : m->L[i].dn_out);
+    for (int i = 0; i < NL; i++) {
+        free(KIND[i] ? m->L[i].o : m->L[i].dn_out);
+        free(m->L[i].q); free(m->L[i].k); free(m->L[i].v);
+    }
     free(m->L); free(m->c.is_attn);
     /* qdw_register malloc'd an int8 copy and a scale row per matrix; the
      * engine keeps them for the process lifetime, a test between two arms
@@ -102,8 +134,10 @@ static void run_arm(Model *m, const char *place, const char *what) {
     tier_up(place);
     build_model(m);
     trunk_offer_out(m);               /* as main() does, before qt_init */
+    trunk_offer_attnproj(m);
     ck(qt_init(NL, NE, D, IH, NE, TOPK, 0, 1), what);
     trunk_place_out(m);
+    trunk_place_attnproj(m);
 }
 
 int main(void) {
@@ -187,6 +221,42 @@ int main(void) {
            "off places no output projection");
     ck(qt_dense_count() == 0, "no resident matrix taken");
     ck(G_trunk_bytes[0] == 0, "and no trunk bytes charged");
+    qt_shutdown(); free_model(&m);
+
+    printf(" 6. attnproj: q ++ k ++ v fused into one GEMV, same numbers\n");
+    run_arm(&m, "experts=0,attnproj=0", "tier starts");
+    ck(m.L[0].h_attnproj > 0 && m.L[2].h_attnproj > 0, "attnproj placed on both attention layers");
+    ck(m.L[1].h_attnproj == 0 && m.L[3].h_attnproj == 0, "and on neither DeltaNet layer");
+    ck(m.L[0].h_attnout == 0 && m.L[1].h_dnout == 0,
+       "naming attnproj alone places nothing else");
+    ck(G_trunk_bytes[0] == 2 * ((size_t)D * QKV_OUT + (size_t)QKV_OUT * sizeof(float)),
+       "the fused bytes are charged to the trunk");
+    {
+        /* The fused GEMV must answer exactly what the three separate CPU
+         * matmuls answer, in that order. This is the assertion the fusion
+         * exists for: a wrong offset or a mis-assembled scale row survives
+         * every other check in this file. */
+        float x[D], want[QKV_OUT], got[QKV_OUT];
+        for (int i = 0; i < D; i++) x[i] = xval(i);
+        for (int i = 0; i < NL; i++) {
+            if (!KIND[i]) continue;
+            memset(want, 0, sizeof want); memset(got, 0, sizeof got);
+            matmul_d(want,                  x, m.L[i].q, 1, D, Q_OUT);
+            matmul_d(want + Q_OUT,          x, m.L[i].k, 1, D, KV_OUT);
+            matmul_d(want + Q_OUT + KV_OUT, x, m.L[i].v, 1, D, KV_OUT);
+            ck(trunk_out_matmul(m.L[i].h_attnproj, got, x, D, QKV_OUT), "the device answers");
+            ck(memcmp(want, got, sizeof want) == 0, "fused == q, then k, then v");
+        }
+    }
+    qt_shutdown(); free_model(&m);
+
+    printf(" 7. attnproj is explicit-only: auto does not take it\n");
+    /* dnout/attnout are offered to auto because an A/B measured them. This one
+     * has not been measured, so a default run must not move it -- the same
+     * argument that kept those two out until 19 September. */
+    run_arm(&m, "", "tier starts in auto mode");
+    for (int i = 0; i < NL; i++)
+        ck(m.L[i].h_attnproj == 0, "auto places no attnproj (nothing offers it)");
     qt_shutdown(); free_model(&m);
 
     printf(fails ? "FAILED\n" : "OK\n");
