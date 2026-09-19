@@ -650,6 +650,11 @@ typedef struct {
     float *dn_dtbias, *dn_alog;            /* dt_bias[vh], A_log[vh] */
     float *dn_norm;                        /* RMSNormGated weight [vdim] */
     float *dn_out;                         /* out_proj [hidden, value_dim] */
+    /* Resident-GPU handles for the two OUTPUT projections, when COLI_PLACE
+     * puts them there. Biased by one so that calloc's zero means "on the
+     * CPU": qt_dense_init hands back 0 for the first matrix it takes, and a
+     * Layer is calloc'd long before any placement runs. */
+    int h_attnout, h_dnout;
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -1312,6 +1317,66 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
         return;
     }
     matmul(y, x, W, S, I, O);
+}
+
+/* ---- the two OUTPUT projections, placed like the input ones ---------------
+ * qwen36_tier.h has carried `dnout` in its COLI_PLACE example since the
+ * placement table was written, but the engine only ever asked qt_place_of()
+ * about "lmhead" and "dnproj" -- so `COLI_PLACE=dnout=0` parsed, stored a
+ * device, and moved nothing. This makes the output half of the pair real:
+ * DeltaNet out_proj on the DeltaNet layers, and `attnout` (a name the header
+ * did not have) for attention o_proj on the rest.
+ *
+ * Deliberately NOT offered to the automatic placer (qt_trunk_offer). An offer
+ * lets auto_place() move these on its own, which would change what a default
+ * run does before anyone has measured whether it pays -- and each placed
+ * matrix adds a driver round-trip to the layer chain, the very cost under
+ * investigation. Explicit COLI_PLACE needs no offer (qt_place_of parses the
+ * variable directly when auto is off), so this is an A/B you ask for.
+ *
+ * Its own function rather than more lines inside main() because main() is not
+ * callable from a test; tests/test_qwen36_trunk_place.c drives this. */
+static void trunk_place_out(Model *m)
+{
+    int n_attn = 0, n_dn = 0; double bytes = 0;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        Layer *l = &m->L[i];
+        int attn = m->c.is_attn && m->c.is_attn[i];
+        const float *W = attn ? l->o : l->dn_out;
+        int I = attn ? m->c.o_in : m->c.dn_vheads * m->c.dn_vdim;
+        int O = m->c.hidden;
+        if (!W || I <= 0 || O <= 0) continue;
+        int dev = qt_place_of(attn ? "attnout" : "dnout", i);
+        if (dev == QT_PLACE_CPU) continue;
+        const int8_t *q = NULL; const float *sc = NULL;
+        for (int j = 0; j < g_qdw_n; j++)
+            if (g_qdw[j].w == W) {
+                /* Take the shape from the registry, and only when it is the
+                 * shape the forward will call with. The tier uploads once and
+                 * the backend then multiplies the cached weights by whatever
+                 * dimensions the CALL carries, so an init that disagreed with
+                 * the call site would not fail -- it would answer. matmul_d
+                 * matches the same way (`w == W && I == I`), which is why a
+                 * disagreement here would also have silently dropped the CPU
+                 * int8 path back to f32. */
+                if (g_qdw[j].I == I && g_qdw[j].O == O) { q = g_qdw[j].q; sc = g_qdw[j].sc; }
+                break;
+            }
+        if (!q || !sc) continue;          /* dense-i8 off: the CPU path stands */
+        int h = qt_dense_init(q, sc, I, O, dev, 0);
+        if (h < 0) continue;              /* out of VRAM: this layer stays put */
+        if (attn) { l->h_attnout = h + 1; n_attn++; } else { l->h_dnout = h + 1; n_dn++; }
+        bytes += (double)I * O;
+    }
+    if (n_attn || n_dn)
+        fprintf(stderr, "[place] %d attnout + %d dnout on GPU (%.2f GB VRAM)\n",
+                n_attn, n_dn, bytes / 1073741824.0);
+}
+
+/* h is the Layer field: 0 means CPU, otherwise the handle plus one. */
+static int trunk_out_matmul(int h, float *y, const float *x, int I, int O)
+{
+    return h > 0 && qt_dense_matmul(h - 1, y, x, I, O);
 }
 
 /* The DeltaNet causal conv is ~180 us per layer of serial work (see the loop in
@@ -2230,7 +2295,10 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         float g = gate_dim ? gate[o] : 0.f;
         ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
     }
-    matmul_d(out, ag, l->o, S, H*hd, D);
+    /* decode only: qt_dense_matmul is one GEMV per call, and a prompt row
+     * batch is exactly where the CPU int8 path is already efficient. */
+    if (!(S == 1 && trunk_out_matmul(l->h_attnout, out, ag, H*hd, D)))
+        matmul_d(out, ag, l->o, S, H*hd, D);
     /* nothing to free: every buffer above is a slice of the shared block. */
 }
 
@@ -2696,7 +2764,12 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 outr[(int64_t)h * vdim + d] = val * zr[d] / (1.f + expf(-zr[d]));
             }
         }
-        matmul_d(out + (int64_t)s * H, outr, l->dn_out, 1, value_dim, H);
+        /* Decode only, like the attention o_proj. This matmul is already
+         * per-row -- the loop around it hands one row at a time -- so a
+         * placed handle would turn a prompt into S driver round-trips per
+         * layer, which is a cost with nothing on the other side of it. */
+        if (!(S == 1 && trunk_out_matmul(l->h_dnout, out + (int64_t)s * H, outr, value_dim, H)))
+            matmul_d(out + (int64_t)s * H, outr, l->dn_out, 1, value_dim, H);
         if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
         if (layer == 0 && s == 0 && getenv("DN_DBG")) {
             FILE *dbg = fopen(getenv("DN_DBG"), "wb");
@@ -3671,6 +3744,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
                         placed, vram / 1073741824.0);
         }
+        trunk_place_out(&m);
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
          * slots along the way. */
