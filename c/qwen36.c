@@ -3289,6 +3289,124 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+/* CONSIST=1: prefill/decode self-consistency, ported from colibri.c's
+ * run_consist. The same position is evaluated twice -- arm A pushes the whole
+ * sequence through one batched prefill, arm B prefills a prefix and then walks
+ * the rest one token at a time through the KV cache and the DeltaNet
+ * recurrence, exactly as generate() does. Both arms share weights, so any
+ * disagreement beyond float accumulation order is a defect in one of them.
+ *
+ * Why this engine needs it more than colibri does: a DeltaNet layer carries a
+ * RECURRENT state, and the two arms build it by different arithmetic -- prefill
+ * runs a causal convolution over the batch with zero padding at the start,
+ * decode advances the recurrence one step at a time from the carried state.
+ * Those two have never been checked against each other here, and DeltaNet is
+ * 42 % of this model's decode.
+ *
+ * Needs no oracle and no reference implementation: it is the engine against
+ * itself, so it runs on any model, any quantization and any backend --
+ * including the placements added in #18..#20, which is the point.
+ *
+ * DIFFERENT FROM colibri's version, because qwen36 has no step_all(): its
+ * step() returns the logits of the LAST position only, so there is no batched
+ * row to compare position by position. Instead one arm A is compared against
+ * SEVERAL arm Bs that reach the same final position after a different number
+ * of decode steps. That is the better shape for the failure this is hunting:
+ * a recurrence that drifts from the convolution drifts further the longer it
+ * runs, so the sweep shows the gap as a function of decode steps rather than
+ * collapsing it into one number.
+ *
+ * The gate is the largest RELATIVE logit gap, because that is what separates
+ * the two failure classes: reordered f32 accumulation over the hidden dim
+ * lands near D*eps, a wrong mask or a misaddressed KV row lands at O(1).
+ * Argmax flips are reported but NOT gated -- a flip requires the top two to be
+ * within 2*gap by construction, so gating them would be an assertion that
+ * cannot fail. */
+
+/* Per-REQUEST state, the same set generate() clears at c/qwen36.c's
+ * `m->first_step = 1` block. Both arms must start from it or they are not
+ * comparable, and the difference would be read as an engine defect. */
+static void consist_reset(Model *m) {
+    reset_recurrent(m);
+    m->kv_len = 0;
+    m->first_step = 1;
+    if (m->seen) memset(m->seen, 0, (size_t)m->c.n_layers * m->c.n_experts);
+    if (m->momentum_logits)
+        memset(m->momentum_logits, 0,
+               (size_t)m->c.n_layers * m->c.n_experts * sizeof(float));
+}
+
+static void run_consist(Model *m, const int *full, int nfull) {
+    Cfg *c = &m->c; int V = c->vocab;
+    if (nfull < 4) {
+        fprintf(stderr, "CONSIST needs at least 4 tokens, got %d\n", nfull); return; }
+    if (nfull > QWEN36_ATTN_MAX_CTX) {
+        fprintf(stderr, "CONSIST: %d tokens exceed the %d-token ceiling\n",
+                nfull, QWEN36_ATTN_MAX_CTX); return; }
+
+    m->max_t = nfull + 2;
+    ensure_kv(m);
+
+    consist_reset(m);
+    float *A = step(m, full, nfull, 0);       /* arm A: one batched prefill */
+    if (!A) { fprintf(stderr, "CONSIST: prefill returned no logits\n"); return; }
+
+    /* Split points, coarse to fine in decode steps: 1, a quarter, a half, and
+     * as many as the sequence allows. Deduplicated, and a prefix shorter than
+     * 2 tokens is not a prefill. */
+    int want[4] = { nfull - 1, nfull - nfull/4, nfull/2, 2 };
+    double tol = getenv("CONSIST_TOL") ? atof(getenv("CONSIST_TOL")) : 1e-2;
+    double worst = 0; int worst_np = -1, arms = 0, fails = 0;
+
+    /* Say the cost up front. The arms together walk roughly 2.5x the sequence
+     * in single-token decode, which on a real model is the difference between
+     * a diagnostic and an afternoon. */
+    { int steps = 0;
+      for (int wi = 0; wi < 4; wi++) {
+          int np = want[wi]; if (np < 2 || np >= nfull) continue;
+          int dup = 0; for (int k = 0; k < wi; k++) if (want[k] == np) dup = 1;
+          if (!dup) steps += nfull - np; }
+      printf("CONSIST prefill vs decode: %d tokens, tol %.1e | %d decode steps to run\n",
+             nfull, tol, steps); }
+    for (int wi = 0; wi < 4; wi++) {
+        int np = want[wi];
+        if (np < 2 || np >= nfull) continue;
+        int dup = 0; for (int k = 0; k < wi; k++) if (want[k] == np) dup = 1;
+        if (dup) continue;
+
+        consist_reset(m);
+        float *lo = step(m, full, np, 0);
+        for (int i = np; i < nfull; i++) { free(lo); lo = step(m, &full[i], 1, i); }
+        if (!lo) { fprintf(stderr, "CONSIST: decode returned no logits\n"); break; }
+
+        double gap = 0, scale = 0; int ia = 0, ib = 0;
+        for (int v = 0; v < V; v++) {
+            double d = fabs((double)A[v] - (double)lo[v]); if (d > gap) gap = d;
+            double sc = fabs((double)A[v]);                if (sc > scale) scale = sc;
+            if (A[v]  > A[ia])  ia = v;
+            if (lo[v] > lo[ib]) ib = v;
+        }
+        double rel = scale > 0 ? gap / scale : gap;
+        if (rel > worst) { worst = rel; worst_np = np; }
+        arms++; if (rel > tol) fails++;
+        printf("  prefix %5d + %5d decode steps | relative gap %.3e (abs %.3e)%s%s\n",
+               np, nfull - np, rel, gap,
+               ia != ib ? " | argmax flip" : "",
+               rel > tol ? "  <-- over tol" : "");
+        free(lo);
+    }
+    free(A);
+
+    if (!arms) { fprintf(stderr, "CONSIST: no usable split point\n"); return; }
+    if (fails) {
+        fprintf(stderr, "CONSIST FAIL: worst relative gap %.3e at prefix %d exceeds tol %.1e -- "
+                        "prefill and decode do not agree on the same position\n",
+                worst, worst_np, tol);
+        exit(1);
+    }
+    printf("CONSIST OK: %d arms, worst relative gap %.3e\n", arms, worst);
+}
+
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
     Cfg *c = &m->c;
     if (nfull > QWEN36_ATTN_MAX_CTX) {
@@ -3932,6 +4050,14 @@ int main(int argc, char **argv) {
         if (!g_tok) { fprintf(stderr, "[serve] tokenizer.json required (put in SNAP or set TOK)\n"); return 1; }
         serve_loop(&m);
         return 0;
+    }
+
+    /* CONSIST takes whatever token sequence this run already has: the ref
+     * file's full_ids when there is one, the encoded prompt otherwise. It
+     * needs no continuation of its own -- both arms replay the same tokens. */
+    if (getenv("CONSIST") && atoi(getenv("CONSIST")) == 1) {
+        run_consist(&m, is_ref ? full : prompt, is_ref ? nfull : np);
+        free(buf); free(arena); return 0;
     }
 
     if (is_ref && getenv("PPL") && atoi(getenv("PPL")) == 1) {

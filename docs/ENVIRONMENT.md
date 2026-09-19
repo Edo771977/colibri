@@ -295,6 +295,8 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `TF` | unset | Teacher-forcing mode. |
 | `CHAT_TEMPLATE` | `1` | Apply the GLM chat template (`0` = raw prompt). |
 | `PPL` | off (`olmoe.c` and `qwen38.c` only) | `PPL=1` enters teacher-forced NLL/perplexity meter mode in the OLMoE and Qwen3.8 sister engines. |
+| `CONSIST` | off | `CONSIST=1` runs the engine against itself: one batched prefill of the whole sequence against a prefix prefill followed by token-by-token decode, over several split points, comparing the logits of the same final position. No oracle and no reference implementation, so it runs on any model, quantization and backend. In `qwen36.c` it is the only check that compares the DeltaNet **recurrence** against the zero-padded prefill **convolution** — the two paths the oracle never sees together. Exits non-zero when the largest relative gap exceeds `CONSIST_TOL`. |
+| `CONSIST_TOL` | `1e-2` | Gate for `CONSIST`. The quantity separates the two failure classes: reordered f32 accumulation over the hidden dim lands near `D*eps`, a wrong mask or a misaddressed KV row lands at O(1). Argmax flips are reported but never gated — a flip requires the top two within `2*gap` by construction. |
 | `ABLATE_SCORE` | unset | Causal-ablation sweep over `ABLATE_SCORE=<file>`, with a per-target-position final-logit read-out. Runs before `SCORE` and exits when done. |
 | `ABLATE_OUT` | unset | Where the ablation sweep writes its logit read-out. Pair with `ABLATE_SCORE`; an optional `ROUTE_TRACE` records the post-ablation router trace. |
 | `DEBUG_LOGITS` | unset | In reference-comparison mode, dump per-position logit diagnostics. |

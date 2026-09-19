@@ -446,6 +446,32 @@ jobs:
               ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: Prefill and decode agree on the same position (CONSIST)
+        run: |
+          cd c
+          make qwen36
+          # The engine against itself: arm A pushes the whole sequence through
+          # one batched prefill, arm B prefills a prefix and walks the rest one
+          # token at a time. No oracle involved -- this catches what the oracle
+          # cannot, because the oracle only ever sees one of the two paths.
+          #
+          # It is the DeltaNet layers that make this worth a job: prefill runs a
+          # causal convolution with zero padding, decode advances a recurrence
+          # from carried state, and until now nothing compared the two. cap=1
+          # evicts on every routed expert, for the same reason the run above
+          # uses it. The engine exits non-zero when the gap exceeds CONSIST_TOL.
+          for cap in 1 8; do
+            echo "::group::CONSIST cap=$cap (dense f32)"
+            COLI_DENSE_I8=0 CONSIST=1 SNAP=qwen36_tiny_c \
+              ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+          # And once on the default dense int8 path, which the runs above never
+          # enter: both arms quantize identically, so the agreement must hold
+          # there too, and a placement that broke only one arm would show here.
+          echo "::group::CONSIST cap=8 (dense int8, the default)"
+          CONSIST=1 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json
+          echo "::endgroup::"
       - name: Quantize-at-load is bit-identical to quantize-after-load (dense int8 on)
         run: |
           cd c
