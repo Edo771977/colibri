@@ -1,0 +1,100 @@
+Qwen3.6-35B-A3B: dnout+attnout placement, re-measured on a clang build.
+19 September 2026.
+
+The placement A/B in docs/qwen36-cuda-tier.md read -7.77 ms/token on a
+gcc/MinGW-libgomp binary. The prediction on record was that the gain would
+SHRINK on clang, because placement pays by removing CPU reads and libgomp
+makes those reads cost about twice what libomp charges. This tests it.
+
+Host: Ryzen 9 7950X, 64 GB DDR5-5200, RTX 4070 Ti SUPER 16 GB, Windows 11.
+Model: Qwen/Qwen3.6-35B-A3B, Colibri int4 gs64. COLI_GPUS=0, 25-token prompt,
+128 generated. Both binaries from the same commit via `make -B`.
+
+  A  COLI_PLACE="experts=0,lmhead=0,dnproj=0"
+  B  COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"
+
+2x2 {gcc, clang} x {A, B}, arms alternated cA cB gA gB within each repetition,
+heat warmed then frozen and restored before every run. Unlike 19 September's
+run this session settles at a 98.1-98.2 % VRAM hit rate rather than 100 %, so
+arm B pays the expert-displacement cost that a fully resident session hides.
+
+--- session 1, 4 repetitions -----------------------------------------------
+
+  cA 33.60 33.10 33.40 33.30      cB 28.50 28.40 28.20 28.40
+  gA 54.50 55.80 56.50 71.70      gB 49.60 49.60 49.70 60.10
+
+--- session 2, 8 repetitions -----------------------------------------------
+
+  rip   cA     cB     gA     gB
+   1  33.10  28.30  79.40  67.70
+   2  33.20  28.90  54.30  49.00
+   3  33.50  28.50  54.90  49.80
+   4  33.30  28.20  56.10  49.50
+   5  33.50  28.50  74.50  76.00
+   6  33.40  28.90  55.40  49.60
+   7  33.10  30.20  68.40  78.60
+   8  34.30  28.20  67.50  63.00
+
+--- the gcc arm is not measurable by its mean -------------------------------
+
+Four of the eight gcc repetitions are disturbed (1, 5, 7, 8), and in two of
+them the B arm is SLOWER than A. Clang, which runs inside the same repetition
+minutes apart, stays between 33.10 and 34.30 for all eight. So this is not the
+machine slowing down under both: the gcc binary itself is unstable here, which
+is consistent with the wider relative spread the OpenMP-runtime record already
+reported for its gcc arm.
+
+More repetitions do not fix a recurrent disturbance. What does is the PAIRED
+delta: gA and gB run back to back inside a repetition, so their difference
+absorbs whatever both are suffering.
+
+  paired delta per repetition (session 2)
+    clang  -4.80 -4.30 -5.00 -5.10 -5.00 -4.50 -2.90 -6.10   median -4.90
+    gcc   -11.70 -5.30 -5.10 -6.60 +1.50 -5.80 +10.20 -4.50  median -5.20
+
+Clang across sessions: -4.97 (4 reps, mean), -4.71 (8 reps, mean), -4.90
+(8 reps, paired median). The clang number is stable at about -4.9.
+
+--- rows, clang, session 2 (means; this arm is stable) ----------------------
+
+  ms/token                A                  B               delta
+  step() total     33.43 (33.1-34.3)  28.71 (28.2-30.2)      -4.71
+  norm+out->dnout   5.50 (5.4-5.6)     2.44 (2.3-2.6)        -3.06
+  dn-sub proj       6.21 (6.0-6.5)     5.54 (5.4-5.8)        -0.68
+  attention->attnout 6.51 (6.4-6.7)    5.94 (5.7-6.1)        -0.57
+  lm_head           2.69 (2.6-2.8)     2.31 (2.3-2.3)        -0.38
+  take              0.69 (0.5-0.8)     0.27 (0.2-0.3)        -0.42
+  issue             2.32 (2.2-2.5)     2.08 (1.8-2.3)        -0.23
+  shared            4.02 (3.6-4.6)     4.24 (3.9-4.7)        +0.22
+  router            0.62 (0.6-0.6)     0.84 (0.6-1.0)        +0.22
+  cpu-miss          4.73 (4.2-5.3)     5.04 (4.7-5.6)        +0.31
+
+--- the prediction was wrong ------------------------------------------------
+
+The absolute gain does NOT shrink on clang: -4.90 against gcc's -5.20. What
+changes is its weight, and in the opposite direction to the prediction --
+-14.7 % of a 33.4 ms token against roughly -9.5 % of a 55 ms one. Placement
+matters MORE on a sane build, not less.
+
+The row that says why:
+
+  norm+out -> dnout    clang  5.50 -> 2.44   (-3.06)
+                       gcc    9.31 -> 6.13   (-3.19)
+
+Very different baselines, near-identical saving. What placement removes is one
+large streaming GEMV, and that is DRAM-bandwidth bound -- DRAM does not know
+which compiler built the host. libgomp's price is per-parallel-region overhead
+(54 us a region, measured in the OpenMP record), which lands on the many small
+operations -- router, shared expert, the gated norm -- not on the single large
+read being displaced. The original mechanism, "libgomp makes those reads cost
+twice as much so removing them saves twice as much", does not survive its own
+row.
+
+--- control rows ------------------------------------------------------------
+
+shared +0.22, router +0.22, cpu-miss +0.31, where 19 September had them flat
+(-0.09, +0.01, -0.09). cpu-miss has a candidate explanation: this session runs
+at 98 % rather than 100 %, so arm B's 0.31 GB of displaced experts costs real
+misses that a fully resident session hides. shared and router do not have one.
+They are small against -4.90 and do not overturn the result, but they are a
+difference from the earlier measurement and they are recorded, not explained.
