@@ -1116,6 +1116,49 @@ void qt_take(uint32_t mask,const float *val,int K,float *out){
     pthread_mutex_unlock(&G.mx);
 }
 
+/* The resident dense GEMVs -- lm_head, dnproj, dnout, attnout, attnproj --
+ * priced the only way that answers the question they raise. A 24 MB GEMV has
+ * one job, streaming its weights, so bytes over kernel time IS the kernel's
+ * bandwidth; bytes over WALL time is what the caller actually gets, and the two
+ * diverging is the round-trip. Printing the milliseconds without the GB/s would
+ * leave everyone to do this division by hand and some of them to skip it.
+ *
+ * indent is "" for the total and "  " for a card, so a two-line block on one
+ * GPU does not grow a redundant per-device copy of itself. */
+static void dense_stats_one(const char *indent, const char *label, int device){
+    uint64_t dcalls=0, dbytes=0; double dh2d=0, dker=0, dd2h=0, dwall=0;
+    coli_cuda_dense_stats(device,&dcalls,&dbytes,&dh2d,&dker,&dd2h,&dwall);
+    if(!(dcalls && dwall>0)) return;
+    double gb = (double)dbytes/1073741824.0;
+    double rt = 100.0*(dwall-dh2d-dker-dd2h)/dwall;
+    fprintf(stderr,"[qtier] %s%s: %llu calls, %.2f GB (weights+scales) | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms, wall %.0f ms\n",
+        indent, label, (unsigned long long)dcalls, gb, dh2d, dker, dd2h, dwall);
+    /* A negative round-trip share means the CPU clock and the GPU timeline
+     * disagreed by more than the gap -- possible on very short calls summed
+     * over many. Say that instead of printing a percentage below zero, which
+     * reads as a defect in the engine rather than in the measurement. */
+    if(rt < 0)
+        fprintf(stderr,"[qtier] %s  kernel %.0f GB/s | wall %.0f GB/s | round-trip below clock resolution\n",
+            indent, dker>0 ? gb/(dker/1000.0) : 0.0, gb/(dwall/1000.0));
+    else
+        fprintf(stderr,"[qtier] %s  kernel %.0f GB/s | wall %.0f GB/s | round-trip %.0f %% of wall\n",
+            indent, dker>0 ? gb/(dker/1000.0) : 0.0, gb/(dwall/1000.0), rt);
+}
+
+/* One card: the total IS that card, so print it once. Two or more: auto_place
+ * splits the trunk by budget and the cards need not be the same model, so a
+ * single blended GB/s is an average of numbers that belong to different
+ * hardware. Break it out, and keep the total for the step-time arithmetic. */
+static void dense_stats_print(void){
+    dense_stats_one("", "dense_stats", -1);
+    if(G.ndev > 1)
+        for(int i=0;i<G.ndev;i++){
+            char label[32];
+            snprintf(label,sizeof label,"dev %d dense",G.dev[i]);
+            dense_stats_one("  ", label, G.dev[i]);
+        }
+}
+
 void qt_stats(void){
     if(!G.on) return;
     uint64_t hits=0; size_t res=0;
@@ -1149,32 +1192,7 @@ void qt_stats(void){
       else if(calls)
           fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | timings not recorded (set COLI_CUDA_PROFILE=1; mixed-format groups never record)\n",
               (unsigned long long)calls,(unsigned long long)ex); }
-    /* The resident dense GEMVs -- lm_head, dnproj, dnout, attnout, attnproj --
-     * priced the only way that answers the question they raise. A 24 MB GEMV
-     * has one job, streaming its weights, so bytes over kernel time IS the
-     * kernel's bandwidth; bytes over WALL time is what the caller actually
-     * gets, and the two diverging is the round-trip. Printing the milliseconds
-     * without the GB/s would leave everyone to do this division by hand and
-     * some of them to skip it. */
-    { uint64_t dcalls=0, dbytes=0; double dh2d=0, dker=0, dd2h=0, dwall=0;
-      coli_cuda_dense_stats(&dcalls,&dbytes,&dh2d,&dker,&dd2h,&dwall);
-      if(dcalls && dwall>0){
-          double gb = (double)dbytes/1073741824.0;
-          double rt = 100.0*(dwall-dh2d-dker-dd2h)/dwall;
-          fprintf(stderr,"[qtier] dense_stats: %llu calls, %.2f GB (weights+scales) | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms, wall %.0f ms\n",
-              (unsigned long long)dcalls, gb, dh2d, dker, dd2h, dwall);
-          /* A negative round-trip share means the CPU clock and the GPU
-           * timeline disagreed by more than the gap -- possible on very short
-           * calls summed over many. Say that instead of printing a percentage
-           * below zero, which reads as a defect in the engine rather than in
-           * the measurement. */
-          if(rt < 0)
-              fprintf(stderr,"[qtier]   kernel %.0f GB/s | wall %.0f GB/s | round-trip below clock resolution\n",
-                  dker>0 ? gb/(dker/1000.0) : 0.0, gb/(dwall/1000.0));
-          else
-              fprintf(stderr,"[qtier]   kernel %.0f GB/s | wall %.0f GB/s | round-trip %.0f %% of wall\n",
-                  dker>0 ? gb/(dker/1000.0) : 0.0, gb/(dwall/1000.0), rt);
-      } }
+    dense_stats_print();
 }
 
 static void dense_free_all(void){

@@ -74,8 +74,12 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *expert
  * the average -- and wall minus the three GPU phases prices the round-trip.
  * weight_bytes counts weights and scales, the traffic the kernel actually
  * reads. Optional symbol: a DLL predating it leaves the wrapper reporting
- * zeros rather than taking the backend down. */
-COLI_CUDA_DLLEXPORT void coli_cuda_dense_stats(uint64_t *calls, uint64_t *weight_bytes,
+ * zeros rather than taking the backend down.
+ * device < 0 sums every card; a device with no context reports zeros. The
+ * per-device form is not a separate export the way group_stats_device is,
+ * because this counter is new enough to have no callers to keep working. */
+COLI_CUDA_DLLEXPORT void coli_cuda_dense_stats(int device,
+                           uint64_t *calls, uint64_t *weight_bytes,
                            double *h2d_ms, double *kernel_ms,
                            double *d2h_ms, double *wall_ms);
 /* Per-device form of coli_cuda_group_stats; unknown devices return zeros. */

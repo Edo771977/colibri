@@ -69,7 +69,8 @@ typedef int            (*fn_device_integrated)(int device);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
-typedef void           (*fn_dense_stats)(uint64_t *calls, uint64_t *weight_bytes,
+typedef void           (*fn_dense_stats)(int device,
+                                         uint64_t *calls, uint64_t *weight_bytes,
                                          double *h2d_ms, double *kernel_ms,
                                          double *d2h_ms, double *wall_ms);
 typedef void           (*fn_group_stats_device)(int device, uint64_t *calls,
@@ -1587,7 +1588,8 @@ void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
     g_cuda.group_stats(calls, experts, rows, h2d_ms, kernel_ms, d2h_ms);
 }
 
-void coli_cuda_dense_stats(uint64_t *calls, uint64_t *weight_bytes,
+void coli_cuda_dense_stats(int device,
+                           uint64_t *calls, uint64_t *weight_bytes,
                            double *h2d_ms, double *kernel_ms,
                            double *d2h_ms, double *wall_ms){
     if(!g_cuda.available || !g_cuda.dense_stats){
@@ -1596,7 +1598,7 @@ void coli_cuda_dense_stats(uint64_t *calls, uint64_t *weight_bytes,
         if(d2h_ms)*d2h_ms=0; if(wall_ms)*wall_ms=0;
         return;
     }
-    g_cuda.dense_stats(calls, weight_bytes, h2d_ms, kernel_ms, d2h_ms, wall_ms);
+    g_cuda.dense_stats(device, calls, weight_bytes, h2d_ms, kernel_ms, d2h_ms, wall_ms);
 }
 
 void coli_cuda_group_stats_device(int device, uint64_t *calls, uint64_t *experts,
