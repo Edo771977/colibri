@@ -5797,16 +5797,30 @@ class BatchCompletionHTTPTest(unittest.TestCase):
     def test_client_disconnect_mid_batch_stops_further_submits(self):
         # Built, not hoped for (#1329): the engine signals an Event only
         # once the third member has actually finished, and then blocks on
-        # a second Event that the test sets only after confirming the
-        # socket is closed. client_disconnected() is wrapped so the
-        # moment it first observes the closed socket is itself an Event
-        # -- the batch loop raises ClientCancelled synchronously inside
-        # that same call, before any further engine submit, so waiting
-        # for this Event (rather than a fixed sleep) is enough to know
-        # engine.calls has already reached its final count.
+        # a second Event that the test sets only after closing the
+        # socket. client_disconnected() is wrapped so the moment it first
+        # observes the closed socket is itself an Event -- the batch loop
+        # raises ClientCancelled synchronously inside that same call,
+        # before any further engine submit, so waiting for this Event
+        # (rather than a fixed sleep) is enough to know engine.calls has
+        # already reached its final count.
+        #
+        # What close() does NOT do is put the RST in the server's receive
+        # queue: it hands the segment to the local stack and returns.
+        # Releasing the engine on the next line therefore raced the
+        # kernel -- on Linux loopback the reset is there before the loop
+        # looks, on a macOS runner it was not, and the loop read a live
+        # client and submitted a fourth member (4 != 3, `check` on main
+        # at 24cf9b7). So the wrapper below re-asks for a bounded window
+        # once the test has closed its end. It buys the RST time to
+        # arrive; it does not weaken what is asserted, because the answer
+        # still comes from the real client_disconnected() and a server
+        # that genuinely never notices still fails this test -- five
+        # seconds later instead of at once.
         member_three_done = threading.Event()
         resume = threading.Event()
         disconnect_observed = threading.Event()
+        socket_closed = threading.Event()
 
         class DisconnectAfterThirdEngine(ScriptedEngine):
             def generate(self, *args, **kwargs):
@@ -5830,6 +5844,11 @@ class BatchCompletionHTTPTest(unittest.TestCase):
 
         def watched_client_disconnected(self):
             seen = original_client_disconnected(self)
+            if not seen and socket_closed.is_set():
+                deadline = time.monotonic() + 5
+                while not seen and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    seen = original_client_disconnected(self)
             if seen:
                 disconnect_observed.set()
             return seen
@@ -5849,8 +5868,9 @@ class BatchCompletionHTTPTest(unittest.TestCase):
             # immediately.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
             sock.close()
+            socket_closed.set()
             resume.set()
-            self.assertTrue(disconnect_observed.wait(5),
+            self.assertTrue(disconnect_observed.wait(10),
                             "server's own client_disconnected() never observed "
                             "the closed socket")
         self.assertEqual(len(engine.calls), 3,
