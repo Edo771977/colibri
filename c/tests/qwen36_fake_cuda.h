@@ -98,6 +98,20 @@ int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const
     return 0;
 }
 const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
+/* The resident dense GEMV counters. The fake records no timings -- it has no
+ * GPU timeline to record -- so this reports zero calls and qt_stats prints
+ * nothing, which is the same thing a real backend does with the profiling flag
+ * off. It exists so the tier tests link. */
+void coli_cuda_dense_stats(int device,
+                           uint64_t *calls, uint64_t *weight_bytes,
+                           double *h2d_ms, double *kernel_ms,
+                           double *d2h_ms, double *wall_ms) {
+    (void)device;
+    if (calls) *calls = 0;              if (weight_bytes) *weight_bytes = 0;
+    if (h2d_ms) *h2d_ms = 0;            if (kernel_ms) *kernel_ms = 0;
+    if (d2h_ms) *d2h_ms = 0;            if (wall_ms) *wall_ms = 0;
+}
+
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d, double *kernel, double *d2h) {
     if (calls) *calls = 0; if (experts) *experts = 0; if (rows) *rows = 0;

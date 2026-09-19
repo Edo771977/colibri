@@ -67,6 +67,21 @@ COLI_CUDA_DLLEXPORT int coli_cuda_device_integrated(int device);
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
+/* Resident dense GEMVs (coli_cuda_matmul): lm_head, dnproj, dnout, attnout,
+ * attnproj. Filled only under COLI_CUDA_PROFILE, and zero otherwise.
+ * wall_ms is the H2D -> D2H window, not the whole function -- the tensor
+ * upload and the buffer reserve sit before it, so a first call does not poison
+ * the average -- and wall minus the three GPU phases prices the round-trip.
+ * weight_bytes counts weights and scales, the traffic the kernel actually
+ * reads. Optional symbol: a DLL predating it leaves the wrapper reporting
+ * zeros rather than taking the backend down.
+ * device < 0 sums every card; a device with no context reports zeros. The
+ * per-device form is not a separate export the way group_stats_device is,
+ * because this counter is new enough to have no callers to keep working. */
+COLI_CUDA_DLLEXPORT void coli_cuda_dense_stats(int device,
+                           uint64_t *calls, uint64_t *weight_bytes,
+                           double *h2d_ms, double *kernel_ms,
+                           double *d2h_ms, double *wall_ms);
 /* Per-device form of coli_cuda_group_stats; unknown devices return zeros. */
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats_device(
     int device, uint64_t *calls, uint64_t *experts, uint64_t *rows,

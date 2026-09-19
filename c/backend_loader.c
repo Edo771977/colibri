@@ -69,6 +69,10 @@ typedef int            (*fn_device_integrated)(int device);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
+typedef void           (*fn_dense_stats)(int device,
+                                         uint64_t *calls, uint64_t *weight_bytes,
+                                         double *h2d_ms, double *kernel_ms,
+                                         double *d2h_ms, double *wall_ms);
 typedef void           (*fn_group_stats_device)(int device, uint64_t *calls,
                                                 uint64_t *experts, uint64_t *rows,
                                                 double *h2d_ms, double *kernel_ms,
@@ -167,6 +171,7 @@ static struct {
     fn_stats           stats;
     fn_group_stats     group_stats;
     fn_group_stats_device group_stats_device;
+    fn_dense_stats     dense_stats;
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
     fn_expert_group_pinned expert_group_pinned;
@@ -1418,6 +1423,10 @@ static int coli_cuda_load(void){
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(group_stats_device, fn_group_stats_device)
+    /* Optional on purpose, like device_integrated above: a coli_cuda.dll built
+     * before this symbol existed would otherwise fail to load entirely and take
+     * the whole GPU backend down over one diagnostic counter. */
+    RESOLVE_OPT(dense_stats, fn_dense_stats)
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE_OPT(expert_group_pinned, fn_expert_group_pinned)
@@ -1577,6 +1586,19 @@ void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
         return;
     }
     g_cuda.group_stats(calls, experts, rows, h2d_ms, kernel_ms, d2h_ms);
+}
+
+void coli_cuda_dense_stats(int device,
+                           uint64_t *calls, uint64_t *weight_bytes,
+                           double *h2d_ms, double *kernel_ms,
+                           double *d2h_ms, double *wall_ms){
+    if(!g_cuda.available || !g_cuda.dense_stats){
+        if(calls)*calls=0; if(weight_bytes)*weight_bytes=0;
+        if(h2d_ms)*h2d_ms=0; if(kernel_ms)*kernel_ms=0;
+        if(d2h_ms)*d2h_ms=0; if(wall_ms)*wall_ms=0;
+        return;
+    }
+    g_cuda.dense_stats(device, calls, weight_bytes, h2d_ms, kernel_ms, d2h_ms, wall_ms);
 }
 
 void coli_cuda_group_stats_device(int device, uint64_t *calls, uint64_t *experts,

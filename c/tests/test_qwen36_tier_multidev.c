@@ -129,6 +129,15 @@ int main(void) {
     float out[D]; memset(out, 0, sizeof out);
     qt_take(mask2, val, 32, out);   /* take returns NULL in the fake backend; fine */
 
+    /* qt_stats had no caller in the whole test suite, so its per-device loops
+     * -- the dense_stats one added with the per-card breakdown, and the VRAM
+     * one before it -- were shipped unexecuted. This does not assert the
+     * numbers (the fake records no timings, so the dense block prints nothing
+     * and the real index lookup lives in the nvcc-only backend); it runs the
+     * iteration and the snprintf under ASan on a TWO-device G, which is the
+     * shape that indexes out of bounds if the loop is wrong. */
+    qt_stats();
+
     qt_shutdown();
 
     if (fails) { printf("test_qwen36_tier_multidev: %d fallimenti\n", fails); return 1; }
