@@ -338,6 +338,21 @@ g_qt_cpu += _q2 - _q1;
 `g_qt_cpu` is the whole CPU-side overlap window, and the shared expert is
 computed inside it deliberately, to cover the GPU's latency. So it counts work
 that is neither a miss nor waste, and that the `(shared)` row already reports.
+
+**The counter is now split, because writing this paragraph did not stop it
+happening again.** A later session read `cpu-miss 4.95` off a profile, called
+the misses a fifth of the token, and published that before checking this page.
+`cpu-miss` is the miss loop alone from here on, and the overlap window is
+reported separately as `shared-ovl`:
+
+```
+[timers]   qtier: issue 1.76 | cpu-miss 0.78 | take 0.53 | shared-ovl 4.17 ms/token
+```
+
+`shared-ovl` is last in the line although it happens between `cpu-miss` and
+`take`, so that scripts parsing the original three keys keep matching. It is
+the same work the `(shared)` row reports; the two should agree, and a gap
+between them is CPU-side miss work this split did not capture.
 Subtracting the two says how much of it really was misses:
 
 | | `cpu-miss` | `(shared)` | difference |
