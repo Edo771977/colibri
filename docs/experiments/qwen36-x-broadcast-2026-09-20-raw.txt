@@ -1,0 +1,101 @@
+COLI_CUDA_X_BCAST: one input row broadcast to every expert chunk
+=================================================================
+RESULT: correct, saves the traffic it was meant to save, and is worth
+ZERO on the token. Predicted, and the prediction is the useful part.
+
+Box      : Windows, RTX 4070 Ti SUPER 16 GB (sm_89), CUDA 13.4, CUDA_DLL=1
+Engine   : qwen36_clang.exe (LLVM libomp), rebuilt by the script
+Model    : C:\modelli\qwen36_i4_gs64, prompt25.txt (25 prompt tokens)
+Script   : misure-bcast.ps1 (2 arms x 6 alternated reps at N_NEW=128, heat
+           frozen after warm-up, then one COLI_CUDA_PROFILE pass per arm at
+           N_NEW=64)
+Dense    : COLI_CUDA_I8_ROWS=2 pinned in both arms (the shipped default)
+Guards   : DLL newer than backend_cuda.cu; engine newer than its sources;
+           every run announced its path from inside the running binary
+           ("[qtier] expert input: ...")
+
+
+1. THE MEASUREMENT
+------------------
+
+  arm        step() median   paired delta vs bcast=0
+  bcast=0      24.25            --
+  bcast=1      24.35            0.00  [0.20 -0.10 0.00 -0.50 0.00 0.30]
+
+Six pairs, three of each sign, per-arm spread 0.50 (2 %). There is no
+effect on the token. Not a small effect: none that this can resolve.
+
+  COLI_CUDA_PROFILE, same 3520 calls / 28160 experts in both arms:
+
+  arm        h2d     kernel    d2h
+  bcast=0    69 ms   554 ms    30 ms
+  bcast=1    55 ms   550 ms    30 ms
+
+The traffic saving is real and lands where it was aimed: -20 % of h2d.
+
+
+2. WHY IT BUYS NOTHING
+----------------------
+
+Predicted before the run, in the commit message and the PR:
+
+  "the H2D drop will be 8x and will buy NOTHING on the token -- take is
+   0.53 ms/token, so the GPU side of this path is not what the token waits
+   for [...] the host memcpy is the only part on the critical path, inside
+   issue (1.76 ms/token); 0.3-0.5 ms/token is the estimate to beat."
+
+Half right. The GPU half was right for the stated reason. The host-memcpy
+half was wrong: 4.5 MB a token of memcpy removed, and the token did not
+move. Either it was never 4.5 MB of real cost (8 KiB copies inside a
+2 GB/s-class L2-warm path are cheap) or it is hidden behind something else
+in `issue`. The estimate was an arithmetic guess at memcpy bandwidth, not a
+measurement of `issue`, and it should not have been offered as a number.
+
+This is the SECOND path in a row to come back at zero for the same reason.
+grouped_down_g4r made the expert kernels 21.5 % faster: zero on the token,
+and a regression from SM contention. This makes the expert input traffic
+8x smaller: zero. `take` is 0.53 ms of a 24 ms token. The expert path --
+its kernels AND its transfers -- is not what the token is waiting for, and
+that is now measured twice rather than argued once.
+
+
+3. A SUB-FINDING WORTH MORE THAN THE CHANGE
+-------------------------------------------
+
+h2d fell only 20 %, not the 8x the payload fell.
+
+  bcast=0: 69 ms / 3520 copies = 19.6 us per 64 KiB copy  -> 3.3 GB/s
+  bcast=1: 55 ms / 3520 copies = 15.6 us per  8 KiB copy  -> 0.5 GB/s
+
+The transfer is dominated by PER-CALL OVERHEAD, not by bytes. 15.6 us for
+8 KiB on a PCIe 4.0 x16 link is all latency. That is the same ~10 us/call
+WDDM figure docs/qwen36.md derives for `issue` from a different direction,
+and it says the lever on this path is the NUMBER of driver calls, not their
+size -- which is what CUDA graphs address and payload reduction cannot.
+
+
+4. WHAT WENT WRONG ON THE WAY
+-----------------------------
+
+Two bugs, both mine, both worth recording because of what caught them.
+
+(a) The readback used xb (input size) where it needed yb (output size).
+    With a broadcast input xb is ONE row, so qt_take summed stale pinned
+    memory into seven of eight experts. It presented as a 14 % SLOWDOWN
+    with a 90.4 % hit rate, and it was not slow -- it was wrong: the
+    generation had diverged onto different experts. hits+miss was 48640 in
+    both arms, identical, which is what gave it away. A wrong-answer bug
+    wearing a performance regression's clothes, and the d2h counter (30 ms
+    -> 17 ms) had said so plainly for an hour before anyone read it.
+
+(b) Adding GroupDesc.xoff zero-filled it in five hand-built literals in
+    tests/, because C++ aggregate initialisation does that silently. Only
+    the literals whose chunks start at row 0 survived. test_fp8_cuda caught
+    it at 76777 mismatches.
+
+Both were caught by tests that already existed. Neither was caught before
+the sweep, because the sweep went first. `make cuda-test` costs 30 seconds
+and would have caught (a) at once: tests/test_grouped_g4_cuda.cu compares
+every output row of a broadcast issue against a duplicated one, bitwise.
+Three quarters of the time lost on this change was spent measuring code
+that a test in the same commit already knew was broken.
