@@ -1078,6 +1078,144 @@ __global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
 }
 
+/* COLI_CUDA_DOWN_ROWS: R output rows per block for grouped_down_g4.
+ *
+ * The down projection is the worst-shaped kernel in the expert path. Its grid
+ * is (D, rows, chunks) -- one block per output row -- and each block reads the
+ * whole activation row. For qwen36 (D=2048, I=512, top-8) that is 16,384
+ * blocks of 256 threads per launch, in which every thread reads exactly ONE
+ * packed byte ((I+1)/2 = 256 bytes over 256 threads) and then joins a 256-wide
+ * reduction with nine __syncthreads(). It also moves 2048 bytes of x per block
+ * against 256 bytes of weights: x is 8x the weight traffic, served by L2
+ * rather than DRAM but paid for in latency at every one of those blocks.
+ *
+ * R rows per block is the same change quant_matmul_i8r made to the dense GEMV:
+ * x is read once per R rows, the grid drops by R, and each thread issues R
+ * independent byte loads instead of one -- which is what the dense kernel's
+ * Nsight profile said this family actually wants (memory-LATENCY-bound, not
+ * bandwidth-bound). The per-thread partition of the input, the multiplication
+ * order (x * nibble * scale), the reduction tree and the epilogue are all
+ * untouched, so every output is BITWISE identical to grouped_down_g4's and
+ * this cannot move a logit. tests/test_grouped_down_rows_cuda.cu asserts that
+ * with memcmp.
+ *
+ * MEASURED, AND IT LOSES -- leave it off. On an RTX 4070 Ti SUPER the kernel
+ * does exactly what the paragraph above predicts: expert-group kernel time
+ * 558 -> 438 ms at R=4, and qtier take 0.53 -> 0.33 ms/token, two independent
+ * measurements agreeing the group finishes earlier. The token still gets 5 %
+ * SLOWER (24.05 -> 25.20 ms/token, 4/4 repetitions same sign).
+ *
+ * Two reasons, and the first is the one that matters for anyone else working
+ * on this path. moe_total does not move: take was 0.53 ms of a 24 ms token,
+ * so these kernels were ALREADY off the critical path, overlapped with CPU
+ * work that finishes later, and 1.9 ms/token of freed GPU time had nowhere to
+ * go. Second, 91 % of the regression lands on dn-sub proj, norm+out and
+ * lm_head -- the placed dense GEMVs, which run on stream 0 alongside the
+ * expert group: 4,096 long-lived blocks holding 4 KB of shared memory each
+ * leave fewer scheduling slots than 16,384 that retire almost at once.
+ *
+ * It stays in the tree because it is bitwise identical (so it costs nothing
+ * while unset), because it is the only way to reproduce that finding, and
+ * because it stops being a bad idea the day the expert path does land on the
+ * critical path -- a larger batch, or a configuration where cpu-miss is
+ * fixed. docs/experiments/qwen36-expert-down-rows-2026-09-20-raw.txt */
+template<int R>
+__global__ static void grouped_down_g4r(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    int o0=(int)blockIdx.x*R, s=(int)blockIdx.y, c=(int)blockIdx.z;
+    GroupDesc d=desc[c]; if(s>=d.rows)return;
+    int nr = D-o0 < R ? D-o0 : R;
+    int dgs = d.dgs>0?d.dgs:I;
+    size_t ng = (size_t)((I+dgs-1)/dgs), rb=(size_t)((I+1)/2);
+    const uint8_t *rw[R]; const float *dsc[R];
+#pragma unroll
+    for(int r=0;r<R;r++){
+        /* the tail block clamps to o0 instead of predicating the hot loop:
+         * those lanes compute a duplicate row nobody stores. */
+        int o = o0 + (r<nr?r:0);
+        rw[r]=(const uint8_t*)d.d+(size_t)o*rb;
+        dsc[r]=d.ds+(size_t)o*ng;
+    }
+    const float *xs=x+(size_t)(d.offset+s)*I;
+    float acc[R];
+#pragma unroll
+    for(int r=0;r<R;r++) acc[r]=0.0f;
+    for(int b=threadIdx.x;b<(int)rb;b+=blockDim.x){
+        int i=b*2;
+        float a[R],z[R];
+#pragma unroll
+        for(int r=0;r<R;r++) unpack_s4(rw[r][b],&a[r],&z[r]);
+        float x0=xs[i], x1=(i+1<I)?xs[i+1]:0.0f;
+        /* one integer division per iteration, not R: dgs is a runtime value,
+         * so i/dgs is a real divide and the unrolled body below would be
+         * relying on CSE to notice it is loop-invariant. */
+        int gi=i/dgs;
+#pragma unroll
+        for(int r=0;r<R;r++){
+            float sv=dsc[r][gi];
+            acc[r]+=x0*a[r]*sv;
+            if(i+1<I)acc[r]+=x1*z[r]*sv;
+        }
+    }
+    __shared__ float p[R][256];
+#pragma unroll
+    for(int r=0;r<R;r++) p[r][threadIdx.x]=acc[r];
+    __syncthreads();
+    for(int n=128;n;n>>=1){
+        if(threadIdx.x<(unsigned)n){
+#pragma unroll
+            for(int r=0;r<R;r++) p[r][threadIdx.x]+=p[r][threadIdx.x+n];
+        }
+        __syncthreads();
+    }
+    if(threadIdx.x<(unsigned)nr){
+        int r=(int)threadIdx.x;
+        y[(size_t)(d.offset+s)*D+o0+r]=p[r][0];
+    }
+}
+
+/* 0/unset keeps the original one-row-per-block kernel; 2, 4 and 8 are the
+ * instantiated widths; anything else reads as off rather than rounding. */
+static int down_rows_mode(void){
+    const char *e=getenv("COLI_CUDA_DOWN_ROWS");
+    if(!e||!*e) return 0;
+    char *end; long v=strtol(e,&end,10);
+    if(*end) return 0;
+    return (v==2||v==4||v==8)?(int)v:0;
+}
+
+/* Launch counter, read by tests/test_grouped_down_rows_cuda.cu: the
+ * bitwise-identity contract is ALSO satisfied by a dispatch that never fires,
+ * so the test needs a way to tell "identical" from "never ran". */
+static uint64_t g_downr_launches;
+
+static void down_g4_launch(float *y,const float *x,const GroupDesc *dev,
+                           int D,int I,int max_rows,int count,cudaStream_t st){
+    int R=down_rows_mode();
+    if(R){
+        /* Say so once, on stderr, the first time the branch actually fires.
+         *
+         * Under CUDA_DLL=1 every kernel here lives in coli_cuda.dll, which only
+         * `make cuda-dll` rebuilds: a measurement script that rebuilds the
+         * engine and not the DLL sets COLI_CUDA_DOWN_ROWS, changes nothing, and
+         * reports a clean flat result. That cost a day on the dense GEMV. A
+         * line in the log is the cheapest way for a run to prove the toggle
+         * reached the binary it is running, rather than the one on disk when
+         * the script started. Silent when the variable is unset, so the default
+         * path's output is unchanged. */
+        static int announced;
+        if(!announced){ announced=1;
+            fprintf(stderr,"[cuda] expert down-rows active: R=%d\n",R); }
+        g_downr_launches++;
+        dim3 og((unsigned)((D+R-1)/R),(unsigned)max_rows,(unsigned)count);
+        if(R==2)      grouped_down_g4r<2><<<og,256,0,st>>>(y,x,dev,D,I);
+        else if(R==4) grouped_down_g4r<4><<<og,256,0,st>>>(y,x,dev,D,I);
+        else          grouped_down_g4r<8><<<og,256,0,st>>>(y,x,dev,D,I);
+        return;
+    }
+    dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+    grouped_down_g4<<<og,256,0,st>>>(y,x,dev,D,I);
+}
+
 /* fmt=8 fp8-e4m3 variants: same structure as the g4 kernels, but one byte per
  * weight (decoded through c_e4m3) and the scale is per 128x128 BLOCK of the
  * member's [O,I] matrix — sc[(o/128)*ceil(I/128) + i/128]. The block edge is a
@@ -2316,9 +2454,9 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     }else if(all_q4&&any_g4){
         /* grouped-int4 (fmt=4) present: per-group scales (#334). fmt=2 members
          * ride along as the ng=1 special case. silu fused in the dual epilogue. */
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        down_g4_launch(ctx->y,ctx->gate,dev,D,I,max_rows,count,ctx->stream);
     }else{
         /* generic path decodes fmt 0/1/2/3 only — refuse everything else rather
          * than whitelist known offenders: a fmt=4 group that slipped the gates
@@ -2521,12 +2659,11 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
          * applied one per-row scale to a grouped container -> wrong output. */
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
-        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         /* silu is fused in the dual kernel's epilogue (like the sync path):
          * an extra silu_mul here would re-apply it against the never-written
          * ctx->up buffer. */
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        down_g4_launch(ctx->y,ctx->gate,dev,D,I,max_rows,count,ctx->stream);
     } else {
         /* Fallback runs quant_matmul with gs=0,ng=1 — per-row-scale semantics.
          * That is only correct for fmt 0/1/2/3: refuse group/block-scaled
