@@ -1110,9 +1110,13 @@ __global__ static void grouped_down_g4r(float *y,const float *x,const GroupDesc 
 #pragma unroll
         for(int r=0;r<R;r++) unpack_s4(rw[r][b],&a[r],&z[r]);
         float x0=xs[i], x1=(i+1<I)?xs[i+1]:0.0f;
+        /* one integer division per iteration, not R: dgs is a runtime value,
+         * so i/dgs is a real divide and the unrolled body below would be
+         * relying on CSE to notice it is loop-invariant. */
+        int gi=i/dgs;
 #pragma unroll
         for(int r=0;r<R;r++){
-            float sv=dsc[r][i/dgs];
+            float sv=dsc[r][gi];
             acc[r]+=x0*a[r]*sv;
             if(i+1<I)acc[r]+=x1*z[r]*sv;
         }
