@@ -108,6 +108,28 @@ typedef struct {
     /* Same tri-state as ev_grp, for the resident dense GEMV path. */
     cudaEvent_t ev_dm[4]; int ev_dm_ok;
     void *group_desc; size_t group_desc_cap;
+    /* Host side of the descriptor upload. It used to be a stack local in
+     * coli_cuda_expert_group_issue_x, which a CUDA graph cannot carry: a graph
+     * records the memcpy's SOURCE ADDRESS, and a stack frame is gone by the
+     * time the graph replays. Pinned and per-context, so the address is fixed
+     * for the life of the process and only the CONTENT changes between
+     * launches -- which is exactly what a replayed graph needs. */
+    void *host_desc; size_t host_desc_cap;
+    /* COLI_CUDA_GRAPH: one instantiated graph per `count` (1..8 resident
+     * experts), captured lazily on the first launch at that count.
+     *
+     * A graph is a promise that nothing about the sequence changes except the
+     * bytes in the buffers it points at. Two things can break that promise,
+     * and both are checked rather than assumed: a reserve() that reallocates
+     * one of x/y/gate/up/group_desc (buf_gen counts those, and a mismatch
+     * throws the graphs away), and the profiling events, which the graph path
+     * refuses to run under at all -- four cudaEventRecord inside a capture
+     * would bake the timing branch into the graph, so COLI_CUDA_PROFILE=1
+     * takes the ordinary path and measures the ordinary path. */
+#if COLI_GPU_HAS_GRAPH
+    cudaGraphExec_t graph_exec[9]; unsigned graph_gen[9];
+#endif
+    unsigned buf_gen;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
 #ifdef COLI_ANS
@@ -1446,6 +1468,29 @@ static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
 }
 
+/* Same as reserve_pinned, for a buffer that is not floats. The descriptor
+ * staging needs to be pinned for two reasons at once: cudaMemcpyAsync from
+ * pageable memory is not capture-safe, and a graph records the SOURCE
+ * ADDRESS, so it has to be one that outlives the call. */
+static int reserve_pinned_bytes(void **ptr,size_t *cap,size_t bytes){
+    if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
+}
+
+/* COLI_CUDA_GRAPH: replay the expert group as one cudaGraphLaunch instead of
+ * five driver calls. Off until measured -- two previous attempts at this path
+ * were correct and worth nothing, and this one is only worth something if
+ * `issue` (1.76 ms/token of CPU spent LAUNCHING, per COLI_TIMERS) is really
+ * on the critical path. */
+static int graph_mode(void){
+#if COLI_GPU_HAS_GRAPH
+    const char *e=getenv("COLI_CUDA_GRAPH");
+    return e&&*e&&*e!='0';
+#else
+    return 0;
+#endif
+}
+
 static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
@@ -1627,6 +1672,14 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
+        if (ctx->host_desc) cudaFreeHost(ctx->host_desc);
+        ctx->host_desc=nullptr; ctx->host_desc_cap=0;
+#if COLI_GPU_HAS_GRAPH
+        /* Before the stream goes: an instantiated graph belongs to it. */
+        for(int gi=0;gi<9;gi++) if(ctx->graph_exec[gi]){
+            cudaGraphExecDestroy(ctx->graph_exec[gi]);
+            ctx->graph_exec[gi]=nullptr; ctx->graph_gen[gi]=0; }
+#endif
         if (ctx->ev_grp_ok>0) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_grp[e]); }
         ctx->ev_grp_ok=0;
         if (ctx->ev_dm_ok>0) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_dm[e]); }
@@ -2592,11 +2645,32 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
      * x_rows rows, y still carries one per expert row. */
     size_t xb=(size_t)x_rows*D*sizeof(float), yb=(size_t)total*D*sizeof(float),
            ib=(size_t)total*I*sizeof(float);
+    /* A graph points at addresses. reserve() only grows, so in steady state
+     * nothing moves -- but the first calls do grow these, and a graph captured
+     * before that points at freed memory. Rather than assume warm-up is over,
+     * watch the pointers: any reallocation bumps buf_gen and every graph
+     * captured under the old generation is thrown away. */
+    const void *pre[5]={ctx->x,ctx->y,ctx->gate,ctx->up,ctx->group_desc};
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,yb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
        !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))||
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,yb)) return 0;
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,yb)||
+       !reserve_pinned_bytes(&ctx->host_desc,&ctx->host_desc_cap,
+                             (size_t)count*sizeof(GroupDesc))) return 0;
+    if(pre[0]!=ctx->x||pre[1]!=ctx->y||pre[2]!=ctx->gate||pre[3]!=ctx->up||
+       pre[4]!=ctx->group_desc){
+        ctx->buf_gen++;
+#if COLI_GPU_HAS_GRAPH
+        /* The signature check alone would stop them being USED; they still
+         * have to be freed, or a run that keeps growing its buffers keeps a
+         * dead graph per generation. */
+        for(int gi=0;gi<9;gi++) if(ctx->graph_exec[gi]){
+            cudaGraphExecDestroy(ctx->graph_exec[gi]);
+            ctx->graph_exec[gi]=nullptr; ctx->graph_gen[gi]=0; }
+#endif
+    }
+    std::memcpy(ctx->host_desc,host,(size_t)count*sizeof(GroupDesc));
     std::memcpy(ctx->host_x,x,xb);
     /* Timing is opt-in because measuring it changes it: four cudaEventRecord
      * per call, 40 calls a token, is launch overhead added to the path whose
@@ -2616,17 +2690,66 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         ctx->ev_grp_ok=ok?1:-1;
     }
     ctx->group_timed=gprof&&ctx->ev_grp_ok>0;
-    if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
+    if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,ctx->host_desc,
+                                (size_t)count*sizeof(GroupDesc),
                                 cudaMemcpyHostToDevice,ctx->stream),
-                "expert group issue descriptors")) return 0;
+                "expert group issue descriptors")){
+#if COLI_GPU_HAS_GRAPH
+        /* A return inside a stream capture leaves the stream captured, and
+         * every later launch on it fails. Close it before leaving. */
+        if(capturing_){ cudaGraph_t g_=nullptr; cudaStreamEndCapture(ctx->stream,&g_);
+                        if(g_) cudaGraphDestroy(g_); cudaGetLastError(); }
+#endif
+        return 0;
+    }
     /* ev_grp[0] goes AFTER the descriptor copy because expert_group_impl puts
      * ev[0] after its own: "h2d" is already a defined quantity in this file,
      * and both paths add into the same counter. Widening it here would make
      * the printed total the sum of two different measurements -- which is the
      * failure this instrumentation exists to end, not to repeat. */
+    /* Which of the five dispatch arms will run. Computed HERE, before
+     * anything is enqueued, because the graph is keyed on it: a group whose
+     * formats change must not replay a graph captured for other kernels.
+     * Only arms 3 and 4 are ever captured -- arm 1 can `return 0` in the
+     * middle of its sequence (e8_rot_rows_dev) and arm 5 can return before
+     * launching anything, and a return inside a stream capture leaves the
+     * stream captured. */
+    int w4p_=!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED"));
+    int branch_= all_e8?1 : all_f8?2 : (all_s4&&w4p_)?3 : (all_q4&&any_g4)?4 : 5;
+    unsigned gsig_=(ctx->buf_gen<<8)|((unsigned)branch_<<4)|(unsigned)count;
+    int graphable_= graph_mode() && !ctx->group_timed && x_rows==1 &&
+                    count>=1 && count<=8 && (branch_==3||branch_==4);
+#if COLI_GPU_HAS_GRAPH
+    if(graphable_ && ctx->graph_exec[count] && ctx->graph_gen[count]==gsig_){
+        /* Everything the launch depends on is already in the graph except the
+         * CONTENTS of host_desc and host_x, which were just refreshed above.
+         * One driver call replaces the descriptor copy, the input copy, two
+         * kernels and the readback. */
+        if(!cuda_ok(cudaGraphLaunch(ctx->graph_exec[count],ctx->stream),
+                    "expert group graph launch")) return 0;
+        ctx->group_pending=1; ctx->group_pending_bytes=yb;
+        return 1;
+    }
+    int capturing_=0;
+    if(graphable_ && !(ctx->graph_exec[count]&&ctx->graph_gen[count]==gsig_) &&
+       ctx->graph_gen[count]!=gsig_){
+        /* graph_gen == gsig with a null exec means "tried at this signature
+         * and failed"; do not retry every call. */
+        capturing_ = cudaStreamBeginCapture(ctx->stream,
+                        cudaStreamCaptureModeThreadLocal)==cudaSuccess;
+    }
+#endif
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[0],ctx->stream);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
-                "expert group issue upload")) return 0;
+                "expert group issue upload")){
+#if COLI_GPU_HAS_GRAPH
+        /* A return inside a stream capture leaves the stream captured, and
+         * every later launch on it fails. Close it before leaving. */
+        if(capturing_){ cudaGraph_t g_=nullptr; cudaStreamEndCapture(ctx->stream,&g_);
+                        if(g_) cudaGraphDestroy(g_); cudaGetLastError(); }
+#endif
+        return 0;
+    }
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[1],ctx->stream);
     if(all_e8){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
@@ -2691,10 +2814,55 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         * row, so this copied expert 0's result and left the other seven rows
         * of host_y holding whatever the previous call had put there. qt_take
         * summed stale memory into the token -- wrong logits, a generation
-        * that diverges, and a profile that reads as a 14 %% slowdown. */
+        * that diverges, and a profile that reads as a 14 % slowdown. */
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,yb,cudaMemcpyDeviceToHost,ctx->stream),
-                "expert group issue download")) return 0;
+                "expert group issue download")){
+#if COLI_GPU_HAS_GRAPH
+        /* A return inside a stream capture leaves the stream captured, and
+         * every later launch on it fails. Close it before leaving. */
+        if(capturing_){ cudaGraph_t g_=nullptr; cudaStreamEndCapture(ctx->stream,&g_);
+                        if(g_) cudaGraphDestroy(g_); cudaGetLastError(); }
+#endif
+        return 0;
+    }
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[3],ctx->stream);
+#if COLI_GPU_HAS_GRAPH
+    if(capturing_){
+        /* Nothing above actually ran: capture records, it does not execute.
+         * Close it, instantiate, and launch the result -- so this call gets
+         * its work done by the same graph every later call will replay. */
+        cudaGraph_t g=nullptr;
+        cudaError_t ec=cudaStreamEndCapture(ctx->stream,&g);
+        /* Mark the attempt BEFORE it can fail: a null exec at this signature
+         * is how the branch above remembers not to try again until something
+         * changes. */
+        ctx->graph_gen[count]=gsig_;
+        if(ctx->graph_exec[count]){ cudaGraphExecDestroy(ctx->graph_exec[count]);
+                                    ctx->graph_exec[count]=nullptr; }
+        if(ec==cudaSuccess&&g){
+            if(cudaGraphInstantiate(&ctx->graph_exec[count],g,0)!=cudaSuccess)
+                ctx->graph_exec[count]=nullptr;
+            cudaGraphDestroy(g);
+        }
+        cudaGetLastError();                      /* swallow a failed capture */
+        if(!ctx->graph_exec[count]){
+            /* Capture or instantiate failed and NOTHING was enqueued. Refuse
+             * the call: qt_issue hands these experts to the CPU for this one
+             * layer, which is slower and correct. Silently returning success
+             * here would leave host_y holding the previous call's rows. */
+            static int said=0;
+            if(!said){ said=1;
+                fprintf(stderr,"[cuda] expert group graph capture failed; "
+                               "falling back to per-call launches\n"); }
+            return 0;
+        }
+        if(!cuda_ok(cudaGraphLaunch(ctx->graph_exec[count],ctx->stream),
+                    "expert group graph launch")) return 0;
+        static int said_ok=0;
+        if(!said_ok){ said_ok=1;
+            fprintf(stderr,"[cuda] expert group graph active (count=%d)\n",count); }
+    }
+#endif
     ctx->group_pending=1; ctx->group_pending_bytes=yb;   /* the readback, not the upload */
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       int index=(int)(ctx-g_ctx);
