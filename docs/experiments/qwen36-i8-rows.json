@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "hypothesis": "The fmt=1 per-row int8 dense GEMV gives one block to one output row, so every block reads the whole activation vector: a call moves I*O weight bytes and I*O*4 activation bytes, and four fifths of its traffic is x. Giving a block R output rows should read x once per R rows and cut total traffic from 5x the weight bytes to (1 + 4/R)x. The same kernel also issues R*U independent weight loads before consuming any, because Nsight Compute measures the original as memory-latency-bound rather than bandwidth-bound (occupancy 91.9 %, DRAM throughput 34.6 %, 60 % of a 27-cycle issue gap stalled on an L1TEX scoreboard). Both changes are in the same kernel and this record cannot separate them.",
+  "commit": "b2039205ecbed774f416d98cc7ea8e9129f37294",
+  "model": "Qwen/Qwen3.6-35B-A3B converted to the Colibri int4 gs64 container (C:\\modelli\\qwen36_i4_gs64), routed experts int4 packed, dense trunk int8 at load with one scale per row (gs=0), CUDA expert tier active",
+  "command": "make -C c cuda-dll CUDA_ARCH=sm_89 (the kernel lives in coli_cuda.dll under CUDA_DLL=1 and no other target rebuilds it), then powershell -ExecutionPolicy Bypass -File .\\misure-place-clang.ps1 -Model C:\\modelli\\qwen36_i4_gs64 -RowsSweep. Four arms (COLI_CUDA_I8_ROWS = 0/2/4/8) x four alternated repetitions of a 200-token decode for step(), heat table frozen after warm-up (hit 98.1 % in every repetition), then one COLI_CUDA_PROFILE=1 pass per arm outside the A/B for the kernel time.",
+  "prompt_hash": "not recorded: misure-place-clang.ps1 builds its own prompt and is not in the repository, so no digest exists to cite. The same script, model, engine binary and heat table produced every sample here; only the environment variable named in changed_variables differs between arms.",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 7950X, 16 cores / 32 threads, 2 CCDs, AVX-512",
+    "ram": "64 GB DDR5 at 5200 MT/s, 4 DIMMs",
+    "storage": "Silicon Power UD90 4 TB NVMe (PCIe 4.0 x4), NTFS",
+    "os": "Windows 11; engine built with MSYS2 CLANG64 clang 22.1.8 (-O3 -march=native -fopenmp, LLVM libomp); coli_cuda.dll built with nvcc CUDA 13.4 -arch=sm_89 from the commit above; NVIDIA GeForce RTX 4070 Ti SUPER 16 GB (sm_89, 672 GB/s peak)"
+  },
+  "warmup_runs": 3,
+  "changed_variables": [
+    "COLI_CUDA_I8_ROWS"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_CUDA_I8_ROWS": "0 (original one-row-per-block quant_matmul branch)"
+    },
+    "samples": {
+      "step_ms_per_token": [27.50, 27.50, 27.30, 27.30],
+      "tok_s": [36.36, 36.36, 36.63, 36.63],
+      "dense_kernel_ms": [588],
+      "dense_kernel_gb_s": [191]
+    },
+    "median_tok_s": 36.5,
+    "quality": {
+      "method": "Not a numerical arm: quant_matmul_i8r keeps the original summation order (i = t, t+256, ... ascending), the same 256-wide reduction tree and the same trailing f32 scale, so its output is bitwise identical to this arm's and the comparison cannot be confounded by a quality difference. c/tests/test_int8_rows_cuda.cu asserts exactly that with memcmp on trunk geometry, on S > 1 and on the short-block shapes (O = 13, 5, 17, 3, 1), against a double-precision CPU reference, with a mutated-weight probe so that identity between two kernels that read nothing would fail. That test was last executed on an earlier commit of this branch and has NOT been re-run on the commit recorded here; it needs a GPU and one has not been available since.",
+      "passed": null
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-i8-rows-2026-09-20-raw.txt, section 'SESSION 2', arm r0",
+      "sha256": "48113d4da1491d7e81ed521013f062ef42766ec3037d9fa0e40f952dbd5ebff8"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_CUDA_I8_ROWS": "2 (quant_matmul_i8r<2,8>)"
+    },
+    "samples": {
+      "step_ms_per_token": [23.50, 23.40, 23.30, 23.50],
+      "tok_s": [42.55, 42.74, 42.92, 42.55],
+      "dense_kernel_ms": [301],
+      "dense_kernel_gb_s": [372]
+    },
+    "median_tok_s": 42.65,
+    "quality": {
+      "method": "Same as the baseline: the two arms are bitwise identical by construction and by test, so this record's only open quality item is re-running c/tests/test_int8_rows_cuda.cu on the recorded commit.",
+      "passed": null
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-i8-rows-2026-09-20-raw.txt, section 'SESSION 2', arm r2",
+      "sha256": "48113d4da1491d7e81ed521013f062ef42766ec3037d9fa0e40f952dbd5ebff8"
+    }
+  },
+  "outcome": "improvement",
+  "notes": "The R=4 and R=8 arms are in the raw log and not in this record, which compares the shipped default against the original. R=4 (342 GB/s, 23.90 ms/token here) and R=2 traded places between two sessions and their spreads overlap; R=8 (299 GB/s, 23.80) was the slowest of the three in both sessions. A first session on the same box and commit gave 187/381/389/318 GB/s and 27.25/24.35/23.75/23.70 ms/token for R=0/2/4/8. Three earlier kernel measurements on this box were void: under CUDA_DLL=1 the executable links only backend_loader.o and every kernel lives in coli_cuda.dll, so a script that rebuilt the engine and not the DLL measured one unchanged DLL in all four arms and reported a flat result. Both sessions recorded here ran after make cuda-dll, with the measurement script refusing to start unless the DLL is newer than backend_cuda.cu."
+}

@@ -502,6 +502,126 @@ __global__ static void quant_matmul_f8w(float *y,const float *x,const void *weig
     (void)S;
 }
 
+/* fmt=1 per-row int8 dense GEMV, R OUTPUT ROWS PER BLOCK (COLI_CUDA_I8_ROWS).
+ *
+ * The generic branch below gives one 256-thread block to one output row, and
+ * every block reads the WHOLE activation vector. So a call moves
+ *
+ *     weights   I * O * 1 byte
+ *     x         I * O * 4 byte      (O blocks, I floats each)
+ *
+ * -- four fifths of the traffic is activations, and dense_stats counts only
+ * the weights. With R rows per block, x is read once per R rows and the total
+ * falls from 5x the weight bytes to (1 + 4/R)x: at R=8 that is 1.5x, a factor
+ * of 3.3. The qwen3.6 trunk measures 29 % of this card's bandwidth -- 1/3.4 --
+ * so this is the first hypothesis that predicts the observed number rather
+ * than merely being plausible.
+ *
+ * WHAT NSIGHT COMPUTE ACTUALLY SAYS, measured on a dnproj call (grid 12288,
+ * 113 us): occupancy 91.9 %, DRAM throughput 34.6 %, and 60 % of a 27-cycle
+ * issue gap spent stalled on an L1TEX scoreboard -- 0.64 eligible warps per
+ * scheduler out of 11 active. The kernel is MEMORY-LATENCY-bound, not
+ * bandwidth-bound, and ncu's own prescription is ILP, unrolling, pipelining.
+ *
+ * That is why the first two attempts failed. quant_matmul_i8w (#28) widened
+ * the loads to char4/float4 -- the right move for bandwidth, the wrong one for
+ * latency -- and lengthened the dependency chain with a per-block reduction
+ * and double accumulation: 1.5-5 % SLOWER. The first cut of THIS kernel
+ * blocked rows but kept `if (r < nr)` between the loads in the hot loop, which
+ * is exactly the shape that lets the compiler serialise what should be
+ * independent: flat, 178 -> 184 GB/s across R = 0, 2, 4, 8.
+ *
+ * So the hot path now issues R*U independent weight loads before consuming
+ * any of them, with no runtime predicate among them, and the short last block
+ * gets its own guarded loop. R*U is held at 16 across all three
+ * instantiations (R=2/U=8, R=4/U=4, R=8/U=2) so the ILP budget is constant and
+ * only its shape changes.
+ *
+ * ONE VARIABLE. The per-thread partition (thread t takes i = t, t+256, ...),
+ * the byte-at-a-time weight read, the 256-wide shared reduction tree and the
+ * trailing f32 scale are all EXACTLY the generic branch's. The only change is
+ * that one block now carries R rows and reads each x element once for all of
+ * them. The R trees run in lockstep under the same eight barriers, so the
+ * barrier count per output FALLS by R as well, but that is a side effect of
+ * the blocking rather than a second thing being changed.
+ *
+ * Consequence worth more than the speed: the result should be BIT-IDENTICAL
+ * to the original kernel, because every addition happens in the same order on
+ * the same operands. tests/test_int8_rows_cuda.cu asserts exactly that with
+ * memcmp rather than a tolerance. An optimisation that cannot move a logit
+ * cannot flip a token, which is what made #28's reordering need the oracle
+ * before any default could change.
+ *
+ * Off by default all the same: unmeasured is unmeasured. COLI_CUDA_I8_ROWS=8
+ * (or 2/4) turns it on. */
+template<int R, int U>
+__global__ static void quant_matmul_i8r(float *y, const float *x, const void *weights,
+                                        const float *scales, int S, int I, int O) {
+    /* The launch fixes 256; as a constant it lets the compiler fold the stride
+     * arithmetic instead of re-deriving it from blockDim every iteration. */
+    const int BS = 256;
+    int o0 = (int)blockIdx.x * R, s = blockIdx.y;
+    const float *xs = x + (size_t)s * I;
+    const int8_t *w = static_cast<const int8_t *>(weights);
+    int nr = O - o0 < R ? O - o0 : R;        /* the last block may be short */
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    int i = (int)threadIdx.x;
+    if (nr == R) {
+        /* HOT PATH. R*U independent weight loads are issued before any of them
+         * is consumed -- the whole point, and the reason the R loop carries no
+         * runtime predicate here: an `if (r < nr)` between the loads is exactly
+         * what lets the compiler serialise them again. The short last block
+         * takes the guarded loop below instead, once per call. */
+        const int8_t *wr[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) wr[r] = w + (size_t)(o0 + r) * I;
+        for (; i + (U - 1) * BS < I; i += U * BS) {
+            float xv[U], wv[R][U];
+#pragma unroll
+            for (int u = 0; u < U; u++) xv[u] = xs[i + u * BS];
+#pragma unroll
+            for (int r = 0; r < R; r++)
+#pragma unroll
+                for (int u = 0; u < U; u++) wv[r][u] = (float)wr[r][i + u * BS];
+            /* u outermost keeps the per-row summation order ascending in i --
+             * i, i+BS, i+2BS, ... -- which is what the original kernel does and
+             * what the bitwise-identity contract rests on. */
+#pragma unroll
+            for (int u = 0; u < U; u++)
+#pragma unroll
+                for (int r = 0; r < R; r++) acc[r] += xv[u] * wv[r][u];
+        }
+    }
+    /* Tail of the strided range, and the whole of a short last block. */
+    for (; i < I; i += BS) {
+        float xv = xs[i];
+#pragma unroll
+        for (int r = 0; r < R; r++)
+            if (r < nr) acc[r] += xv * static_cast<float>(w[(size_t)(o0 + r) * I + i]);
+    }
+
+    /* The generic branch's tree, R of them under the same barriers. */
+    __shared__ float partial[R][256];
+#pragma unroll
+    for (int r = 0; r < R; r++) if (r < nr) partial[r][threadIdx.x] = acc[r];
+    __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) {
+        if (threadIdx.x < (unsigned)n)
+#pragma unroll
+            for (int r = 0; r < R; r++)
+                if (r < nr) partial[r][threadIdx.x] += partial[r][threadIdx.x + n];
+        __syncthreads();
+    }
+    if (threadIdx.x < (unsigned)nr) {
+        int o = o0 + (int)threadIdx.x;
+        y[(size_t)s * O + o] = partial[threadIdx.x][0] * scales[o];
+    }
+    (void)S;
+}
+
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
                                     const float *scales, int fmt, int S, int I, int O,
                                     size_t rb, int gs, int ng) {
@@ -1725,16 +1845,67 @@ static int f8_warp_mode(void) {
     return *end ? COLI_F8_DEFAULT : (int)v;
 }
 
+/* COLI_CUDA_I8_ROWS: rows per block for the fmt=1 per-row GEMV. 0 keeps the
+ * original one-row-per-block kernel; 2, 4 and 8 are the instantiated widths.
+ * Unset, or set to a width this build has no instantiation for, reads as the
+ * default rather than silently rounding to a neighbouring width.
+ *
+ * Default 2 is measured on one GPU only (RTX 4070 Ti SUPER, sm_89, qwen36
+ * i4 gs64): the R>=2 kernels run the placed dense GEMVs at 342-381 GB/s
+ * against the original's 187-191. R=2 and R=4 landed inside each other's
+ * spread across two sessions, R=8 was the slowest of the three in both, so R=2 is the pick
+ * for being no worse on the measurements and the cheapest in registers and
+ * shared memory -- the side to err on for an architecture nobody has
+ * measured. COLI_CUDA_I8_ROWS=0 restores the original kernel; the outputs
+ * are bitwise identical either way (tests/test_int8_rows_cuda.cu). */
+#ifndef COLI_I8_ROWS_DEFAULT
+#define COLI_I8_ROWS_DEFAULT 2
+#endif
+/* Launch counter, read by tests/test_int8_rows_cuda.cu.
+ *
+ * The bitwise-identity contract quant_matmul_i8r is built around is ALSO
+ * satisfied by a dispatch that never fires: the same kernel running twice is
+ * trivially identical, so a test that only compares outputs passes whether or
+ * not the branch was ever taken. This counter is how the test tells those two
+ * worlds apart. One increment on a path that is already launching a kernel. */
+static uint64_t g_i8r_launches;
+
+static int i8_rows_mode(void) {
+    const char *e = std::getenv("COLI_CUDA_I8_ROWS");
+    if (!e || !*e) return COLI_I8_ROWS_DEFAULT;
+    char *end; long v = std::strtol(e, &end, 10);
+    if (*end) return COLI_I8_ROWS_DEFAULT;
+    if (v == 0) return 0;
+    return (v == 2 || v == 4 || v == 8) ? (int)v : COLI_I8_ROWS_DEFAULT;
+}
+
 /* One launch site for the dense matvec so fmt=8 honors the same toggle as
  * f8_group_launch: mode 0 runs the original quant_matmul branch (fully
  * original behavior), anything else the warp/shared-LUT rework. */
 static void quant_matmul_launch(float *y, const float *x, const void *w,
         const float *sc, int fmt, int S, int I, int O, size_t rb, int gs, int ng) {
     dim3 grid((unsigned)O, (unsigned)S);
-    if (fmt == 8 && f8_warp_mode())
+    if (fmt == 8 && f8_warp_mode()) {
         quant_matmul_f8w<<<grid, 256>>>(y, x, w, sc, S, I, O);
-    else
-        quant_matmul<<<grid, 256>>>(y, x, w, sc, fmt, S, I, O, rb, gs, ng);
+        return;
+    }
+    /* gs <= 0 only: grouped int8 keeps its own branch, whose per-group scale
+     * application order is part of its CPU-reference contract. The grid is
+     * O/R blocks here, not O -- the one place this path's launch geometry
+     * differs from the original's. */
+    if (fmt == 1 && gs <= 0) {
+        int R = i8_rows_mode();
+        if (R) {
+            g_i8r_launches++;
+            dim3 rgrid((unsigned)((O + R - 1) / R), (unsigned)S);
+            /* R*U = 16 independent loads in flight in every shape. */
+            if (R == 2)      quant_matmul_i8r<2,8><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            else if (R == 4) quant_matmul_i8r<4,4><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            else             quant_matmul_i8r<8,2><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            return;
+        }
+    }
+    quant_matmul<<<grid, 256>>>(y, x, w, sc, fmt, S, I, O, rb, gs, ng);
 }
 
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
