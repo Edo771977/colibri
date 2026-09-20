@@ -1091,7 +1091,20 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * calling the legacy symbol with a one-row buffer would have it read
      * c*D floats off the end. Asked once -- this runs 40 times a token. */
     static int bcast = -1;
-    if(bcast < 0) bcast = coli_cuda_has_group_x_broadcast();
+    if(bcast < 0){
+        /* COLI_CUDA_X_BCAST=0 forces the duplicating path even on a DLL that
+         * has the broadcast entry. Without it this change has no B arm: the
+         * fast path is taken whenever the symbol resolves, and "measure it"
+         * would mean rebuilding the DLL between arms -- which is how three
+         * kernel measurements were lost this week. It doubles as the escape
+         * hatch if the broadcast form is ever suspected. */
+        const char *e = getenv("COLI_CUDA_X_BCAST");
+        bcast = (e && *e=='0') ? 0 : coli_cuda_has_group_x_broadcast();
+        if(getenv("COLI_TIMERS"))
+            fprintf(stderr,"[qtier] expert input: %s\n",
+                    bcast ? "one row broadcast to every chunk"
+                          : "duplicated once per chunk");
+    }
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
