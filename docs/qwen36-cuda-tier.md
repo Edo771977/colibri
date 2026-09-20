@@ -256,30 +256,94 @@ all eight. That binary is unstable on this host, so more repetitions do not
 average it away. What works is the **paired** delta: `gA` and `gB` run back to
 back, so their difference absorbs whatever both are suffering.
 
-**The absolute gain does not shrink on clang** — −4.90 against −5.20 — and the
-prediction had the *relative* movement backwards too: −14.7 % of a 33.4 ms
-token against roughly −9.5 % of a 55 ms one. Placement is worth **more** on a
-sane build, not less.
-
-One row carries the reason:
+**The absolute gain shrinks modestly on clang, and the relative gain grows.**
+A later session with *both* arms quiet — 6 % spread on gcc, 1 % on clang, no
+arm flagged — prices them properly
+(`qwen36-place-clang-clean-2026-09-20-raw.txt`):
 
 ```
-norm+out -> dnout    clang  5.50 -> 2.44   (−3.06)
-                     gcc    9.31 -> 6.13   (−3.19)
+clang  paired deltas  −5.10 −5.00 −5.00 −5.30    median −5.05   (−15.3 % of 33.05)
+gcc    paired deltas  −6.20 −6.70 −5.60 −6.00    median −6.10   (−11.0 % of 55.60)
 ```
 
-Very different baselines, near-identical saving. What placement removes is one
+The two sets do not overlap, so the difference is real: clang keeps **83 %** of
+gcc's absolute saving while that saving is worth **half again as much** of its
+token. The −5.20 above was biased low by the disturbed arm; clang has held at
+−4.97, −4.71, −4.90 and −5.05 across four sessions. So the original prediction
+was right about the direction and wrong about the size — the gain does not halve
+with the CPU read cost, it gives up about a sixth.
+
+One row carries most of the reason (clean session):
+
+```
+norm+out -> dnout    clang  5.55 -> 2.20   (−3.35)
+                     gcc    8.70 -> 5.03   (−3.68)
+```
+
+Baselines 57 % apart, savings 9 % apart. What placement removes there is one
 large streaming GEMV, and that is DRAM-bandwidth bound — DRAM does not know
 which compiler built the host. libgomp's price is per-parallel-region overhead
 (54 µs a region, from the OpenMP record), which falls on the many small
 operations — router, shared expert, the gated norm — not on the single large
 read being displaced.
 
-Control rows, stated rather than explained: `shared` +0.22, `router` +0.22,
-`cpu-miss` +0.31, where 19 September had them flat. `cpu-miss` has a candidate
-reason — 98 % residency means arm B's 0.31 GB of displaced experts costs real
-misses. `shared` and `router` do not. They are small against −4.90 and do not
-overturn it, but they moved and the earlier measurement's did not.
+That is also where the missing sixth is. The biggest row keeps 91 % of its
+saving across the toolchains; the small ones keep less (`attention` 76 %,
+`dn-sub proj` and `lm_head` 83 %), and the total lands at 83 %. Most of the
+gain is bandwidth, which the compiler cannot touch; the remainder is the
+per-region overhead it can.
+
+**The control rows follow the build, not the session.** They move on clang —
+`shared` +0.19, `router` +0.28, `cpu-miss` +0.27 — and are flat on gcc
+(−0.01, −0.01, +0.06) in the **same session at the same residency**. That
+disposes of the reason offered here first, that 98 % residency makes arm B pay
+for displaced experts: residency is identical in all four arms and only clang
+moves. It is a property of the binary, it is small against −5.05, and it is
+not explained.
+
+#### What the placed GEMVs actually spend — `COLI_CUDA_PROFILE`
+
+The dense counters exist to tell two costs apart: kernels that leave the card
+idle, and a call structure that never lets it start. One profiled run per arm,
+outside the A/B because four `cudaEventRecord` on calls this short are overhead
+on exactly the calls in question:
+
+| | calls | GB | kernel | kernel GB/s | wall GB/s | round-trip |
+|---|---:|---:|---:|---:|---:|---:|
+| clang, arm A | 2704 | 92.37 | **475 ms** | **194** | 146 | 4 % |
+| gcc, arm A | 2704 | 92.37 | **750 ms** | **123** | 98 | 7 % |
+| clang, arm B | 5224 | 112.07 | 593 ms | 189 | 128 | 8 % |
+| gcc, arm B | 5224 | 112.07 | 852 ms | 132 | 95 | 9 % |
+
+**The kernel window is not all kernel.** The two arm-A rows issue the *same*
+2704 calls over the *same* 92.37 GB to the *same* card, and the interval
+between the events is 475 ms against 750 — 1.58×, from changing the **host**
+compiler. A GPU does not know what compiled its host; what it can know is when
+the launch arrives. `ev[1]` is recorded right after the H2D copy and `ev[2]`
+after the launch, both on stream 0, so any delay in the CPU *issuing* the
+launch is GPU idle time sitting inside the measured interval. About 275 ms of
+gcc's "kernel" time is the host failing to feed the card — the spinning
+16-thread libgomp team against the driver's own threads, which is the
+contention the OpenMP record hypothesised and never measured. Read every
+`kernel GB/s` in this document as a lower bound.
+
+**The round-trip is not the problem.** It is 4–9 % of wall. `coli_cuda_matmul`
+really is synchronous three times per call, and that really is not where these
+GEMVs spend their time. The cost is inside the kernel window: partly host
+contention, and the rest a kernel running at **194 GB/s against the card's
+672 — 29 % of peak** on the toolchain that feeds it properly.
+
+So the claim that motivated these counters — placed GEMVs running at 10–20 % of
+the card — survives with better numbers. The 137 GB/s behind it was a
+gcc-contaminated floor; 194 is the figure on a sane build, and it is still 3.5×
+short of the hardware. That gap is now the largest single unexplained cost in
+the decode path, and it is a kernel question, not a scheduling one.
+
+One structural detail worth keeping: arm B issues **93 % more calls for 21 %
+more bytes**, because `dnout` and `attnout` are smaller matrices than `dnproj`,
+and its round-trip share doubles from 4 % to 8 %. Placing many small matrices
+costs more overhead per byte than placing few large ones — which bounds how far
+the `COLI_PLACE` allowlist is worth extending downward.
 
 **A row that should not have moved.** `lm_head` is on the GPU in every arm of
 the 2×2, and still goes 2.65 → 3.92 ms when only the *host* compiler changes.
