@@ -1,0 +1,95 @@
+Qwen3.6-35B-A3B: the placement A/B with BOTH arms stable, plus the first
+dense_stats readings. 20 September 2026.
+
+The two sessions in qwen36-place-clang-2026-09-19-raw.txt could not price the
+gcc arm: half its repetitions were disturbed. This one is quiet -- 6 % spread
+on gcc, 1 % on clang, no arm flagged -- so it is the first clean comparison of
+the two deltas, and the first run on a build carrying the COLI_CUDA_PROFILE
+dense counters.
+
+Host, model, arms and method as in the 19 September file. 4 repetitions,
+arms alternated cA cB gA gB, heat frozen and restored before every run,
+98.1-98.2 % VRAM residency in every arm.
+
+--- per-run, ms/token -------------------------------------------------------
+
+  rip   cA     cB     gA     gB
+   1  33.30  28.20  56.10  49.90
+   2  32.90  27.90  55.10  48.40
+   3  33.00  28.00  53.70  48.10
+   4  33.10  27.80  57.00  51.00
+
+  arm stability (range as a share of the median)
+    cA  1 %    cB  1 %    gA  6 %    gB  6 %      none flagged
+
+--- paired deltas -----------------------------------------------------------
+
+  clang  -5.10  -5.00  -5.00  -5.30     median  -5.05   (-15.3 % of 33.05)
+  gcc    -6.20  -6.70  -5.60  -6.00     median  -6.10   (-11.0 % of 55.60)
+
+The two sets do not overlap: clang lies in [-5.30, -5.00], gcc in
+[-6.70, -5.60]. The absolute gain IS smaller on clang -- 83 % of gcc's -- and
+the relative gain is larger. The 19 September reading of -5.20 for gcc was
+biased low by the disturbance; clang has been stable across four sessions at
+-4.97, -4.71, -4.90, -5.05.
+
+--- rows ---------------------------------------------------------------------
+
+  ms/token              clang A   clang B   delta      gcc A    gcc B   delta
+  step() total            33.08     27.98   -5.10      55.48    49.35   -6.13
+  norm+out -> dnout        5.55      2.20   -3.35       8.70     5.03   -3.68
+  dn-sub proj              6.08      5.35   -0.72      10.65     9.78   -0.87
+  attention -> attnout     6.47      5.81   -0.67      10.14     9.26   -0.88
+  lm_head                  2.68      2.29   -0.39       3.71     3.24   -0.47
+  take                     0.70      0.31   -0.39       0.43     0.31   -0.12
+  issue                    2.12      1.86   -0.26       1.90     1.62   -0.28
+  shared                   4.08      4.26   +0.19       9.23     9.22   -0.01
+  router                   0.61      0.89   +0.28       2.68     2.67   -0.01
+  cpu-miss                 4.79      5.06   +0.27      10.78    10.84   +0.06
+
+The control rows move on clang and are FLAT on gcc, in the same session at the
+same residency. That rules out the explanation offered on 19 September, that
+98 % residency makes arm B pay for displaced experts: the residency is
+identical in both arms of both toolchains, and only clang moves. The cause is
+a property of the binary, and it is not known.
+
+--- dense_stats, COLI_CUDA_PROFILE=1, one run per arm -----------------------
+
+  cA clang  2704 calls,  92.37 GB | h2d  52 | kernel  475 | d2h  76 | wall  632 ms
+            kernel 194 GB/s | wall 146 GB/s | round-trip 4 % of wall
+  cB clang  5224 calls, 112.07 GB | h2d  99 | kernel  593 | d2h 116 | wall  876 ms
+            kernel 189 GB/s | wall 128 GB/s | round-trip 8 % of wall
+  gA gcc    2704 calls,  92.37 GB | h2d  52 | kernel  750 | d2h  75 | wall  941 ms
+            kernel 123 GB/s | wall  98 GB/s | round-trip 7 % of wall
+  gB gcc    5224 calls, 112.07 GB | h2d 100 | kernel  852 | d2h 118 | wall 1180 ms
+            kernel 132 GB/s | wall  95 GB/s | round-trip 9 % of wall
+
+Two readings, and the first one is the reason these counters exist.
+
+THE KERNEL WINDOW IS NOT ALL KERNEL. cA and gA issue the same 2704 calls over
+the same 92.37 GB to the same card, and the window between the two events is
+475 ms against 750 -- 1.58x, from changing the HOST compiler. A GPU does not
+know what compiled its host. What it can know is when the launch arrives:
+ev[1] is recorded right after the H2D memcpy and ev[2] after the launch, both
+on stream 0, so any delay in the CPU ISSUING the launch is GPU idle time
+sitting inside the measured "kernel" interval. About 275 ms of gcc's kernel
+time is the host failing to feed the card -- a spinning 16-thread libgomp team
+against the driver's own threads, which is the contention this repo's OpenMP
+record hypothesised and never measured. Read every "kernel GB/s" here as an
+upper bound on the time, a lower bound on the bandwidth.
+
+THE ROUND-TRIP IS NOT THE PROBLEM. It is 4-9 % of wall. coli_cuda_matmul being
+synchronous three times per call is real and it is not what these GEMVs are
+spending their time on. The cost is inside the kernel window: partly host
+contention, and the rest a kernel running at 194 GB/s against the card's 672 --
+29 % of peak, on the toolchain that feeds it properly.
+
+So the claim that opened the dense-counter work -- that placed GEMVs run at
+10-20 % of the card -- survives with better numbers. The 137 GB/s that
+motivated it was a gcc-contaminated floor; 194 is the figure on a sane build,
+and it is still 3.5x short of the hardware.
+
+One structural detail worth keeping: arm B issues 93 % MORE calls for only
+21 % more bytes, because dnout and attnout are smaller matrices than dnproj,
+and its round-trip share doubles from 4 % to 8 %. Placing many small matrices
+costs more overhead per byte than placing few large ones.
