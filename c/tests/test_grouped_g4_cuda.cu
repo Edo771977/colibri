@@ -210,6 +210,36 @@ int main(void){
             else { const float *yl=coli_cuda_expert_group_take(0);
                    if(!yl||memcmp(ydup,yl,(size_t)COUNT*D*4)!=0){
                        printf("FAIL x_rows=0 is not the legacy path\n"); api_bad++; } }
+            /* COLI_CUDA_GRAPH: the same issue replayed as one cudaGraphLaunch
+             * must land on the same bits. Three calls, not one: the first
+             * CAPTURES (and executes the captured sequence), the later ones
+             * REPLAY, and those are different code paths -- a capture that
+             * records the right work but replays against a stale pointer
+             * would pass a one-shot test.
+             *
+             * Nothing else here exercises this: cuda-test never sets the
+             * variable, so without this block the graph path ships compiled
+             * and unrun. */
+            setenv("COLI_CUDA_GRAPH", "1", 1);
+            for (int rep = 0; rep < 3; rep++) {
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,1)){
+                    printf("FAIL graph issue (rep %d)\n", rep); return 1; }
+                const float *yg = coli_cuda_expert_group_take(0);
+                if(!yg){ printf("FAIL graph take (rep %d)\n", rep); return 1; }
+                int g_bad = memcmp(ydup,yg,(size_t)COUNT*D*4)!=0;
+                if(g_bad) api_bad++;
+                printf("grouped-g4 graph: rep %d (%s) vs per-call launches: %s\n",
+                       rep, rep?"replay":"capture", g_bad?"DIFFERS":"bitwise");
+            }
+            /* And back off cleanly: a graph left armed would follow this
+             * process into the next block. */
+            setenv("COLI_CUDA_GRAPH", "0", 1);
+            if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,1)){
+                printf("FAIL post-graph issue\n"); return 1; }
+            { const float *yo = coli_cuda_expert_group_take(0);
+              if(!yo||memcmp(ydup,yo,(size_t)COUNT*D*4)!=0){
+                  printf("FAIL per-call path after the graph\n"); api_bad++; } }
+
             free(xd); free(ydup);
         }
         for(int c=0;c<COUNT;c++){ coli_cuda_tensor_free(tg[c]);coli_cuda_tensor_free(tu[c]);coli_cuda_tensor_free(td[c]);

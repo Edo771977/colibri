@@ -1484,6 +1484,14 @@ static int reserve_pinned_bytes(void **ptr,size_t *cap,size_t bytes){
  * on the critical path. */
 static int graph_mode(void){
 #if COLI_GPU_HAS_GRAPH
+    /* Deliberately NOT cached in a static, unlike gprof a few lines down.
+     * The cost argument that applies there -- 40 calls a token is no place
+     * for a getenv -- is real but small next to the ~10 us driver call this
+     * function decides whether to make, and it falls out of a paired A/B
+     * because both arms pay it. What caching would cost is the only test
+     * this path has: tests/test_grouped_g4_cuda.cu flips the variable
+     * mid-process to compare the graph against per-call launches, and a
+     * latched static would make that test measure one arm twice. */
     const char *e=getenv("COLI_CUDA_GRAPH");
     return e&&*e&&*e!='0';
 #else
