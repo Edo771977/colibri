@@ -517,11 +517,25 @@ __global__ static void quant_matmul_f8w(float *y,const float *x,const void *weig
  * so this is the first hypothesis that predicts the observed number rather
  * than merely being plausible.
  *
- * It is also the SECOND attempt at that number. The first (quant_matmul_i8w,
- * PR #28) widened the loads to char4/float4 and replaced the reduction tree
- * with warp shuffles, and came out 1.5-5 % SLOWER across two sessions. What
- * that bought was the knowledge that the inner loop is not the limit, so this
- * kernel deliberately does not touch it.
+ * WHAT NSIGHT COMPUTE ACTUALLY SAYS, measured on a dnproj call (grid 12288,
+ * 113 us): occupancy 91.9 %, DRAM throughput 34.6 %, and 60 % of a 27-cycle
+ * issue gap spent stalled on an L1TEX scoreboard -- 0.64 eligible warps per
+ * scheduler out of 11 active. The kernel is MEMORY-LATENCY-bound, not
+ * bandwidth-bound, and ncu's own prescription is ILP, unrolling, pipelining.
+ *
+ * That is why the first two attempts failed. quant_matmul_i8w (#28) widened
+ * the loads to char4/float4 -- the right move for bandwidth, the wrong one for
+ * latency -- and lengthened the dependency chain with a per-block reduction
+ * and double accumulation: 1.5-5 % SLOWER. The first cut of THIS kernel
+ * blocked rows but kept `if (r < nr)` between the loads in the hot loop, which
+ * is exactly the shape that lets the compiler serialise what should be
+ * independent: flat, 178 -> 184 GB/s across R = 0, 2, 4, 8.
+ *
+ * So the hot path now issues R*U independent weight loads before consuming
+ * any of them, with no runtime predicate among them, and the short last block
+ * gets its own guarded loop. R*U is held at 16 across all three
+ * instantiations (R=2/U=8, R=4/U=4, R=8/U=2) so the ILP budget is constant and
+ * only its shape changes.
  *
  * ONE VARIABLE. The per-thread partition (thread t takes i = t, t+256, ...),
  * the byte-at-a-time weight read, the 256-wide shared reduction tree and the
@@ -540,9 +554,12 @@ __global__ static void quant_matmul_f8w(float *y,const float *x,const void *weig
  *
  * Off by default all the same: unmeasured is unmeasured. COLI_CUDA_I8_ROWS=8
  * (or 2/4) turns it on. */
-template<int R>
+template<int R, int U>
 __global__ static void quant_matmul_i8r(float *y, const float *x, const void *weights,
                                         const float *scales, int S, int I, int O) {
+    /* The launch fixes 256; as a constant it lets the compiler fold the stride
+     * arithmetic instead of re-deriving it from blockDim every iteration. */
+    const int BS = 256;
     int o0 = (int)blockIdx.x * R, s = blockIdx.y;
     const float *xs = x + (size_t)s * I;
     const int8_t *w = static_cast<const int8_t *>(weights);
@@ -551,8 +568,36 @@ __global__ static void quant_matmul_i8r(float *y, const float *x, const void *we
 #pragma unroll
     for (int r = 0; r < R; r++) acc[r] = 0.0f;
 
-    for (int i = threadIdx.x; i < I; i += blockDim.x) {
-        float xv = xs[i];                    /* read ONCE, used for R rows */
+    int i = (int)threadIdx.x;
+    if (nr == R) {
+        /* HOT PATH. R*U independent weight loads are issued before any of them
+         * is consumed -- the whole point, and the reason the R loop carries no
+         * runtime predicate here: an `if (r < nr)` between the loads is exactly
+         * what lets the compiler serialise them again. The short last block
+         * takes the guarded loop below instead, once per call. */
+        const int8_t *wr[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) wr[r] = w + (size_t)(o0 + r) * I;
+        for (; i + (U - 1) * BS < I; i += U * BS) {
+            float xv[U], wv[R][U];
+#pragma unroll
+            for (int u = 0; u < U; u++) xv[u] = xs[i + u * BS];
+#pragma unroll
+            for (int r = 0; r < R; r++)
+#pragma unroll
+                for (int u = 0; u < U; u++) wv[r][u] = (float)wr[r][i + u * BS];
+            /* u outermost keeps the per-row summation order ascending in i --
+             * i, i+BS, i+2BS, ... -- which is what the original kernel does and
+             * what the bitwise-identity contract rests on. */
+#pragma unroll
+            for (int u = 0; u < U; u++)
+#pragma unroll
+                for (int r = 0; r < R; r++) acc[r] += xv[u] * wv[r][u];
+        }
+    }
+    /* Tail of the strided range, and the whole of a short last block. */
+    for (; i < I; i += BS) {
+        float xv = xs[i];
 #pragma unroll
         for (int r = 0; r < R; r++)
             if (r < nr) acc[r] += xv * static_cast<float>(w[(size_t)(o0 + r) * I + i]);
@@ -1840,9 +1885,10 @@ static void quant_matmul_launch(float *y, const float *x, const void *w,
         if (R) {
             g_i8r_launches++;
             dim3 rgrid((unsigned)((O + R - 1) / R), (unsigned)S);
-            if (R == 2)      quant_matmul_i8r<2><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
-            else if (R == 4) quant_matmul_i8r<4><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
-            else             quant_matmul_i8r<8><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            /* R*U = 16 independent loads in flight in every shape. */
+            if (R == 2)      quant_matmul_i8r<2,8><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            else if (R == 4) quant_matmul_i8r<4,4><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            else             quant_matmul_i8r<8,2><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
             return;
         }
     }
