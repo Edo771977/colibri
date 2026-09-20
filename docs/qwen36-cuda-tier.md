@@ -485,7 +485,7 @@ contract `tests/test_int8_rows_cuda.cu` asserts with `memcmp`, on trunk
 geometry, on `S > 1`, and on the short-block shapes (`O` = 13, 5, 17, 3, 1)
 where the tail path runs.
 
-### Measured (RTX 4090, sm_89, qwen36 i4 gs64, clang build, 200-token decode)
+### Measured (RTX 4070 Ti SUPER, sm_89, qwen36 i4 gs64, clang build, 200-token decode)
 
 Two sessions, each 4 arms x 4 alternated repetitions for `step()` plus one
 profiled pass per arm for the kernel time. `dense_stats` weight bytes are

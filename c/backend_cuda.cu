@@ -1850,10 +1850,10 @@ static int f8_warp_mode(void) {
  * Unset, or set to a width this build has no instantiation for, reads as the
  * default rather than silently rounding to a neighbouring width.
  *
- * Default 2 is measured on one GPU only (RTX 4090, sm_89, qwen36 i4 gs64):
- * the R>=2 kernels run the placed dense GEMVs at 342-381 GB/s against the
- * original's 187-191. R=2 and R=4 landed inside each other's spread across
- * two sessions, R=8 was the slowest of the three in both, so R=2 is the pick
+ * Default 2 is measured on one GPU only (RTX 4070 Ti SUPER, sm_89, qwen36
+ * i4 gs64): the R>=2 kernels run the placed dense GEMVs at 342-381 GB/s
+ * against the original's 187-191. R=2 and R=4 landed inside each other's
+ * spread across two sessions, R=8 was the slowest of the three in both, so R=2 is the pick
  * for being no worse on the measurements and the cheapest in registers and
  * shared memory -- the side to err on for an architecture nobody has
  * measured. COLI_CUDA_I8_ROWS=0 restores the original kernel; the outputs
