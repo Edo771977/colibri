@@ -485,10 +485,13 @@ contract `tests/test_int8_rows_cuda.cu` asserts with `memcmp`, on trunk
 geometry, on `S > 1`, and on the short-block shapes (`O` = 13, 5, 17, 3, 1)
 where the tail path runs.
 
-### Measured (RTX 4070 Ti SUPER, sm_89, qwen36 i4 gs64, clang build, 200-token decode)
+### Measured (RTX 4070 Ti SUPER, sm_89, qwen36 i4 gs64, clang build)
 
 Two sessions, each 4 arms x 4 alternated repetitions for `step()` plus one
-profiled pass per arm for the kernel time. `dense_stats` weight bytes are
+profiled pass per arm for the kernel time. The repetitions generate 128
+tokens from a 25-token prompt; the profiled pass generates 64. The two
+columns below therefore come from different run lengths -- compare within a
+column, never across. `dense_stats` weight bytes are
 identical across arms (112.07 GB over 5224 calls), so the GB/s column is a
 like-for-like ratio of kernel times.
 
