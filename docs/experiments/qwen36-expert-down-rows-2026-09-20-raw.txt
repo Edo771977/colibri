@@ -1,0 +1,107 @@
+grouped_down_g4r: R output rows per block for the expert down projection
+=========================================================================
+RESULT: the kernel gets 21.5 % faster and the token gets 5 % SLOWER.
+Do not enable this. The reason is worth more than the kernel.
+
+Box      : Windows, RTX 4070 Ti SUPER 16 GB (sm_89), CUDA 13.4, CUDA_DLL=1
+Engine   : qwen36_clang.exe (LLVM libomp)
+Model    : C:\modelli\qwen36_i4_gs64
+Script   : misure-down.ps1 (4 arms x 4 alternated reps at N_NEW=128, heat
+           frozen after warm-up, then one COLI_CUDA_PROFILE pass per arm at
+           N_NEW=64), prompt25.txt, hit 98.1 % in every repetition
+Placement: COLI_PLACE=experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0
+Dense    : COLI_CUDA_I8_ROWS=2 pinned in every arm (the shipped default)
+Guard    : every arm printed "[cuda] expert down-rows active: R=N" from
+           inside coli_cuda.dll; no run was marked invalid
+
+
+1. THE TWO NUMBERS THAT DISAGREE
+--------------------------------
+
+  R   group_stats kernel   step() median   paired delta vs R=0
+  0        558 ms            24.05           --
+  2        533 ms  (-4.5%)   23.95           -0.20  [-0.20 0.50 -0.40 -0.20]  discordant
+  4        438 ms (-21.5%)   25.20           +1.20  [ 1.40 1.20  0.80  1.20]  4/4 same sign
+  8        473 ms (-15.2%)   25.05           +1.05  [ 1.10 1.00  1.20  0.90]  4/4 same sign
+
+Per-arm spread on step() is 0.40-0.70 ms (2-3 % of the median), so neither
+the gain nor the regression is noise. group_stats compares like for like:
+3520 calls and 28160 experts in every arm.
+
+
+2. WHERE THE TIME WENT (rip 1, ms/token)
+----------------------------------------
+
+  phase                 R=0     R=2     R=4     R=8    R4-R0
+  deltanet             7.70    7.66    8.56    8.42    +0.86
+    dn-sub proj        3.50    3.50    4.10    4.00    +0.60
+    norm+out (dnout)   1.70    1.70    1.90    1.90    +0.20
+  attention            5.68    5.66    5.72    5.78    +0.04
+  moe_total            8.55    8.44    8.57    8.47    +0.02
+    (shared)           4.17    4.22    4.33    4.34    +0.16
+    (router)           0.99    0.94    0.94    0.92    -0.05
+  lm_head              1.06    1.05    1.45    1.35    +0.39
+  qtier issue          1.76    1.83    1.84    1.81    +0.08
+  qtier cpu-miss       4.95    5.01    5.12    5.14    +0.17
+  qtier take           0.53    0.33    0.33    0.28    -0.20
+  TOTAL               22.99   22.80   24.30   24.02    +1.31
+  step()              24.10   23.90   25.50   25.20    +1.40
+
+Three readings, in order of how much they matter.
+
+(a) THE KERNEL REALLY IS FASTER, and `take` says so independently of
+    group_stats: 0.53 -> 0.33 ms/token at R=4, 0.28 at R=8. Two separate
+    measurements agree that the expert group finishes earlier.
+
+(b) AND IT BUYS NOTHING, because moe_total does not move (8.55 -> 8.57).
+    `take` was only 0.53 ms of a 24 ms token to begin with: the expert
+    kernels were ALREADY off the critical path, overlapped with CPU work
+    that finishes later. 1.9 ms/token of GPU time was freed and had
+    nowhere to go.
+
+(c) AND IT COSTS. 91 % of the +1.31 ms regression is three lines --
+    dn-sub proj +0.60, norm+out +0.20, lm_head +0.39, sum +1.19 -- and
+    those three ARE the placed dense GEMVs (dnproj, dnout, lmhead in the
+    COLI_PLACE list), which run on stream 0 concurrently with the expert
+    group on ctx->stream.
+
+    The mechanism follows from the kernel's shape. At R=0 the down kernel
+    is 16,384 blocks that each read one byte and retire almost at once,
+    leaving scheduling slots free for the dense blocks interleaved with
+    them. At R=4 it is 4,096 blocks that live four times as long and hold
+    4 KB of shared memory each (partial[R][256]), so fewer dense blocks
+    fit alongside. The kernel wins its own race and slows down the one
+    next to it.
+
+    attnout is also placed, and `attention` barely moves (+0.04) -- so the
+    contention is not uniform across the placed matrices. Not explained.
+
+
+3. WHAT THIS SAYS ABOUT THE EXPERT PATH
+---------------------------------------
+
+nsys put grouped_down_g4 at 183 ms and grouped_hidden_g4_dual at 167 ms
+against quant_matmul's 247 ms, and that comparison is what motivated this
+kernel. It was misleading: expert GPU time is overlapped, dense GEMV time
+is on the critical path, and nsys totals cannot tell them apart.
+
+The lever is not the expert kernels. On this configuration the token is
+CPU-bound, and the big items are:
+
+  deltanet        7.70   (of which dn-sub proj 3.5, l2n+rec 2.1)
+  moe_total       8.55   (of which cpu-miss 4.95, shared 4.17)
+  attention       5.68
+
+cpu-miss is 4.95 ms/token at a 98.1 % hit rate: the remaining 1.9 % of
+expert misses cost a fifth of the token.
+
+
+4. WHY THE KERNEL STAYS IN THE TREE, OFF
+----------------------------------------
+
+It is bitwise identical to grouped_down_g4 (tests/test_grouped_down_rows_
+cuda.cu, memcmp on eight shapes), so it costs nothing while unset, and it
+is the only way to reproduce the finding above. It also stops being a bad
+idea the moment the expert path lands on the critical path -- a larger
+batch, or a configuration where cpu-miss is fixed and the GPU becomes the
+bottleneck. Today it is neither of those, and the default reflects that.

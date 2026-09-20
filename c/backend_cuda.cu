@@ -1082,8 +1082,26 @@ __global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *
  * this cannot move a logit. tests/test_grouped_down_rows_cuda.cu asserts that
  * with memcmp.
  *
- * Off by default: the shape argument above is an argument, not a measurement,
- * and on this engine the difference between the two has cost a day before. */
+ * MEASURED, AND IT LOSES -- leave it off. On an RTX 4070 Ti SUPER the kernel
+ * does exactly what the paragraph above predicts: expert-group kernel time
+ * 558 -> 438 ms at R=4, and qtier take 0.53 -> 0.33 ms/token, two independent
+ * measurements agreeing the group finishes earlier. The token still gets 5 %
+ * SLOWER (24.05 -> 25.20 ms/token, 4/4 repetitions same sign).
+ *
+ * Two reasons, and the first is the one that matters for anyone else working
+ * on this path. moe_total does not move: take was 0.53 ms of a 24 ms token,
+ * so these kernels were ALREADY off the critical path, overlapped with CPU
+ * work that finishes later, and 1.9 ms/token of freed GPU time had nowhere to
+ * go. Second, 91 % of the regression lands on dn-sub proj, norm+out and
+ * lm_head -- the placed dense GEMVs, which run on stream 0 alongside the
+ * expert group: 4,096 long-lived blocks holding 4 KB of shared memory each
+ * leave fewer scheduling slots than 16,384 that retire almost at once.
+ *
+ * It stays in the tree because it is bitwise identical (so it costs nothing
+ * while unset), because it is the only way to reproduce that finding, and
+ * because it stops being a bad idea the day the expert path does land on the
+ * critical path -- a larger batch, or a configuration where cpu-miss is
+ * fixed. docs/experiments/qwen36-expert-down-rows-2026-09-20-raw.txt */
 template<int R>
 __global__ static void grouped_down_g4r(float *y,const float *x,const GroupDesc *desc,int D,int I){
     int o0=(int)blockIdx.x*R, s=(int)blockIdx.y, c=(int)blockIdx.z;
