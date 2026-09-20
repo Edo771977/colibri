@@ -385,6 +385,17 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "CUDA syntax check passed"
+      - name: Compile the int8 warp GEMV test (syntax only, no GPU)
+        run: |
+          cd c
+          # tests/test_int8_warp_cuda.cu includes backend_cuda.cu and is the
+          # only check quant_matmul_i8w gets without a card: `make cuda-test`
+          # needs a GPU and nothing else compiles the test files. Compiling it
+          # here is not the same as running it -- the kernel's arithmetic stays
+          # unverified until someone with silicon runs cuda-test.
+          nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_int8_warp_cuda.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "int8 warp test compiles"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |
           cd c

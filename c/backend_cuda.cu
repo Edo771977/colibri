@@ -502,6 +502,87 @@ __global__ static void quant_matmul_f8w(float *y,const float *x,const void *weig
     (void)S;
 }
 
+/* fmt=1 per-row int8 dense GEMV, warp rework (COLI_CUDA_I8_WARP, default OFF).
+ *
+ * The generic quant_matmul branch below reads ONE BYTE per thread per
+ * iteration and then spends a 256-wide shared-memory tree -- nine
+ * __syncthreads -- to produce a single output scalar. On the qwen3.6 trunk
+ * (lm_head and the 30 dnproj layers, uploaded with gs=0 so they take that
+ * branch) it measures 194 GB/s against 672 of card, 29 % of peak, which is
+ * what a byte-wise GEMV with a block-wide reduction costs
+ * (docs/experiments/qwen36-place-clang-clean-2026-09-20-raw.txt).
+ *
+ * This is quant_matmul_f8w's shape applied to fmt=1: same grid and block
+ * contract (one 256-thread block per (o,s)), warps striding 128-element
+ * blocks, char4 + float4 loads on aligned full blocks with a guarded byte
+ * path for tails and unaligned bases, and a warp shuffle instead of the
+ * shared tree. Four bytes of weight and sixteen of activation per thread per
+ * load instead of one and four, and one __syncthreads per output instead of
+ * nine.
+ *
+ * DEFAULT OFF, and that is deliberate. The accumulation order changes -- the
+ * old kernel partitions I as thread t taking t, t+256, ..., this one as lane
+ * l taking 4l..4l+3 within each 128-block -- so the last bits of every logit
+ * move. This repo gates on token-exact oracles, where a moved last bit can
+ * flip a token on a near-tie. It also has never run on hardware: no nvcc in
+ * the environment that wrote it, so CI's syntax gate is the only thing it has
+ * passed. Turn it on with COLI_CUDA_I8_WARP=1, measure, and check the oracle
+ * before proposing a default flip.
+ *
+ * Narrow on purpose: fmt=1 with per-row scales only. Grouped int8 (gs>0) has
+ * its own branch with its own CPU-reference accumulation contract, and
+ * widening this to formats whose scale application order is load-bearing is
+ * how a bit-exactness argument gets lost.
+ *
+ * Accumulation mirrors f8w: f32 within a 128-block, double across blocks in
+ * fixed warp order, so the order is a pure function of the dims and two
+ * launches of the same shape agree. The per-row scale multiplies the double
+ * once at the end -- the old kernel multiplies the f32 tree result instead,
+ * which is the other half of why the two are not bit-identical. */
+__global__ static void quant_matmul_i8w(float *y, const float *x, const void *weights,
+                                        const float *scales, int S, int I, int O) {
+    int o = blockIdx.x, s = blockIdx.y;
+    const float *xs = x + (size_t)s * I;
+    const int8_t *wrow = static_cast<const int8_t *>(weights) + (size_t)o * I;
+    __shared__ double dsum[32];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    int nblk = (I + 127) >> 7;
+    /* char4 wants the row 4-byte aligned, float4 wants x 16-byte aligned; i0
+     * is a multiple of 4 by construction, so these two checks are the whole
+     * precondition. A zero-copy view can fail them: correct, slower. */
+    int vec = !(I & 3) && !((size_t)wrow & 3) && !((size_t)xs & 15);
+    double a = 0.0;
+    for (int bi = warp; bi < nblk; bi += nw) {
+        int base = bi << 7, len = I - base < 128 ? I - base : 128;
+        int i0 = base + lane * 4;
+        float wv[4], xv[4];
+        if (vec && len == 128) {
+            char4 q = *(const char4 *)(wrow + i0);
+            wv[0] = (float)q.x; wv[1] = (float)q.y;
+            wv[2] = (float)q.z; wv[3] = (float)q.w;
+            float4 xf = *(const float4 *)(xs + i0);
+            xv[0] = xf.x; xv[1] = xf.y; xv[2] = xf.z; xv[3] = xf.w;
+        } else {
+            for (int k = 0; k < 4; k++) {
+                int in = i0 + k < base + len;
+                wv[k] = in ? (float)wrow[i0 + k] : 0.f;
+                xv[k] = in ? xs[i0 + k] : 0.f;
+            }
+        }
+        float p = 0.f;
+        for (int k = 0; k < 4; k++) p += xv[k] * wv[k];
+        for (int off = 16; off; off >>= 1) p += f8_shfl_down(p, off);
+        if (!lane) a += (double)p;
+    }
+    if (!lane) dsum[warp] = a;
+    __syncthreads();
+    if (!threadIdx.x) {
+        for (int w = 1; w < nw; w++) a += dsum[w];
+        y[(size_t)s * O + o] = (float)(a * (double)scales[o]);
+    }
+    (void)S;
+}
+
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
                                     const float *scales, int fmt, int S, int I, int O,
                                     size_t rb, int gs, int ng) {
@@ -1725,6 +1806,17 @@ static int f8_warp_mode(void) {
     return *end ? COLI_F8_DEFAULT : (int)v;
 }
 
+/* COLI_CUDA_I8_WARP: opt-in for the fmt=1 per-row warp GEMV. Same strict
+ * parse as f8_warp_mode -- a non-numeric value selects the default -- but the
+ * default is OFF on every vendor, because this kernel changes the summation
+ * order and has never been run on hardware. See quant_matmul_i8w. */
+static int i8_warp_on(void) {
+    const char *e = std::getenv("COLI_CUDA_I8_WARP");
+    if (!e || !*e) return 0;
+    char *end; long v = std::strtol(e, &end, 10);
+    return *end ? 0 : (v != 0);
+}
+
 /* One launch site for the dense matvec so fmt=8 honors the same toggle as
  * f8_group_launch: mode 0 runs the original quant_matmul branch (fully
  * original behavior), anything else the warp/shared-LUT rework. */
@@ -1733,6 +1825,10 @@ static void quant_matmul_launch(float *y, const float *x, const void *w,
     dim3 grid((unsigned)O, (unsigned)S);
     if (fmt == 8 && f8_warp_mode())
         quant_matmul_f8w<<<grid, 256>>>(y, x, w, sc, S, I, O);
+    /* gs <= 0 only: grouped int8 keeps its own branch, whose scale-per-group
+     * application order is part of its CPU-reference contract. */
+    else if (fmt == 1 && gs <= 0 && i8_warp_on())
+        quant_matmul_i8w<<<grid, 256>>>(y, x, w, sc, S, I, O);
     else
         quant_matmul<<<grid, 256>>>(y, x, w, sc, fmt, S, I, O, rb, gs, ng);
 }
