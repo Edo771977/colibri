@@ -165,13 +165,23 @@ int main(void) {
             check(coli_cuda_matmul(&t, y, x, w, sc, 1, 1, I, O, 0, 0), "dispatch probe, ROWS=8");
             check(g_i8r_launches == before + 1, "ROWS=8 MUST take the row-blocked branch");
 
+            /* The default is ON at R=COLI_I8_ROWS_DEFAULT, so "off" now has to
+             * be asked for: an unset variable must dispatch, or the shipped
+             * build is quietly running the old kernel. */
+            setenv("COLI_CUDA_I8_ROWS", "", 1);
+            check(i8_rows_mode() == COLI_I8_ROWS_DEFAULT, "unset reads as the compiled default");
+            before = g_i8r_launches;
+            check(coli_cuda_matmul(&t, y, x, w, sc, 1, 1, I, O, 0, 0), "dispatch probe, unset");
+            check(g_i8r_launches == before + 1, "unset MUST take the row-blocked branch");
+
             setenv("COLI_CUDA_I8_ROWS", "3", 1);   /* not instantiated */
-            check(i8_rows_mode() == 0, "an uninstantiated R reads as off, not rounded");
+            check(i8_rows_mode() == COLI_I8_ROWS_DEFAULT,
+                  "an uninstantiated R falls back to the default, not to a neighbour");
             coli_cuda_tensor_free(t);
         } else { printf("FAIL alloc dispatch probe\n"); fails++; }
         free(w); free(sc); free(x); free(y);
     }
-    printf("dispatch: the row-blocked branch fires on ROWS=8 and not on ROWS=0\n");
+    printf("dispatch: the row-blocked branch fires on ROWS=8 and unset, not on ROWS=0\n");
 
     printf("fmt=1 per-row int8: R rows per block must be BITWISE identical\n");
     shape(2048, 512, 1);   /* trunk geometry, O divisible by 2/4/8 */

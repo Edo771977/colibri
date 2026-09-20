@@ -461,6 +461,75 @@ overwrote the group's input and output mid-flight -- no CUDA error, only
 wrong numbers. qwen36 never called the dense path inside that window, so its
 outputs were unaffected.
 
+## The per-row int8 dense GEMV: R output rows per block (`COLI_CUDA_I8_ROWS`)
+
+The generic `quant_matmul` branch gives one block to one output row, so every
+block reads the **whole** activation vector: a call moves `I*O` bytes of
+weights and `I*O*4` of activations, and four fifths of the traffic is `x`.
+`dense_stats` counts only the weights, which is why its reported GB/s sat at
+29 % of the card while the kernel was in fact moving five times that.
+
+`quant_matmul_i8r<R,U>` gives a block R rows. `x` is then read once per R
+rows and the traffic falls from 5x the weight bytes to `(1 + 4/R)x`. The hot
+path also issues `R*U` independent weight loads -- 16 in every instantiation
+-- before consuming any, because Nsight Compute measures this kernel as
+**memory-latency-bound, not bandwidth-bound**: occupancy 91.9 %, DRAM
+throughput 34.6 %, 0.64 eligible warps out of 11 active, and 60 % of a
+27-cycle issue gap stalled on an L1TEX scoreboard. Those two changes went in
+together and the measurements below cannot separate them.
+
+The summation order per row is untouched -- `i = t, t+256, ...` ascending,
+the same 256-wide reduction tree, the same trailing f32 scale -- so the
+output is **bitwise identical** to the original kernel's. That is the
+contract `tests/test_int8_rows_cuda.cu` asserts with `memcmp`, on trunk
+geometry, on `S > 1`, and on the short-block shapes (`O` = 13, 5, 17, 3, 1)
+where the tail path runs.
+
+### Measured (RTX 4090, sm_89, qwen36 i4 gs64, clang build, 200-token decode)
+
+Two sessions, each 4 arms x 4 alternated repetitions for `step()` plus one
+profiled pass per arm for the kernel time. `dense_stats` weight bytes are
+identical across arms (112.07 GB over 5224 calls), so the GB/s column is a
+like-for-like ratio of kernel times.
+
+| R | kernel GB/s (s1 / s2) | `step()` ms/token (s1 / s2) |
+|---|---|---|
+| 0 (original) | 187 / 191 | 27.25 / 27.40 |
+| **2** | **381 / 372** | **24.35 / 23.45** |
+| 4 | 389 / 342 | 23.75 / 23.90 |
+| 8 | 318 / 299 | 23.70 / 23.80 |
+
+**The step gain reproduces and is large**: every `R >= 2` arm lands at
+23.3-24.7 ms/token against 27.3-27.5 for the original, with no overlap
+between the original and any of them in either session -- about **-13 % on
+the whole token**, from 36.6 to 42.5 tok/s.
+
+**The ranking among R does not reproduce.** R=4 won session 1 on both
+metrics and R=2 won session 2 on both; their spreads overlap. R=8 was the
+slowest of the three in both sessions on both metrics, which is the one
+ordering the data does support. The default is therefore R=2: no worse than
+R=4 on anything measured, and the cheaper of the two in registers and in
+shared memory (`partial[R][256]`), which is the side to err on for an
+architecture nobody has run this on.
+
+The traffic model predicted the direction and not the curve. Measured over
+predicted is 1.17-1.22 at R=2, 0.72-0.83 at R=4, 0.47-0.51 at R=8 -- the same
+shape in both sessions. Past R=2 the `x` re-read is no longer what limits the
+kernel, and R=8 gives back in occupancy and register pressure more than it
+saves in traffic.
+
+### A measurement caveat that cost a day
+
+Under `CUDA_DLL=1` (the Windows path) `CUDA_OBJ = backend_loader.o`: the
+executable links only the loader, and **every kernel in this file lives in
+`coli_cuda.dll`**, which only `make cuda-dll` rebuilds. A measurement script
+that rebuilds the engine and not the DLL measures the DLL it started with, in
+every arm, and reports a clean flat result with a straight face. Three
+kernel measurements were lost that way before anyone noticed; the numbers
+above are from runs where the DLL is newer than `backend_cuda.cu`, and the
+measurement script now refuses to start otherwise. Any future kernel A/B on
+Windows has to prove the same thing before its numbers mean anything.
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |

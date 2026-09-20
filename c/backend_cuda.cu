@@ -1845,10 +1845,22 @@ static int f8_warp_mode(void) {
     return *end ? COLI_F8_DEFAULT : (int)v;
 }
 
-/* COLI_CUDA_I8_ROWS: rows per block for the fmt=1 per-row GEMV. 0/unset keeps
- * the original one-row-per-block kernel; 2, 4 and 8 are the instantiated
- * widths. Anything else -- including a value this build has no instantiation
- * for -- reads as off rather than silently rounding to one that exists. */
+/* COLI_CUDA_I8_ROWS: rows per block for the fmt=1 per-row GEMV. 0 keeps the
+ * original one-row-per-block kernel; 2, 4 and 8 are the instantiated widths.
+ * Unset, or set to a width this build has no instantiation for, reads as the
+ * default rather than silently rounding to a neighbouring width.
+ *
+ * Default 2 is measured on one GPU only (RTX 4090, sm_89, qwen36 i4 gs64):
+ * the R>=2 kernels run the placed dense GEMVs at 342-381 GB/s against the
+ * original's 187-191. R=2 and R=4 landed inside each other's spread across
+ * two sessions, R=8 was the slowest of the three in both, so R=2 is the pick
+ * for being no worse on the measurements and the cheapest in registers and
+ * shared memory -- the side to err on for an architecture nobody has
+ * measured. COLI_CUDA_I8_ROWS=0 restores the original kernel; the outputs
+ * are bitwise identical either way (tests/test_int8_rows_cuda.cu). */
+#ifndef COLI_I8_ROWS_DEFAULT
+#define COLI_I8_ROWS_DEFAULT 2
+#endif
 /* Launch counter, read by tests/test_int8_rows_cuda.cu.
  *
  * The bitwise-identity contract quant_matmul_i8r is built around is ALSO
@@ -1860,10 +1872,11 @@ static uint64_t g_i8r_launches;
 
 static int i8_rows_mode(void) {
     const char *e = std::getenv("COLI_CUDA_I8_ROWS");
-    if (!e || !*e) return 0;
+    if (!e || !*e) return COLI_I8_ROWS_DEFAULT;
     char *end; long v = std::strtol(e, &end, 10);
-    if (*end) return 0;
-    return (v == 2 || v == 4 || v == 8) ? (int)v : 0;
+    if (*end) return COLI_I8_ROWS_DEFAULT;
+    if (v == 0) return 0;
+    return (v == 2 || v == 4 || v == 8) ? (int)v : COLI_I8_ROWS_DEFAULT;
 }
 
 /* One launch site for the dense matvec so fmt=8 honors the same toggle as

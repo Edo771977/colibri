@@ -1,0 +1,141 @@
+quant_matmul_i8r: R output rows per block for the fmt=1 per-row int8 dense GEMV
+================================================================================
+
+Box      : Windows, RTX 4090 (sm_89), CUDA 13.4, CUDA_DLL=1
+Engine   : qwen36_clang.exe (LLVM libomp; see qwen36-toolchain-2x-2026-09-19)
+Model    : C:\modelli\qwen36_i4_gs64
+Script   : misure-place-clang.ps1 -RowsSweep  (4 arms x 4 alternated reps for
+           step(), then one COLI_CUDA_PROFILE pass per arm outside the A/B)
+Arms     : COLI_CUDA_I8_ROWS = 0 (original kernel) / 2 / 4 / 8
+Heat     : frozen after warm-up; every rep reports hit 98.1 %
+
+READ THIS FIRST
+---------------
+Under CUDA_DLL=1 the executable links only backend_loader.o and every kernel
+lives in coli_cuda.dll, rebuilt ONLY by `make cuda-dll`. Three earlier kernel
+measurements (PR #28's warp GEMV, and two sweeps of this kernel) rebuilt the
+engine and not the DLL, so all four arms ran the same untouched DLL and came
+back flat. Those results are void and are not reproduced here. Both sessions
+below ran after `make cuda-dll CUDA_ARCH=sm_89`, with the script's staleness
+guard confirming the DLL is newer than backend_cuda.cu.
+
+
+SESSION 1 -- 2026-09-20, after the first valid `make cuda-dll`
+--------------------------------------------------------------
+(aggregates as reported by the script; per-rep lines not retained)
+
+  === step() per R (mediana) ===
+    R=0  step  27,25 ms/token
+    R=2  step  24,35 ms/token
+    R=4  step  23,75 ms/token
+    R=8  step  23,70 ms/token
+
+  === COLI_CUDA_PROFILE ===
+    r0  kernel 600 ms | 187 GB/s | round-trip  8 %
+    r2  kernel 294 ms | 381 GB/s | round-trip 13 %
+    r4  kernel 288 ms | 389 GB/s | round-trip 12 %
+    r8  kernel 353 ms | 318 GB/s | round-trip 12 %
+
+  === kernel GB/s: misurato contro previsto ===
+  R         misurato    previsto    rapporto
+  0              187         187        1,00
+  2              381         312        1,22
+  4              389         468        0,83
+  8              318         623        0,51
+
+
+SESSION 2 -- 2026-09-20, replication (verbatim)
+-----------------------------------------------
+
+C:\colibri-fork\c>make cuda-dll CUDA_ARCH=sm_89
+"nvcc" -O3 -std=c++17 -ftz=false -arch=sm_89 -Xcompiler=-W3 -shared -DCOLI_CUDA_BUILDING_DLL \
+        -L"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4/lib/x64" -lcudart \
+        backend_cuda.cu -o coli_cuda.dll
+backend_cuda.cu
+   Creazione della libreria coli_cuda.lib e dell'oggetto coli_cuda.exp
+
+C:\colibri-fork\c>powershell -ExecutionPolicy Bypass -File .\misure-place-clang.ps1 -Model C:\modelli\qwen36_i4_gs64 -RowsSweep
+  coli_cuda.dll piu' recente del sorgente CUDA: ok (20/09/2026 14:11:23)
+=== compilatori ===
+  clang : clang version 22.1.8 (https://github.com/msys2/MINGW-packages d34feaaa1d0aff624c870910b6f2589aa40d20de)
+=== build ===
+  build qwen36_clang.exe ... ok
+
+=== preflight ===
+  qwen36_clang.exe: ok (25 token di prompt)
+
+=== warm-up heat table ===
+  warm -> hit 69,9 %
+  warm -> hit 100 %
+  warm -> hit 100 %
+  congelata
+
+=== misura: 4 arm x 4 rip, alternati ===
+  r0 rip 1  step  27,50 | hit 98,1 %
+  r2 rip 1  step  23,50 | hit 98,1 %
+  r4 rip 1  step  23,30 | hit 98,1 %
+  r8 rip 1  step  24,70 | hit 98,1 %
+  r0 rip 2  step  27,50 | hit 98,1 %
+  r2 rip 2  step  23,40 | hit 98,1 %
+  r4 rip 2  step  24,60 | hit 98,1 %
+  r8 rip 2  step  23,90 | hit 98,1 %
+  r0 rip 3  step  27,30 | hit 98,1 %
+  r2 rip 3  step  23,30 | hit 98,1 %
+  r4 rip 3  step  23,90 | hit 98,1 %
+  r8 rip 3  step  23,50 | hit 98,1 %
+  r0 rip 4  step  27,30 | hit 98,1 %
+  r2 rip 4  step  23,50 | hit 98,1 %
+  r4 rip 4  step  23,90 | hit 98,1 %
+  r8 rip 4  step  23,70 | hit 98,1 %
+
+=== step() per R (mediana) ===
+  R=0  step  27,40 ms/token
+  R=2  step  23,45 ms/token
+  R=4  step  23,90 ms/token
+  R=8  step  23,80 ms/token
+
+=== COLI_CUDA_PROFILE, fuori dall'A/B (1 run per arm) ===
+  --- r0 (clang) ---
+    [qtier] dense_stats: 5224 calls, 112.07 GB (weights+scales) | h2d 100 ms, kernel 588 ms, d2h 107 ms, wall 867 ms
+    [qtier]   kernel 191 GB/s | wall 129 GB/s | round-trip 8 % of wall
+  --- r2 (clang) ---
+    [qtier] dense_stats: 5224 calls, 112.07 GB (weights+scales) | h2d 96 ms, kernel 301 ms, d2h 120 ms, wall 588 ms
+    [qtier]   kernel 372 GB/s | wall 191 GB/s | round-trip 12 % of wall
+  --- r4 (clang) ---
+    [qtier] dense_stats: 5224 calls, 112.07 GB (weights+scales) | h2d 100 ms, kernel 328 ms, d2h 124 ms, wall 624 ms
+    [qtier]   kernel 342 GB/s | wall 180 GB/s | round-trip 12 % of wall
+  --- r8 (clang) ---
+    [qtier] dense_stats: 5224 calls, 112.07 GB (weights+scales) | h2d 100 ms, kernel 375 ms, d2h 127 ms, wall 682 ms
+    [qtier]   kernel 299 GB/s | wall 164 GB/s | round-trip 12 % of wall
+
+=== kernel GB/s: misurato contro previsto ===
+R         misurato    previsto    rapporto
+0              191         191        1,00
+2              372         318        1,17
+4              342         478        0,72
+8              299         637        0,47
+
+
+READING
+-------
+Reproduces:
+  - R>=2 beats R=0 by ~2x on kernel GB/s (187-191 -> 299-381) and by ~-13 %
+    on step() (27.25-27.40 -> 23.4-23.9 ms/token, i.e. 36.6 -> 42.5 tok/s).
+    No overlap between the R=0 arm and any other arm in either session.
+  - R=8 is the slowest of the three R>=2 arms in both sessions, on both
+    metrics.
+  - measured/predicted falls off with R in the same shape both times
+    (1.17-1.22 at R=2, 0.47-0.51 at R=8): the (1 + 4/R)x traffic model is not
+    what governs this kernel past R=2.
+
+Does NOT reproduce:
+  - the ordering of R=2 vs R=4. R=4 won session 1 on both metrics, R=2 won
+    session 2 on both. Their spreads overlap; the data does not separate them.
+    Default picked as R=2 for lower register and shared-memory cost.
+
+Not separable from this data:
+  - row blocking (fewer x re-reads) vs the R*U independent-load ILP. Both
+    landed in the same kernel; no arm isolates one of them.
+
+Single GPU, single model, single shape mix. Nothing here says what this
+kernel does on another architecture.
