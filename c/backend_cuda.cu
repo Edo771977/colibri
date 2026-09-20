@@ -2542,10 +2542,16 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
     }}
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[2],ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
-       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+       /* yb, not xb. The two were the same number until x_rows existed, and
+        * the readback needs the OUTPUT size: with a broadcast input xb is one
+        * row, so this copied expert 0's result and left the other seven rows
+        * of host_y holding whatever the previous call had put there. qt_take
+        * summed stale memory into the token -- wrong logits, a generation
+        * that diverges, and a profile that reads as a 14 %% slowdown. */
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,yb,cudaMemcpyDeviceToHost,ctx->stream),
                 "expert group issue download")) return 0;
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[3],ctx->stream);
-    ctx->group_pending=1; ctx->group_pending_bytes=xb;
+    ctx->group_pending=1; ctx->group_pending_bytes=yb;   /* the readback, not the upload */
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       int index=(int)(ctx-g_ctx);
       g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
