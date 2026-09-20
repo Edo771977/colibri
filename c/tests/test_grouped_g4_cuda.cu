@@ -26,6 +26,16 @@
 
 #include "../backend_cuda.cu"
 
+/* offset_to_signed_s4 is one thread per byte with an `if (i < n)` guard -- no
+ * grid-stride loop -- so the grid must cover the whole buffer. The fixed
+ * <<<64,256>>> this file used converts only the first 16 KiB; it happened to
+ * be enough for D=200, I=96 (9,600 bytes) and would have gone on being enough
+ * until someone enlarged the dims, at which point the kernels would read the
+ * tail as offset binary and the failure would look like a kernel bug. */
+static void convert_s4(uint8_t *q,size_t n){
+    offset_to_signed_s4<<<(unsigned)((n+255)/256),256>>>(q,n);
+}
+
 static void cpu_gemv_g4(const uint8_t *q,const float *sc,int K,int O,int gs,
                         const float *x,float *y){
     int rb=(K+1)/2, ng=gs>0?(K+gs-1)/gs:1, egs=gs>0?gs:K;
@@ -75,9 +85,9 @@ int main(void){
             cudaMemcpy(qg[c],hg[c],(size_t)I*rbD,cudaMemcpyHostToDevice);
             cudaMemcpy(qu[c],hu[c],(size_t)I*rbD,cudaMemcpyHostToDevice);
             cudaMemcpy(qd[c],hd[c],(size_t)D*rbI,cudaMemcpyHostToDevice);
-            offset_to_signed_s4<<<64,256>>>(qg[c],(size_t)I*rbD);
-            offset_to_signed_s4<<<64,256>>>(qu[c],(size_t)I*rbD);
-            offset_to_signed_s4<<<64,256>>>(qd[c],(size_t)D*rbI);
+            convert_s4(qg[c],(size_t)I*rbD);
+            convert_s4(qu[c],(size_t)I*rbD);
+            convert_s4(qd[c],(size_t)D*rbI);
             cudaMemcpy(sg[c],hgs[c],(size_t)I*cngD*4,cudaMemcpyHostToDevice);
             cudaMemcpy(su[c],hus[c],(size_t)I*cngD*4,cudaMemcpyHostToDevice);
             cudaMemcpy(sd[c],hds[c],(size_t)D*cngI*4,cudaMemcpyHostToDevice);

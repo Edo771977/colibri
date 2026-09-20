@@ -48,6 +48,18 @@ static void check(int ok,const char *what){
     if(!ok){ printf("FAIL %s\n",what); fails++; }
 }
 
+/* offset_to_signed_s4 is one thread per byte with an `if (i < n)` guard -- no
+ * grid-stride loop -- so the grid has to cover the whole buffer. A fixed
+ * <<<64,256>>> converts the first 16 KiB and silently leaves the rest in
+ * offset binary, which the kernels then read as garbage weights. The
+ * bitwise-identity checks pass right through that (both kernels read the same
+ * wrong bytes and agree); only the double-precision reference catches it,
+ * which is what it is here for. The production call site sizes the grid this
+ * way too (backend_cuda.cu, coli_cuda_tensor_upload). */
+static void convert_s4(uint8_t *q,size_t n){
+    offset_to_signed_s4<<<(unsigned)((n+255)/256),256>>>(q,n);
+}
+
 static unsigned long long rs=88172645463325252ULL;
 static unsigned rnd(void){ rs^=rs<<13; rs^=rs>>7; rs^=rs<<17; return (unsigned)(rs>>11); }
 static float rndf(void){ return (float)((int)(rnd()%2000)-1000)/1000.0f; }
@@ -102,7 +114,7 @@ static void shape(int D,int I,int gs){
         for(size_t i=0;i<(size_t)D*ng;i++) hds[c][i]=0.01f+0.05f*(float)(rnd()%1000)/1000.0f;
         cudaMalloc(&qd[c],(size_t)D*rb); cudaMalloc(&sd[c],(size_t)D*ng*4);
         cudaMemcpy(qd[c],hd[c],(size_t)D*rb,cudaMemcpyHostToDevice);
-        offset_to_signed_s4<<<64,256>>>(qd[c],(size_t)D*rb);
+        convert_s4(qd[c],(size_t)D*rb);
         cudaMemcpy(sd[c],hds[c],(size_t)D*ng*4,cudaMemcpyHostToDevice);
         host[c]={NULL,NULL,qd[c],NULL,NULL,sd[c],4,4,4,rowsper[c],offs[c],gs,gs,gs};
     }
@@ -185,7 +197,7 @@ int main(void){
         uint8_t *qd; float *sd;
         cudaMalloc(&qd,(size_t)D*rb); cudaMalloc(&sd,(size_t)D*ng*4);
         cudaMemcpy(qd,hd,(size_t)D*rb,cudaMemcpyHostToDevice);
-        offset_to_signed_s4<<<64,256>>>(qd,(size_t)D*rb);
+        convert_s4(qd,(size_t)D*rb);
         cudaMemcpy(sd,hds,(size_t)D*ng*4,cudaMemcpyHostToDevice);
         GroupDesc host[1]={{NULL,NULL,qd,NULL,NULL,sd,4,4,4,1,0,gs,gs,gs}};
         GroupDesc *ddesc; cudaMalloc(&ddesc,sizeof host);
