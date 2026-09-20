@@ -85,15 +85,27 @@ against quant_matmul's 247 ms, and that comparison is what motivated this
 kernel. It was misleading: expert GPU time is overlapped, dense GEMV time
 is on the critical path, and nsys totals cannot tell them apart.
 
-The lever is not the expert kernels. On this configuration the token is
-CPU-bound, and the big items are:
+The lever is not the expert kernels. On this configuration the big items are:
 
   deltanet        7.70   (of which dn-sub proj 3.5, l2n+rec 2.1)
-  moe_total       8.55   (of which cpu-miss 4.95, shared 4.17)
+  moe_total       8.55   (router 0.99 + issue 1.76 + CPU window 4.95 + take 0.53)
   attention       5.68
 
-cpu-miss is 4.95 ms/token at a 98.1 % hit rate: the remaining 1.9 % of
-expert misses cost a fifth of the token.
+CAREFUL WITH `cpu-miss`. Despite the name it is not the cost of the misses:
+it is the whole window between qt_issue and qt_take (qwen36.c, `_q1` to
+`_q2`), and the SHARED EXPERT is computed inside it on purpose, to overlap
+with the GPU groups. So 4.95 = shared 4.17 + roughly 0.78 of actual
+CPU-computed misses. The misses cost about 3 % of the token, not the fifth
+that the raw counter suggests. An earlier version of this file said the
+latter; it was wrong.
+
+What the corrected reading shows is more useful anyway: the CPU window
+(4.95) and the GPU expert group are NEARLY BALANCED -- take is only 0.53,
+so the GPU finishes 0.53 ms after the CPU is done with it. That is why this
+kernel bought nothing, and it also says speeding up the CPU side alone would
+run into the GPU within half a millisecond. The two have to move together:
+cut the shared expert AND keep a faster down kernel, and both start paying.
+That is a prediction, and it is the reason the toggle stays in the tree.
 
 
 4. WHY THE KERNEL STAYS IN THE TREE, OFF
