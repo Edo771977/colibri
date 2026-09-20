@@ -146,3 +146,29 @@ Not separable from this data:
 
 Single GPU, single model, single shape mix. Nothing here says what this
 kernel does on another architecture.
+
+
+IDENTITY TEST, EXECUTED
+-----------------------
+The record above shipped with quality.passed = null: the bitwise-identity
+test had never been run on the merged code. It has now been, on the same box
+(RTX 4070 Ti SUPER, CUDA 13.4, nvcc -arch=native), via `make cuda-test`:
+
+  ./int8_rows_test.exe
+  [CUDA] device 0: NVIDIA GeForce RTX 4070 Ti SUPER, 17.2 GB VRAM, sm_89
+  dispatch: the row-blocked branch fires on ROWS=8 and unset, not on ROWS=0
+  fmt=1 per-row int8: R rows per block must be BITWISE identical
+    [  512 x  2048] S=1  ref rms 9.74e-08 |  R=2 bitwise  R=4 bitwise  R=8 bitwise
+    [   64 x  2048] S=4  ref rms 1.05e-07 |  R=2 bitwise  R=4 bitwise  R=8 bitwise
+    [   13 x  2048] S=1  ref rms 9.01e-08 |  R=2 bitwise  R=4 bitwise  R=8 bitwise
+    [    5 x  2048] S=1  ref rms 7.21e-08 |  R=2 bitwise  R=4 bitwise  R=8 bitwise
+    [   17 x  2050] S=1  ref rms 7.25e-08 |  R=2 bitwise  R=4 bitwise  R=8 bitwise
+    [    3 x    96] S=1  ref rms 0.00e+00 |  R=2 bitwise  R=4 bitwise  R=8 bitwise
+    [    1 x     4] S=1  ref rms 0.00e+00 |  R=2 bitwise  R=4 bitwise  R=8 bitwise
+  test_int8_rows_cuda: ok
+
+The dispatch line matters as much as the identity: "unset" now means R=2,
+so that line is what proves the shipped default takes the new branch rather
+than quietly falling back to the original kernel.
+
+The full `make cuda-test` recipe passed end to end on the same run.
