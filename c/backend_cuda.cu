@@ -1804,6 +1804,15 @@ static int f8_warp_mode(void) {
  * the original one-row-per-block kernel; 2, 4 and 8 are the instantiated
  * widths. Anything else -- including a value this build has no instantiation
  * for -- reads as off rather than silently rounding to one that exists. */
+/* Launch counter, read by tests/test_int8_rows_cuda.cu.
+ *
+ * The bitwise-identity contract quant_matmul_i8r is built around is ALSO
+ * satisfied by a dispatch that never fires: the same kernel running twice is
+ * trivially identical, so a test that only compares outputs passes whether or
+ * not the branch was ever taken. This counter is how the test tells those two
+ * worlds apart. One increment on a path that is already launching a kernel. */
+static uint64_t g_i8r_launches;
+
 static int i8_rows_mode(void) {
     const char *e = std::getenv("COLI_CUDA_I8_ROWS");
     if (!e || !*e) return 0;
@@ -1829,6 +1838,7 @@ static void quant_matmul_launch(float *y, const float *x, const void *w,
     if (fmt == 1 && gs <= 0) {
         int R = i8_rows_mode();
         if (R) {
+            g_i8r_launches++;
             dim3 rgrid((unsigned)((O + R - 1) / R), (unsigned)S);
             if (R == 2)      quant_matmul_i8r<2><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
             else if (R == 4) quant_matmul_i8r<4><<<rgrid, 256>>>(y, x, w, sc, S, I, O);

@@ -135,6 +135,44 @@ int main(void) {
     int devs[1] = {0};
     if (!coli_cuda_init(devs, 1)) { printf("FAIL cuda init\n"); return 1; }
 
+    /* FIRST, and before any identity is claimed: does the branch fire at all?
+     * Bitwise identity is satisfied by a dispatch that never fires -- the same
+     * kernel twice is trivially identical -- so every check below is worthless
+     * without this one. It cost a whole measurement session to learn that the
+     * hard way: a four-point sweep came back flat, and nothing in this file
+     * could say whether that meant the hypothesis was wrong or the kernel had
+     * never run. */
+    {
+        int I = 2048, O = 64;
+        int8_t *w = (int8_t *)malloc((size_t)I * O);
+        float *sc = (float *)malloc((size_t)O * sizeof(float));
+        float *x = (float *)malloc((size_t)I * sizeof(float));
+        float *y = (float *)malloc((size_t)O * sizeof(float));
+        if (w && sc && x && y) {
+            for (size_t i = 0; i < (size_t)I * O; i++) w[i] = (int8_t)(rnd() % 127);
+            for (int o = 0; o < O; o++) sc[o] = 0.01f;
+            for (int i = 0; i < I; i++) x[i] = rndf();
+            ColiCudaTensor *t = NULL;
+
+            setenv("COLI_CUDA_I8_ROWS", "0", 1);
+            check(i8_rows_mode() == 0, "ROWS=0 parses as off");
+            uint64_t before = g_i8r_launches;
+            check(coli_cuda_matmul(&t, y, x, w, sc, 1, 1, I, O, 0, 0), "dispatch probe, ROWS=0");
+            check(g_i8r_launches == before, "ROWS=0 must NOT take the row-blocked branch");
+
+            setenv("COLI_CUDA_I8_ROWS", "8", 1);
+            check(i8_rows_mode() == 8, "ROWS=8 parses as 8");
+            check(coli_cuda_matmul(&t, y, x, w, sc, 1, 1, I, O, 0, 0), "dispatch probe, ROWS=8");
+            check(g_i8r_launches == before + 1, "ROWS=8 MUST take the row-blocked branch");
+
+            setenv("COLI_CUDA_I8_ROWS", "3", 1);   /* not instantiated */
+            check(i8_rows_mode() == 0, "an uninstantiated R reads as off, not rounded");
+            coli_cuda_tensor_free(t);
+        } else { printf("FAIL alloc dispatch probe\n"); fails++; }
+        free(w); free(sc); free(x); free(y);
+    }
+    printf("dispatch: the row-blocked branch fires on ROWS=8 and not on ROWS=0\n");
+
     printf("fmt=1 per-row int8: R rows per block must be BITWISE identical\n");
     shape(2048, 512, 1);   /* trunk geometry, O divisible by 2/4/8 */
     shape(2048, 64, 4);    /* S > 1 */
