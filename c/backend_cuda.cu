@@ -2690,23 +2690,6 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         ctx->ev_grp_ok=ok?1:-1;
     }
     ctx->group_timed=gprof&&ctx->ev_grp_ok>0;
-    if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,ctx->host_desc,
-                                (size_t)count*sizeof(GroupDesc),
-                                cudaMemcpyHostToDevice,ctx->stream),
-                "expert group issue descriptors")){
-#if COLI_GPU_HAS_GRAPH
-        /* A return inside a stream capture leaves the stream captured, and
-         * every later launch on it fails. Close it before leaving. */
-        if(capturing_){ cudaGraph_t g_=nullptr; cudaStreamEndCapture(ctx->stream,&g_);
-                        if(g_) cudaGraphDestroy(g_); cudaGetLastError(); }
-#endif
-        return 0;
-    }
-    /* ev_grp[0] goes AFTER the descriptor copy because expert_group_impl puts
-     * ev[0] after its own: "h2d" is already a defined quantity in this file,
-     * and both paths add into the same counter. Widening it here would make
-     * the printed total the sum of two different measurements -- which is the
-     * failure this instrumentation exists to end, not to repeat. */
     /* Which of the five dispatch arms will run. Computed HERE, before
      * anything is enqueued, because the graph is keyed on it: a group whose
      * formats change must not replay a graph captured for other kernels.
@@ -2739,6 +2722,23 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
                         cudaStreamCaptureModeThreadLocal)==cudaSuccess;
     }
 #endif
+    if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,ctx->host_desc,
+                                (size_t)count*sizeof(GroupDesc),
+                                cudaMemcpyHostToDevice,ctx->stream),
+                "expert group issue descriptors")){
+#if COLI_GPU_HAS_GRAPH
+        /* A return inside a stream capture leaves the stream captured, and
+         * every later launch on it fails. Close it before leaving. */
+        if(capturing_){ cudaGraph_t g_=nullptr; cudaStreamEndCapture(ctx->stream,&g_);
+                        if(g_) cudaGraphDestroy(g_); cudaGetLastError(); }
+#endif
+        return 0;
+    }
+    /* ev_grp[0] goes AFTER the descriptor copy because expert_group_impl puts
+     * ev[0] after its own: "h2d" is already a defined quantity in this file,
+     * and both paths add into the same counter. Widening it here would make
+     * the printed total the sum of two different measurements -- which is the
+     * failure this instrumentation exists to end, not to repeat. */
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[0],ctx->stream);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                 "expert group issue upload")){
