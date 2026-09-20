@@ -1081,12 +1081,29 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     }
     pthread_mutex_unlock(&G.mx);
 
+    /* All K experts of a decode token read the SAME activation vector, so the
+     * copy below used to write it c times -- 8 KiB becoming 64 KiB per layer,
+     * ~2.2 MB a token of host memcpy, and the same again through the pinned
+     * staging buffer and over PCIe. The broadcast entry takes one row and
+     * points every chunk at it.
+     *
+     * The duplicating path stays for a DLL built before that entry existed:
+     * calling the legacy symbol with a one-row buffer would have it read
+     * c*D floats off the end. Asked once -- this runs 40 times a token. */
+    static int bcast = -1;
+    if(bcast < 0) bcast = coli_cuda_has_group_x_broadcast();
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
-        float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D;     /* per-device input block */
-        for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
-        if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
+        int ok;
+        if(bcast){
+            ok = coli_cuda_expert_group_issue_x(tg[di],tu[di],td[di],rows,c,x,1);
+        } else {
+            float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D; /* per-device input block */
+            for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
+            ok = coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr);
+        }
+        if(!ok){
             /* issue failed -> hand these k back to the CPU */
             for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[di][j]);
             G.is_cnt[di]=0;

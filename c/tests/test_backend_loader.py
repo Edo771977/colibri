@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 9 optional, parsed from backend_loader.c.
+        """47 mandatory + 10 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,7 +929,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 9)   # +matmul_mxfp4 (kimi_k3 via the DLL, #1405), +available_device_count (qwen36 tier, #1533), +dense_stats (resident dense GEMV bandwidth under COLI_CUDA_PROFILE)
+        self.assertEqual(len(f.optional), 10)  # +matmul_mxfp4 (kimi_k3 via the DLL, #1405), +available_device_count (qwen36 tier, #1533), +dense_stats (resident dense GEMV bandwidth under COLI_CUDA_PROFILE), +expert_group_issue_x (one input row broadcast to every chunk, #1602)
         self.assertEqual(len(f.exports), 56)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)

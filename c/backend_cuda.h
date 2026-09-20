@@ -159,6 +159,21 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue(ColiCudaTensor *const *gate
                                ColiCudaTensor *const *ups,
                                ColiCudaTensor *const *downs,
                                const int *rows, int count, const float *x);
+/* Same, but `x` carries x_rows rows instead of one per expert row. 0 keeps the
+ * call above's contract; 1 broadcasts a single row to every chunk, which is
+ * decode -- K experts of one token all consume the same activation vector, so
+ * it is copied and uploaded once instead of K times. Only 0, 1 and the total
+ * row count are accepted; anything else is refused rather than guessed at.
+ * Resolved optionally from the DLL: ask coli_cuda_has_group_x_broadcast()
+ * before using it, and keep a duplicating path for when it says no. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
+                               ColiCudaTensor *const *ups,
+                               ColiCudaTensor *const *downs,
+                               const int *rows, int count, const float *x,
+                               int x_rows);
+/* Not a DLL export: answered by the loader (does this DLL have it?) or by the
+ * directly-linked backend (yes). */
+int coli_cuda_has_group_x_broadcast(void);
 COLI_CUDA_DLLEXPORT const float *coli_cuda_expert_group_take(int device);
 
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
