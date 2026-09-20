@@ -315,7 +315,7 @@ int main(void){
         cudaMemcpy(dcs,cancel,12,cudaMemcpyHostToDevice);
         cudaMemcpy(dos,one,12,cudaMemcpyHostToDevice);
         GroupDesc hd_={dw,dw,dw,(const float*)dcs,(const float*)dcs,(const float*)dcs,
-                       8,8,8,1,0,0,0,0};
+                       8,8,8,1,0,0,0,0,0};
         cudaMemcpy(ddesc,&hd_,sizeof(hd_),cudaMemcpyHostToDevice);
         grouped_down_f8w<0><<<dim3(1,1),256>>>((float*)dy,(const float*)dx,
                                                (const GroupDesc*)ddesc,1,384);
@@ -326,7 +326,7 @@ int main(void){
             printf("FAIL grouped down accumulation convention: got %a want %a\n",got,expect);
             return 1; }
         GroupDesc hh_={dw,dw,dw,(const float*)dcs,(const float*)dos,(const float*)dcs,
-                       8,8,8,1,0,0,0,0};
+                       8,8,8,1,0,0,0,0,0};
         cudaMemcpy(ddesc,&hh_,sizeof(hh_),cudaMemcpyHostToDevice);
         grouped_hidden_f8w_dual<0><<<dim3(1,1),256>>>((float*)dg,(float*)du,
                 (const float*)dx,(const GroupDesc*)ddesc,1,384);
@@ -362,7 +362,7 @@ int main(void){
         cudaMemcpy((float*)dxm+1,hxv,K*4,cudaMemcpyHostToDevice);
         cudaMemcpy(ds,hs,sizeof(hs),cudaMemcpyHostToDevice);
         GroupDesc pd={dq,dq,dq,(const float*)ds,(const float*)ds,(const float*)ds,
-                      8,8,8,1,0,0,0,0};
+                      8,8,8,1,0,0,0,0,0};
         cudaMemcpy(ddesc,&pd,sizeof(pd),cudaMemcpyHostToDevice);
         grouped_down_f8w<0><<<dim3(1,1),256>>>((float*)dya,(const float*)dxa,
                                                (const GroupDesc*)ddesc,O,K);

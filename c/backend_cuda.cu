@@ -129,9 +129,16 @@ typedef struct {
      * all K experts of a token consume the SAME activation vector, so the
      * caller can upload it once and point every chunk at row 0. `offset`
      * keeps driving gate/up/y, which are genuinely per-expert and must not
-     * collide. Every GroupDesc built in this file sets this explicitly; an
-     * aggregate initialiser that left it out would zero-fill it, which is a
-     * broadcast nobody asked for. */
+     * collide.
+     *
+     * SET IT EXPLICITLY, EVERYWHERE. C++ aggregate initialisation zero-fills
+     * a trailing field nobody mentions, and zero here means "read row 0" --
+     * a broadcast nobody asked for, silent at compile time. Adding this field
+     * did exactly that to five hand-built GroupDesc literals in tests/, and
+     * test_fp8_cuda caught it at 76777 mismatches. The tests are the gate;
+     * the alternative design, if this ever bites again, is a kernel parameter
+     * instead of a struct field, because then every missed site is a compile
+     * error rather than a wrong number. */
     int xoff;
 } GroupDesc;
 
