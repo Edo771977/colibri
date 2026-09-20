@@ -27,8 +27,8 @@
     },
     "median_tok_s": 36.5,
     "quality": {
-      "method": "Not a numerical arm: quant_matmul_i8r keeps the original summation order (i = t, t+256, ... ascending), the same 256-wide reduction tree and the same trailing f32 scale, so its output is bitwise identical to this arm's and the comparison cannot be confounded by a quality difference. c/tests/test_int8_rows_cuda.cu asserts exactly that with memcmp on trunk geometry, on S > 1 and on the short-block shapes (O = 13, 5, 17, 3, 1), against a double-precision CPU reference, with a mutated-weight probe so that identity between two kernels that read nothing would fail. That test was last executed on an earlier commit of this branch and has NOT been re-run on the commit recorded here; it needs a GPU and one has not been available since.",
-      "passed": null
+      "method": "Not a numerical arm: quant_matmul_i8r keeps the original summation order (i = t, t+256, ... ascending), the same 256-wide reduction tree and the same trailing f32 scale, so its output is bitwise identical to this arm's and the comparison cannot be confounded by a quality difference. c/tests/test_int8_rows_cuda.cu asserts exactly that with memcmp on trunk geometry, on S > 1 and on the short-block shapes (O = 13, 5, 17, 3, 1), against a double-precision CPU reference, with a mutated-weight probe so that identity between two kernels that read nothing would fail, and a launch counter so that it cannot be satisfied by a branch that never fires. EXECUTED on the merged code (RTX 4070 Ti SUPER, CUDA 13.4, `make cuda-test`): all seven shapes bitwise identical at R = 2, 4 and 8, reference rms 0.00e+00 to 1.05e-07, dispatch probe confirming the branch fires when unset and not at ROWS=0.",
+      "passed": true
     },
     "evidence": {
       "uri": "docs/experiments/qwen36-i8-rows-2026-09-20-raw.txt, section 'SESSION 2', arm r0",
@@ -47,8 +47,8 @@
     },
     "median_tok_s": 42.65,
     "quality": {
-      "method": "Same as the baseline: the two arms are bitwise identical by construction and by test, so this record's only open quality item is re-running c/tests/test_int8_rows_cuda.cu on the recorded commit.",
-      "passed": null
+      "method": "Same as the baseline: the two arms are bitwise identical by construction and by test, and that test has now been executed on the merged code -- see the baseline's method field. No open quality item remains.",
+      "passed": true
     },
     "evidence": {
       "uri": "docs/experiments/qwen36-i8-rows-2026-09-20-raw.txt, section 'SESSION 2', arm r2",
