@@ -92,6 +92,11 @@ typedef int            (*fn_expert_group_issue)(ColiCudaTensor *const *gates,
                                                 ColiCudaTensor *const *ups,
                                                 ColiCudaTensor *const *downs,
                                                 const int *rows, int count, const float *x);
+typedef int            (*fn_expert_group_issue_x)(ColiCudaTensor *const *gates,
+                                                  ColiCudaTensor *const *ups,
+                                                  ColiCudaTensor *const *downs,
+                                                  const int *rows, int count,
+                                                  const float *x, int x_rows);
 typedef const float *  (*fn_expert_group_take)(int device);
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
@@ -176,6 +181,7 @@ static struct {
     fn_expert_group    expert_group;
     fn_expert_group_pinned expert_group_pinned;
     fn_expert_group_issue expert_group_issue;
+    fn_expert_group_issue_x expert_group_issue_x;
     fn_expert_group_take expert_group_take;
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
@@ -1431,6 +1437,10 @@ static int coli_cuda_load(void){
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE_OPT(expert_group_pinned, fn_expert_group_pinned)
     RESOLVE(expert_group_issue, fn_expert_group_issue)
+    /* #1602: one input row broadcast to every chunk. Optional so a new
+     * engine keeps working against a DLL built before it -- the caller
+     * duplicates as it always did when this resolves to NULL. */
+    RESOLVE_OPT(expert_group_issue_x, fn_expert_group_issue_x)
     RESOLVE(expert_group_take, fn_expert_group_take)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
@@ -1644,6 +1654,22 @@ int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                                  const int *rows, int count, const float *x){
     if(!g_cuda.available) return 0;
     return g_cuda.expert_group_issue(gates, ups, downs, rows, count, x);
+}
+
+int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
+                                   ColiCudaTensor *const *ups,
+                                   ColiCudaTensor *const *downs,
+                                   const int *rows, int count, const float *x,
+                                   int x_rows){
+    if(!g_cuda.available || !g_cuda.expert_group_issue_x) return 0;
+    return g_cuda.expert_group_issue_x(gates, ups, downs, rows, count, x, x_rows);
+}
+
+/* The caller asks this ONCE and keeps its duplicating path for a no: a DLL
+ * older than #1602 exports no broadcast entry, and calling the legacy one
+ * with a one-row buffer would have it read total*D floats off the end. */
+int coli_cuda_has_group_x_broadcast(void){
+    return g_cuda.available && g_cuda.expert_group_issue_x != NULL;
 }
 
 const float *coli_cuda_expert_group_take(int device){

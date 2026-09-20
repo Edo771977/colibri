@@ -338,6 +338,21 @@ g_qt_cpu += _q2 - _q1;
 `g_qt_cpu` is the whole CPU-side overlap window, and the shared expert is
 computed inside it deliberately, to cover the GPU's latency. So it counts work
 that is neither a miss nor waste, and that the `(shared)` row already reports.
+
+**The counter is now split, because writing this paragraph did not stop it
+happening again.** A later session read `cpu-miss 4.95` off a profile, called
+the misses a fifth of the token, and published that before checking this page.
+`cpu-miss` is the miss loop alone from here on, and the overlap window is
+reported separately as `shared-ovl`:
+
+```
+[timers]   qtier: issue 1.76 | cpu-miss 0.78 | take 0.53 | shared-ovl 4.17 ms/token
+```
+
+`shared-ovl` is last in the line although it happens between `cpu-miss` and
+`take`, so that scripts parsing the original three keys keep matching. It is
+the same work the `(shared)` row reports; the two should agree, and a gap
+between them is CPU-side miss work this split did not capture.
 Subtracting the two says how much of it really was misses:
 
 | | `cpu-miss` | `(shared)` | difference |
@@ -376,8 +391,28 @@ either.
 One lossless saving found while reading this path: `qt_issue` copies the same
 `x` once per expert (`memcpy(xr + j*G.D, x, ...)`), so 8 KB becomes 64 KB per
 layer and ~2.6 MB per token of host copies and H2D traffic for one vector that
-never changes. `GroupDesc` already carries an `offset`; pointing every expert at
-offset 0 removes both.
+never changes.
+
+**Done (#1602), and the recipe written here was wrong.** "Pointing every
+expert at offset 0" does not work: `GroupDesc.offset` indexes the OUTPUT as
+well (`y[(d.offset+s)*D+o]`), so zeroing it makes the K experts write over
+each other. The fix needs a second offset — `xoff`, read only by the
+`grouped_hidden_*` kernels, which are the only ones that touch the group's
+input — while `offset` goes on driving gate/up/y, which really are per-expert.
+
+It also could not widen `coli_cuda_expert_group_issue`, because under
+`CUDA_DLL=1` the engine and the kernels ship apart: a new engine meeting an
+older `coli_cuda.dll` would have that DLL ignore the new argument and read
+`total*D` floats out of a one-row buffer. So the broadcast form is a separate,
+optionally-resolved export (`coli_cuda_expert_group_issue_x`), and `qt_issue`
+keeps the duplicating loop for when `coli_cuda_has_group_x_broadcast()` says
+no.
+
+What it saves is host-side and on the critical path: two memcpys per layer
+drop from 64 KB to 8 KB (the caller's, and the backend's into pinned memory),
+about 4.5 MB a token. The H2D drops by the same 8x — and that part should buy
+nothing, because `take` is 0.53 ms/token, so the GPU side of this path is not
+what the token is waiting for.
 
 The three CPU rows the runtime was predicted to own moved as predicted (~2.5,
 ~0.5, ~5 against 4.0, 0.6, 5.5). The two GPU rows moved as well, which was not

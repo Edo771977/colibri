@@ -91,7 +91,7 @@ int main(void){
             cudaMemcpy(sg[c],hgs[c],(size_t)I*cngD*4,cudaMemcpyHostToDevice);
             cudaMemcpy(su[c],hus[c],(size_t)I*cngD*4,cudaMemcpyHostToDevice);
             cudaMemcpy(sd[c],hds[c],(size_t)D*cngI*4,cudaMemcpyHostToDevice);
-            host[c]={qg[c],qu[c],qd[c],sg[c],su[c],sd[c],4,4,4,1,c,cgs,cgs,cgs};
+            host[c]={qg[c],qu[c],qd[c],sg[c],su[c],sd[c],4,4,4,1,c,cgs,cgs,cgs,c};
         }
         for(size_t i=0;i<(size_t)COUNT*D;i++) xs[i]=(rand()/(float)RAND_MAX-.5f)*2.f;
         GroupDesc *ddesc; cudaMalloc(&ddesc,sizeof(host));
@@ -173,6 +173,45 @@ int main(void){
             off+=rows[c];
         }
         printf("grouped-g4 API: sync vs oracle + async(issue/take) vs sync, %d mismatches\n",api_bad);
+
+        /* One input row broadcast to every chunk (#1602). Decode hands K
+         * experts the same activation vector; the caller used to copy it K
+         * times. Passing it once with x_rows=1 must land on exactly the same
+         * bits as passing K copies -- it is the same arithmetic reading the
+         * same row, so a tolerance would be the wrong gate. */
+        {
+            int rows1[COUNT]; for(int c=0;c<COUNT;c++) rows1[c]=1;
+            float *xd=(float*)malloc((size_t)COUNT*D*4);
+            for(int c=0;c<COUNT;c++) memcpy(xd+(size_t)c*D,x,(size_t)D*4);
+            float *ydup=(float*)malloc((size_t)COUNT*D*4);
+            if(!coli_cuda_expert_group_issue(tg,tu,td,rows1,COUNT,xd)){ printf("FAIL dup issue\n"); return 1; }
+            const float *yd=coli_cuda_expert_group_take(0);
+            if(!yd){ printf("FAIL dup take\n"); return 1; }
+            memcpy(ydup,yd,(size_t)COUNT*D*4);
+            if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,1)){ printf("FAIL bcast issue\n"); return 1; }
+            const float *yb=coli_cuda_expert_group_take(0);
+            if(!yb){ printf("FAIL bcast take\n"); return 1; }
+            int bc_bad = memcmp(ydup,yb,(size_t)COUNT*D*4)!=0;
+            if(bc_bad) api_bad++;
+            printf("grouped-g4 broadcast: x_rows=1 vs %d duplicated rows: %s\n",
+                   COUNT, bc_bad?"DIFFERS":"bitwise");
+
+            /* The refusals. A chunk with two rows would read xoff+1, and
+             * there is no second row; a bogus x_rows would read off the end
+             * of the caller's buffer. Both must be rejected, not guessed. */
+            int rows2[COUNT]; for(int c=0;c<COUNT;c++) rows2[c]=1; rows2[0]=2;
+            if(coli_cuda_expert_group_issue_x(tg,tu,td,rows2,COUNT,x,1)){
+                printf("FAIL broadcast accepted a multi-row chunk\n"); api_bad++; }
+            if(coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,COUNT+1)){
+                printf("FAIL broadcast accepted x_rows past the total\n"); api_bad++; }
+            /* x_rows=0 is the legacy contract: one row per expert row. */
+            if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,xd,0)){
+                printf("FAIL x_rows=0 (legacy) refused\n"); api_bad++; }
+            else { const float *yl=coli_cuda_expert_group_take(0);
+                   if(!yl||memcmp(ydup,yl,(size_t)COUNT*D*4)!=0){
+                       printf("FAIL x_rows=0 is not the legacy path\n"); api_bad++; } }
+            free(xd); free(ydup);
+        }
         for(int c=0;c<COUNT;c++){ coli_cuda_tensor_free(tg[c]);coli_cuda_tensor_free(tu[c]);coli_cuda_tensor_free(td[c]);
             free(hg[c]);free(hu[c]);free(hd[c]);free(hgs[c]);free(hus[c]);free(hds[c]); }
         free(x);free(ysync);

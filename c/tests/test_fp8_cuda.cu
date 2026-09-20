@@ -99,7 +99,7 @@ int main(void){
             cudaMemcpy(dus,hus[c],hs_n*4,cudaMemcpyHostToDevice);
             cudaMemcpy(dds,hds[c],ds_n*4,cudaMemcpyHostToDevice);
             host[c]={dg,du,dd,(const float*)dgs,(const float*)dus,(const float*)dds,
-                     8,8,8,rows[c],off,0,0,0};
+                     8,8,8,rows[c],off,0,0,0,off};   /* xoff == offset: per-row input */
             off+=rows[c];
         }
         float *xs=(float*)malloc((size_t)total*D*4);
