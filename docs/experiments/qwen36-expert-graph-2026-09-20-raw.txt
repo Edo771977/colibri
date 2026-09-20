@@ -1,0 +1,125 @@
+COLI_CUDA_GRAPH: the expert group as one cudaGraphLaunch
+=========================================================
+RESULT: the mechanism works -- `issue` -0.61 ms/token, six pairs of six the
+same sign -- and the token does not move, because the saving lands in `take`
+one for one. This is the measurement that explains the other two.
+
+Box      : Windows, RTX 4070 Ti SUPER 16 GB (sm_89), CUDA 13.4, CUDA_DLL=1
+Engine   : qwen36_clang.exe, rebuilt by the script
+Model    : C:\modelli\qwen36_i4_gs64, prompt25.txt, N_NEW=128
+Script   : misure-graph.ps1, 2 arms x 6 alternated reps, heat frozen
+Dense    : COLI_CUDA_I8_ROWS=2 pinned in both arms
+Guards   : DLL and engine both newer than their sources; every arm announced
+           its path from inside the running binary
+
+
+1. THE MEASUREMENT
+------------------
+
+  arm        step() median   issue   paired delta on step()
+  graph=0      26.65          2.11     --
+  graph=1      26.85          1.51     +0.20  [0.20 -0.20 0.10 0.20 0.30 1.60]
+
+  paired delta on issue: -0.60  [-0.61 -0.59 -0.52 -0.55 -0.60 -0.64]
+
+`issue` falls 28 %, and every pair agrees. `step()` does not move: the pairs
+disagree in sign and one of them (1.60) carries the median on its own.
+
+
+2. WHERE THE SAVING WENT (rip 1, ms/token)
+------------------------------------------
+
+  phase          graph=0   graph=1    delta
+  issue            2.13      1.52     -0.61
+  cpu-miss         0.83      0.80     -0.03
+  take             1.14      1.86     +0.72
+  shared-ovl       4.27      4.21     -0.06
+  (router)         0.96      1.03     +0.07
+  sum              9.33      9.42     +0.09
+  moe_total        9.67      9.74     +0.07
+  unaccounted      0.34      0.32
+
+`issue` -0.61, `take` +0.72. The CPU reaches qt_take 0.61 ms earlier and
+stands still 0.72 ms longer. moe_total is unchanged. The accounting is tight
+and stable (0.33 unaccounted in both arms), so this is not a rounding story.
+
+
+3. THE MODEL THAT EXPLAINS ALL THREE ZEROS
+------------------------------------------
+
+The MoE phase is
+
+    issue  +  max(CPU window, GPU group)  +  residue
+
+where the CPU window is the shared expert plus the real misses, and `take`
+is what is left of the GPU group after the CPU finishes covering it. take >
+0 in every measurement taken today, which says the phase is GPU-BOUND and
+the CPU has idle time inside it.
+
+Every lever tried lands in that slack:
+
+  - grouped_down_g4r (#30): GPU group -1.9 ms/token. take 0.53 -> 0.33,
+    moe_total unchanged. The saving is capped by how far take can fall, and
+    the kernel's own SM contention then cost +1.2 ms on the placed dense
+    GEMVs, so the token got WORSE.
+  - COLI_CUDA_X_BCAST (#34): h2d -20 %, a GPU-side saving of ~0.2 ms.
+    Nothing, for the same reason.
+  - COLI_CUDA_GRAPH (this one): issue -0.61, a CPU-side saving. It converts
+    to take, one for one. Nothing.
+
+The map this session started from was wrong in a specific way, which is the
+useful part: `issue` IS CPU on the critical path of the CPU thread, but the
+CPU thread is not what the MoE phase waits for. Being on a critical path
+and being on THE critical path are different claims, and this record kept
+conflating them.
+
+
+4. WHAT THE MODEL SAYS TO TRY NEXT
+----------------------------------
+
+take is 1.14 ms/token with the graph off and 1.86 with it on: that is real
+headroom a GPU-side saving can now convert, where in the earlier session
+(take 0.53) it could not. And #30's kernel offers ~1.9 ms/token of GPU
+saving that was capped at 0.53 when it was measured alone.
+
+So the two levers that each measured zero are predicted to interact:
+
+    COLI_CUDA_GRAPH=1 makes take bigger (more room)
+    COLI_CUDA_DOWN_ROWS=4 makes the GPU group smaller (fills the room)
+
+with #30's contention cost (+1.2 ms on dn-sub proj, norm+out and lm_head)
+subtracted. Net estimate: -0.6 ms/token, marginal, and the sign depends on
+whether the contention cost survives when the launches are batched.
+
+A 2x2 over {GRAPH 0,1} x {DOWN_ROWS 0,4} tests this directly. It is the
+first experiment this session where the prediction comes from a model fitted
+to measurements rather than from a shape argument.
+
+
+5. THE TOKEN, FOR SCALE (arm 0)
+-------------------------------
+
+  moe_total     9.67   38.0 %
+  deltanet      8.60   33.8 %
+  attention     5.79   22.7 %
+  lm_head       1.39    5.5 %
+                      ------
+  TOTAL        25.46
+
+Three sessions of work have been spent inside the 38 %, on the part of it
+the CPU is not waiting for. deltanet is 34 % and has not been looked at once.
+
+
+6. TWO FLAWS IN THE MEASUREMENT ITSELF
+--------------------------------------
+
+The profiled pass reported [NON VALIDO] for graph=1. That is the script's
+fault, not the engine's: COLI_CUDA_PROFILE disables the graph by design, so
+the absence of the announcement there is expected. A guard that cries wolf
+is how a real one stops being read; fixed.
+
+step() was noisier this session than the effect being measured: the graph=0
+arm spread 1.50 ms (6 %) and one pair contributed 1.60. The `issue` result
+is solid on its own (six pairs, tight, same sign) and the take transfer is
+what carries the conclusion -- but any future claim about step() on this
+path needs more repetitions than six.
