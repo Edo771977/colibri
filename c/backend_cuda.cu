@@ -1157,6 +1157,19 @@ static void down_g4_launch(float *y,const float *x,const GroupDesc *dev,
                            int D,int I,int max_rows,int count,cudaStream_t st){
     int R=down_rows_mode();
     if(R){
+        /* Say so once, on stderr, the first time the branch actually fires.
+         *
+         * Under CUDA_DLL=1 every kernel here lives in coli_cuda.dll, which only
+         * `make cuda-dll` rebuilds: a measurement script that rebuilds the
+         * engine and not the DLL sets COLI_CUDA_DOWN_ROWS, changes nothing, and
+         * reports a clean flat result. That cost a day on the dense GEMV. A
+         * line in the log is the cheapest way for a run to prove the toggle
+         * reached the binary it is running, rather than the one on disk when
+         * the script started. Silent when the variable is unset, so the default
+         * path's output is unchanged. */
+        static int announced;
+        if(!announced){ announced=1;
+            fprintf(stderr,"[cuda] expert down-rows active: R=%d\n",R); }
         g_downr_launches++;
         dim3 og((unsigned)((D+R-1)/R),(unsigned)max_rows,(unsigned)count);
         if(R==2)      grouped_down_g4r<2><<<og,256,0,st>>>(y,x,dev,D,I);
