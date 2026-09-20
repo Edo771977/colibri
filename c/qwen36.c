@@ -806,7 +806,12 @@ static double g_tm_dec[6], g_tm_pre[6];   /* 0=deltanet 1=attention 2=moe_total 
 static long g_tm_dec_tokens = 0, g_tm_pre_tokens = 0;
 static double tm_now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1e3 + ts.tv_nsec/1e6; }
 static int tm_on(void){ if(g_timers<0){ const char *e=getenv("COLI_TIMERS"); g_timers = (e && *e=='1'); } return g_timers; }
-double g_qt_iss=0, g_qt_cpu=0, g_qt_tak=0;   /* QTIER-Phasen (Decode) */
+/* QTIER phases (decode). cpu-miss is the miss loop ALONE; shared-ovl is the
+ * shared expert, computed in the same issue..take window on purpose so it
+ * overlaps the GPU groups. They were one counter until the name misled a
+ * reading of the profile: 4.95 looked like the price of a 1.9 % miss rate
+ * and was mostly the shared expert. */
+double g_qt_iss=0, g_qt_cpu=0, g_qt_shr=0, g_qt_tak=0;
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
 double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
@@ -842,9 +847,13 @@ static void tm_report(void){
     if(g_xf_load+g_xf_run>0)
         fprintf(stderr,"[timers]   expert kernel: fetch %.2f | compute %.2f ms/token\n",
                 g_xf_load/g_tm_dec_tokens, g_xf_run/g_tm_dec_tokens);
-    if(g_qt_iss+g_qt_cpu+g_qt_tak>0)
-        fprintf(stderr,"[timers]   qtier: issue %.2f | cpu-miss %.2f | take %.2f ms/token\n",
-                g_qt_iss/g_tm_dec_tokens, g_qt_cpu/g_tm_dec_tokens, g_qt_tak/g_tm_dec_tokens);
+    if(g_qt_iss+g_qt_cpu+g_qt_shr+g_qt_tak>0)
+        /* shared-ovl goes LAST although it happens between cpu-miss and take:
+         * the existing three keys keep their order so the measurement scripts
+         * that parse `issue X | cpu-miss Y | take Z` keep matching. */
+        fprintf(stderr,"[timers]   qtier: issue %.2f | cpu-miss %.2f | take %.2f | shared-ovl %.2f ms/token\n",
+                g_qt_iss/g_tm_dec_tokens, g_qt_cpu/g_tm_dec_tokens,
+                g_qt_tak/g_tm_dec_tokens, g_qt_shr/g_tm_dec_tokens);
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
 }
@@ -2688,6 +2697,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 float w = val[kk]; float *os = out + (int64_t)s*D;
                 for (int d = 0; d < D; d++) os[d] += w * hh[d];
             }
+            /* The miss loop ends here. Everything from _q1 to _qm is the
+             * experts this layer had to compute on the CPU; what follows is
+             * the shared expert, which is NOT a miss. Timing them together
+             * was how `cpu-miss` came to read 4.95 ms/token when the misses
+             * themselves cost about 0.78 -- a counter named after one of the
+             * two things inside it. */
+            double _qm = tm_now();
             /* Compute the shared expert NOW so it overlaps with the GPU
              * groups; the common block below is skipped. */
             {
@@ -2710,8 +2726,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             double _q2 = tm_now();
             qt_take(qmask, val, K, out + (int64_t)s*D);
             if (tm_on() && S==1) {
-                extern double g_qt_iss, g_qt_cpu, g_qt_tak;
-                g_qt_iss += _q1-_q0; g_qt_cpu += _q2-_q1; g_qt_tak += tm_now()-_q2;
+                extern double g_qt_iss, g_qt_cpu, g_qt_shr, g_qt_tak;
+                g_qt_iss += _q1-_q0; g_qt_cpu += _qm-_q1;
+                g_qt_shr += _q2-_qm; g_qt_tak += tm_now()-_q2;
             }
         } else {
             for (int kk = 0; kk < K; kk++) {
