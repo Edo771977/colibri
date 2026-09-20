@@ -157,7 +157,7 @@ int main(void){
             int S=svals[si];
             for(int c=0;c<E;c++)
                 host[c]={dg[c],du[c],dd[c],(const float*)dgs[c],(const float*)dus[c],
-                         (const float*)dds[c],8,8,8,S,c*S,0,0,0};
+                         (const float*)dds[c],8,8,8,S,c*S,0,0,0,c*S};
             CK(cudaMemcpy(ddesc,host,sizeof(host),cudaMemcpyHostToDevice));
             for(int w=0;w<3;w++) cfg[k].fn(ddesc,gate,up,x,y,S);
             CK(cudaDeviceSynchronize()); CK(cudaGetLastError());

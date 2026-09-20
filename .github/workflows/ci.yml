@@ -396,6 +396,16 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_int8_rows_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "int8 row-blocked test compiles"
+      - name: Compile the grouped-g4 oracle (syntax only, no GPU)
+        run: |
+          cd c
+          # Carries the broadcast (x_rows) assertions. It is not in
+          # `make gpu-compile` because it uses cudaMallocManaged, which
+          # backend_gpu_compat.h does not map for HIP, so nvcc here is the
+          # only thing that compiles it on a runner without a card.
+          nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_grouped_g4_cuda.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "grouped-g4 oracle compiles"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |
           cd c

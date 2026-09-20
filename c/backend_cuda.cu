@@ -123,6 +123,23 @@ typedef struct {
     const void *g,*u,*d; const float *gs,*us,*ds;
     int gf,uf,df,rows,offset;
     int ggs,ugs,dgs;      /* per-tensor quant group size; 0 = per-row scales (#334 fmt=4) */
+    /* Row offset into the group's INPUT buffer, which `offset` used to serve
+     * as well. They are the same for every caller that hands over one input
+     * row per expert -- and they differ for the one that does not: in decode
+     * all K experts of a token consume the SAME activation vector, so the
+     * caller can upload it once and point every chunk at row 0. `offset`
+     * keeps driving gate/up/y, which are genuinely per-expert and must not
+     * collide.
+     *
+     * SET IT EXPLICITLY, EVERYWHERE. C++ aggregate initialisation zero-fills
+     * a trailing field nobody mentions, and zero here means "read row 0" --
+     * a broadcast nobody asked for, silent at compile time. Adding this field
+     * did exactly that to five hand-built GroupDesc literals in tests/, and
+     * test_fp8_cuda caught it at 76777 mismatches. The tests are the gate;
+     * the alternative design, if this ever bites again, is a kernel parameter
+     * instead of a struct field, because then every missed site is a compile
+     * error rather than a wrong number. */
+    int xoff;
 } GroupDesc;
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
@@ -914,7 +931,7 @@ __global__ static void grouped_hidden(float *y,const float *x,const GroupDesc *d
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z; GroupDesc d=desc[c];
     if(s>=d.rows) return;
     const void *w=which?d.u:d.g; const float *sc=which?d.us:d.gs; int fmt=which?d.uf:d.gf;
-    size_t rb=row_bytes(fmt,D),row=(size_t)o*rb; const float *xs=x+(size_t)(d.offset+s)*D;
+    size_t rb=row_bytes(fmt,D),row=(size_t)o*rb; const float *xs=x+(size_t)(d.xoff+s)*D;
     float sum=0; for(int i=threadIdx.x;i<D;i+=blockDim.x) sum+=xs[i]*weight_at(w,fmt,row,i);
     __shared__ float p[256]; p[threadIdx.x]=sum; __syncthreads();
     for(int n=128;n;n>>=1){ if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n]; __syncthreads(); }
@@ -939,7 +956,7 @@ __global__ static void grouped_hidden_e8_dual(float *gate,const float *x,
     size_t rb=row_bytes(6,D);
     const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*rb;
     const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*rb;
-    const float *xs=x+(size_t)(d.offset+s)*D;float ga=0,ua=0;
+    const float *xs=x+(size_t)(d.xoff+s)*D;float ga=0,ua=0;
     int nsub=(D+COLI_E8_SUB-1)/COLI_E8_SUB;
     for(int sb=threadIdx.x;sb<nsub;sb+=blockDim.x){
         int ib=sb%(COLI_E8_QK/COLI_E8_SUB);
@@ -983,7 +1000,7 @@ __global__ static void grouped_hidden_w4(float *y,const float *x,const GroupDesc
                                          int I,int D,int which){
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
     const uint8_t *w=(const uint8_t*)(which?d.u:d.g);const float *sc=which?d.us:d.gs;
-    const uint8_t *row=w+(size_t)o*((D+1)/2);const float *xs=x+(size_t)(d.offset+s)*D;
+    const uint8_t *row=w+(size_t)o*((D+1)/2);const float *xs=x+(size_t)(d.xoff+s)*D;
     float sum=0;for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float a,z;unpack_s4(row[b],&a,&z);
         int i=b*2;sum+=xs[i]*a;if(i+1<D)sum+=xs[i+1]*z;}
     __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
@@ -996,7 +1013,7 @@ __global__ static void grouped_hidden_w4_dual(float *gate,float *up,const float 
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
     const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*((D+1)/2);
     const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*((D+1)/2);
-    const float *xs=x+(size_t)(d.offset+s)*D;float ga=0,ua=0;
+    const float *xs=x+(size_t)(d.xoff+s)*D;float ga=0,ua=0;
     for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float g0,g1,u0,u1;unpack_s4(gr[b],&g0,&g1);unpack_s4(ur[b],&u0,&u1);
         int i=b*2;ga+=xs[i]*g0;ua+=xs[i]*u0;if(i+1<D){ga+=xs[i+1]*g1;ua+=xs[i+1]*u1;}}
     __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
@@ -1034,7 +1051,7 @@ __global__ static void grouped_hidden_g4_dual(float *gate,float *up,const float 
     int ggs=d.ggs>0?d.ggs:D, ugs=d.ugs>0?d.ugs:D;
     const float *gsc=d.gs+(size_t)o*(size_t)((D+ggs-1)/ggs);
     const float *usc=d.us+(size_t)o*(size_t)((D+ugs-1)/ugs);
-    const float *xs=x+(size_t)(d.offset+s)*D;float ga=0,ua=0;
+    const float *xs=x+(size_t)(d.xoff+s)*D;float ga=0,ua=0;
     for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float g0,g1,u0,u1;unpack_s4(gr[b],&g0,&g1);unpack_s4(ur[b],&u0,&u1);
         int i=b*2;float gv=gsc[i/ggs],uv=usc[i/ugs];
         ga+=xs[i]*g0*gv;ua+=xs[i]*u0*uv;
@@ -1075,7 +1092,7 @@ __global__ static void grouped_hidden_f8_dual(float *gate,float *up,const float 
     int nblk=(D+127)>>7;
     const float *gsc=d.gs+(size_t)(o>>7)*nblk;
     const float *usc=d.us+(size_t)(o>>7)*nblk;
-    const float *xs=x+(size_t)(d.offset+s)*D;float ga=0,ua=0;
+    const float *xs=x+(size_t)(d.xoff+s)*D;float ga=0,ua=0;
     for(int i=threadIdx.x;i<D;i+=blockDim.x){float xv=xs[i];int b=i>>7;
         ga+=xv*c_e4m3[gr[i]]*gsc[b];ua+=xv*c_e4m3[ur[i]]*usc[b];}
     __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
@@ -2167,7 +2184,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
                  g->fmt,u->fmt,d->fmt,rows[c],total,
-                 g->gs,u->gs,d->gs};
+                 g->gs,u->gs,d->gs,total};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
         all_q4&=(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&(d->fmt==2||d->fmt==4)&&
                 !(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);   /* even gs: a packed byte never straddles groups */
@@ -2375,12 +2392,24 @@ extern "C" int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
  * scratch buffers. Small batches only (decode/spec): bigger totals keep the sync
  * path with its TC variants. Numerics are the sync path's small-batch kernels,
  * so greedy output is byte-identical by construction. */
-extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
+/* x_rows: how many rows `x` holds. 0 means the original contract -- one input
+ * row per expert row -- and is what the legacy export below passes, so an old
+ * caller keeps its exact behavior. 1 means every chunk reads the same row.
+ *
+ * This is a SEPARATE export rather than a wider signature on the old one
+ * because the two halves ship apart: under CUDA_DLL=1 the kernels live in
+ * coli_cuda.dll and only `make cuda-dll` rebuilds it, so a new engine can
+ * meet an old DLL. Widening the old symbol would have that DLL ignore x_rows
+ * and read total*D floats out of a one-row buffer. The loader resolves this
+ * one optionally and the caller keeps its duplication path for when it is
+ * absent. */
+extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
                                               ColiCudaTensor *const *ups,
                                               ColiCudaTensor *const *downs,
                                               const int *rows, int count,
-                                              const float *x) {
+                                              const float *x, int x_rows) {
     if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64) return 0;
+    if (x_rows < 0) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1,
@@ -2392,7 +2421,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
                  g->fmt,u->fmt,d->fmt,rows[c],total,
-                 g->gs,u->gs,d->gs};
+                 g->gs,u->gs,d->gs,total};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
         any_e8|=g->fmt==6||u->fmt==6||d->fmt==6;
         all_e8&=g->fmt==6&&u->fmt==6&&d->fmt==6;
@@ -2406,14 +2435,30 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     if(any_e8&&!all_e8) return 0;
     if(any_f8&&!all_f8) return 0;   /* mixed FP8: no homogeneous kernel, sync path has the per-expert loop */
     if(total>8) return 0;                       /* decode-scale only */
+    /* x_rows says how many rows `x` actually holds. Two shapes are accepted
+     * and nothing else: one input row per expert row (x_rows == total, the
+     * original contract), or ONE row shared by every chunk (x_rows == 1),
+     * which is decode -- K experts, one token, one activation vector. The
+     * broadcast form requires rows[c] == 1 everywhere, because a chunk with
+     * two rows would read xoff+1 and there is no such row. Anything else is
+     * refused rather than guessed at: a wrong x_rows reads off the end of the
+     * caller's buffer. */
+    if(x_rows==0) x_rows=total;          /* legacy contract */
+    if(x_rows!=total){
+        if(x_rows!=1||max_rows!=1) return 0;
+        for(int c=0;c<count;c++) host[c].xoff=0;
+    }
     DeviceContext *ctx=find_ctx(device); if(!ctx||ctx->group_pending||!select_ctx(ctx)) return 0;
     if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
-    size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
-    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+    /* Input and output are sized apart now that they can differ: x carries
+     * x_rows rows, y still carries one per expert row. */
+    size_t xb=(size_t)x_rows*D*sizeof(float), yb=(size_t)total*D*sizeof(float),
+           ib=(size_t)total*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,yb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
        !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))||
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)) return 0;
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,yb)) return 0;
     std::memcpy(ctx->host_x,x,xb);
     /* Timing is opt-in because measuring it changes it: four cudaEventRecord
      * per call, 40 calls a token, is launch overhead added to the path whose
@@ -2504,10 +2549,16 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     }}
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[2],ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
-       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+       /* yb, not xb. The two were the same number until x_rows existed, and
+        * the readback needs the OUTPUT size: with a broadcast input xb is one
+        * row, so this copied expert 0's result and left the other seven rows
+        * of host_y holding whatever the previous call had put there. qt_take
+        * summed stale memory into the token -- wrong logits, a generation
+        * that diverges, and a profile that reads as a 14 %% slowdown. */
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,yb,cudaMemcpyDeviceToHost,ctx->stream),
                 "expert group issue download")) return 0;
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[3],ctx->stream);
-    ctx->group_pending=1; ctx->group_pending_bytes=xb;
+    ctx->group_pending=1; ctx->group_pending_bytes=yb;   /* the readback, not the upload */
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       int index=(int)(ctx-g_ctx);
       g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
@@ -2515,6 +2566,19 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
       g_device_group_rows[index]+=(uint64_t)total; }
     return 1;
 }
+
+/* The original symbol, unchanged for every caller and every old DLL. */
+extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
+                                            ColiCudaTensor *const *ups,
+                                            ColiCudaTensor *const *downs,
+                                            const int *rows, int count,
+                                            const float *x) {
+    return coli_cuda_expert_group_issue_x(gates,ups,downs,rows,count,x,0);
+}
+
+/* Linked directly (no CUDA_DLL), so the broadcast form is always present.
+ * backend_loader.c has the other definition, which asks the DLL. */
+extern "C" int coli_cuda_has_group_x_broadcast(void){ return 1; }
 
 extern "C" const float *coli_cuda_expert_group_take(int device) {
     DeviceContext *ctx=find_ctx(device);
@@ -3119,7 +3183,7 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
                  g->fmt,u->fmt,d->fmt,1,total,
-                 g->gs,u->gs,d->gs};
+                 g->gs,u->gs,d->gs,total};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
         total++;
     }

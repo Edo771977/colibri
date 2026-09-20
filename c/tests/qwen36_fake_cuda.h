@@ -97,6 +97,16 @@ int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const
     if (fake_issue_hook) return fake_issue_hook(count > 0 ? g[0]->device : -1, count, x);
     return 0;
 }
+/* The fake backend answers "no broadcast", so qt_issue exercises the
+ * duplicating path here -- which is the path a pre-#1602 DLL takes, and the
+ * one that would otherwise go untested. */
+int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *g, ColiCudaTensor *const *u,
+                                   ColiCudaTensor *const *d, const int *rows,
+                                   int count, const float *x, int x_rows) {
+    (void)g; (void)u; (void)d; (void)rows; (void)count; (void)x; (void)x_rows;
+    return 0;
+}
+int coli_cuda_has_group_x_broadcast(void) { return 0; }
 const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
 /* The resident dense GEMV counters. The fake records no timings -- it has no
  * GPU timeline to record -- so this reports zero calls and qt_stats prints
