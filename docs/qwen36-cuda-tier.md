@@ -227,15 +227,59 @@ recorded fact as this gets.
 **What survives and what does not.** The A/B is a within-session ratio — same
 binary in both arms, alternated, frozen residency, spread 2.1 ms — so `dnout`
 and `attnout` are still worth placing. What does not survive is the absolute
-level: 59.75 ms/token is a build nobody should ship, and **−7.77 ms is very
-likely an overestimate for a clang build**. Placement pays by removing CPU
-reads, and libgomp makes those reads cost about twice what libomp charges, so
-the same 335 MB/token buys less on a sane build. Re-measuring on clang is
-outstanding.
+level: 59.75 ms/token is a build nobody should ship. The prediction that
+followed — that −7.77 ms would shrink on clang, because placement pays by
+removing CPU reads and libgomp makes those reads cost twice what libomp
+charges — was then measured, and was **wrong**. See below.
 
 The same caveat reaches the bytes-to-time arithmetic two paragraphs up: the
 55.03 GB/s that turns 335.5 MB into 6.1 ms is this machine under libgomp, not
 this machine.
+
+#### Re-measured on clang — `qwen36-place-clang-2026-09-19-raw.txt`
+
+Same 2×2 discipline, {gcc, clang} × {A, B}, arms alternated inside every
+repetition so both deltas are born in one session rather than compared across
+days. Unlike 19 September this session settles at a **98.1–98.2 % hit rate**
+rather than 100 %, so arm B pays the expert-displacement cost a fully resident
+session hides — which makes this the more honest number of the two.
+
+```
+clang   A 33.43 (33.1-34.3)   B 28.71 (28.2-30.2)   paired median  −4.90
+gcc     A see below           B see below           paired median  −5.20
+```
+
+**The gcc arm is not measurable by its mean here.** Four of eight repetitions
+are disturbed, and in two of them the B arm is *slower* than A — while clang,
+running minutes apart inside the same repetition, stays inside 1.2 ms across
+all eight. That binary is unstable on this host, so more repetitions do not
+average it away. What works is the **paired** delta: `gA` and `gB` run back to
+back, so their difference absorbs whatever both are suffering.
+
+**The absolute gain does not shrink on clang** — −4.90 against −5.20 — and the
+prediction had the *relative* movement backwards too: −14.7 % of a 33.4 ms
+token against roughly −9.5 % of a 55 ms one. Placement is worth **more** on a
+sane build, not less.
+
+One row carries the reason:
+
+```
+norm+out -> dnout    clang  5.50 -> 2.44   (−3.06)
+                     gcc    9.31 -> 6.13   (−3.19)
+```
+
+Very different baselines, near-identical saving. What placement removes is one
+large streaming GEMV, and that is DRAM-bandwidth bound — DRAM does not know
+which compiler built the host. libgomp's price is per-parallel-region overhead
+(54 µs a region, from the OpenMP record), which falls on the many small
+operations — router, shared expert, the gated norm — not on the single large
+read being displaced.
+
+Control rows, stated rather than explained: `shared` +0.22, `router` +0.22,
+`cpu-miss` +0.31, where 19 September had them flat. `cpu-miss` has a candidate
+reason — 98 % residency means arm B's 0.31 GB of displaced experts costs real
+misses. `shared` and `router` do not. They are small against −4.90 and do not
+overturn it, but they moved and the earlier measurement's did not.
 
 **A row that should not have moved.** `lm_head` is on the GPU in every arm of
 the 2×2, and still goes 2.65 → 3.92 ms when only the *host* compiler changes.
