@@ -6,6 +6,13 @@ Engine   : qwen36_clang.exe (LLVM libomp; see qwen36-toolchain-2x-2026-09-19)
 Model    : C:\modelli\qwen36_i4_gs64
 Script   : misure-place-clang.ps1 -RowsSweep  (4 arms x 4 alternated reps for
            step(), then one COLI_CUDA_PROFILE pass per arm outside the A/B)
+Tokens   : prompt25.txt (25 prompt tokens). The A/B repetitions generate
+           N_NEW=128 tokens each; the warm-up and the profiled pass generate
+           64. So the step() column below is a 128-token decode and the
+           kernel GB/s column is a 64-token one -- they are not the same run
+           and their absolute times are not comparable to each other.
+Placement: COLI_PLACE=experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0 (arm B),
+           identical in every arm; only COLI_CUDA_I8_ROWS differs.
 Arms     : COLI_CUDA_I8_ROWS = 0 (original kernel) / 2 / 4 / 8
 Heat     : frozen after warm-up; every rep reports hit 98.1 %
 
