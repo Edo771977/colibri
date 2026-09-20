@@ -502,6 +502,81 @@ __global__ static void quant_matmul_f8w(float *y,const float *x,const void *weig
     (void)S;
 }
 
+/* fmt=1 per-row int8 dense GEMV, R OUTPUT ROWS PER BLOCK (COLI_CUDA_I8_ROWS).
+ *
+ * The generic branch below gives one 256-thread block to one output row, and
+ * every block reads the WHOLE activation vector. So a call moves
+ *
+ *     weights   I * O * 1 byte
+ *     x         I * O * 4 byte      (O blocks, I floats each)
+ *
+ * -- four fifths of the traffic is activations, and dense_stats counts only
+ * the weights. With R rows per block, x is read once per R rows and the total
+ * falls from 5x the weight bytes to (1 + 4/R)x: at R=8 that is 1.5x, a factor
+ * of 3.3. The qwen3.6 trunk measures 29 % of this card's bandwidth -- 1/3.4 --
+ * so this is the first hypothesis that predicts the observed number rather
+ * than merely being plausible.
+ *
+ * It is also the SECOND attempt at that number. The first (quant_matmul_i8w,
+ * PR #28) widened the loads to char4/float4 and replaced the reduction tree
+ * with warp shuffles, and came out 1.5-5 % SLOWER across two sessions. What
+ * that bought was the knowledge that the inner loop is not the limit, so this
+ * kernel deliberately does not touch it.
+ *
+ * ONE VARIABLE. The per-thread partition (thread t takes i = t, t+256, ...),
+ * the byte-at-a-time weight read, the 256-wide shared reduction tree and the
+ * trailing f32 scale are all EXACTLY the generic branch's. The only change is
+ * that one block now carries R rows and reads each x element once for all of
+ * them. The R trees run in lockstep under the same eight barriers, so the
+ * barrier count per output FALLS by R as well, but that is a side effect of
+ * the blocking rather than a second thing being changed.
+ *
+ * Consequence worth more than the speed: the result should be BIT-IDENTICAL
+ * to the original kernel, because every addition happens in the same order on
+ * the same operands. tests/test_int8_rows_cuda.cu asserts exactly that with
+ * memcmp rather than a tolerance. An optimisation that cannot move a logit
+ * cannot flip a token, which is what made #28's reordering need the oracle
+ * before any default could change.
+ *
+ * Off by default all the same: unmeasured is unmeasured. COLI_CUDA_I8_ROWS=8
+ * (or 2/4) turns it on. */
+template<int R>
+__global__ static void quant_matmul_i8r(float *y, const float *x, const void *weights,
+                                        const float *scales, int S, int I, int O) {
+    int o0 = (int)blockIdx.x * R, s = blockIdx.y;
+    const float *xs = x + (size_t)s * I;
+    const int8_t *w = static_cast<const int8_t *>(weights);
+    int nr = O - o0 < R ? O - o0 : R;        /* the last block may be short */
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+
+    for (int i = threadIdx.x; i < I; i += blockDim.x) {
+        float xv = xs[i];                    /* read ONCE, used for R rows */
+#pragma unroll
+        for (int r = 0; r < R; r++)
+            if (r < nr) acc[r] += xv * static_cast<float>(w[(size_t)(o0 + r) * I + i]);
+    }
+
+    /* The generic branch's tree, R of them under the same barriers. */
+    __shared__ float partial[R][256];
+#pragma unroll
+    for (int r = 0; r < R; r++) if (r < nr) partial[r][threadIdx.x] = acc[r];
+    __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) {
+        if (threadIdx.x < (unsigned)n)
+#pragma unroll
+            for (int r = 0; r < R; r++)
+                if (r < nr) partial[r][threadIdx.x] += partial[r][threadIdx.x + n];
+        __syncthreads();
+    }
+    if (threadIdx.x < (unsigned)nr) {
+        int o = o0 + (int)threadIdx.x;
+        y[(size_t)s * O + o] = partial[threadIdx.x][0] * scales[o];
+    }
+    (void)S;
+}
+
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
                                     const float *scales, int fmt, int S, int I, int O,
                                     size_t rb, int gs, int ng) {
@@ -1725,16 +1800,43 @@ static int f8_warp_mode(void) {
     return *end ? COLI_F8_DEFAULT : (int)v;
 }
 
+/* COLI_CUDA_I8_ROWS: rows per block for the fmt=1 per-row GEMV. 0/unset keeps
+ * the original one-row-per-block kernel; 2, 4 and 8 are the instantiated
+ * widths. Anything else -- including a value this build has no instantiation
+ * for -- reads as off rather than silently rounding to one that exists. */
+static int i8_rows_mode(void) {
+    const char *e = std::getenv("COLI_CUDA_I8_ROWS");
+    if (!e || !*e) return 0;
+    char *end; long v = std::strtol(e, &end, 10);
+    if (*end) return 0;
+    return (v == 2 || v == 4 || v == 8) ? (int)v : 0;
+}
+
 /* One launch site for the dense matvec so fmt=8 honors the same toggle as
  * f8_group_launch: mode 0 runs the original quant_matmul branch (fully
  * original behavior), anything else the warp/shared-LUT rework. */
 static void quant_matmul_launch(float *y, const float *x, const void *w,
         const float *sc, int fmt, int S, int I, int O, size_t rb, int gs, int ng) {
     dim3 grid((unsigned)O, (unsigned)S);
-    if (fmt == 8 && f8_warp_mode())
+    if (fmt == 8 && f8_warp_mode()) {
         quant_matmul_f8w<<<grid, 256>>>(y, x, w, sc, S, I, O);
-    else
-        quant_matmul<<<grid, 256>>>(y, x, w, sc, fmt, S, I, O, rb, gs, ng);
+        return;
+    }
+    /* gs <= 0 only: grouped int8 keeps its own branch, whose per-group scale
+     * application order is part of its CPU-reference contract. The grid is
+     * O/R blocks here, not O -- the one place this path's launch geometry
+     * differs from the original's. */
+    if (fmt == 1 && gs <= 0) {
+        int R = i8_rows_mode();
+        if (R) {
+            dim3 rgrid((unsigned)((O + R - 1) / R), (unsigned)S);
+            if (R == 2)      quant_matmul_i8r<2><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            else if (R == 4) quant_matmul_i8r<4><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            else             quant_matmul_i8r<8><<<rgrid, 256>>>(y, x, w, sc, S, I, O);
+            return;
+        }
+    }
+    quant_matmul<<<grid, 256>>>(y, x, w, sc, fmt, S, I, O, rb, gs, ng);
 }
 
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
