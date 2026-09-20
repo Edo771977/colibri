@@ -27,15 +27,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <cuda_runtime.h>
+#include <cstdint>
 
+/* No direct <cuda_runtime.h>: the backend include below pulls the right
+ * runtime header for the target (cuda_runtime.h, or hip_runtime.h through
+ * backend_gpu_compat.h). A direct include breaks the hipcc build, which is
+ * what `make gpu-compile` runs this file through. For the same reason the
+ * buffers below are plain cudaMalloc + memcpy, not cudaMallocManaged: the
+ * compat header does not map managed allocation. */
 #include "../backend_cuda.cu"
 
 #ifdef _WIN32
 static int setenv(const char *name,const char *value,int overwrite){
-    (void)overwrite; char buf[128];
-    snprintf(buf,sizeof buf,"%s=%s",name,value);
-    return _putenv(buf);
+    (void)overwrite; return _putenv_s(name,value);
 }
 #endif
 
@@ -105,23 +109,26 @@ static void shape(int D,int I,int gs){
     GroupDesc *ddesc; cudaMalloc(&ddesc,sizeof host);
     cudaMemcpy(ddesc,host,sizeof host,cudaMemcpyHostToDevice);
 
-    float *x,*y0,*yr;
-    cudaMallocManaged(&x,(size_t)total*I*4);
-    cudaMallocManaged(&y0,(size_t)total*D*4);
-    cudaMallocManaged(&yr,(size_t)total*D*4);
-    for(size_t i=0;i<(size_t)total*I;i++) x[i]=rndf();
-    size_t yn=(size_t)total*D;
+    size_t xn=(size_t)total*I, yn=(size_t)total*D;
+    float *hx=(float*)malloc(xn*sizeof(float));
+    float *y0=(float*)malloc(yn*sizeof(float));
+    float *yr=(float*)malloc(yn*sizeof(float));
+    for(size_t i=0;i<xn;i++) hx[i]=rndf();
+    float *x,*dy;
+    cudaMalloc(&x,xn*sizeof(float)); cudaMalloc(&dy,yn*sizeof(float));
+    cudaMemcpy(x,hx,xn*sizeof(float),cudaMemcpyHostToDevice);
 
     setenv("COLI_CUDA_DOWN_ROWS","0",1);
-    down_g4_launch(y0,x,ddesc,D,I,max_rows,COUNT,0);
+    down_g4_launch(dy,x,ddesc,D,I,max_rows,COUNT,0);
     check(cudaDeviceSynchronize()==cudaSuccess,"original ran");
+    cudaMemcpy(y0,dy,yn*sizeof(float),cudaMemcpyDeviceToHost);
 
     /* the reference underneath the identity */
     double worst=0;
     for(int c=0;c<COUNT;c++)
         for(int s=0;s<rowsper[c];s++){
             float *ref=(float*)malloc((size_t)D*4);
-            cpu_down_g4(hd[c],hds[c],I,D,gs,x+(size_t)(offs[c]+s)*I,ref);
+            cpu_down_g4(hd[c],hds[c],I,D,gs,hx+(size_t)(offs[c]+s)*I,ref);
             double r=rel_rms(y0+(size_t)(offs[c]+s)*D,ref,(size_t)D);
             if(r>worst) worst=r;
             free(ref);
@@ -133,10 +140,11 @@ static void shape(int D,int I,int gs){
     for(int R=2;R<=8;R*=2){
         char v[4]; snprintf(v,sizeof v,"%d",R);
         setenv("COLI_CUDA_DOWN_ROWS",v,1);
-        memset(yr,0,yn*sizeof(float));
-        down_g4_launch(yr,x,ddesc,D,I,max_rows,COUNT,0);
+        cudaMemsetAsync(dy,0,yn*sizeof(float),0);
+        down_g4_launch(dy,x,ddesc,D,I,max_rows,COUNT,0);
         snprintf(name,sizeof name,"R=%d ran [D=%d I=%d]",R,D,I);
         check(cudaDeviceSynchronize()==cudaSuccess,name);
+        cudaMemcpy(yr,dy,yn*sizeof(float),cudaMemcpyDeviceToHost);
         int same=!memcmp(y0,yr,yn*sizeof(float));
         printf("  R=%d %s",R,same?"bitwise":"DIFFERS");
         snprintf(name,sizeof name,"R=%d bitwise identical [D=%d I=%d gs=%d]",R,D,I,gs);
@@ -152,16 +160,17 @@ static void shape(int D,int I,int gs){
         uint8_t after=(uint8_t)(before^0x11);
         cudaMemcpy(qd[0]+probe,&after,1,cudaMemcpyHostToDevice);
         setenv("COLI_CUDA_DOWN_ROWS","8",1);
-        memset(yr,0,yn*sizeof(float));
-        down_g4_launch(yr,x,ddesc,D,I,max_rows,COUNT,0);
+        cudaMemsetAsync(dy,0,yn*sizeof(float),0);
+        down_g4_launch(dy,x,ddesc,D,I,max_rows,COUNT,0);
         cudaDeviceSynchronize();
+        cudaMemcpy(yr,dy,yn*sizeof(float),cudaMemcpyDeviceToHost);
         snprintf(name,sizeof name,"mutated weight changes the R kernel's output [D=%d I=%d]",D,I);
         check(memcmp(y0,yr,yn*sizeof(float))!=0,name);
         cudaMemcpy(qd[0]+probe,&before,1,cudaMemcpyHostToDevice);
     }
 
     for(int c=0;c<COUNT;c++){ cudaFree(qd[c]); cudaFree(sd[c]); free(hd[c]); free(hds[c]); }
-    cudaFree(ddesc); cudaFree(x); cudaFree(y0); cudaFree(yr);
+    cudaFree(ddesc); cudaFree(x); cudaFree(dy); free(hx); free(y0); free(yr);
 }
 
 int main(void){
@@ -181,8 +190,10 @@ int main(void){
         GroupDesc host[1]={{NULL,NULL,qd,NULL,NULL,sd,4,4,4,1,0,gs,gs,gs}};
         GroupDesc *ddesc; cudaMalloc(&ddesc,sizeof host);
         cudaMemcpy(ddesc,host,sizeof host,cudaMemcpyHostToDevice);
-        float *x,*y; cudaMallocManaged(&x,(size_t)I*4); cudaMallocManaged(&y,(size_t)D*4);
-        for(int i=0;i<I;i++) x[i]=rndf();
+        float *hxp=(float*)malloc((size_t)I*sizeof(float));
+        for(int i=0;i<I;i++) hxp[i]=rndf();
+        float *x,*y; cudaMalloc(&x,(size_t)I*sizeof(float)); cudaMalloc(&y,(size_t)D*sizeof(float));
+        cudaMemcpy(x,hxp,(size_t)I*sizeof(float),cudaMemcpyHostToDevice);
 
         setenv("COLI_CUDA_DOWN_ROWS","0",1);
         check(down_rows_mode()==0,"ROWS=0 parses as off");
@@ -201,7 +212,7 @@ int main(void){
         check(down_rows_mode()==0,"an uninstantiated R reads as off, not rounded");
 
         cudaFree(qd); cudaFree(sd); cudaFree(ddesc); cudaFree(x); cudaFree(y);
-        free(hd); free(hds);
+        free(hd); free(hds); free(hxp);
     }
     printf("dispatch: the row-blocked branch fires on ROWS=8 and not on ROWS=0\n");
 
