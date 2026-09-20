@@ -396,6 +396,14 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_int8_rows_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "int8 row-blocked test compiles"
+      - name: Compile the expert down row-blocked test (syntax only, no GPU)
+        run: |
+          cd c
+          # Same reason as above: tests/test_grouped_down_rows_cuda.cu is the
+          # only check grouped_down_g4r gets on a runner without a card.
+          nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_grouped_down_rows_cuda.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "expert down row-blocked test compiles"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |
           cd c
