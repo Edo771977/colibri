@@ -1195,14 +1195,59 @@ __global__ static void grouped_down_g4r(float *y,const float *x,const GroupDesc 
     }
 }
 
-/* 0/unset keeps the original one-row-per-block kernel; 2, 4 and 8 are the
- * instantiated widths; anything else reads as off rather than rounding. */
+/* ON BY DEFAULT AT R=4, AND ONLY BECAUSE THE GRAPH IS ON TOO.
+ *
+ * Measured alone, this kernel COSTS 1.15 ms/token (+4 %): it is faster on the
+ * GPU -- expert-group kernel time 697 -> 572 ms, -18 % -- and the token gets
+ * worse, because `take` was already near zero and the freed GPU time had
+ * nowhere to go while 4,096 long-lived blocks squeezed the placed dense GEMVs
+ * sharing the SMs.
+ *
+ * COLI_CUDA_GRAPH changes that. The graph moves ~0.7 ms out of `issue` and
+ * into `take`, which is exactly the headroom this kernel needs to convert. A
+ * 2x2 over {GRAPH 0,1} x {DOWN_ROWS 0,4} measured the interaction directly:
+ *
+ *     effect of DOWN_ROWS with GRAPH=0:   +1.15 ms/token
+ *     effect of DOWN_ROWS with GRAPH=1:   -0.25 ms/token
+ *     INTERACTION:                        -1.40 ms/token
+ *     both on vs both off (the diagonal): -0.43, 6/6 repetitions negative
+ *
+ * So the default below is a PAIR, not two independent choices, and it is
+ * compiled off wherever the graph cannot exist: on HIP there is no
+ * cudaStreamBeginCapture, so COLI_GPU_HAS_GRAPH is 0, so the arm that makes
+ * this kernel pay is not available and the measured-bad half would ship
+ * alone. Turning it on there needs its own measurement on that hardware.
+ *
+ * RTX 4070 Ti SUPER, qwen36 i4 gs64, clang, 4 cells x 6 alternated reps,
+ * identical generation in every cell:
+ * docs/experiments/qwen36-expert-down-rows-2026-09-20-raw.txt and the 2x2
+ * record alongside it. */
+/* Defined further down, next to the graph capture it controls. Declared here
+ * because the default below is justified by it and down_g4_launch warns when
+ * the two disagree -- the same declaration-order trap CI caught the first
+ * time this file grew a cross-reference. */
+static int graph_mode(void);
+
+#ifndef COLI_DOWN_ROWS_DEFAULT
+#  if COLI_GPU_HAS_GRAPH
+#    define COLI_DOWN_ROWS_DEFAULT 4
+#  else
+#    define COLI_DOWN_ROWS_DEFAULT 0
+#  endif
+#endif
+
+/* Unset reads as the compiled default; an explicit 0 is how "off" is asked
+ * for now that the default is on; 2, 4 and 8 are the instantiated widths;
+ * anything else falls back to the default rather than rounding to a
+ * neighbour, so a typo in a measurement script gives the shipped arm rather
+ * than a third arm nobody meant to run. Same shape as i8_rows_mode(). */
 static int down_rows_mode(void){
     const char *e=getenv("COLI_CUDA_DOWN_ROWS");
-    if(!e||!*e) return 0;
+    if(!e||!*e) return COLI_DOWN_ROWS_DEFAULT;
     char *end; long v=strtol(e,&end,10);
-    if(*end) return 0;
-    return (v==2||v==4||v==8)?(int)v:0;
+    if(*end) return COLI_DOWN_ROWS_DEFAULT;
+    if(v==0) return 0;
+    return (v==2||v==4||v==8)?(int)v:COLI_DOWN_ROWS_DEFAULT;
 }
 
 /* Launch counter, read by tests/test_grouped_down_rows_cuda.cu: the
@@ -1226,7 +1271,27 @@ static void down_g4_launch(float *y,const float *x,const GroupDesc *dev,
          * path's output is unchanged. */
         static int announced;
         if(!announced){ announced=1;
-            fprintf(stderr,"[cuda] expert down-rows active: R=%d\n",R); }
+            /* Only when the variable was SET. The announcement exists to prove
+             * a measurement's toggle reached the binary it is running; now
+             * that the default is on, printing it unset would put a line on
+             * every ordinary run for no one's benefit. The shipped default is
+             * asserted by the dispatch probe in
+             * tests/test_grouped_down_rows_cuda.cu, which is the right place
+             * for it -- a test, not a log line. */
+            const char *e=getenv("COLI_CUDA_DOWN_ROWS");
+            if(e&&*e) fprintf(stderr,"[cuda] expert down-rows active: R=%d\n",R);
+            /* The one combination measured WORSE than shipping neither. This
+             * kernel's default is justified only by the headroom the graph
+             * opens in `take`; without it the same kernel cost +1.15 ms/token
+             * on the box where both were measured. Not silently corrected --
+             * a flag that means one thing is worth more than a flag that
+             * quietly rewrites another -- but not silent either. */
+            if(!graph_mode())
+                fprintf(stderr,"[cuda] WARNING: expert down-rows is on with "
+                               "COLI_CUDA_GRAPH off. Measured +1.15 ms/token "
+                               "in that combination; set COLI_CUDA_DOWN_ROWS=0 "
+                               "too, or leave the graph on.\n");
+        }
         g_downr_launches++;
         dim3 og((unsigned)((D+R-1)/R),(unsigned)max_rows,(unsigned)count);
         if(R==2)      grouped_down_g4r<2><<<og,256,0,st>>>(y,x,dev,D,I);
@@ -1478,10 +1543,23 @@ static int reserve_pinned_bytes(void **ptr,size_t *cap,size_t bytes){
 }
 
 /* COLI_CUDA_GRAPH: replay the expert group as one cudaGraphLaunch instead of
- * five driver calls. Off until measured -- two previous attempts at this path
- * were correct and worth nothing, and this one is only worth something if
- * `issue` (1.76 ms/token of CPU spent LAUNCHING, per COLI_TIMERS) is really
- * on the critical path. */
+ * five driver calls. ON by default, and `=0` turns it off.
+ *
+ * Measured alone it is worth nothing on the token: `issue` falls 28 %
+ * (2.47 -> 1.79 ms/token) and every millisecond of it reappears in `take`
+ * (0.76 -> 1.50), because the MoE phase is GPU-bound with idle CPU inside it
+ * and a CPU-side saving there just converts into waiting.
+ *
+ * It ships because of what that widened `take` lets the expert down-rows
+ * kernel do -- the interaction is measured, and the argument is written out
+ * over down_rows_mode(). The two are a pair: turning THIS off while leaving
+ * COLI_CUDA_DOWN_ROWS on is the one combination known to be worse than
+ * shipping neither, and down_g4_launch says so on stderr if it sees it.
+ *
+ * Capture is not assumed to succeed. If cudaStreamBeginCapture or
+ * cudaGraphInstantiate fails, the call refuses (qt_issue hands that one layer
+ * to the CPU, slower and correct), says so once on stderr, and records the
+ * signature so it does not retry every call. */
 static int graph_mode(void){
 #if COLI_GPU_HAS_GRAPH
     /* Deliberately NOT cached in a static, unlike gprof a few lines down.
@@ -1493,7 +1571,9 @@ static int graph_mode(void){
      * mid-process to compare the graph against per-call launches, and a
      * latched static would make that test measure one arm twice. */
     const char *e=getenv("COLI_CUDA_GRAPH");
-    return e&&*e&&*e!='0';
+    /* On unless explicitly disabled. Unset is the shipped arm now: see the
+     * interaction measurement above down_rows_mode(). */
+    return !e||!*e||*e!='0';
 #else
     return 0;
 #endif
@@ -2866,9 +2946,15 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         }
         if(!cuda_ok(cudaGraphLaunch(ctx->graph_exec[count],ctx->stream),
                     "expert group graph launch")) return 0;
+        /* Gated on the variable being SET, for the reason down_g4_launch
+         * gives: on by default, so an unset run must not grow a log line.
+         * The capture-FAILED message above stays unconditional -- that one is
+         * a problem the user needs to see whether or not they asked. */
         static int said_ok=0;
         if(!said_ok){ said_ok=1;
-            fprintf(stderr,"[cuda] expert group graph active (count=%d)\n",count); }
+            const char *ge=getenv("COLI_CUDA_GRAPH");
+            if(ge&&*ge)
+                fprintf(stderr,"[cuda] expert group graph active (count=%d)\n",count); }
     }
 #endif
     ctx->group_pending=1; ctx->group_pending_bytes=yb;   /* the readback, not the upload */

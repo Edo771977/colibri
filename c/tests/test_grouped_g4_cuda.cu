@@ -22,9 +22,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <cuda_runtime.h>
 
+/* No direct <cuda_runtime.h>: the backend include below pulls the right
+ * runtime header for the target (cuda_runtime.h, or hip_runtime.h through
+ * backend_gpu_compat.h). A direct include breaks the hipcc build, which is
+ * what `make gpu-compile HIP=1` runs this file through now that it is no
+ * longer compile-only -- together with the managed allocations below, it was
+ * the second thing keeping this file out of `make cuda-test`. */
 #include "../backend_cuda.cu"
+
+#ifdef _WIN32
+/* cuda-test runs on Windows too, and MSVC has no setenv. */
+static int setenv(const char *name,const char *value,int overwrite){
+    (void)overwrite; return _putenv_s(name,value);
+}
+#endif
 
 /* offset_to_signed_s4 is one thread per byte with an `if (i < n)` guard -- no
  * grid-stride loop -- so the grid must cover the whole buffer. The fixed
@@ -55,6 +67,28 @@ static void cpu_gemv_g4(const uint8_t *q,const float *sc,int K,int O,int gs,
     }
 }
 
+/* The default is a shipped decision, so it gets an assertion rather than a
+ * comment. Unset must be ON where the graph can exist; `=0` must be the way
+ * off; anything else must be on, because a typo in a measurement script
+ * should give the shipped arm. */
+static int check_graph_default(void){
+    int bad=0;
+#if COLI_GPU_HAS_GRAPH
+    setenv("COLI_CUDA_GRAPH","",1);
+    if(!graph_mode()){ printf("FAIL unset must read as ON (the shipped default)\n"); bad++; }
+    setenv("COLI_CUDA_GRAPH","0",1);
+    if(graph_mode()){ printf("FAIL \"0\" must read as off\n"); bad++; }
+    setenv("COLI_CUDA_GRAPH","1",1);
+    if(!graph_mode()){ printf("FAIL \"1\" must read as on\n"); bad++; }
+#else
+    /* No cudaStreamBeginCapture on this target: the path is compiled out and
+     * graph_mode() is 0 whatever the variable says. */
+    setenv("COLI_CUDA_GRAPH","1",1);
+    if(graph_mode()){ printf("FAIL graph must be off where COLI_GPU_HAS_GRAPH is 0\n"); bad++; }
+#endif
+    return bad;
+}
+
 int main(void){
     srand(7);
     const int D=200, I=96, gs=64;            /* tail group: 200 % 64 = 8 */
@@ -63,9 +97,24 @@ int main(void){
     const int ngD=(D+gs-1)/gs, ngI=(I+gs-1)/gs;
     int trials=50, bad=0;
     for(int t=0;t<trials;t++){
-        GroupDesc host[COUNT]; float *xs; cudaMallocManaged(&xs,(size_t)COUNT*D*4);
-        float *gate,*up,*y; cudaMallocManaged(&gate,(size_t)COUNT*I*4);
-        cudaMallocManaged(&up,(size_t)COUNT*I*4); cudaMallocManaged(&y,(size_t)COUNT*D*4);
+        /* Explicit host buffers plus explicit device buffers, NOT
+         * cudaMallocManaged. backend_gpu_compat.h does not map managed
+         * allocation for HIP, and that single dependency is why this file was
+         * compile-only: it could not be added to `make cuda-test`, which also
+         * serves `make hip-test`. So the graph assertions further down shipped
+         * having never executed anywhere. The convention here is the one
+         * tests/test_fp8_warp_cuda.cu documents. xs and gate and y keep their
+         * names as the HOST side, so every reference below reads unchanged;
+         * up is device-only because the fused epilogue leaves it untouched
+         * and nothing on the host looks at it. */
+        GroupDesc host[COUNT];
+        float *xs  =(float*)malloc((size_t)COUNT*D*4);
+        float *gate=(float*)malloc((size_t)COUNT*I*4);
+        float *y   =(float*)malloc((size_t)COUNT*D*4);
+        float *xs_d,*gate_d,*up_d,*y_d;
+        cudaMalloc(&xs_d,(size_t)COUNT*D*4); cudaMalloc(&gate_d,(size_t)COUNT*I*4);
+        cudaMalloc(&up_d,(size_t)COUNT*I*4); cudaMalloc(&y_d,(size_t)COUNT*D*4);
+        if(!xs||!gate||!y){ printf("FAIL alloc trial\n"); return 1; }
         uint8_t *qg[COUNT],*qu[COUNT],*qd[COUNT]; float *sg[COUNT],*su[COUNT],*sd[COUNT];
         uint8_t *hg[COUNT],*hu[COUNT],*hd[COUNT]; float *hgs[COUNT],*hus[COUNT],*hds[COUNT];
         for(int c=0;c<COUNT;c++){
@@ -94,12 +143,17 @@ int main(void){
             host[c]={qg[c],qu[c],qd[c],sg[c],su[c],sd[c],4,4,4,1,c,cgs,cgs,cgs,c};
         }
         for(size_t i=0;i<(size_t)COUNT*D;i++) xs[i]=(rand()/(float)RAND_MAX-.5f)*2.f;
+        cudaMemcpy(xs_d,xs,(size_t)COUNT*D*4,cudaMemcpyHostToDevice);
         GroupDesc *ddesc; cudaMalloc(&ddesc,sizeof(host));
         cudaMemcpy(ddesc,host,sizeof(host),cudaMemcpyHostToDevice);
         dim3 hgd((unsigned)I,1,(unsigned)COUNT),ogd((unsigned)D,1,(unsigned)COUNT);
-        grouped_hidden_g4_dual<<<hgd,256>>>(gate,up,xs,ddesc,I,D);
-        grouped_down_g4<<<ogd,256>>>(y,gate,ddesc,D,I);
+        grouped_hidden_g4_dual<<<hgd,256>>>(gate_d,up_d,xs_d,ddesc,I,D);
+        grouped_down_g4<<<ogd,256>>>(y_d,gate_d,ddesc,D,I);
         if(cudaDeviceSynchronize()!=cudaSuccess){ printf("FAIL cuda\n"); return 1; }
+        /* gate is read below both as an output to check and as the input to
+         * the down-projection reference, so it has to come back. */
+        cudaMemcpy(gate,gate_d,(size_t)COUNT*I*4,cudaMemcpyDeviceToHost);
+        cudaMemcpy(y,y_d,(size_t)COUNT*D*4,cudaMemcpyDeviceToHost);
         for(int c=0;c<COUNT;c++){
             int cgs=c==2?0:gs;
             float rg[512],ru[512],rh[512],ry[512];
@@ -116,7 +170,9 @@ int main(void){
         for(int c=0;c<COUNT;c++){ cudaFree(qg[c]);cudaFree(qu[c]);cudaFree(qd[c]);
             cudaFree(sg[c]);cudaFree(su[c]);cudaFree(sd[c]);
             free(hg[c]);free(hu[c]);free(hd[c]);free(hgs[c]);free(hus[c]);free(hds[c]); }
-        cudaFree(ddesc);cudaFree(xs);cudaFree(gate);cudaFree(up);cudaFree(y);
+        cudaFree(ddesc);
+        cudaFree(xs_d);cudaFree(gate_d);cudaFree(up_d);cudaFree(y_d);
+        free(xs);free(gate);free(y);
     }
     printf("grouped-g4 oracle: %d trials x %d experts (gs=64 + tail + per-row member), %d mismatches\n",
            trials,COUNT,bad);
@@ -128,7 +184,19 @@ int main(void){
     {
         int devs[1]={0};
         if(!coli_cuda_init(devs,1)){ printf("FAIL cuda init\n"); return 1; }
+
+        /* THE GRAPH IS ON BY DEFAULT NOW, and that quietly breaks this file
+         * unless it is pinned here. Everything below compares some path
+         * against a per-call reference; if the reference itself is produced
+         * with the variable unset, it runs through the graph too and every
+         * memcmp becomes graph-against-graph -- vacuously true, and the one
+         * assertion this file exists to make would be gone. So: explicitly
+         * off for the reference, explicitly on inside the graph block, and
+         * the default itself asserted right here rather than assumed. */
         int rows[COUNT]={1,2,1}, total=4, api_bad=0;
+        api_bad += check_graph_default();
+        setenv("COLI_CUDA_GRAPH","0",1);
+
         ColiCudaTensor *tg[COUNT]={},*tu[COUNT]={},*td[COUNT]={};
         uint8_t *hg[COUNT],*hu[COUNT],*hd[COUNT]; float *hgs[COUNT],*hus[COUNT],*hds[COUNT];
         for(int c=0;c<COUNT;c++){

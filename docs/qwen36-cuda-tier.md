@@ -533,6 +533,125 @@ above are from runs where the DLL is newer than `backend_cuda.cu`, and the
 measurement script now refuses to start otherwise. Any future kernel A/B on
 Windows has to prove the same thing before its numbers mean anything.
 
+## The pair: expert graph + expert down-rows (`COLI_CUDA_GRAPH`, `COLI_CUDA_DOWN_ROWS`)
+
+**Both on by default. Neither is worth anything alone; one of them is a
+regression alone. They ship together or not at all.**
+
+Three optimisations in this area measured correct and worth exactly zero on
+the token, and one fact explains all three. The MoE phase is
+
+```
+issue + max(CPU window, GPU group) + residue
+```
+
+and `take` is what is left of the GPU group after the CPU stops covering it.
+**`take` > 0 in every measurement taken on this path**, which means the phase
+is GPU-bound *with idle CPU inside it*. A CPU-side saving there converts into
+waiting; a GPU-side saving is capped by how far `take` can fall.
+
+That model made a prediction, and the prediction is why these two are on:
+
+- `COLI_CUDA_GRAPH` is a **CPU-side** saving. It should widen `take`.
+- `COLI_CUDA_DOWN_ROWS` is a **GPU-side** saving. It needs a wide `take` to
+  have anywhere to go.
+- So they should **interact**, negatively. If the interaction came out zero or
+  positive, the model was wrong and had to be thrown away.
+
+### The 2×2
+
+Four cells, six alternated repetitions each, `N_NEW=128`, heat table frozen,
+hit rate 98.1 % and `miss(CPU)` 901 identical in every cell.
+
+| cell | `step()` | `issue` | `take` | `moe` |
+|---|---|---|---|---|
+| graph 0, rows 0 | 27.40 | 2.47 | 0.76 | 9.92 |
+| graph 1, rows 0 | 27.35 | 1.79 | 1.50 | 9.60 |
+| graph 0, rows 4 | 28.25 | 2.47 | 0.57 | 10.21 |
+| **graph 1, rows 4** | **27.05** | 1.83 | 0.73 | **9.09** |
+
+```
+GRAPH at ROWS=0    -0.20 ms/token   signs disagree
+GRAPH at ROWS=4    -1.50 ms/token
+ROWS at GRAPH=0    +1.15 ms/token
+ROWS at GRAPH=1    -0.25 ms/token   signs disagree
+
+INTERACTION        -1.40 ms/token   <- the model holds
+```
+
+And the diagonal, which is what a default change actually rests on —
+everything off against everything on:
+
+```
+rep      off     on    delta
+ 1     27.90  27.60   -0.30
+ 2     27.20  27.10   -0.10
+ 3     27.10  26.70   -0.40
+ 4     27.60  27.20   -0.40
+ 5     27.00  26.70   -0.30
+ 6     28.10  27.00   -1.10
+             mean    -0.43     6 of 6 repetitions negative
+```
+
+**−0.43 ms/token, 1.6 %.** Small, and the first thing to move on this path.
+
+The mechanism is confirmed to within 0.06 ms: the graph takes 0.68 ms out of
+`issue` and 0.74 ms reappears in `take`. A transfer, not a saving — until the
+down-rows kernel is there to spend it.
+
+### Why the pair, and not two switches
+
+`COLI_CUDA_DOWN_ROWS=4` **alone costs 1.15 ms/token**. The kernel is 18 %
+faster on the GPU (expert-group kernel time 697 → 572 ms over 64 tokens) and
+the token gets *worse*, because 91 % of the regression lands on `dn-sub proj`,
+`norm+out` and `lm_head` — the placed dense GEMVs, which run on stream 0
+concurrently with the expert group. 4,096 long-lived blocks holding 4 KB of
+shared memory each leave fewer scheduling slots than 16,384 that retire at
+once.
+
+So turning the graph off while leaving down-rows on is **the one combination
+known to be worse than shipping neither**. It is not silently corrected — a
+flag that means one thing is worth more than a flag that quietly rewrites
+another — but `down_g4_launch` prints a warning when it sees it, and
+`COLI_DOWN_ROWS_DEFAULT` is compiled to 0 wherever `COLI_GPU_HAS_GRAPH` is 0
+(HIP has no `cudaStreamBeginCapture`), because there the arm that pays for the
+kernel does not exist.
+
+### The cap has moved, not gone
+
+`DOWN_ROWS=4` removes ~1.9 ms/token of expert-group GPU work and the token
+gains 0.43: **22 % of the GPU saving reaches the token**, and `take` is still
+0.73 in the best cell. The phase is still GPU-bound with idle CPU inside it.
+
+### What this is not
+
+One box, one model, one placement, six repetitions. Half the pair is a
+measured regression on its own, and the pair is justified only by the
+interaction above. On different silicon the SM-contention term could scale
+differently from the `take` headroom the graph opens, and the pair could go
+the other way. **Measure the 2×2 before trusting these defaults on other
+hardware.** The within-cell spread (0.70–1.90 ms) is larger than the −0.43 the
+diagonal claims; the claim rests on the pairing and on 6/6 sign agreement, not
+on the medians being far apart.
+
+Both changes are **bitwise identical** to the paths they replace — `memcmp` in
+`tests/test_grouped_down_rows_cuda.cu` and `tests/test_grouped_g4_cuda.cu` —
+so no logit and no token can move, and the tiny-model oracle is untouched.
+
+Full record: `docs/experiments/qwen36-graph-downrows-2x2-2026-09-21-raw.txt`.
+
+### A correction that shipped with them
+
+`tests/test_grouped_g4_cuda.cu` holds the **only** assertions that ever
+*execute* the expert graph — capture, two replays, and the per-call path after
+the graph is switched off. It was compile-only: it used `cudaMallocManaged`,
+which `backend_gpu_compat.h` does not map for HIP, so it could not join
+`make cuda-test`, which also serves `make hip-test`. **The graph had shipped
+with its bitwise assertions never run anywhere.** The managed allocations are
+gone, the file is in `cuda-test` and `gpu-compile`, and its reference arm now
+pins `COLI_CUDA_GRAPH=0` explicitly — without that, the new default would have
+made every `memcmp` in it compare the graph against itself.
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |

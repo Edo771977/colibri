@@ -1,0 +1,151 @@
+COLI_CUDA_GRAPH x COLI_CUDA_DOWN_ROWS: the 2x2 that made both defaults
+=======================================================================
+RESULT: the interaction is real and negative, as predicted from the phase
+model. Neither lever is worth anything alone; together they are worth
+-0.43 ms/token with 6/6 repetitions of the same sign. Both defaults on.
+
+Box      : Windows, RTX 4070 Ti SUPER 16 GB (sm_89), CUDA 13.4, CUDA_DLL=1
+Engine   : qwen36_clang.exe (LLVM libomp)
+Model    : C:\modelli\qwen36_i4_gs64, prompt25.txt (25 prompt tokens)
+Script   : misure-2x2.ps1 (4 cells x 6 alternated reps at N_NEW=128, heat
+           frozen after warm-up, then one COLI_CUDA_PROFILE pass per cell)
+Placement: COLI_PLACE=experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0
+Dense    : COLI_CUDA_I8_ROWS=2 (the shipped default) in every cell
+Guards   : DLL newer than backend_cuda.cu; engine newer than its sources;
+           every run announced its own path; hit 98.1 % and miss(CPU) 901
+           identical in all four cells.
+
+Cells: g<graph><down>, e.g. g1d4 = GRAPH=1, DOWN_ROWS=4.
+
+
+1. THE PREDICTION, MADE BEFORE THE RUN
+--------------------------------------
+
+  From PR #35: the MoE phase is `issue + max(CPU window, GPU group) +
+  residue`, and `take` is what is left of the GPU group after the CPU stops
+  covering it. take > 0 in every measurement of the session, so the phase is
+  GPU-bound with idle CPU inside it.
+
+  Therefore: GRAPH frees CPU time in `issue`, which converts into a wider
+  `take` -- headroom that a GPU-side saving can then fill. DOWN_ROWS is a
+  GPU-side saving that had nowhere to go when take was 0.53. So the two
+  should INTERACT, and the interaction should be NEGATIVE.
+
+  Stated falsification condition: "if the interaction is zero or positive,
+  the model is wrong and must be thrown away."
+
+
+2. THE MEASUREMENT
+------------------
+
+  cell    step()   issue    take     moe    spread
+  g0d0    27.40    2.47     0.76     9.92    1.10
+  g1d0    27.35    1.79     1.50     9.60    0.70
+  g0d4    28.25    2.47     0.57    10.21    1.90
+  g1d4    27.05    1.83     0.73     9.09    0.90
+
+  simple effects, paired on step():
+
+    GRAPH at DOWN=0     -0.20 ms/token   [-0.40 -0.30 0.50 -0.10 0.10 -0.90]  signs disagree
+    GRAPH at DOWN=4     -1.50 ms/token   [-1.90 -1.60 -1.40 -0.40 -1.60 -1.20]
+    DOWN at GRAPH=0     +1.15 ms/token   [1.60 1.50 1.00 0.00 1.30 0.10]
+    DOWN at GRAPH=1     -0.25 ms/token   [0.10 0.20 -0.90 -0.30 -0.40 -0.20]  signs disagree
+
+    INTERACTION         -1.40 ms/token
+
+  The interaction is negative: the model holds, and the falsification
+  condition did not fire.
+
+  THE DIAGONAL, which the script did not print and which is what a default
+  change actually rests on -- everything off against everything on:
+
+    rep   g0d0    g1d4    delta
+     1   27.90   27.60   -0.30
+     2   27.20   27.10   -0.10
+     3   27.10   26.70   -0.40
+     4   27.60   27.20   -0.40
+     5   27.00   26.70   -0.30
+     6   28.10   27.00   -1.10
+                median  -0.35
+                  mean  -0.43     6 of 6 repetitions negative
+
+  -0.43 ms/token, 1.6 %. Small, and the only thing that moved all day.
+
+
+3. THE MECHANISM, CONFIRMED NUMERICALLY
+---------------------------------------
+
+  The graph's saving transfers one for one into waiting:
+
+    issue  2.47 -> 1.79   (-0.68)
+    take   0.76 -> 1.50   (+0.74)
+
+  That is the transfer the model predicted, to within 0.06 ms. And with
+  take widened to 1.50 there is finally room for the down-rows kernel to
+  convert: at GRAPH=1 it pulls take back to 0.73 and moe to 9.09, the
+  lowest of the four cells.
+
+  Kernel time, COLI_CUDA_PROFILE, same 3520 calls / 28160 experts in every
+  cell (the graph does not run under the profiler by design, so g0/g1 are
+  the same road here -- this block prices DOWN_ROWS only):
+
+    cell    h2d     kernel    d2h
+    g0d0    53 ms   697 ms    31 ms
+    g1d0    50 ms   706 ms    32 ms
+    g0d4    53 ms   572 ms    32 ms
+    g1d4    55 ms   587 ms    32 ms
+
+  DOWN_ROWS=4 removes ~125 ms of expert-group kernel time over 64 tokens,
+  i.e. ~1.9 ms/token of GPU work. The token gains 0.43. **22 % of the GPU
+  saving reaches the token**, and take is still 0.73 in the best cell: the
+  phase remains GPU-bound with idle CPU inside it. The cap has moved; it
+  has not gone.
+
+
+4. WHY DOWN_ROWS ALONE IS A REGRESSION
+--------------------------------------
+
+  +1.15 ms/token at GRAPH=0, and the earlier session
+  (qwen36-expert-down-rows-2026-09-20-raw.txt) located it: 91 % of the
+  regression is `dn-sub proj` +0.60, `norm+out` +0.20 and `lm_head` +0.39 --
+  the placed dense GEMVs, which run on stream 0 concurrently with the expert
+  group. 4,096 long-lived blocks holding 4 KB of shared memory each leave
+  fewer scheduling slots than 16,384 that retire at once.
+
+  That is why the two defaults are a PAIR and why down_g4_launch warns when
+  it sees the kernel on with the graph off.
+
+
+5. WHAT WAS SHIPPED
+-------------------
+
+  COLI_CUDA_GRAPH      default ON  (compiled out where COLI_GPU_HAS_GRAPH is 0)
+  COLI_CUDA_DOWN_ROWS  default 4   (compiled 0 where the graph cannot exist)
+
+  Both are bitwise identical to the paths they replace, asserted by memcmp
+  in tests/test_grouped_down_rows_cuda.cu and tests/test_grouped_g4_cuda.cu,
+  so no token can move and the tiny-model oracle is unaffected.
+
+  A correction shipped with them: test_grouped_g4_cuda.cu, which holds the
+  ONLY assertions that execute the graph, was compile-only -- it used
+  cudaMallocManaged, which backend_gpu_compat.h does not map for HIP, so it
+  could not join `make cuda-test`. The graph had shipped with its bitwise
+  assertions never run. The managed allocations are gone, the file is in
+  cuda-test, and its reference arm now pins COLI_CUDA_GRAPH=0 explicitly --
+  without that, the new default would have made every memcmp in it compare
+  the graph against itself.
+
+
+6. CAVEATS
+----------
+
+  One box, one model, one placement, six repetitions. The down-rows half is
+  a measured REGRESSION on its own, and the pair is justified only by the
+  interaction measured here. On different silicon the SM-contention term
+  that makes down-rows expensive could scale differently from the take
+  headroom the graph opens, and the pair could go the other way. Anyone
+  measuring on other hardware should run the 2x2, not trust this row.
+
+  The spread within a cell (0.70 to 1.90 ms) is larger than the -0.43 the
+  diagonal claims. The claim rests on the pairing and on 6/6 sign agreement,
+  not on the medians being far apart.

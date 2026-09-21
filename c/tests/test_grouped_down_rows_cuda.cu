@@ -221,12 +221,32 @@ int main(void){
         check(g_downr_launches==before+1,"ROWS=8 MUST take the row-blocked branch");
 
         setenv("COLI_CUDA_DOWN_ROWS","3",1);   /* not instantiated */
-        check(down_rows_mode()==0,"an uninstantiated R reads as off, not rounded");
+        check(down_rows_mode()==COLI_DOWN_ROWS_DEFAULT,
+              "an uninstantiated R falls back to the default, not to a neighbour");
+
+        /* The default is ON at COLI_DOWN_ROWS_DEFAULT now, so "off" has to be
+         * asked for and "unset" has to DISPATCH -- otherwise the shipped build
+         * is quietly running the kernel the measurement did not choose. This
+         * is the assertion that makes the default real. */
+        setenv("COLI_CUDA_DOWN_ROWS","",1);
+        check(down_rows_mode()==COLI_DOWN_ROWS_DEFAULT,
+              "unset reads as the compiled default");
+        before=g_downr_launches;
+        down_g4_launch(y,x,ddesc,D,I,1,1,0);
+        check(cudaDeviceSynchronize()==cudaSuccess,"dispatch probe, unset");
+#if COLI_DOWN_ROWS_DEFAULT
+        check(g_downr_launches==before+1,"unset MUST take the row-blocked branch");
+#else
+        /* Compiled off (no graph on this target, see backend_cuda.cu): then
+         * unset must NOT dispatch, and asserting the opposite here would
+         * hard-code one target's choice into a test both must pass. */
+        check(g_downr_launches==before,"unset must NOT dispatch where the default is 0");
+#endif
 
         cudaFree(qd); cudaFree(sd); cudaFree(ddesc); cudaFree(x); cudaFree(y);
         free(hd); free(hds); free(hxp);
     }
-    printf("dispatch: the row-blocked branch fires on ROWS=8 and not on ROWS=0\n");
+    printf("dispatch: the row-blocked branch fires on ROWS=8 and on unset (default %d), not on ROWS=0\n", COLI_DOWN_ROWS_DEFAULT);
 
     printf("grouped_down_g4: R rows per block must be BITWISE identical\n");
     shape(2048, 512, 64);   /* qwen36 trunk geometry: D divisible by 2/4/8 */
