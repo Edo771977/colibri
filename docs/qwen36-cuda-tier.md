@@ -652,6 +652,147 @@ gone, the file is in `cuda-test` and `gpu-compile`, and its reference arm now
 pins `COLI_CUDA_GRAPH=0` explicitly — without that, the new default would have
 made every `memcmp` in it compare the graph against itself.
 
+## The dense round-trip: pinned host staging (`COLI_CUDA_DENSE_PINNED`)
+
+`coli_cuda_matmul` is the placed dense GEMV — `dnproj`, `dnout`, `attnout`,
+`lm_head`, the shared expert. It runs **81.6 times a token** on qwen36, and
+each call does exactly this:
+
+```
+cudaMemcpy(ctx->dx, x, xb, H2D)      synchronous, from PAGEABLE host memory
+quant_matmul_launch(...)
+cudaMemcpy(y, ctx->dy, yb, D2H)      synchronous, to PAGEABLE host memory
+```
+
+`COLI_CUDA_PROFILE=1` prices it. From the R=2 arm of the `COLI_CUDA_I8_ROWS`
+session (5224 calls over 64 tokens, `docs/experiments/qwen36-i8-rows-2026-09-20-raw.txt`):
+
+| | total | per token | per call |
+|---|---|---|---|
+| kernel | 301 ms | 4.70 ms | 57.6 µs |
+| h2d | 96 ms | 1.50 ms | 18.4 µs |
+| d2h | 120 ms | 1.88 ms | 23.0 µs |
+| residue (launch + sync) | 71 ms | 1.11 ms | 13.6 µs |
+| **wall** | **588 ms** | **9.19 ms** | **112.6 µs** |
+
+**Half the wall clock of this path is not the kernel.** 4.48 ms/token of it
+is transfer and driver overhead, against a 25 ms token — and unlike the expert
+group, *none of it is hidden*: these copies are synchronous, so the engine
+thread is stopped inside them. There is no CPU window covering this the way
+`qt_issue`/`qt_take` covers the expert group, which is precisely why the three
+optimisations that preceded this one were each correct and each worth zero.
+
+A pageable `cudaMemcpy` is not one copy. The driver cannot DMA out of memory
+the OS may page, so it stages through a pinned buffer of its own — two copies,
+one of them serialised against the caller. `COLI_CUDA_DENSE_PINNED` gives that
+buffer to the backend instead:
+
+| value | behaviour |
+|---|---|
+| `0` / unset | the original path: two synchronous pageable copies |
+| `1` | pinned staging, both copies still synchronous |
+| `2` | pinned staging, both copies async on stream 0, **one** synchronize |
+
+Three values rather than two on purpose. There are two separate mechanisms in
+here — the driver's hidden staging, and the two blocking round-trips — and a
+single flag that changed both would produce a number nobody could attribute.
+`1` prices the staging alone; `2` adds the collapse to one wait.
+
+The staging cannot change a value, only where the bytes are read from, so the
+contract is **bitwise identity** across all three modes and
+`tests/test_dense_pinned_cuda.cu` asserts it with `memcmp`. Mode 2 is the one
+that needs a test: async copies into a reused host buffer fail *silently* when
+the synchronize is missing — the caller reads the previous call's answer, which
+for a repeated shape is usually almost right. The test therefore interleaves
+mode 2 with the pageable path on a **new input every iteration**, where a stale
+buffer shows up as the previous answer instead of passing unnoticed.
+
+### The prediction, written down before the run -- and wrong
+
+*Kept as written, because the failure is the useful part. It is answered below.*
+
+Every dense call here is `S=1`: `xb` is `I*4` — **8 KiB** for the qwen36 trunk —
+and `yb` is smaller still. At that size pinned memory buys essentially nothing
+in *bandwidth*; the driver's hidden staging copy it removes is itself an 8 KiB
+memcpy. So:
+
+- **mode 1 should be worth roughly zero.** It removes a small copy and nothing
+  else. If it shows a large gain, the explanation is not the one written here
+  and the result should be distrusted until it is.
+- **mode 2 is the actual bet.** It collapses two blocking waits into one, and
+  the residue line already prices those at 13.6 µs/call on top of the 41.4 µs
+  the two transfers cost. Pinned memory is only the precondition: a
+  `cudaMemcpyAsync` out of pageable memory is synchronous anyway.
+
+If mode 2 is also flat, the conclusion is not "try harder here" — it is that
+81.6 driver round-trips a token is the floor of this design, and the next lever
+is **fewer calls**, not faster ones: batching the placed GEMVs, or a graph over
+the dense trunk the way `COLI_CUDA_GRAPH` does for the expert group.
+
+### Measured (RTX 4070 Ti SUPER, sm_89, qwen36 i4 gs64, clang, 3 x 6 alternated)
+
+**Both pinned arms make the token slower, 6/6 repetitions each. Leave it off.**
+
+| arm | `step()` | deltanet | dn-sub proj | attention | lm_head |
+|---|---|---|---|---|---|
+| m0 pageable | **27.20** | 10.25 | 5.40 | 5.77 | 2.30 |
+| m1 pinned sync | 28.75 | 11.53 | 6.05 | 5.97 | 2.34 |
+| m2 pinned async | 29.20 | 11.93 | 6.25 | 6.07 | 2.35 |
+
+```
+m1 - m0   +1.60 ms/token   [1.90 1.50 1.80 0.90 1.60 1.60]   6/6 positive
+m2 - m0   +2.00 ms/token   [2.00 1.90 1.90 2.00 2.00 4.50]   6/6 positive
+m2 - m1   +0.40 ms/token   [0.10 0.40 0.10 1.10 0.40 2.90]   6/6 positive
+```
+
+Every phase moves the same way, and they are exactly the phases holding the
+placed dense GEMVs, so the damage is where the change is. Hit rate 100 % and
+`miss(CPU)` 0 in all three arms: the arms generated the same thing.
+
+`COLI_CUDA_PROFILE`, 5224 dense calls over 64 tokens, one run per arm
+(residue = `wall - h2d - kernel - d2h`, i.e. launch and synchronisation):
+
+| arm | h2d | kernel | d2h | residue | wall |
+|---|---|---|---|---|---|
+| m0 | 140 ms | 640 ms | 171 ms | 39 ms | 990 ms |
+| m1 | **186 ms** | 604 ms | 140 ms | 83 ms | 1013 ms |
+| m2 | 118 ms | 607 ms | **34 ms** | **160 ms** | 919 ms |
+
+Mode 2 did exactly what it was built to do: the D2H collapses by 80 %, and the
+wait does not vanish, it **moves** into the residue -- the one
+`cudaStreamSynchronize`. Transfers plus residue, 350 -> 312 ms. And the token
+is 2.00 ms worse. (The profile pass and the A/B are different runs -- 64 vs 128
+tokens, events on vs off -- so each block is read on its own, with no
+arithmetic across them.)
+
+### Why the premise was wrong
+
+`h2d` rose from 140 to 186 ms in the arm that is supposed to be doing strictly
+less work. That is the answer.
+
+CUDA's documented behaviour for a **pageable** host-to-device `cudaMemcpy` is
+that it returns once the bytes are in the driver's staging buffer -- the DMA to
+the device need not have completed. Every dense call on this path is `S=1`, so
+`xb` is 8 KiB, well inside that window.
+
+So the two "synchronous pageable copies" this toggle set out to remove **were
+not both synchronous**. The H2D was effectively fire-and-forget, and the
+driver's hidden staging copy was not a cost: on an 8 KiB payload it was buying
+asynchrony for free, because the copy is cheaper than the wait. Pinning the
+buffer removed the staging copy and, with it, the early return.
+
+Mode 2 restores asynchrony explicitly and still loses, by a further 0.40 ms. A
+blocking `cudaStreamSynchronize` per call, 81.6 times a token, against 16
+OpenMP threads spinning under `OMP_WAIT_POLICY=ACTIVE`, is not obviously
+cheaper than the driver's own early return. This run does not separate that
+from the other candidates and does not pretend to.
+
+**Kept, off by default, as the B arm for a fact worth not re-deriving: on this
+path the pageable copy is the fast one.** It also retires the hypothesis that
+opened the day -- the 4.48 ms/token outside the dense kernels is real, but it
+is not two removable copies. Full record:
+`docs/experiments/qwen36-dense-pinned-2026-09-21-raw.txt`.
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |
