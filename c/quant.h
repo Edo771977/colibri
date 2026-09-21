@@ -110,16 +110,45 @@ static int i4_acc512_selftest(void){
  * inner sum is sequential either way, so no result can move -- which is why
  * this needs no oracle run, unlike quantising a matrix would.
  *
- * The threshold is deliberately conservative: it excludes only work small
- * enough that one core finishes it in the time a region takes to open. A
- * 2048x2048 matmul is 4.2M FMAs, sixteen times over the line. Override with
- * COLI_MATMUL_OMP_MIN (0 restores a team for every shape, which is the B arm).
+ * MEASURED, AND WORTH NOTHING ON THIS HOST -- so it ships OFF (default 0,
+ * a team for every shape, exactly the behaviour before this change). Set
+ * COLI_MATMUL_OMP_MIN to a work count to turn it on.
  *
- * NOT YET MEASURED OUTSIDE qwen36's DeltaNet. Every engine's f32 matmuls come
- * through here; the change cannot alter a result anywhere, but it can alter a
- * time, and only one engine's has been looked at. */
+ * 2 arms x 6 alternated repetitions, RTX 4070 Ti SUPER host, clang/LLVM
+ * libomp, OMP_WAIT_POLICY=ACTIVE:
+ *
+ *     dn-sub proj   +0.05 ms/token   [-0.20 0.10 -0.20 0.10 0.00 0.10]
+ *     step()        -0.15 ms/token   [-0.20 0.60 -0.80 -0.10 -0.20 0.70]
+ *
+ * Signs disagree on every metric. `attention`, the control (no matmul under
+ * any sensible threshold), did not move either: 5.94 vs 5.86.
+ *
+ * WHY, and it is arithmetic rather than mystery. The 53 us region this was
+ * aimed at is MinGW libgomp's. Under LLVM libomp with the threads already
+ * spinning, a region costs single-digit us:
+ *
+ *     team    ~3 us region + 65k FMA / 16 threads  ~= 3.3 us
+ *     serial   65k FMA on one core                 ~= 4.3 us
+ *
+ * The DeltaNet gate shape sits ON the break-even point. There is nothing to
+ * win. Worse, a threshold calibrated for a 53 us region is far too high for a
+ * 3 us one: at 262144 FMAs one core needs ~17 us and sixteen need ~1 + 3, so
+ * that setting would switch the team OFF where it still pays. Any value here
+ * belongs to an OpenMP runtime, not to a shape.
+ *
+ * Kept, off, with its test, as the B arm for a host where the region really
+ * does cost 53 us -- this project measured 57.70 ms/token under MinGW libgomp
+ * against 32.73 under libomp on the same commit, so such hosts exist. On one
+ * of those, 60 regions a decode token is ~3 ms and this knob is worth trying.
+ * That is a hypothesis about another runtime, which is why it is not a
+ * default.
+ *
+ * NEVER MEASURED OUTSIDE qwen36's DeltaNet either way. Every engine's f32
+ * matmuls come through here; the change cannot alter a result anywhere, but
+ * it can alter a time. Record:
+ * docs/experiments/qwen36-matmul-omp-min-2026-09-21-raw.txt */
 #ifndef COLI_MATMUL_OMP_MIN_DEFAULT
-#define COLI_MATMUL_OMP_MIN_DEFAULT 262144
+#define COLI_MATMUL_OMP_MIN_DEFAULT 0
 #endif
 /* A file-scope global rather than a function-local static, so a test can drive
  * both arms in one process: matmul() is far too hot for a getenv per call, but

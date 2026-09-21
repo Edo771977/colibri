@@ -98,27 +98,37 @@ int main(void){
     shape(1,     1,    1, "degenerate");
     shape(1,  2048,    1, "one output row: nothing for a team to split");
 
-    printf("the threshold sits where it was meant to\n");
+    printf("the knob parses, and ships OFF\n");
     {
-        /* The decision, checked at the condition rather than at the dispatch:
-         * see the header. The DeltaNet gate shape must fall below the default
-         * and an ordinary trunk matmul above it, or the change is aimed at the
-         * wrong work. */
-        g_matmul_omp_min = -1;                          /* re-read the env */
-        unsetenv("COLI_MATMUL_OMP_MIN");
-        int64_t lim = matmul_omp_min();
-        check(lim == COLI_MATMUL_OMP_MIN_DEFAULT, "unset reads as the compiled default");
-        check((int64_t)1*2048*32   <  lim, "the DeltaNet gate shape is below the line");
-        check((int64_t)1*2048*2048 >= lim, "an ordinary trunk matmul is above it");
-        check((int64_t)1*512*512   >= lim, "512x512 still earns a team");
-
+        /* It ships off: measured worth nothing on an LLVM libomp host, where a
+         * region costs single-digit us and the DeltaNet gate shape sits ON the
+         * break-even point. See quant.h. So the first assertion here is that
+         * the default changes NOTHING -- a threshold of 0 means every shape
+         * still gets a team, exactly as before. */
         g_matmul_omp_min = -1;
-        setenv("COLI_MATMUL_OMP_MIN", "0", 1);
-        check(matmul_omp_min() == 0, "\"0\" restores a team for every shape (the B arm)");
+        unsetenv("COLI_MATMUL_OMP_MIN");
+        check(matmul_omp_min() == 0, "unset means a team for every shape (no default change)");
+        check(COLI_MATMUL_OMP_MIN_DEFAULT == 0, "the compiled default is off");
+
+        /* And that when someone DOES set it -- on a host where a region really
+         * costs 53 us -- it lands between the work it was aimed at and the work
+         * it must not touch. Checked at the condition, not the dispatch: see
+         * the header. */
+        g_matmul_omp_min = -1;
+        setenv("COLI_MATMUL_OMP_MIN", "262144", 1);
+        int64_t lim = matmul_omp_min();
+        check(lim == 262144, "an explicit value is honoured");
+        check((int64_t)1*2048*32   <  lim, "the DeltaNet gate shape falls below it");
+        check((int64_t)1*2048*2048 >= lim, "an ordinary trunk matmul stays above it");
+
         g_matmul_omp_min = -1;
         setenv("COLI_MATMUL_OMP_MIN", "zzz", 1);
         check(matmul_omp_min() == COLI_MATMUL_OMP_MIN_DEFAULT,
-              "garbage reads as the default, not as 0");
+              "garbage reads as the default, not as some other number");
+        g_matmul_omp_min = -1;
+        setenv("COLI_MATMUL_OMP_MIN", "-5", 1);
+        check(matmul_omp_min() == COLI_MATMUL_OMP_MIN_DEFAULT,
+              "a negative value reads as the default: -1 is the not-read-yet marker");
         unsetenv("COLI_MATMUL_OMP_MIN");
         g_matmul_omp_min = -1;
     }

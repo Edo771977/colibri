@@ -1,0 +1,146 @@
+COLI_MATMUL_OMP_MIN: skip the OpenMP team for a matmul too small to pay for it
+==============================================================================
+RESULT: worth NOTHING on this host, and the arithmetic says why. Ships off
+(default 0 = a team for every shape, i.e. no behaviour change). Kept with
+its test as the B arm for a host whose OpenMP runtime is slower to open a
+region.
+
+Box      : Windows, RTX 4070 Ti SUPER 16 GB (sm_89), CUDA 13.4, CUDA_DLL=1
+Engine   : qwen36_clang.exe (clang / LLVM libomp), rebuilt for this run
+Model    : C:\modelli\qwen36_i4_gs64, prompt25.txt (25 prompt tokens)
+Script   : misure-ompmin.ps1 (2 arms x 6 alternated reps at N_NEW=128, heat
+           frozen after warm-up, NO COLI_CUDA_PROFILE -- this is a clean A/B)
+Placement: COLI_PLACE=experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0
+Threads  : OMP_NUM_THREADS=16, OMP_WAIT_POLICY=ACTIVE, OMP_PROC_BIND=close
+Arms     : thresh = COLI_MATMUL_OMP_MIN unset at the then-default 262144
+           team   = COLI_MATMUL_OMP_MIN=0, a team for every shape
+           (no rebuild between arms: the knob is read at runtime)
+
+
+1. WHAT IT WAS AIMED AT
+-----------------------
+
+  qwen36's two DeltaNet gate projections, in_proj_a and in_proj_b, are
+  [32 x 2048]: 65k FMAs each, about 4 us on one core. matmul() opened an
+  OpenMP team for each of them, twice per DeltaNet layer, 30 DeltaNet
+  layers -- SIXTY regions a decode token.
+
+  The per-site dense profile put the pair at 0.86 ms/token: proj measured
+  8.0 and dnproj's own wall accounted for 7.14 (238.1 us x 30).
+
+  Predicted before the run, in the commit message and the script: proj down
+  ~0.6 ms/token, and step() down by the same, because this is CPU work on a
+  path with no GPU waiting on it.
+
+
+2. THE MEASUREMENT
+------------------
+
+  arm      step()   deltanet   dn-sub proj   attention
+  thresh    28.45     11.03        5.85         5.94
+  team      28.60     11.06        5.85         5.86
+
+  paired deltas (thresh - team), 6 pairs, negative = the threshold wins:
+
+    step()        -0.15 ms/token   [-0.20 0.60 -0.80 -0.10 -0.20 0.70]  signs disagree
+    deltanet      +0.07 ms/token   [-0.26 0.23 -0.43 0.03 0.11 0.26]    signs disagree
+    dn-sub proj   +0.05 ms/token   [-0.20 0.10 -0.20 0.10 0.00 0.10]    signs disagree
+
+  Identical generation in both arms (hit 100 %, miss(CPU) 0), as it must be:
+  the change is bitwise identical by construction.
+
+  The control behaved: `attention` holds no matmul under any sensible
+  threshold and did not move (5.94 vs 5.86).
+
+  Per-arm spread: thresh 1.80, team 0.50. The effect, if any, is far inside
+  the noise of a single arm.
+
+
+3. WHY THE PREDICTION WAS WRONG
+-------------------------------
+
+  Two mistakes, and the second is the interesting one.
+
+  (a) The 0.86 ms/token came from a PROFILED pass, as a difference between
+      two numbers that were both inflated by four cudaEventRecord per call.
+      Unprofiled, proj is 5.85, not 8.0. A difference of inflated numbers is
+      not an inflated difference, and treating it as one is how this got
+      predicted at 0.6.
+
+  (b) The 53 us region this was aimed at belongs to MinGW libgomp. Under
+      LLVM libomp with OMP_WAIT_POLICY=ACTIVE the threads are already
+      spinning and a region costs single-digit us:
+
+          team    ~3 us region + 65k FMA / 16 threads  ~= 3.3 us
+          serial   65k FMA on one core                 ~= 4.3 us
+
+      The DeltaNet gate shape sits ON the break-even point. There was never
+      anything to win here.
+
+      Worse, a threshold calibrated for a 53 us region is far too high for a
+      3 us one. At 262144 FMAs one core needs ~17 us and sixteen need ~1 + 3,
+      so the shipped setting would have switched the team OFF where it still
+      pays. The right value belongs to an OpenMP runtime, not to a shape --
+      which is precisely why there is no good default.
+
+
+4. WHAT SHIPPED
+---------------
+
+  COLI_MATMUL_OMP_MIN, default 0: a team for every shape, exactly the
+  behaviour before the change. The knob, the test and this record stay.
+
+  It is worth trying on a host where a region really does cost 53 us. This
+  project measured 57.70 ms/token under MinGW libgomp against 32.73 under
+  LLVM libomp on the same commit and container
+  (qwen36-toolchain-2x-2026-09-19-raw.txt), so such hosts exist; there 60
+  regions a decode token is ~3 ms. That is a hypothesis about another
+  runtime, and hypotheses are not defaults.
+
+  tests/test_matmul_omp_threshold.c asserts the two arms are bitwise
+  identical on six shapes against a double reference, that the default is
+  off, and that an explicitly set threshold lands between the gate shape and
+  an ordinary trunk matmul.
+
+
+5. WHAT THIS COSTS THE PLAN IT CAME FROM
+----------------------------------------
+
+  This change existed to replace a worse one: fusing in_proj_a and in_proj_b
+  into the dnproj GEMV, which would have quantised them from f32 to int8
+  per-row on the path computing beta and g -- the gates that multiply a
+  persistent recurrent state every token. dn_qkv, dn_z and dn_out go through
+  qdw_take; dn_a and dn_b deliberately do not.
+
+  That fusion is still not worth making, and now for a second reason: the
+  pair is not costing 0.86 ms/token, it is costing whatever is left after
+  the profiler's own overhead is removed -- and the A/B above bounds the
+  whole a/b OpenMP question at under 0.2 ms/token. There is no 0.86 to
+  recover, with or without a numerics change.
+
+  The dense round-trip finding from the same profile stands and is
+  unaffected: 60 of DeltaNet's calls cost ~66-69 us of transfer each, with
+  only ~11 us of launch/sync residue. That is where the time is.
+
+
+6. RAW
+------
+
+=== 2 bracci x 6 rip, alternate (N_NEW=128) ===
+  thresh  rip 1  step  28,40 | deltanet 10,88 | proj  5,70 | attn  5,85 | hit 100,0 %
+  team    rip 1  step  28,60 | deltanet 11,14 | proj  5,90 | attn  6,00 | hit 100,0 %
+  thresh  rip 2  step  29,60 | deltanet 11,42 | proj  6,00 | attn  6,05 | hit 100,0 %
+  team    rip 2  step  29,00 | deltanet 11,19 | proj  5,90 | attn  6,06 | hit 100,0 %
+  thresh  rip 3  step  27,80 | deltanet 10,57 | proj  5,60 | attn  5,81 | hit 100,0 %
+  team    rip 3  step  28,60 | deltanet 11,00 | proj  5,80 | attn  5,87 | hit 100,0 %
+  thresh  rip 4  step  28,50 | deltanet 11,07 | proj  5,90 | attn  6,02 | hit 100,0 %
+  team    rip 4  step  28,60 | deltanet 11,04 | proj  5,80 | attn  5,85 | hit 100,0 %
+  thresh  rip 5  step  28,30 | deltanet 10,98 | proj  5,80 | attn  5,85 | hit 100,0 %
+  team    rip 5  step  28,50 | deltanet 10,87 | proj  5,80 | attn  5,82 | hit 100,0 %
+  thresh  rip 6  step  29,40 | deltanet 11,33 | proj  6,00 | attn  6,05 | hit 100,0 %
+  team    rip 6  step  28,70 | deltanet 11,07 | proj  5,90 | attn  5,84 | hit 100,0 %
+
+=== mediane ===
+  braccio     step  deltanet    proj      attn
+  thresh    28,45    11,03     5,85     5,94   escursione  1,80
+  team      28,60    11,06     5,85     5,86   escursione  0,50
