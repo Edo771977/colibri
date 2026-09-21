@@ -89,6 +89,17 @@ typedef struct {
      * qt_issue and qt_take. Sharing x/y there overwrote the group's input and
      * output mid-flight (silent, output-only corruption, no CUDA error). */
     float *dx, *dy; size_t dx_cap, dy_cap;
+    /* COLI_CUDA_DENSE_PINNED: host side of that same staging. A cudaMemcpy
+     * out of PAGEABLE memory is not one copy, it is two -- the driver stages
+     * through a pinned buffer of its own -- and it blocks the calling thread
+     * until the whole thing is done. This path runs ~80 times a token and
+     * both of its copies are that kind, which is the measurement that made
+     * these fields worth adding.
+     *
+     * They cannot share host_x/host_y for the same reason dx/dy cannot share
+     * x/y: the expert group owns those while it is in flight on ctx->stream,
+     * and the engine calls coli_cuda_matmul between qt_issue and qt_take. */
+    float *host_dx, *host_dy; size_t host_dx_cap, host_dy_cap;
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
@@ -1626,6 +1637,8 @@ extern "C" void coli_cuda_shutdown(void) {
         for(int b=0;b<27;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
+        if (ctx->host_dx) cudaFreeHost(ctx->host_dx);
+        if (ctx->host_dy) cudaFreeHost(ctx->host_dy);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
         if (ctx->ev_grp_ok>0) { for(int e=0;e<4;e++) cudaEventDestroy(ctx->ev_grp[e]); }
         ctx->ev_grp_ok=0;
@@ -1648,10 +1661,12 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->host_x=ctx->host_y=ctx->host_kv=nullptr;ctx->stream=nullptr;
+        ctx->host_dx=ctx->host_dy=nullptr;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
         ctx->host_x_cap=ctx->host_y_cap=ctx->host_kv_cap=0;
+        ctx->host_dx_cap=ctx->host_dy_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
     g_nctx = 0;
@@ -2063,6 +2078,42 @@ static void quant_matmul_launch(float *y, const float *x, const void *w,
     quant_matmul<<<grid, 256>>>(y, x, w, sc, fmt, S, I, O, rb, gs, ng);
 }
 
+/* COLI_CUDA_DENSE_PINNED: stage the resident dense GEMV's two host copies
+ * through pinned memory instead of handing pageable pointers to the driver.
+ *
+ *   0 / unset  the original path: two synchronous pageable cudaMemcpy.
+ *   1          pinned staging, both copies still synchronous.
+ *   2          pinned staging, both copies async on stream 0, ONE sync.
+ *
+ * Three values rather than two because there are two separate mechanisms in
+ * here and lumping them into one flag would produce a number nobody can
+ * attribute: 1 prices the pageable staging alone, 2 adds the collapse from
+ * two blocking round-trips to one. Anything else reads as off rather than
+ * rounding, matching COLI_CUDA_DOWN_ROWS.
+ *
+ * Off by default. Three measured-and-correct optimisations in this area were
+ * worth exactly zero on the token because the time they saved was already
+ * being covered by something else; this one has no right to be assumed
+ * different until it is measured on the target machine.
+ *
+ * Deliberately not cached in a static, for the reason graph_mode() gives:
+ * tests/test_dense_pinned_cuda.cu flips the variable mid-process to compare
+ * the arms against each other, and a latched static would make it measure
+ * one arm three times. One getenv against a round-trip measured at ~55 us
+ * is not the cost worth saving here. */
+static int dense_pinned_mode(void){
+    const char *e=getenv("COLI_CUDA_DENSE_PINNED");
+    if(!e||!*e) return 0;
+    char *end; long v=strtol(e,&end,10);
+    if(*end) return 0;
+    return (v==1||v==2)?(int)v:0;
+}
+
+/* Read by tests/test_dense_pinned_cuda.cu: bitwise identity between the arms
+ * is ALSO satisfied by a toggle that never fires, so the test needs a way to
+ * tell "identical" from "never ran". */
+static uint64_t g_dense_pinned_calls;
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
@@ -2083,6 +2134,34 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
 
+    int pin = dense_pinned_mode();
+    if (pin) {
+        /* An allocation failure here is a real out-of-memory, not a reason to
+         * abort a call that has a correct slower path available. Take it --
+         * but SAY SO, once: a run that quietly drops back to pageable copies
+         * and reports a flat A/B is the exact failure mode that cost a day on
+         * the dense GEMV, and it is indistinguishable from "the toggle does
+         * nothing" unless the binary says which arm it actually ran. */
+        if (!reserve_pinned(&ctx->host_dx, &ctx->host_dx_cap, xb) ||
+            !reserve_pinned(&ctx->host_dy, &ctx->host_dy_cap, yb)) {
+            static int warned;
+            if (!warned) { warned = 1;
+                fprintf(stderr, "[cuda] dense pinned staging unavailable, "
+                                "falling back to pageable copies\n"); }
+            pin = 0;
+        } else {
+            /* Same announcement contract as the expert down-rows kernel: under
+             * CUDA_DLL=1 every line of this file lives in coli_cuda.dll, which
+             * only `make cuda-dll` rebuilds. A script that rebuilds the engine
+             * alone sets this variable, changes nothing, and reports a clean
+             * flat result. Silent when the variable is unset. */
+            static int announced;
+            if (!announced) { announced = 1;
+                fprintf(stderr, "[cuda] dense pinned staging active: mode=%d\n", pin); }
+            g_dense_pinned_calls++;
+        }
+    }
+
     /* Opt-in for the same reason the group path's is: four cudaEventRecord on
      * a call this short are not free. Off, this is one cached int. */
     static int dprof = -1;
@@ -2101,18 +2180,51 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     std::chrono::steady_clock::time_point t0;
     if (timed) { t0 = std::chrono::steady_clock::now(); cudaEventRecord(ctx->ev_dm[0], 0); }
 
-    if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
+    /* The host-side half of the pinned arms. It sits INSIDE the wall window on
+     * purpose: it is real cost this arm pays and the pageable arm does not, and
+     * hiding it would flatter the comparison this toggle exists to make. It is
+     * CPU work, so cudaEvent timings do not see it directly -- on an idle
+     * stream it widens the ev[0]->ev[1] gap anyway, because ev[0]'s device
+     * timestamp is taken before the memcpy starts. Either way it is counted. */
+    if (pin) std::memcpy(ctx->host_dx, x, xb);
+    const float *src = pin ? ctx->host_dx : x;
+    float *dst = pin ? ctx->host_dy : y;
+
+    if (pin == 2) {
+        if (!cuda_ok(cudaMemcpyAsync(ctx->dx, src, xb, cudaMemcpyHostToDevice, 0),
+                     "input upload")) return 0;
+    } else {
+        if (!cuda_ok(cudaMemcpy(ctx->dx, src, xb, cudaMemcpyHostToDevice),
+                     "input upload")) return 0;
+    }
     if (timed) cudaEventRecord(ctx->ev_dm[1], 0);
     quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
     if (timed) cudaEventRecord(ctx->ev_dm[2], 0);
-    if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
-        !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "matmul launch")) return 0;
+    /* Stream 0 for the async arm, same stream the kernel and the events are on,
+     * so the ordering H2D -> kernel -> D2H is the stream's own and needs no
+     * extra synchronisation to be correct -- only the one below, to know the
+     * bytes have landed before they are read. */
+    if (pin == 2) {
+        if (!cuda_ok(cudaMemcpyAsync(dst, ctx->dy, yb, cudaMemcpyDeviceToHost, 0),
+                     "output download")) return 0;
+    } else {
+        if (!cuda_ok(cudaMemcpy(dst, ctx->dy, yb, cudaMemcpyDeviceToHost),
+                     "output download")) return 0;
+    }
+    if (timed) cudaEventRecord(ctx->ev_dm[3], 0);
+    /* The whole point of pin==2: ONE blocking wait for the round-trip instead
+     * of two. Nothing below may touch host_dy before it returns. */
+    if (pin == 2 && !cuda_ok(cudaStreamSynchronize(0), "dense round-trip synchronize"))
+        return 0;
+    if (pin) std::memcpy(y, ctx->host_dy, yb);
 
     if (timed) {
-        cudaEventRecord(ctx->ev_dm[3], 0);
         /* Wall BEFORE the sync, or the sync's own cost lands in the number that
-         * exists to price the round-trip. The D2H above is synchronous, so the
-         * work is already done and this sync only waits for the record. */
+         * exists to price the round-trip. Every arm has already waited for the
+         * device by this point -- the pageable and pin==1 arms in their
+         * synchronous D2H, pin==2 in the cudaStreamSynchronize above -- so this
+         * event sync only waits for the record. */
         double wall = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
         cudaEventSynchronize(ctx->ev_dm[3]);

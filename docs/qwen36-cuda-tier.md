@@ -533,6 +533,88 @@ above are from runs where the DLL is newer than `backend_cuda.cu`, and the
 measurement script now refuses to start otherwise. Any future kernel A/B on
 Windows has to prove the same thing before its numbers mean anything.
 
+## The dense round-trip: pinned host staging (`COLI_CUDA_DENSE_PINNED`)
+
+`coli_cuda_matmul` is the placed dense GEMV — `dnproj`, `dnout`, `attnout`,
+`lm_head`, the shared expert. It runs **81.6 times a token** on qwen36, and
+each call does exactly this:
+
+```
+cudaMemcpy(ctx->dx, x, xb, H2D)      synchronous, from PAGEABLE host memory
+quant_matmul_launch(...)
+cudaMemcpy(y, ctx->dy, yb, D2H)      synchronous, to PAGEABLE host memory
+```
+
+`COLI_CUDA_PROFILE=1` prices it. From the R=2 arm of the `COLI_CUDA_I8_ROWS`
+session (5224 calls over 64 tokens, `docs/experiments/qwen36-i8-rows-2026-09-20-raw.txt`):
+
+| | total | per token | per call |
+|---|---|---|---|
+| kernel | 301 ms | 4.70 ms | 57.6 µs |
+| h2d | 96 ms | 1.50 ms | 18.4 µs |
+| d2h | 120 ms | 1.88 ms | 23.0 µs |
+| residue (launch + sync) | 71 ms | 1.11 ms | 13.6 µs |
+| **wall** | **588 ms** | **9.19 ms** | **112.6 µs** |
+
+**Half the wall clock of this path is not the kernel.** 4.48 ms/token of it
+is transfer and driver overhead, against a 25 ms token — and unlike the expert
+group, *none of it is hidden*: these copies are synchronous, so the engine
+thread is stopped inside them. There is no CPU window covering this the way
+`qt_issue`/`qt_take` covers the expert group, which is precisely why the three
+optimisations that preceded this one were each correct and each worth zero.
+
+A pageable `cudaMemcpy` is not one copy. The driver cannot DMA out of memory
+the OS may page, so it stages through a pinned buffer of its own — two copies,
+one of them serialised against the caller. `COLI_CUDA_DENSE_PINNED` gives that
+buffer to the backend instead:
+
+| value | behaviour |
+|---|---|
+| `0` / unset | the original path: two synchronous pageable copies |
+| `1` | pinned staging, both copies still synchronous |
+| `2` | pinned staging, both copies async on stream 0, **one** synchronize |
+
+Three values rather than two on purpose. There are two separate mechanisms in
+here — the driver's hidden staging, and the two blocking round-trips — and a
+single flag that changed both would produce a number nobody could attribute.
+`1` prices the staging alone; `2` adds the collapse to one wait.
+
+The staging cannot change a value, only where the bytes are read from, so the
+contract is **bitwise identity** across all three modes and
+`tests/test_dense_pinned_cuda.cu` asserts it with `memcmp`. Mode 2 is the one
+that needs a test: async copies into a reused host buffer fail *silently* when
+the synchronize is missing — the caller reads the previous call's answer, which
+for a repeated shape is usually almost right. The test therefore interleaves
+mode 2 with the pageable path on a **new input every iteration**, where a stale
+buffer shows up as the previous answer instead of passing unnoticed.
+
+### The prediction, written down before the run
+
+Every dense call here is `S=1`: `xb` is `I*4` — **8 KiB** for the qwen36 trunk —
+and `yb` is smaller still. At that size pinned memory buys essentially nothing
+in *bandwidth*; the driver's hidden staging copy it removes is itself an 8 KiB
+memcpy. So:
+
+- **mode 1 should be worth roughly zero.** It removes a small copy and nothing
+  else. If it shows a large gain, the explanation is not the one written here
+  and the result should be distrusted until it is.
+- **mode 2 is the actual bet.** It collapses two blocking waits into one, and
+  the residue line already prices those at 13.6 µs/call on top of the 41.4 µs
+  the two transfers cost. Pinned memory is only the precondition: a
+  `cudaMemcpyAsync` out of pageable memory is synchronous anyway.
+
+If mode 2 is also flat, the conclusion is not "try harder here" — it is that
+81.6 driver round-trips a token is the floor of this design, and the next lever
+is **fewer calls**, not faster ones: batching the placed GEMVs, or a graph over
+the dense trunk the way `COLI_CUDA_GRAPH` does for the expert group.
+
+**Off by default, and unmeasured.** The mechanism is real and the profile above
+is real; whether removing it moves `step()` is a separate question, and on this
+engine the answer has been "no" three times running. Do not turn it on in a
+default build before it has a paired A/B on the target machine, and do not
+believe a flat result until the log has shown `[cuda] dense pinned staging
+active` — under `CUDA_DLL=1` this file is in the DLL, see the caveat above.
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |

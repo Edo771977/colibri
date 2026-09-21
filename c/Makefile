@@ -1024,7 +1024,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
@@ -1055,6 +1055,15 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# multi-row chunk.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_grouped_down_rows_cuda.cu -o grouped_down_rows_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./grouped_down_rows_test$(EXE)
+	# Pinned host staging for the resident dense GEMV (COLI_CUDA_DENSE_PINNED).
+	# Staging changes where the bytes come from, never their value, so the
+	# contract is again BITWISE identity across all three modes. Mode 2 is the
+	# one that needs the test: async copies into a reused host buffer fail
+	# SILENTLY when the synchronize is missing, so the test interleaves it with
+	# the pageable path on changing inputs, where a stale buffer shows up as
+	# the previous answer instead of passing unnoticed.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_dense_pinned_cuda.cu -o dense_pinned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./dense_pinned_test$(EXE)
 	# The batch and ragged absorb kernels must reproduce their own output: they
 	# reduce in a fixed tree order with no atomics, so two identical launches
 	# that disagree have read shared memory another thread was still writing.
@@ -1136,6 +1145,7 @@ gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_int8_rows_cuda.cu -o int8_rows_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_grouped_down_rows_cuda.cu -o grouped_down_rows_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_dense_pinned_cuda.cu -o dense_pinned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 

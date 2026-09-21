@@ -404,6 +404,16 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_grouped_down_rows_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "expert down row-blocked test compiles"
+      - name: Compile the dense pinned-staging test (syntax only, no GPU)
+        run: |
+          cd c
+          # Same reason again: tests/test_dense_pinned_cuda.cu is the only
+          # check COLI_CUDA_DENSE_PINNED gets on a runner without a card. Its
+          # real assertion -- that the async arm is not reading a stale host
+          # buffer -- needs silicon and `make cuda-test`.
+          nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_dense_pinned_cuda.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "dense pinned-staging test compiles"
       - name: Compile the grouped-g4 oracle (syntax only, no GPU)
         run: |
           cd c
