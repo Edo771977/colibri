@@ -2801,6 +2801,24 @@ extern "C" int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
  * and read total*D floats out of a one-row buffer. The loader resolves this
  * one optionally and the caller keeps its duplication path for when it is
  * absent. */
+/* Read by tests/test_grouped_g4_cuda.cu. The graph has two observable states
+ * -- captured and replayed -- and without a way to tell them apart a test
+ * cannot check that a moved buffer causes a RE-CAPTURE rather than a replay
+ * against a freed pointer. Bitwise identity does not distinguish them: a
+ * stale graph that happens to read memory nothing else has reused yet
+ * returns the right answer too. */
+static uint64_t g_graph_captures, g_graph_replays;
+
+/* One call's worth of group accounting. Exists because the graph replay path
+ * returns early and silently stopped counting when it was added. */
+static void group_account(DeviceContext *ctx,int count,int total){
+    std::lock_guard<std::mutex> lock(g_group_stats_mu);
+    int index=(int)(ctx-g_ctx);
+    g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
+    g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
+    g_device_group_rows[index]+=(uint64_t)total;
+}
+
 extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
                                               ColiCudaTensor *const *ups,
                                               ColiCudaTensor *const *downs,
@@ -2857,16 +2875,33 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
      * before that points at freed memory. Rather than assume warm-up is over,
      * watch the pointers: any reallocation bumps buf_gen and every graph
      * captured under the old generation is thrown away. */
-    const void *pre[5]={ctx->x,ctx->y,ctx->gate,ctx->up,ctx->group_desc};
-    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,yb)||
-       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
-       !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))||
-       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,yb)||
-       !reserve_pinned_bytes(&ctx->host_desc,&ctx->host_desc_cap,
-                             (size_t)count*sizeof(GroupDesc))) return 0;
+    /* EIGHT pointers, not five. A graph bakes in every address it was
+     * captured with, and three of them are on the HOST: the capture records
+     * cudaMemcpyAsync(group_desc <- host_desc), (x <- host_x) and
+     * (host_y <- y). Watching only the device buffers left a hole where
+     * reserve_pinned could cudaFreeHost one of those and hand the graph a
+     * dangling address with buf_gen unchanged -- the signature would still
+     * match, the replay would still be attempted, and it would read freed
+     * pinned memory.
+     *
+     * AND THE COMPARISON RUNS EVEN WHEN A RESERVE FAILS. It used to sit
+     * behind the `return 0`, so a reserve that succeeded and MOVED a buffer,
+     * followed by one that failed, left the old pointers armed in a graph
+     * that had just been freed underneath. reserve() nulls what it could not
+     * grow, so a failure always shows up in this comparison -- but only if
+     * the comparison is reached. */
+    const void *pre[8]={ctx->x,ctx->y,ctx->gate,ctx->up,ctx->group_desc,
+                        ctx->host_x,ctx->host_y,ctx->host_desc};
+    int reserved_=reserve(&ctx->x,&ctx->x_cap,xb)&&reserve(&ctx->y,&ctx->y_cap,yb)&&
+       reserve(&ctx->gate,&ctx->gate_cap,ib)&&reserve(&ctx->up,&ctx->up_cap,ib)&&
+       reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))&&
+       reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)&&
+       reserve_pinned(&ctx->host_y,&ctx->host_y_cap,yb)&&
+       reserve_pinned_bytes(&ctx->host_desc,&ctx->host_desc_cap,
+                            (size_t)count*sizeof(GroupDesc));
     if(pre[0]!=ctx->x||pre[1]!=ctx->y||pre[2]!=ctx->gate||pre[3]!=ctx->up||
-       pre[4]!=ctx->group_desc){
+       pre[4]!=ctx->group_desc||pre[5]!=ctx->host_x||pre[6]!=ctx->host_y||
+       pre[7]!=ctx->host_desc){
         ctx->buf_gen++;
 #if COLI_GPU_HAS_GRAPH
         /* The signature check alone would stop them being USED; they still
@@ -2877,6 +2912,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
             ctx->graph_exec[gi]=nullptr; ctx->graph_gen[gi]=0; }
 #endif
     }
+    if(!reserved_) return 0;          /* after the invalidation, never before */
     std::memcpy(ctx->host_desc,host,(size_t)count*sizeof(GroupDesc));
     std::memcpy(ctx->host_x,x,xb);
     /* Timing is opt-in because measuring it changes it: four cudaEventRecord
@@ -2918,6 +2954,17 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         if(!cuda_ok(cudaGraphLaunch(ctx->graph_exec[count],ctx->stream),
                     "expert group graph launch")) return 0;
         ctx->group_pending=1; ctx->group_pending_bytes=yb;
+        g_graph_replays++;
+        /* The replay is a call, an expert count and a row count like any
+         * other. This early return used to skip the accounting, so with the
+         * graph on by default `qt_stats` reported only the CAPTURES -- tens
+         * of calls where there were thousands. It never corrupted a published
+         * number, because the graph refuses to run under COLI_CUDA_PROFILE
+         * and every recorded group_stats figure came from a profiled pass,
+         * but a counter that is right only when you are watching it is not a
+         * counter. Shared helper rather than a second copy, so the two sites
+         * cannot drift again. */
+        group_account(ctx,count,total);
         return 1;
     }
     int capturing_=0;
@@ -3073,6 +3120,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
          * gives: on by default, so an unset run must not grow a log line.
          * The capture-FAILED message above stays unconditional -- that one is
          * a problem the user needs to see whether or not they asked. */
+        g_graph_captures++;
         static int said_ok=0;
         if(!said_ok){ said_ok=1;
             const char *ge=getenv("COLI_CUDA_GRAPH");
@@ -3081,11 +3129,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
     }
 #endif
     ctx->group_pending=1; ctx->group_pending_bytes=yb;   /* the readback, not the upload */
-    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
-      int index=(int)(ctx-g_ctx);
-      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total;
-      g_device_group_calls[index]++; g_device_group_experts[index]+=(uint64_t)count;
-      g_device_group_rows[index]+=(uint64_t)total; }
+    group_account(ctx,count,total);
     return 1;
 }
 
