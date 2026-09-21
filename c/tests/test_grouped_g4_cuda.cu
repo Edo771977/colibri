@@ -288,6 +288,8 @@ int main(void){
              * Nothing else here exercises this: cuda-test never sets the
              * variable, so without this block the graph path ships compiled
              * and unrun. */
+            uint64_t calls_before=0; { uint64_t e=0,r=0; double h=0,k=0,d=0;
+                coli_cuda_group_stats(&calls_before,&e,&r,&h,&k,&d); }
             setenv("COLI_CUDA_GRAPH", "1", 1);
             for (int rep = 0; rep < 3; rep++) {
                 if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,1)){
@@ -299,6 +301,60 @@ int main(void){
                 printf("grouped-g4 graph: rep %d (%s) vs per-call launches: %s\n",
                        rep, rep?"replay":"capture", g_bad?"DIFFERS":"bitwise");
             }
+            /* THE ACCOUNTING. Three issues above: one capture and two
+             * replays. All three are calls, and all three must be counted --
+             * the replay path returns early and used to skip the accounting
+             * entirely, so with the graph on by default qt_stats reported the
+             * captures alone. Checked against the backend's own counters, and
+             * against the capture/replay split, because "three calls counted"
+             * would also pass if all three had been captures. */
+            {
+                uint64_t gc=0,ge=0,gr=0; double h=0,k=0,d=0;
+                coli_cuda_group_stats(&gc,&ge,&gr,&h,&k,&d);
+                if(g_graph_captures!=1 || g_graph_replays!=2){
+                    printf("FAIL graph split: %llu captures, %llu replays (want 1 and 2)\n",
+                           (unsigned long long)g_graph_captures,
+                           (unsigned long long)g_graph_replays); api_bad++; }
+                if(gc < calls_before+3){
+                    printf("FAIL graph calls uncounted: %llu -> %llu, want +3 at least\n",
+                           (unsigned long long)calls_before,(unsigned long long)gc); api_bad++; }
+                else printf("grouped-g4 graph: %llu captures + %llu replays, all counted\n",
+                            (unsigned long long)g_graph_captures,
+                            (unsigned long long)g_graph_replays);
+            }
+
+            /* THE INVALIDATION. A graph holds the addresses it was captured
+             * with. Grow the buffers through the LEGACY path (x_rows=0, one
+             * input row per expert row) so reserve() has to reallocate, then
+             * come back to the same count: the graph must be RE-CAPTURED, not
+             * replayed against pointers that have been freed.
+             *
+             * Bitwise identity cannot test this on its own -- a stale graph
+             * reading memory nothing has reused yet returns the right answer
+             * too -- which is why the capture counter exists. */
+            {
+                uint64_t cap_before=g_graph_captures, rep_before=g_graph_replays;
+                setenv("COLI_CUDA_GRAPH", "1", 1);
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,xd,0)){
+                    printf("FAIL grow issue\n"); return 1; }
+                (void)coli_cuda_expert_group_take(0);
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,1)){
+                    printf("FAIL post-grow issue\n"); return 1; }
+                { const float *yg=coli_cuda_expert_group_take(0);
+                  if(!yg||memcmp(ydup,yg,(size_t)COUNT*D*4)!=0){
+                      printf("FAIL post-grow result\n"); api_bad++; } }
+                /* Either the buffers moved and this is a fresh capture, or
+                 * they did not and a replay was legitimate. What must NEVER
+                 * happen is a replay after a move -- and the only way to tell
+                 * is that one of the two counters advanced, never neither. */
+                int recaptured = g_graph_captures>cap_before;
+                int replayed   = g_graph_replays>rep_before;
+                if(!recaptured && !replayed){
+                    printf("FAIL neither captured nor replayed after the grow\n"); api_bad++; }
+                else printf("grouped-g4 graph after a buffer grow: %s, bitwise\n",
+                            recaptured?"re-captured":"replayed (buffers did not move)");
+            }
+
             /* And back off cleanly: a graph left armed would follow this
              * process into the next block. */
             setenv("COLI_CUDA_GRAPH", "0", 1);
