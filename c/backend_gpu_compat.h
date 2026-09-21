@@ -105,6 +105,10 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
  * refusal COMPILE; its runtime behavior on AMD silicon is not verified by
  * this repo's tests (same hardware caveat as the rest of this HIP arm). */
 #define __trap                   abort
+/* HIP has hipGraph*, but nothing in this header maps it and no runner here
+ * has AMD silicon to check the capture behavior on. The expert-group graph
+ * path compiles out rather than being translated on faith. */
+#define COLI_GPU_HAS_GRAPH       0
 #else
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -113,6 +117,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
  * needs sm_75+, which the host checks at run time from the device's compute
  * capability (see the grouped_s4_wmma dispatch in backend_cuda.cu). */
 #define COLI_GPU_HAS_S4_WMMA     1
+#define COLI_GPU_HAS_GRAPH       1
 #endif
 
 #endif /* COLIBRI_BACKEND_GPU_COMPAT_H */
