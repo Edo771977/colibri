@@ -196,6 +196,17 @@ int main(void){
         int rows[COUNT]={1,2,1}, total=4, api_bad=0;
         api_bad += check_graph_default();
         setenv("COLI_CUDA_GRAPH","0",1);
+        /* ...and down-rows off with it. The two defaults are a PAIR, and
+         * down_g4_launch warns when it sees the kernel on with the graph off
+         * -- correctly, because that combination measured +1.15 ms/token. Here
+         * the graph is off ON PURPOSE, to build a per-call reference, so the
+         * warning is firing at a case that is deliberate and harmless. A guard
+         * that cries wolf stops being read, and this file is where a reader
+         * would meet it first. Nothing below depends on the down-rows kernel:
+         * the grouped-g4 assertions compare group paths against each other and
+         * against the CPU oracle, and R=0 is one of the bitwise-identical
+         * arms tests/test_grouped_down_rows_cuda.cu already pins down. */
+        setenv("COLI_CUDA_DOWN_ROWS","0",1);
 
         ColiCudaTensor *tg[COUNT]={},*tu[COUNT]={},*td[COUNT]={};
         uint8_t *hg[COUNT],*hu[COUNT],*hd[COUNT]; float *hgs[COUNT],*hus[COUNT],*hds[COUNT];
