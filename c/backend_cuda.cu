@@ -1377,7 +1377,14 @@ __global__ static void grouped_hidden_f8w_dual(float *gate,float *up,const float
     int vec=!(D&3)&&!(((size_t)gr|(size_t)ur)&3)&&!((size_t)x&15);
     for(int s0=0;s0<d.rows;s0+=4){
         int ns=d.rows-s0<4?d.rows-s0:4;
-        const float *xs=x+(size_t)(d.offset+s0)*D;
+        /* xoff, not offset: this reads the ACTIVATION, which the broadcast
+         * contract may hand over as a single row shared by every chunk.
+         * offset addresses gate/up/y, which stay per-expert. The mode-0
+         * sibling grouped_hidden_f8_dual was converted when xoff was added
+         * and this one was not -- and this is the CUDA default
+         * (COLI_F8_DEFAULT), so the arm that got the fix is the arm nobody
+         * runs. See tests/test_group_bcast_arms_cuda.cu. */
+        const float *xs=x+(size_t)(d.xoff+s0)*D;
         double ga[4]={0,0,0,0},ua[4]={0,0,0,0};
         for(int bi=0;bi<nblk;bi++){
             int base=bi<<7,len=D-base<128?D-base:128;
@@ -2998,7 +3005,11 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         for(int c=0;c<count;c++){
         int r=rows[c];
         float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
-        float *x16=ctx->x+(size_t)host[c].offset*D,*y16=ctx->y+(size_t)host[c].offset*D;
+        /* x16 is the ACTIVATION and takes xoff; y16 is this expert's output
+         * and keeps offset. Same miss as the fp8 warp kernel: this generic
+         * arm (fmt 0/1/3 -- an int8 expert tier lands here) was not converted
+         * when GroupDesc gained xoff. */
+        float *x16=ctx->x+(size_t)host[c].xoff*D,*y16=ctx->y+(size_t)host[c].offset*D;
         quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
             host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D),0,1);
         quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,

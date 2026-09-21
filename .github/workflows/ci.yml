@@ -404,6 +404,15 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_grouped_down_rows_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "expert down row-blocked test compiles"
+      - name: Compile the per-arm broadcast contract test (syntax only, no GPU)
+        run: |
+          cd c
+          # The test that would have caught the two xoff misses. It links
+          # backend_cuda.cu, so this is also the only check it gets without a
+          # card.
+          nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_group_bcast_arms_cuda.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "per-arm broadcast test compiles"
       - name: Compile the dense pinned-staging test (syntax only, no GPU)
         run: |
           cd c
