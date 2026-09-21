@@ -764,8 +764,91 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
  * tier learning its name. The engine offers sizes through qt_trunk_offer(),
  * asks qt_place_of() where each went, and hands the quantized bytes here. */
 #define QT_DENSE_MAX 1024
-static struct { ColiCudaTensor *t; int dev, on; size_t bytes; int gs; } G_dense[QT_DENSE_MAX];
+static struct { ColiCudaTensor *t; int dev, on; size_t bytes; int gs; int site; } G_dense[QT_DENSE_MAX];
 static int G_dense_n;
+
+/* ---- per-site dense profile (COLI_CUDA_PROFILE=1) --------------------------
+ *
+ * `dense_stats` is one aggregate over every placed GEMV in the engine, and an
+ * aggregate cannot answer the question that matters: qwen36's DeltaNet owns 60
+ * of the ~70 dense calls a decode token makes (30 dnproj + 30 dnout), so most
+ * of that total is one phase's, and nothing printed says so. Splitting the
+ * total by dividing it by a throughput measured in ANOTHER session is how that
+ * question got answered wrongly once already -- the same 5224 calls measured
+ * 372 GB/s one day and 175 GB/s the next, and any arithmetic dividing by that
+ * inherits the factor of two.
+ *
+ * So the split is measured in the same run, by reading the backend's own
+ * accumulators immediately before and after each call and attributing the
+ * delta. No backend change, no new export, no second timing mechanism to
+ * disagree with the first: this reports exactly what dense_stats reports, only
+ * separated.
+ *
+ * The attribution rests on one assumption -- that nothing else calls
+ * coli_cuda_matmul between the two reads -- and that assumption is CHECKED
+ * rather than trusted: the `calls` delta must be exactly 1, and a sample where
+ * it is not lands in `unattributed` instead of being quietly charged to
+ * whichever site happened to be holding the stopwatch. See issue #1609: a
+ * counter that cannot be wrong about its own denominator is worth more than a
+ * counter that is merely precise.
+ *
+ * WHAT THE KERNEL COLUMN IS -- AND IS NOT. It is the ev[1]..ev[2] interval,
+ * and TWO things other than the kernel live inside it.
+ *
+ *   1. ev[1] is recorded after the H2D copy and ev[2] after the LAUNCH, both
+ *      on stream 0, so a host slow to issue the launch leaves the card idle
+ *      inside the measured interval. This is not a theory: the same 2704
+ *      calls over the same 92.37 GB read 475 ms under clang and 750 under
+ *      gcc, from the host compiler alone
+ *      (docs/experiments/qwen36-place-clang-clean-2026-09-20-raw.txt, and the
+ *      COLI_CUDA_PROFILE row in docs/ENVIRONMENT.md, which said so before
+ *      this table existed).
+ *   2. These GEMVs run on stream 0 while the expert group runs on
+ *      ctx->stream, so a kernel sharing the SMs measures longer without doing
+ *      more work.
+ *
+ * Both are candidates for the 2x above, and this table does not separate
+ * them -- it makes them addressable. If dnproj's kernel time tracks expert
+ * activity rather than its own byte count, (2) is the explanation; if it
+ * tracks the host build, (1) is. Either way, do not read this column as
+ * "what the kernel would cost alone".
+ *
+ * Off unless COLI_CUDA_PROFILE is set: the backend only fills its own
+ * accumulators then, so with profiling off these two reads would return the
+ * same zeros twice and cost a mutex for nothing. */
+static uint64_t g_site_calls[QT_SITE_N], g_site_bytes[QT_SITE_N];
+static double   g_site_h2d[QT_SITE_N], g_site_kernel[QT_SITE_N],
+                g_site_d2h[QT_SITE_N], g_site_wall[QT_SITE_N];
+static uint64_t g_site_unattributed;
+
+static int site_profile_on(void){
+    static int on = -1;
+    if(on < 0){ const char *e = getenv("COLI_CUDA_PROFILE"); on = e && atoi(e); }
+    return on;
+}
+
+typedef struct { uint64_t calls, bytes; double h2d, ker, d2h, wall; } SiteSample;
+
+static void site_read(SiteSample *s){
+    coli_cuda_dense_stats(-1, &s->calls, &s->bytes, &s->h2d, &s->ker, &s->d2h, &s->wall);
+}
+
+static void site_charge(int site, const SiteSample *before){
+    SiteSample a; site_read(&a);
+    if(a.calls != before->calls + 1){ g_site_unattributed++; return; }
+    if(site < 0 || site >= QT_SITE_N) site = QT_SITE_OTHER;
+    g_site_calls[site]  += 1;
+    g_site_bytes[site]  += a.bytes - before->bytes;
+    g_site_h2d[site]    += a.h2d  - before->h2d;
+    g_site_kernel[site] += a.ker  - before->ker;
+    g_site_d2h[site]    += a.d2h  - before->d2h;
+    g_site_wall[site]   += a.wall - before->wall;
+}
+
+void qt_dense_site(int h, int site){
+    if(h < 0 || h >= QT_DENSE_MAX) return;
+    G_dense[h].site = (site >= 0 && site < QT_SITE_N) ? site : QT_SITE_OTHER;
+}
 int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device, int gs){
     if(device == QT_PLACE_CPU || !q || !sc || I <= 0 || O <= 0 || gs < 0) return -1;
     if(G_dense_n >= QT_DENSE_MAX) return -1;
@@ -789,7 +872,11 @@ int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
     /* the group size travels with the call: the backend's cached-tensor check
      * compares it against the tensor's, and a grouped upload answered with
      * gs 0 would be refused as a format mismatch */
-    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, 1, 1, I, O, G_dense[h].dev, G_dense[h].gs)) return 1;
+    SiteSample _b; int _p = site_profile_on(); if(_p) site_read(&_b);
+    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, 1, 1, I, O, G_dense[h].dev, G_dense[h].gs)){
+        if(_p) site_charge(G_dense[h].site, &_b);
+        return 1;
+    }
     fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
     G_dense[h].on = 0;
     return 0;
@@ -798,8 +885,11 @@ int qt_dense_count(void){ return G_dense_n; }
 
 int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on) return 0;
-    if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,1,1,I,O,G_dnp[layer].dev,0))
+    SiteSample _b; int _p = site_profile_on(); if(_p) site_read(&_b);
+    if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,1,1,I,O,G_dnp[layer].dev,0)){
+        if(_p) site_charge(QT_SITE_DNPROJ, &_b);
         return 1;
+    }
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
     G_dnp[layer].on = 0;
     return 0;
@@ -808,7 +898,11 @@ int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
     if(!G_lmh.on) return 0;
     /* cached-tensor path: upload params are ignored once *t exists */
-    if(coli_cuda_matmul(&G_lmh.t,y,x,NULL,NULL,1,1,I,O,G_lmh.dev,0)) return 1;
+    SiteSample _b; int _p = site_profile_on(); if(_p) site_read(&_b);
+    if(coli_cuda_matmul(&G_lmh.t,y,x,NULL,NULL,1,1,I,O,G_lmh.dev,0)){
+        if(_p) site_charge(QT_SITE_LMHEAD, &_b);
+        return 1;
+    }
     fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");
     G_lmh.on=0;
     return 0;
@@ -1179,8 +1273,46 @@ static void dense_stats_one(const char *indent, const char *label, int device){
  * splits the trunk by budget and the cards need not be the same model, so a
  * single blended GB/s is an average of numbers that belong to different
  * hardware. Break it out, and keep the total for the step-time arithmetic. */
+/* The per-site table. Printed only when something was attributed, so a run
+ * without COLI_CUDA_PROFILE prints exactly what it printed before.
+ *
+ * `residue` is wall - h2d - kernel - d2h: driver launch and synchronisation,
+ * the part no kernel and no transfer accounts for. It is the reason this table
+ * exists -- 60 of qwen36's ~70 dense calls a token are DeltaNet's, and whether
+ * that phase is paying for bytes or for round-trips is the open question. */
+static void dense_site_print(void){
+    static const char *nm[QT_SITE_N] =
+        { "other", "attnout", "dnout", "attnproj", "dnproj", "lmhead" };
+    uint64_t total = 0;
+    for(int i=0;i<QT_SITE_N;i++) total += g_site_calls[i];
+    if(!total) return;
+    fprintf(stderr,"[qtier]   per site (kernel = device OCCUPANCY under whatever "
+                   "else shared the GPU, not isolated cost):\n");
+    fprintf(stderr,"[qtier]     %-9s %7s %9s %8s %8s %8s %8s %9s %9s\n",
+            "site","calls","GB","h2d ms","ker ms","d2h ms","res ms","us/call","res us/c");
+    for(int i=0;i<QT_SITE_N;i++){
+        if(!g_site_calls[i]) continue;
+        double c = (double)g_site_calls[i];
+        double res = g_site_wall[i] - g_site_h2d[i] - g_site_kernel[i] - g_site_d2h[i];
+        fprintf(stderr,"[qtier]     %-9s %7llu %9.2f %8.0f %8.0f %8.0f %8.0f %9.1f %9.1f\n",
+                nm[i], (unsigned long long)g_site_calls[i],
+                (double)g_site_bytes[i]/1073741824.0,
+                g_site_h2d[i], g_site_kernel[i], g_site_d2h[i], res,
+                1000.0*g_site_wall[i]/c, 1000.0*res/c);
+    }
+    /* Never silent. A sample lands here when the `calls` delta was not 1,
+     * i.e. something else reached coli_cuda_matmul between the two reads --
+     * the one assumption this attribution makes. A non-zero count does not
+     * invalidate the rows above, it bounds them. */
+    if(g_site_unattributed)
+        fprintf(stderr,"[qtier]     unattributed %llu call(s): another caller "
+                       "ran between the two reads; the rows above are short by "
+                       "that much\n", (unsigned long long)g_site_unattributed);
+}
+
 static void dense_stats_print(void){
     dense_stats_one("", "dense_stats", -1);
+    dense_site_print();
     if(G.ndev > 1)
         for(int i=0;i<G.ndev;i++){
             char label[32];

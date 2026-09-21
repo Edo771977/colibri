@@ -1388,6 +1388,12 @@ static void trunk_place_out(Model *m)
         if (!q) continue;
         int h = qt_dense_init(q, sc, I, O, dev, 0);
         if (h < 0) { n_fail++; continue; }
+        /* Label the handle so COLI_CUDA_PROFILE can tell these two apart.
+         * G_dense[] multiplexes attnout, dnout and attnproj, and the aggregate
+         * dense_stats cannot say which of them is spending the time -- which
+         * matters here because dnout is one of DeltaNet's two calls per layer,
+         * and DeltaNet owns 60 of the ~70 dense calls a decode token makes. */
+        qt_dense_site(h, attn ? QT_SITE_ATTNOUT : QT_SITE_DNOUT);
         if (attn) { l->h_attnout = h + 1; n_attn++; } else { l->h_dnout = h + 1; n_dn++; }
         bytes += (double)I * O;
     }
@@ -1527,6 +1533,7 @@ static void trunk_place_attnproj(Model *m)
         int h = qt_dense_init(w, sc, I, O, dev, 0);
         free(w); free(sc);                /* the tier copied during upload */
         if (h < 0) { n_fail++; continue; }
+        qt_dense_site(h, QT_SITE_ATTNPROJ);
         m->L[i].h_attnproj = h + 1; placed++; bytes += (double)I * O;
     }
     if (placed)

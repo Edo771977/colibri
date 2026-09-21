@@ -87,6 +87,18 @@ int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
  * qt_place_of(name, layer) after it, then hand the quantized bytes here.
  * Returns the handle (>= 0) or -1 (stays on the CPU). */
 int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device, int gs);   /* gs 0: one scale per row; else [O][ceil(I/gs)] */
+
+/* Call SITES for the per-site profile (COLI_CUDA_PROFILE=1). dnproj and lmhead
+ * already have their own storage and are told apart for free; G_dense[]
+ * multiplexes everything else, so those handles get a label.
+ *
+ * Optional: an unlabelled handle counts as QT_SITE_OTHER and everything keeps
+ * working. That is deliberate -- qwen38_core.h allocates dense handles through
+ * the same entry point, and a signature change there would put an engine
+ * nobody is measuring in the way of a measurement. */
+enum { QT_SITE_OTHER = 0, QT_SITE_ATTNOUT, QT_SITE_DNOUT, QT_SITE_ATTNPROJ,
+       QT_SITE_DNPROJ, QT_SITE_LMHEAD, QT_SITE_N };
+void qt_dense_site(int handle, int site);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 int  qt_dense_count(void);
 
@@ -147,6 +159,9 @@ static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return -1;}
+enum { QT_SITE_OTHER = 0, QT_SITE_ATTNOUT, QT_SITE_DNOUT, QT_SITE_ATTNPROJ,
+       QT_SITE_DNPROJ, QT_SITE_LMHEAD, QT_SITE_N };
+static inline void qt_dense_site(int a,int b){(void)a;(void)b;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_count(void){return 0;}
 static inline int  qt_ready(void){return 0;}

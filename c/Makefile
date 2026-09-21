@@ -1976,6 +1976,13 @@ tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake
 tests/test_qwen36_tier_dense$(EXE): tests/test_qwen36_tier_dense.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Per-site attribution of the dense GEMV profile: which phase is spending the
+# aggregate dense_stats reports. Asserts the split adds up to the thing it
+# splits, that an unlabelled handle lands in `other`, and that the
+# calls-delta guard refuses a sample another caller interfered with.
+tests/test_qwen36_tier_dense_sites$(EXE): tests/test_qwen36_tier_dense_sites.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_trunk_place$(EXE): tests/test_qwen36_trunk_place.c tests/qwen36_fake_cuda.h qwen36.c expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 

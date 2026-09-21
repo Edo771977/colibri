@@ -793,6 +793,76 @@ opened the day -- the 4.48 ms/token outside the dense kernels is real, but it
 is not two removable copies. Full record:
 `docs/experiments/qwen36-dense-pinned-2026-09-21-raw.txt`.
 
+## Which phase is spending the dense profile (`[qtier] per site`)
+
+`dense_stats` is one aggregate over every placed GEMV in the engine. Counting
+the call sites says why that is not enough on qwen36:
+
+```
+dnproj    30 DeltaNet layers      (qwen36.c, deltanet())
+dnout     30 DeltaNet layers
+attnout   10 attention layers
+lm_head    1
+                                = 71 per decode token
+```
+
+and `dense_stats` measures 5224 calls over a 25-token prompt and 64 decode
+tokens. Prefill contributes 25x30 `dnproj` calls (that one sits inside the loop
+over `s`, with no `S == 1` guard) plus one `lm_head`; the remainder is
+**(5224 - 751) / 64 = 69.9 calls a decode token**, against 71 counted in the
+source. **60 of them are DeltaNet's**, so most of the aggregate belongs to one
+phase and nothing printed said which.
+
+### Why it is measured and not divided
+
+The obvious shortcut — take the aggregate, divide by a throughput, get the
+kernel share — is how this got answered wrongly once. The same 5224 calls over
+the same 112.07 GB reported **372 GB/s in one session and 175 in the next**.
+Any arithmetic dividing by that inherits the factor of two.
+
+So the split is taken inside one run: `qwen36_tier.c` reads the backend's own
+accumulators immediately before and after each call and charges the delta. No
+backend change, no second timing mechanism to disagree with the first — it
+reports exactly what `dense_stats` reports, only separated.
+
+The attribution rests on one assumption: that nothing else reaches
+`coli_cuda_matmul` between the two reads. That is **checked**. The `calls`
+delta must be exactly 1, and a sample where it is not lands in `unattributed`
+rather than being charged to whichever site happened to be holding the
+stopwatch. `tests/test_qwen36_tier_dense_sites.c` asserts the split sums to the
+aggregate, that an unlabelled handle lands in `other`, and that the guard
+fires — including the detail that the interfering call has to happen *inside*
+the window, since one before it is already in the first read.
+
+### What the kernel column is not
+
+The same caveat the `COLI_CUDA_PROFILE` row has always carried, now applying
+per site. `ev[1]` is recorded after the H2D copy and `ev[2]` after the
+**launch**, so two things other than the kernel live inside that interval:
+
+1. **Host launch latency.** A host slow to issue leaves the card idle inside
+   the measured window — the same 2704 calls over the same 92.37 GB read
+   **475 ms under clang and 750 under gcc**, from the host compiler alone
+   (`qwen36-place-clang-clean-2026-09-20-raw.txt`).
+2. **SM contention.** These GEMVs run on stream 0 while the expert group runs
+   on `ctx->stream` (created `cudaStreamNonBlocking`, so they genuinely
+   overlap). A kernel sharing the SMs measures longer without doing more work
+   — the mechanism `COLI_CUDA_DOWN_ROWS` was measured to trigger.
+
+This table does not separate those two. It makes them **addressable**: if
+`dnproj`'s kernel time tracks expert activity rather than its own byte count,
+(2) is the explanation; if it tracks the host build, (1) is. Read the column as
+device occupancy, never as "what the kernel would cost alone".
+
+### The residue column
+
+`wall - h2d - kernel - d2h`: driver launch and synchronisation, the part no
+kernel and no transfer accounts for. It is the reason the table exists.
+DeltaNet is 10.25 ms/token, of which `proj` 5.4 and `norm+out` 2.5 — **77 %,
+and those two sub-timers hold the 60 round-trips**. Whether that phase is
+paying for bytes or for round-trips decides whether the next lever is a faster
+kernel or fewer calls, and until this table existed the engine could not say.
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |

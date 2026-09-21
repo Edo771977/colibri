@@ -108,18 +108,38 @@ int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *g, ColiCudaTensor *con
 }
 int coli_cuda_has_group_x_broadcast(void) { return 0; }
 const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
-/* The resident dense GEMV counters. The fake records no timings -- it has no
- * GPU timeline to record -- so this reports zero calls and qt_stats prints
- * nothing, which is the same thing a real backend does with the profiling flag
- * off. It exists so the tier tests link. */
+/* The resident dense GEMV counters. By default the fake records no timings --
+ * it has no GPU timeline to record -- so this reports zero calls and qt_stats
+ * prints nothing, which is the same thing a real backend does with the
+ * profiling flag off. It exists so the tier tests link.
+ *
+ * fake_dense_profile=1 makes it accumulate instead, with SYNTHETIC per-call
+ * constants rather than measurements. That is not an attempt to model a GPU:
+ * the per-site attribution in qwen36_tier.c works by reading these
+ * accumulators before and after each call and charging the delta, and the only
+ * way to test that arithmetic without a card is to give it accumulators that
+ * move by a known amount. Constants, so a test can assert an exact number
+ * rather than a tolerance. Off by default, so every existing tier test sees
+ * the same zeros it saw before. */
+int fake_dense_profile = 0;
+double fake_ms_h2d = 1.0, fake_ms_kernel = 2.0, fake_ms_d2h = 4.0, fake_ms_wall = 16.0;
+/* fake_dense_interlopers: extra calls the accumulator gains DURING a matmul,
+ * as if another caller had reached the backend between the tier's two reads.
+ * It has to happen inside the call -- incrementing the counter before it is
+ * invisible, because the tier's first read then already includes it. That is
+ * not a detail: it is the whole timing the guard exists to catch. */
+int fake_dense_interlopers = 0;
+static uint64_t fake_dense_calls, fake_dense_bytes;
+static double fake_dense_h2d, fake_dense_kernel, fake_dense_d2h, fake_dense_wall;
+
 void coli_cuda_dense_stats(int device,
                            uint64_t *calls, uint64_t *weight_bytes,
                            double *h2d_ms, double *kernel_ms,
                            double *d2h_ms, double *wall_ms) {
     (void)device;
-    if (calls) *calls = 0;              if (weight_bytes) *weight_bytes = 0;
-    if (h2d_ms) *h2d_ms = 0;            if (kernel_ms) *kernel_ms = 0;
-    if (d2h_ms) *d2h_ms = 0;            if (wall_ms) *wall_ms = 0;
+    if (calls) *calls = fake_dense_calls;   if (weight_bytes) *weight_bytes = fake_dense_bytes;
+    if (h2d_ms) *h2d_ms = fake_dense_h2d;   if (kernel_ms) *kernel_ms = fake_dense_kernel;
+    if (d2h_ms) *d2h_ms = fake_dense_d2h;   if (wall_ms) *wall_ms = fake_dense_wall;
 }
 
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
@@ -144,6 +164,13 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const vo
      * that here so a caller that drops the group size fails on the fake too. */
     if (t && (t->fmt != fmt || t->gs != (gs > 0 ? gs : 0))) return 0;
     fake_matmuls++;
+    if (fake_dense_profile) {
+        int ng = gs > 0 ? (I + gs - 1) / gs : 1;
+        fake_dense_calls += 1 + (unsigned)fake_dense_interlopers;
+        fake_dense_bytes += (uint64_t)I * O + (uint64_t)O * ng * sizeof(float);
+        fake_dense_h2d += fake_ms_h2d;   fake_dense_kernel += fake_ms_kernel;
+        fake_dense_d2h += fake_ms_d2h;   fake_dense_wall   += fake_ms_wall;
+    }
     if (fake_dense_compute && t && t->fmt == 1 && t->w && t->sc && t->I == I && t->O == O) {
         const int8_t *q = (const int8_t *)t->w; const int g = t->gs; const int ng = g > 0 ? (I + g - 1) / g : 1;
         for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
