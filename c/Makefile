@@ -1172,6 +1172,18 @@ fp8_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench
 fp8-bench: fp8_bench$(EXE)
 	./fp8_bench$(EXE)
 
+# What a resident dense GEMV round-trip costs on an IDLE device, across the
+# transports available (pageable / pinned / async+1sync / one captured graph),
+# with and without the kernel. The engine's per-site profile measures ~30 us
+# per transfer under a profiler with the expert group live on another stream;
+# this puts a floor under that number so the gap can be attributed instead of
+# guessed. A bench: it prints and asserts nothing.
+dense_roundtrip_bench$(EXE): backend_gpu_compat.h tests/bench_dense_roundtrip_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_dense_roundtrip_cuda.cu -o dense_roundtrip_bench$(EXE) $(ANS_NVCC_LIBS)
+dense-roundtrip-bench: dense_roundtrip_bench$(EXE)
+	./dense_roundtrip_bench$(EXE)
+
 # NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
 # hand it a define matching nothing and link a runtime it never calls -- a
 # build whose compile line, libraries and exit status all claim "CUDA" while

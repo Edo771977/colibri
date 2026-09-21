@@ -414,6 +414,16 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_dense_pinned_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "dense pinned-staging test compiles"
+      - name: Compile the dense round-trip bench (syntax only, no GPU)
+        run: |
+          cd c
+          # A bench, not a gate -- it needs a card to say anything. Compiling it
+          # here keeps it from rotting: nothing else builds it, and a bench that
+          # stops compiling is discovered at the worst possible moment, which is
+          # when someone finally wants the number.
+          nvcc -O2 -std=c++17 -arch=sm_80 -c tests/bench_dense_roundtrip_cuda.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "dense round-trip bench compiles"
       - name: Compile the grouped-g4 oracle (syntax only, no GPU)
         run: |
           cd c
