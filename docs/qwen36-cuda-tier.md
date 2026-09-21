@@ -588,7 +588,9 @@ for a repeated shape is usually almost right. The test therefore interleaves
 mode 2 with the pageable path on a **new input every iteration**, where a stale
 buffer shows up as the previous answer instead of passing unnoticed.
 
-### The prediction, written down before the run
+### The prediction, written down before the run -- and wrong
+
+*Kept as written, because the failure is the useful part. It is answered below.*
 
 Every dense call here is `S=1`: `xb` is `I*4` — **8 KiB** for the qwen36 trunk —
 and `yb` is smaller still. At that size pinned memory buys essentially nothing
@@ -608,12 +610,69 @@ If mode 2 is also flat, the conclusion is not "try harder here" — it is that
 is **fewer calls**, not faster ones: batching the placed GEMVs, or a graph over
 the dense trunk the way `COLI_CUDA_GRAPH` does for the expert group.
 
-**Off by default, and unmeasured.** The mechanism is real and the profile above
-is real; whether removing it moves `step()` is a separate question, and on this
-engine the answer has been "no" three times running. Do not turn it on in a
-default build before it has a paired A/B on the target machine, and do not
-believe a flat result until the log has shown `[cuda] dense pinned staging
-active` — under `CUDA_DLL=1` this file is in the DLL, see the caveat above.
+### Measured (RTX 4070 Ti SUPER, sm_89, qwen36 i4 gs64, clang, 3 x 6 alternated)
+
+**Both pinned arms make the token slower, 6/6 repetitions each. Leave it off.**
+
+| arm | `step()` | deltanet | dn-sub proj | attention | lm_head |
+|---|---|---|---|---|---|
+| m0 pageable | **27.20** | 10.25 | 5.40 | 5.77 | 2.30 |
+| m1 pinned sync | 28.75 | 11.53 | 6.05 | 5.97 | 2.34 |
+| m2 pinned async | 29.20 | 11.93 | 6.25 | 6.07 | 2.35 |
+
+```
+m1 - m0   +1.60 ms/token   [1.90 1.50 1.80 0.90 1.60 1.60]   6/6 positive
+m2 - m0   +2.00 ms/token   [2.00 1.90 1.90 2.00 2.00 4.50]   6/6 positive
+m2 - m1   +0.40 ms/token   [0.10 0.40 0.10 1.10 0.40 2.90]   6/6 positive
+```
+
+Every phase moves the same way, and they are exactly the phases holding the
+placed dense GEMVs, so the damage is where the change is. Hit rate 100 % and
+`miss(CPU)` 0 in all three arms: the arms generated the same thing.
+
+`COLI_CUDA_PROFILE`, 5224 dense calls over 64 tokens, one run per arm
+(residue = `wall - h2d - kernel - d2h`, i.e. launch and synchronisation):
+
+| arm | h2d | kernel | d2h | residue | wall |
+|---|---|---|---|---|---|
+| m0 | 140 ms | 640 ms | 171 ms | 39 ms | 990 ms |
+| m1 | **186 ms** | 604 ms | 140 ms | 83 ms | 1013 ms |
+| m2 | 118 ms | 607 ms | **34 ms** | **160 ms** | 919 ms |
+
+Mode 2 did exactly what it was built to do: the D2H collapses by 80 %, and the
+wait does not vanish, it **moves** into the residue -- the one
+`cudaStreamSynchronize`. Transfers plus residue, 350 -> 312 ms. And the token
+is 2.00 ms worse. (The profile pass and the A/B are different runs -- 64 vs 128
+tokens, events on vs off -- so each block is read on its own, with no
+arithmetic across them.)
+
+### Why the premise was wrong
+
+`h2d` rose from 140 to 186 ms in the arm that is supposed to be doing strictly
+less work. That is the answer.
+
+CUDA's documented behaviour for a **pageable** host-to-device `cudaMemcpy` is
+that it returns once the bytes are in the driver's staging buffer -- the DMA to
+the device need not have completed. Every dense call on this path is `S=1`, so
+`xb` is 8 KiB, well inside that window.
+
+So the two "synchronous pageable copies" this toggle set out to remove **were
+not both synchronous**. The H2D was effectively fire-and-forget, and the
+driver's hidden staging copy was not a cost: on an 8 KiB payload it was buying
+asynchrony for free, because the copy is cheaper than the wait. Pinning the
+buffer removed the staging copy and, with it, the early return.
+
+Mode 2 restores asynchrony explicitly and still loses, by a further 0.40 ms. A
+blocking `cudaStreamSynchronize` per call, 81.6 times a token, against 16
+OpenMP threads spinning under `OMP_WAIT_POLICY=ACTIVE`, is not obviously
+cheaper than the driver's own early return. This run does not separate that
+from the other candidates and does not pretend to.
+
+**Kept, off by default, as the B arm for a fact worth not re-deriving: on this
+path the pageable copy is the fast one.** It also retires the hypothesis that
+opened the day -- the 4.48 ms/token outside the dense kernels is real, but it
+is not two removable copies. Full record:
+`docs/experiments/qwen36-dense-pinned-2026-09-21-raw.txt`.
 
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 

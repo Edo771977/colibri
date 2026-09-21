@@ -1,0 +1,171 @@
+COLI_CUDA_DENSE_PINNED: pinned host staging for the resident dense GEMV
+=======================================================================
+RESULT: the premise was WRONG. Pinned staging makes the token SLOWER, in
+both modes, 6/6 repetitions each. Keep it off. The finding is worth more
+than the change would have been.
+
+Box      : Windows, RTX 4070 Ti SUPER 16 GB (sm_89), CUDA 13.4, CUDA_DLL=1
+Engine   : qwen36_clang.exe (LLVM libomp), NOT rebuilt -- the toggle lives
+           entirely in backend_cuda.cu, i.e. in coli_cuda.dll
+Model    : C:\modelli\qwen36_i4_gs64, prompt25.txt (25 prompt tokens)
+Script   : misure-pinned.ps1 (3 arms x 6 alternated reps at N_NEW=128, heat
+           table frozen after warm-up and restored before every run, then
+           one COLI_CUDA_PROFILE pass per arm at N_NEW=64)
+Placement: COLI_PLACE=experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0
+Threads  : OMP_NUM_THREADS=16 (7950X physical cores), WAIT_POLICY=ACTIVE
+Guards   : backend_cuda.cu contains COLI_CUDA_DENSE_PINNED; coli_cuda.dll
+           contains the announcement string (read out of the binary, not a
+           timestamp comparison); every run announced its own arm; hit rate
+           100 % and miss(CPU) 0 identical in all three arms.
+
+Arms:
+  m0  the original path: two synchronous cudaMemcpy off pageable buffers
+  m1  pinned staging, both copies still synchronous
+  m2  pinned staging, async on stream 0, one cudaStreamSynchronize
+
+
+1. THE MEASUREMENT
+------------------
+
+  arm    step() median   deltanet   dn-sub proj   attention   lm_head
+  m0        27.20          10.25        5.40         5.77       2.30
+  m1        28.75          11.53        6.05         5.97       2.34
+  m2        29.20          11.93        6.25         6.07       2.35
+
+  paired deltas on step(), 6 pairs each:
+    m1 - m0   +1.60 ms/token   [1.90 1.50 1.80 0.90 1.60 1.60]   6/6 positive
+    m2 - m0   +2.00 ms/token   [2.00 1.90 1.90 2.00 2.00 4.50]   6/6 positive
+    m2 - m1   +0.40 ms/token   [0.10 0.40 0.10 1.10 0.40 2.90]   6/6 positive
+
+  per-arm spread: m0 0.80, m1 0.80, m2 2.10. Mode 2 is also the least
+  stable arm -- its last repetition is a 31.20 outlier.
+
+  Every phase moves the same way: deltanet +1.68, its proj sub-timer +0.85,
+  attention +0.30, lm_head +0.05. Those are exactly the phases holding the
+  placed dense GEMVs. The damage is where the change is.
+
+
+2. THE PROFILE: THE MECHANISM WORKED, AND IT DID NOT HELP
+---------------------------------------------------------
+
+  COLI_CUDA_PROFILE=1, 5224 dense calls over 64 tokens, one run per arm.
+  Residue = wall - h2d - kernel - d2h, i.e. launch and synchronisation.
+
+  arm    h2d    kernel    d2h    residue    wall
+  m0    140 ms   640 ms   171 ms    39 ms   990 ms
+  m1    186 ms   604 ms   140 ms    83 ms  1013 ms
+  m2    118 ms   607 ms    34 ms   160 ms   919 ms
+
+  Mode 2 did precisely what it was built to do. The D2H collapses from
+  171 ms to 34 ms (-80 %): with pinned memory the copy is genuinely async,
+  so the event window measures the transfer instead of a wait. The wait did
+  not vanish, it MOVED -- into the residue, 39 -> 160 ms, which is the one
+  cudaStreamSynchronize. Transfers plus residue: 350 -> 312 ms.
+
+  And the token got 2.00 ms WORSE.
+
+  DISCIPLINE NOTE: the profile pass and the A/B are different runs (64 vs
+  128 tokens, events on vs off). No arithmetic across them is valid here.
+  Each block above is read on its own.
+
+
+3. WHY THE PREMISE WAS WRONG
+----------------------------
+
+  Written down before the run, in the commit message and the docs:
+
+      "mode 1 should be worth roughly zero. It removes a small copy and
+       nothing else."
+
+  It is +1.60 ms/token. That is not noise and not zero, and the failure is
+  the useful part of the day.
+
+  The h2d column says what happened: 140 -> 186 ms in m1, a 33 % INCREASE
+  from the arm that is supposed to be doing strictly less work.
+
+  CUDA's documented behaviour for a pageable host-to-device cudaMemcpy is
+  that it returns once the bytes have been copied into the driver's staging
+  buffer -- the DMA to the device need not have completed. Every dense call
+  on this path is S=1, so xb is 8 KiB, well inside that window.
+
+  So the two "synchronous pageable copies" this patch set out to remove
+  were not both synchronous. The H2D was effectively fire-and-forget, and
+  the driver's hidden staging copy was not a cost: it was buying asynchrony
+  for free, on an 8 KiB payload where the copy is cheaper than the wait.
+  Pinning the buffer removed the staging copy and, with it, the early
+  return -- so the call now genuinely waits for the DMA.
+
+  Mode 2 restores asynchrony explicitly and still loses, by a further 0.40.
+  A blocking cudaStreamSynchronize per call, 81.6 times a token, against
+  16 OpenMP threads spinning under OMP_WAIT_POLICY=ACTIVE, is not obviously
+  cheaper than the driver's own early return. This run does not separate
+  that from the other candidates and does not pretend to.
+
+
+4. WHAT THIS CHANGES
+--------------------
+
+  Kept, off by default, as the B arm for a fact worth not re-deriving:
+  on this path the pageable copy is the fast one.
+
+  It also retires the hypothesis that opened the day. The 4.48 ms/token
+  measured outside the dense kernels is real, but it is not two removable
+  copies. Whatever it is, staging is not the lever.
+
+  The next lever remains what the previous record already named, now with
+  one more arm ruled out: FEWER driver calls, not faster ones. 81.6
+  round-trips a token is the floor of this design -- batching the placed
+  GEMVs, or a graph over the dense trunk the way COLI_CUDA_GRAPH does for
+  the expert group.
+
+
+5. RAW
+------
+
+=== misura: 3 bracci x 6 rip, alternate (N_NEW=128) ===
+  m0 rip 1  step  27,20 | deltanet 10,24 | proj  5,40 | attn  5,76 | head  2,32 | hit 100,0 %
+  m1 rip 1  step  29,10 | deltanet 11,65 | proj  6,20 | attn  5,93 | head  2,34 | hit 100,0 %
+  m2 rip 1  step  29,20 | deltanet 11,96 | proj  6,30 | attn  6,11 | head  2,33 | hit 100,0 %
+  m0 rip 2  step  27,20 | deltanet 10,26 | proj  5,40 | attn  5,78 | head  2,30 | hit 100,0 %
+  m1 rip 2  step  28,70 | deltanet 11,49 | proj  6,00 | attn  5,97 | head  2,35 | hit 100,0 %
+  m2 rip 2  step  29,10 | deltanet 11,85 | proj  6,20 | attn  5,97 | head  2,35 | hit 100,0 %
+  m0 rip 3  step  27,30 | deltanet 10,24 | proj  5,40 | attn  5,64 | head  2,30 | hit 100,0 %
+  m1 rip 3  step  29,10 | deltanet 11,79 | proj  6,30 | attn  6,00 | head  2,33 | hit 100,0 %
+  m2 rip 3  step  29,20 | deltanet 11,89 | proj  6,20 | attn  5,95 | head  2,34 | hit 100,0 %
+  m0 rip 4  step  27,50 | deltanet 10,31 | proj  5,40 | attn  5,77 | head  2,31 | hit 100,0 %
+  m1 rip 4  step  28,40 | deltanet 11,38 | proj  6,00 | attn  5,96 | head  2,32 | hit 100,0 %
+  m2 rip 4  step  29,50 | deltanet 12,04 | proj  6,30 | attn  6,07 | head  2,36 | hit 100,0 %
+  m0 rip 5  step  27,20 | deltanet 10,30 | proj  5,50 | attn  5,83 | head  2,30 | hit 100,0 %
+  m1 rip 5  step  28,80 | deltanet 11,57 | proj  6,10 | attn  5,97 | head  2,34 | hit 100,0 %
+  m2 rip 5  step  29,20 | deltanet 11,88 | proj  6,20 | attn  6,07 | head  2,34 | hit 100,0 %
+  m0 rip 6  step  26,70 | deltanet 10,07 | proj  5,30 | attn  5,68 | head  2,30 | hit 100,0 %
+  m1 rip 6  step  28,30 | deltanet 11,39 | proj  6,00 | attn  5,85 | head  2,32 | hit 100,0 %
+  m2 rip 6  step  31,20 | deltanet 12,62 | proj  6,70 | attn  6,18 | head  2,40 | hit 100,0 %
+
+=== stessa generazione in tutti i bracci? ===
+  m0: hit 100 % | miss(CPU) 0
+  m1: hit 100 % | miss(CPU) 0
+  m2: hit 100 % | miss(CPU) 0
+  identiche: il confronto e' lecito.
+
+=== mediane per braccio ===
+  braccio     step  deltanet    proj      attn      head       moe
+  m0        27,20    10,25     5,40     5,77     2,30     7,73   escursione  0,80
+  m1        28,75    11,53     6,05     5,97     2,34     7,79   escursione  0,80
+  m2        29,20    11,93     6,25     6,07     2,35     7,86   escursione  2,10
+
+=== COLI_CUDA_PROFILE (1 run per braccio, N_NEW=64) ===
+  --- m0 ---
+    [qtier] group_stats: 3520 calls, 28160 experts | h2d 93 ms, kernel 491 ms, d2h 25 ms
+    [qtier] dense_stats: 5224 calls, 112.07 GB (weights+scales) | h2d 140 ms, kernel 640 ms, d2h 171 ms, wall 990 ms
+    [qtier]   kernel 175 GB/s | wall 113 GB/s | round-trip 4 % of wall
+  --- m1 ---
+    [cuda] dense pinned staging active: mode=1
+    [qtier] group_stats: 3520 calls, 28160 experts | h2d 89 ms, kernel 505 ms, d2h 24 ms
+    [qtier] dense_stats: 5224 calls, 112.07 GB (weights+scales) | h2d 186 ms, kernel 604 ms, d2h 140 ms, wall 1013 ms
+    [qtier]   kernel 186 GB/s | wall 111 GB/s | round-trip 8 % of wall
+  --- m2 ---
+    [cuda] dense pinned staging active: mode=2
+    [qtier] group_stats: 3520 calls, 28160 experts | h2d 92 ms, kernel 523 ms, d2h 25 ms
+    [qtier] dense_stats: 5224 calls, 112.07 GB (weights+scales) | h2d 118 ms, kernel 607 ms, d2h 34 ms, wall 919 ms
+    [qtier]   kernel 185 GB/s | wall 122 GB/s | round-trip 17 % of wall
