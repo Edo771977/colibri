@@ -23,6 +23,7 @@ tests/mxfp4_ref.o
 mxfp4_cuda_test
 absorb_determinism_test
 cuda_fmt_trap_test
+grouped_g4_test
 dense_pinned_test
 tests/*.dSYM/
 tests/test_dsa_select

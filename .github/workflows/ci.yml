@@ -417,10 +417,10 @@ jobs:
       - name: Compile the grouped-g4 oracle (syntax only, no GPU)
         run: |
           cd c
-          # Carries the broadcast (x_rows) assertions. It is not in
-          # `make gpu-compile` because it uses cudaMallocManaged, which
-          # backend_gpu_compat.h does not map for HIP, so nvcc here is the
-          # only thing that compiles it on a runner without a card.
+          # Carries the broadcast (x_rows) assertions and the expert-group
+          # CUDA graph ones. Its managed allocations are gone, so it is now
+          # in `make gpu-compile` and in `make cuda-test` as well -- this step
+          # stays as the check that runs without a card.
           nvcc -O2 -std=c++17 -arch=sm_80 -c tests/test_grouped_g4_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "grouped-g4 oracle compiles"
