@@ -24,6 +24,10 @@
 # era indistinguibile dall'effetto del braccio.
 
 param(
+    # Lo script vive in c/tools/ ma il binario, il prompt e la heat table
+    # stanno in c/: la directory di lavoro e' il PADRE dello script, non lo
+    # script. Passare -WorkDir per lanciarlo da altrove.
+    [string] $WorkDir = (Split-Path -Parent $PSScriptRoot),
     [string] $Snap   = "C:\modelli\qwen36_i4_gs64",
     [string] $Exe    = ".\qwen36_clang.exe",
     [string] $Prompt = "prompt25.txt",
@@ -34,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-Location -LiteralPath $PSScriptRoot
+Set-Location -LiteralPath $WorkDir
 
 # ---- guardia ambiente ----------------------------------------------------
 # COLI_CUDA_PROFILE accende la strumentazione a eventi CUDA E disarma il grafo
