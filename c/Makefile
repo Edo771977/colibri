@@ -1535,6 +1535,13 @@ tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c ex
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# matmul()'s OpenMP work threshold: the two arms must be bitwise identical
+# (an `if` clause on the existing pragma, not a second implementation) and the
+# threshold must fall between qwen36's DeltaNet gate projections and an
+# ordinary trunk matmul.
+tests/test_matmul_omp_threshold$(EXE): tests/test_matmul_omp_threshold.c quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

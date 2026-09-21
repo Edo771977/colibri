@@ -94,9 +94,52 @@ static int i4_acc512_selftest(void){
 }
 #endif
 
+/* An OpenMP region costs more than a small matmul does.
+ *
+ * Measured on qwen36: the two DeltaNet gate projections (in_proj_a, in_proj_b)
+ * are [32 x 2048] -- 65k FMAs, about 4 us on one core -- and matmul() opens a
+ * team for each of them, twice per DeltaNet layer, SIXTY regions a decode
+ * token. The per-site dense profile put those two calls at 0.86 ms/token,
+ * roughly four times the work they contain. This project has already priced a
+ * region at up to 53 us on a 7950X under MinGW libgomp and single-digit us
+ * under LLVM libomp (tests/bench_qwen36_decode_omp), which is the whole gap.
+ *
+ * BIT-IDENTICAL BY CONSTRUCTION. This is an `if` clause on the existing
+ * pragma, not a second implementation: the same loop, the same accumulation
+ * order per output row, only without a team. Each `o` is independent and its
+ * inner sum is sequential either way, so no result can move -- which is why
+ * this needs no oracle run, unlike quantising a matrix would.
+ *
+ * The threshold is deliberately conservative: it excludes only work small
+ * enough that one core finishes it in the time a region takes to open. A
+ * 2048x2048 matmul is 4.2M FMAs, sixteen times over the line. Override with
+ * COLI_MATMUL_OMP_MIN (0 restores a team for every shape, which is the B arm).
+ *
+ * NOT YET MEASURED OUTSIDE qwen36's DeltaNet. Every engine's f32 matmuls come
+ * through here; the change cannot alter a result anywhere, but it can alter a
+ * time, and only one engine's has been looked at. */
+#ifndef COLI_MATMUL_OMP_MIN_DEFAULT
+#define COLI_MATMUL_OMP_MIN_DEFAULT 262144
+#endif
+/* A file-scope global rather than a function-local static, so a test can drive
+ * both arms in one process: matmul() is far too hot for a getenv per call, but
+ * a latched local would let tests/test_matmul_omp_threshold.c compare one arm
+ * with itself -- which is how a bitwise test passes while testing nothing. */
+static int64_t g_matmul_omp_min = -1;         /* -1: not read from the env yet */
+static int64_t matmul_omp_min(void){
+    int64_t v = g_matmul_omp_min;
+    if (v < 0) {
+        const char *e = getenv("COLI_MATMUL_OMP_MIN");
+        v = COLI_MATMUL_OMP_MIN_DEFAULT;
+        if (e && *e) { char *end; long long t = strtoll(e, &end, 10); if (!*end && t >= 0) v = (int64_t)t; }
+        g_matmul_omp_min = v;
+    }
+    return v;
+}
+
 /* ---- y[S,O] = x[S,I] @ W^T, W[O,I] f32 ---------------------------------- */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if((int64_t)S*I*O >= matmul_omp_min())
     for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
 }
