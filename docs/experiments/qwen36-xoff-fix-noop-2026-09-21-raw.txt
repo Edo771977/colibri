@@ -1,0 +1,92 @@
+The xoff fix is a no-op on this configuration -- measured, not argued
+=====================================================================
+RESULT: the generated text is IDENTICAL, byte for byte, in all 8 runs
+across both DLLs. The two corrected readers are not executed here, so every
+measurement taken on 19, 20 and 21 September stands unchanged.
+
+Box     : Windows, RTX 4070 Ti SUPER 16 GB (sm_89), CUDA 13.4, CUDA_DLL=1
+Engine  : qwen36_clang.exe -- the SAME binary in both arms
+Model   : C:\modelli\qwen36_i4_gs64, prompt25.txt, N_NEW=64
+Script  : verifica-xoff.ps1 (4 alternated pairs)
+Arms    : the fix lives in backend_cuda.cu, which under CUDA_DLL=1 is the
+          DLL, so only coli_cuda.dll is swapped between arms -- one variable.
+            pre  = origin/main                       (fix absent, verified)
+            post = origin/claude/fix-xoff-missed-arms (fix present, verified)
+          The script checks the SOURCE for the fix rather than trusting the
+          branch name, and refuses to run if the two arms are the same.
+
+
+1. WHY THIS WAS NEEDED
+----------------------
+
+The claim under test was mine: that the two readers missing xoff
+(grouped_hidden_f8w_dual, and x16 in the generic host arm) are never
+executed by this configuration, because the i4 gs64 container uploads
+experts as fmt=4 with a group size, the dispatcher routes those to the g4
+arm, and the g4 arm was converted correctly.
+
+That is an ARGUMENT, deduced by reading the dispatcher. If I had misread
+which branch fmt=4 takes, the whole conclusion falls and I would not have
+noticed. An argument is not a measurement.
+
+
+2. THE CHECK, AND WHY IT IS TOKEN IDENTITY RATHER THAN TIME
+-----------------------------------------------------------
+
+Generation here is pure greedy argmax over the logits with no seed
+(qwen36.c: `for i: if (logit[i] > bv) best = i`), so at fixed weights and
+fixed arithmetic the output text is deterministic. If the corrected code
+does not run, the text is identical BYTE FOR BYTE.
+
+A timing A/B could only ever say "within noise". This says "that code did
+not run". One flipped logit would change a token and cascade through the
+remaining 63.
+
+  pre  rip 1..4   83 characters generated
+  post rip 1..4   83 characters generated
+  IDENTICAL in all 8 runs.
+
+
+3. THE TIMES, AND WHAT THEY ARE NOT
+-----------------------------------
+
+  pre  step median 28.30
+  post step median 27.35
+  paired delta     -0.65 ms/token   [-0.20 -0.90 -0.40 -2.20]
+
+Four of four negative. This does NOT mean the fix is faster: the text is
+identical, so the changed code did not execute, so it cannot have changed
+anything.
+
+The likely cause is a defect in the script: `pre` always runs first in a
+pair and `post` always second, so any systematic within-pair effect -- GPU
+clocks, caches, the Windows scheduler -- lands entirely on one arm. Four
+negative deltas with one at -2.20 is what an order effect looks like.
+
+That defect is in every A/B script used this week: misure-2x2.ps1 always
+walks g0d0, g1d0, g0d4, g1d4 in that order; misure-pinned.ps1 always runs
+thresh before team. The arms were alternated; the ORDER was not
+counterbalanced.
+
+Checked against the 2x2, cell means by POSITION rather than by cell:
+
+  pos 1 (g0d0) 27.48    pos 2 (g1d0) 27.30
+  pos 3 (g0d4) 28.40    pos 4 (g1d4) 27.05
+
+No monotone drift -- the worst cell sits in position 3, so cell identity
+dominates position there. And the internal pattern holds: both graph-on
+cells (positions 2 and 4) sit below both graph-off cells (1 and 3). The
+2x2's interaction is therefore unlikely to be a position artefact. It
+should still have been built so the question could not arise.
+
+
+4. WHAT THIS SETTLES
+--------------------
+
+  - The two fixed readers are not on this configuration's path.
+  - Every number in the records of 19-21 September stands as written.
+  - The bugs remain real and the fix remains necessary: they are reachable
+    from qwen38 with fp8 experts and from any engine with an int8 expert
+    tier, neither of which was ever measured here. That is precisely why
+    they survived three days of green CI, green make check and green
+    cuda-test.
