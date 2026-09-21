@@ -89,7 +89,27 @@ static int check_graph_default(void){
     return bad;
 }
 
+/* COLI_CUDA_PROFILE inherited from the shell disarms the graph: graphable_
+ * requires !ctx->group_timed, because four cudaEventRecord inside a capture
+ * would bake the timing branch into the graph. The three bitwise assertions
+ * below still PASS in that state -- they end up comparing the per-call path
+ * against itself -- and the only thing that notices is the capture/replay
+ * split, which then reports "0 captures, 0 replays" and reads like a graph
+ * defect. It cost an hour of hunting on a 4070 Ti SUPER before the variable
+ * turned out to be inherited from the parent shell. This file is a
+ * correctness oracle, not a profiling run, so it takes the variable off
+ * itself and SAYS so rather than failing obscurely. */
+static void disarm_cuda_profile(void){
+    const char *e=getenv("COLI_CUDA_PROFILE");
+    if(!e||!atoi(e)) return;
+    fprintf(stderr,"note: COLI_CUDA_PROFILE=%s inherited from the environment; "
+                   "forcing it to 0 for this test, because profiling disables "
+                   "the expert-group graph this file exists to exercise\n", e);
+    setenv("COLI_CUDA_PROFILE","0",1);
+}
+
 int main(void){
+    disarm_cuda_profile();
     srand(7);
     const int D=200, I=96, gs=64;            /* tail group: 200 % 64 = 8 */
     const int COUNT=3;                       /* expert 0,1: fmt4 gs=64; expert 2: per-row (gs=0) */
