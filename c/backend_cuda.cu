@@ -2946,6 +2946,18 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
     int graphable_= graph_mode() && !ctx->group_timed && x_rows==1 &&
                     count>=1 && count<=8 && (branch_==3||branch_==4);
 #if COLI_GPU_HAS_GRAPH
+    /* TEMPORANEO (branch claude/graph-diag): COLI_GRAPH_DIAG=1 stampa PERCHE'
+     * il grafo non parte. test_grouped_g4_cuda riporta 0 captures + 0 replays
+     * su silicio mentre le tre asserzioni bitwise passano -- cioe' le tre
+     * chiamate vanno tutte sul percorso per-chiamata e i confronti
+     * "grafo vs per-call" confrontano il percorso normale con se stesso.
+     * Leggere il sorgente non ha deciso se cade graphable_ o se
+     * cudaStreamBeginCapture fallisce in silenzio. NON MERGIARE. */
+    if(getenv("COLI_GRAPH_DIAG"))
+        fprintf(stderr,"[diag] graphable=%d mode=%d timed=%d x_rows=%d count=%d "
+                       "branch=%d exec=%p gen=%u gsig=%u buf_gen=%u\n",
+                graphable_, graph_mode(), ctx->group_timed, x_rows, count, branch_,
+                (void*)ctx->graph_exec[count], ctx->graph_gen[count], gsig_, ctx->buf_gen);
     if(graphable_ && ctx->graph_exec[count] && ctx->graph_gen[count]==gsig_){
         /* Everything the launch depends on is already in the graph except the
          * CONTENTS of host_desc and host_x, which were just refreshed above.
@@ -2974,6 +2986,12 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
          * and failed"; do not retry every call. */
         capturing_ = cudaStreamBeginCapture(ctx->stream,
                         cudaStreamCaptureModeThreadLocal)==cudaSuccess;
+        /* TEMPORANEO: una BeginCapture fallita lascia capturing_=0 e prosegue
+         * sul percorso per-chiamata SENZA stampare nulla -- il messaggio
+         * "capture failed" sta piu' a valle, dopo l'EndCapture. NON MERGIARE. */
+        if(!capturing_)
+            fprintf(stderr,"[diag] cudaStreamBeginCapture FALLITA: %s\n",
+                    cudaGetErrorString(cudaGetLastError()));
     }
 #endif
     if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,ctx->host_desc,
