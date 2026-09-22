@@ -87,12 +87,23 @@ function Muta([string]$Cerca, [string]$Sostituisci, [string]$Nome) {
 # $p.ExitCode viene dall'oggetto processo e non dipende da $LASTEXITCODE, che
 # e' quello che si era svuotato. I due flussi vanno su file separati perche'
 # Start-Process non li sa unire, e vengono poi concatenati.
-function Esegui([string]$Comando) {
+function Esegui([string]$Comando, [int]$TimeoutSec = 1800) {
     $base = [System.IO.Path]::GetTempFileName()
     $bat = "$base.cmd"; $fout = "$base.out"; $ferr = "$base.err"
     Set-Content -LiteralPath $bat -Encoding ASCII -Value @("@echo off", $Comando)
-    $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $bat) -Wait -PassThru `
+    $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $bat) -PassThru `
                        -NoNewWindow -RedirectStandardOutput $fout -RedirectStandardError $ferr
+    # -Wait senza limite trasforma un processo bloccato in uno script
+    # bloccato, che e' cio' che e' successo alla fase 5: nessun messaggio,
+    # nessuna diagnosi, solo attesa. Con un limite il blocco diventa un
+    # risultato: il processo viene ucciso e la fase risulta rossa dicendo
+    # che e' scaduta.
+    $scaduto = $false
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+        $scaduto = $true
+        try { $p.Kill($true) } catch { try { $p.Kill() } catch {} }
+        try { $p.WaitForExit(15000) | Out-Null } catch {}
+    }
     $testo = ""
     foreach ($f in @($fout, $ferr)) {
         if (Test-Path $f) { $c = Get-Content -Raw -LiteralPath $f; if ($c) { $testo += $c } }
@@ -100,7 +111,11 @@ function Esegui([string]$Comando) {
     foreach ($f in @($base, $bat, $fout, $ferr)) {
         Remove-Item -Force -LiteralPath $f -ErrorAction SilentlyContinue
     }
-    return @{ Testo = [string]$testo; Codice = [int]$p.ExitCode }
+    if ($scaduto) {
+        return @{ Testo = ("TIMEOUT dopo $TimeoutSec s. Output raccolto fino a li':`n" + $testo)
+                  Codice = -1; Scaduto = $true }
+    }
+    return @{ Testo = [string]$testo; Codice = [int]$p.ExitCode; Scaduto = $false }
 }
 
 # Stampa le ultime righe dell'output di un comando fallito. Una fase rossa
@@ -227,10 +242,16 @@ if (-not $riga) {
 $r = Esegui $riga
 Verifica ($r.Codice -eq 0) "il g4 mutato compila"
 if ($r.Codice -eq 0) {
-    $r = Esegui ".\grouped_g4_test.exe"
+    $r = Esegui ".\grouped_g4_test.exe" 420
     Verifica ($r.Codice -ne 0) "il g4 diventa ROSSO con la funzione svuotata"
     Verifica ($r.Testo -match 'did not re-capture') "e il messaggio e' quello giusto (did not re-capture)"
-    ($r.Testo -split "`n" | Select-String -Pattern 'FAIL|re-capture|REPLAYED') | ForEach-Object { "       $_" }
+    # SEMPRE, non solo le righe che combaciano. Alla prima esecuzione reale
+    # il g4 e' diventato rosso ma il filtro non ha trovato nulla, quindi il
+    # MOTIVO del rosso e' rimasto sconosciuto -- e un rosso di cui non si
+    # conosce la causa non dimostra niente. Un crash del grafo rigiocato su
+    # memoria liberata, per esempio, non stampa "FAIL": muore prima.
+    "       --- output del g4 mutato (codice $($r.Codice)) ---"
+    Mostra $r 25
 }
 
 Ripristina
@@ -238,12 +259,23 @@ Ripristina
 
 ""
 "=== FASE 5: il g4 torna verde sul sorgente intatto =========================="
+# Questa fase e' una CONFERMA, non la prova: la meta' verde e' gia' stabilita
+# dalla FASE 3, che ha compilato ed eseguito lo stesso test sul sorgente
+# intatto dentro `make cuda-test`. Se qui si blocca o scade, il risultato
+# delle fasi 3 e 4 resta valido.
+#
+# E un blocco qui ha una causa plausibile: la riga di compilazione porta
+# -arch=native, che INTERROGA la scheda per ricavarne l'architettura. La
+# fase 4 ha appena fatto fallire un test che rigioca un grafo su memoria
+# liberata; se quello e' finito con un accesso illegale, il contesto CUDA
+# puo' restare in uno stato in cui quella query non ritorna. Alla prima
+# esecuzione reale questa fase e' rimasta appesa senza dire niente.
 $r = Esegui $riga
 Verifica ($r.Codice -eq 0) "il g4 ricompila"
 if ($r.Codice -eq 0) {
-    $r = Esegui ".\grouped_g4_test.exe"
+    $r = Esegui ".\grouped_g4_test.exe" 420
     Verifica ($r.Codice -eq 0) "il g4 e' di nuovo VERDE una volta ripristinato"
-    ($r.Testo -split "`n" | Select-String -Pattern 'grouped-g4|^OK') | ForEach-Object { "       $_" }
+    Mostra $r 20
 }
 
 } finally {
@@ -256,8 +288,11 @@ if ($fallite.Count -eq 0) {
     "TUTTO VERDE. Le due guardie sono state viste passare E viste fallire."
     "Il buco dichiarato dal test Python e' reale: la FASE 4 lo ha riprodotto."
 } else {
-    "NON PROVATO. Punti falliti:"
+    "PROVA INCOMPLETA. Punti falliti:"
     $fallite | ForEach-Object { "  - $_" }
-    "Nessuna conclusione: finche' una di queste e' rossa la #40 non e' provata."
+    "Le fasi 3 e 4 sono quelle che dimostrano: il test g4 verde sul sorgente"
+    "intatto e ROSSO con l'invalidazione svuotata. Se entrambe sono OK sopra,"
+    "l'asimmetria e' stabilita e un fallimento della fase 5 la conferma solo."
+    "Se invece e' rossa la 3 o la 4, la #40 non e' provata."
     exit 1
 }
