@@ -234,8 +234,8 @@ that record's output, not as this one's.
   THE WITHDRAWAL'S OWN ARGUMENT WAS FALSE. It read: "miss = 10240, and 10240
   is the TOTAL number of experts, so every expert is reached, so 'ones this
   prompt does not ask for' is contradicted". The premise is a warmstart
-  constant, not a measurement of routing. tier_warmstart (c/qwen36.c:3847)
-  runs
+  constant, not a measurement of routing. tier_warmstart in c/qwen36.c, under its own
+  comment "Load ALL experts into RAM, not just the planned (VRAM) set", runs
 
       #pragma omp parallel for schedule(dynamic, 16)
       for (int gi = 0; gi < cap_total; gi++) { ... expert_get(m, l, eidw, &e); }
@@ -350,11 +350,17 @@ publishes: qwen36-attnproj-place-2026-09-22-raw.txt records step() reading
 24.05, 24.25, 26.65, 27.40, 27.20 and 25.20 across six sessions of four days,
 with the code unchanged between several of them.
 
-Every TIMING number above is a within-session paired delta or an arm statistic
-from the same session. Several non-timing figures are imported, and they are
-listed here rather than glossed, because an earlier version of this paragraph
-claimed nothing here came from another day, and a later one claimed exactly
-one thing did. Both were false.
+No TIMING COMPARISON here crosses a session: every delta is paired within one
+session and every arm statistic comes from the arm's own six runs. That is the
+claim that matters, and it holds.
+
+Figures from elsewhere DO appear, and they are listed here rather than
+glossed, because an earlier version of this paragraph claimed nothing here
+came from another day, a later one claimed exactly one thing did, and a third
+narrowed it to "every timing number" -- which lands on the one category the
+paragraph above violates, since it quotes step() readings from six sessions of
+four days. Three wordings, three times wrong, each time by trying to state it
+more precisely than the data allows.
 
   - the tolerance band the control rows are judged against (shared +0.19,
     router +0.28) is from 20 September, and it is what makes the control
@@ -365,9 +371,13 @@ one thing did. Both were false.
     100.0 %, LFRU swaps 0` are from the explicit-COLI_PLACE record of THIS
     day. They are quoted to say what this run does NOT measure, not as
     results of it.
+  - the step() readings 24.05, 24.25, 26.65, 27.40, 27.20 and 25.20, quoted
+    two paragraphs above to show how far this timer drifts between sessions.
+    They are timings, and they are from six sessions across four days. They
+    are cited as the REASON not to compare across sessions, which is the
+    opposite of comparing across sessions -- but they are imported, and an
+    earlier wording of the sentence above silently excluded them.
 
-No timing comparison crosses a session. That is the claim that matters and it
-holds; the earlier absolute wordings did not.
 
 Nothing here says anything about a card other than this one, a model other
 than Qwen3.6-35B-A3B, a context other than this prompt, or prefill.
