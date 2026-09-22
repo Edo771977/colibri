@@ -1604,9 +1604,12 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
 
 /* THE EIGHT BUFFERS A CAPTURED GRAPH BAKES IN -- x, y, gate, up, group_desc,
  * host_x, host_y, host_desc. The list also lives in
- * tests/test_graph_reserve_wrappers.py, which enforces what is written below;
- * a field added or renamed here has to be renamed there too, and that test
- * says so when it goes red.
+ * tests/test_graph_reserve_wrappers.py, which enforces what is written below.
+ * RENAME one of these and that test goes red naming it. ADD a ninth buffer a
+ * capture bakes in and it will not: the list there is closed, and nothing
+ * makes anyone extend it. That gap is written down rather than papered over,
+ * because a comment claiming an enforcement it does not have is the defect
+ * this block exists to remove.
  *
  * A cudaGraph records the addresses it was captured with, and reserve() frees
  * the old block before allocating the new one, so growing any of these turns a
@@ -2958,8 +2961,11 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
      *
      * A FAILED reserve invalidates too, and has to: reserve() nulls what it
      * could not grow, so the graph is pointing at freed memory either way.
-     * That is why `return 0` below comes AFTER these calls rather than being
-     * folded into them. */
+     * (Under the old snapshot/check pair the `return 0` below HAD to come
+     * after the whole chain or the check was skipped. With the invalidation
+     * inside each reserve_graph* that no longer holds: the chain
+     * short-circuits and the folded form is now exactly equivalent. The
+     * shape is kept; the reason it used to have is gone.) */
     int reserved_=reserve_graph(ctx,&ctx->x,&ctx->x_cap,xb)&&reserve_graph(ctx,&ctx->y,&ctx->y_cap,yb)&&
        reserve_graph(ctx,&ctx->gate,&ctx->gate_cap,ib)&&reserve_graph(ctx,&ctx->up,&ctx->up_cap,ib)&&
        reserve_graph_bytes(ctx,&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))&&
