@@ -78,8 +78,36 @@ function Muta([string]$Cerca, [string]$Sostituisci, [string]$Nome) {
 }
 
 function Esegui([string]$Comando) {
-    $out = & cmd /c "$Comando 2>&1"
-    return @{ Testo = ($out | Out-String); Codice = $LASTEXITCODE }
+    # Il comando viene SCRITTO IN UN .cmd ed eseguito, invece di essere
+    # passato a `cmd /c "..."`. Due ragioni, entrambe gia' costate tempo:
+    # catturare la pipeline restituiva output vuoto proprio quando il
+    # comando falliva, cioe' quando serve leggerlo; e annidare le virgolette
+    # (`cmd /c "x > ""y"" 2>&1"`) mette PowerShell, cmd e il comando stesso
+    # a litigare sul riquotaggio. Un file non ha nessuno dei due problemi e
+    # regge qualunque riga di comando, comprese quelle che nvcc produce.
+    $base = [System.IO.Path]::GetTempFileName()
+    $bat  = "$base.cmd"
+    $log  = "$base.log"
+    Set-Content -LiteralPath $bat -Encoding ASCII -Value @(
+        "@echo off",
+        "$Comando > ""$log"" 2>&1",
+        "exit /b %ERRORLEVEL%")
+    & cmd /c $bat
+    $codice = $LASTEXITCODE
+    $testo = if (Test-Path $log) { Get-Content -Raw -LiteralPath $log } else { "" }
+    foreach ($f in @($base, $bat, $log)) {
+        Remove-Item -Force -LiteralPath $f -ErrorAction SilentlyContinue
+    }
+    return @{ Testo = [string]$testo; Codice = $codice }
+}
+
+# Stampa le prime righe dell'output di un comando fallito. Una fase rossa
+# senza il motivo obbliga a rifare tutto a mano.
+function Mostra($Risultato, [int]$Righe = 12) {
+    $t = $Risultato.Testo
+    if ([string]::IsNullOrWhiteSpace($t)) { "       (nessun output, codice $($Risultato.Codice))"; return }
+    ($t -split "`r?`n" | Where-Object { $_ -ne "" } | Select-Object -Last $Righe) |
+        ForEach-Object { "       $_" }
 }
 
 $fallite = @()
@@ -88,12 +116,35 @@ function Verifica([bool]$Condizione, [string]$Cosa) {
     else { "  ROSSA $Cosa"; $script:fallite += $Cosa }
 }
 
+# ---- L'ALBERO E' QUELLO GIUSTO? ------------------------------------------
+# Questo script dimostra la #40, quindi il working tree DEVE contenere la #40.
+# Senza questa guardia lo script girava comunque su un checkout di main: la
+# fase 1 usciva rossa perche' il test non esiste li', e la mutazione non
+# trovava la sua ancora perche' il codice non esiste li'. Due risultati
+# perfettamente spiegabili e completamente fuorvianti -- esattamente il
+# genere di "rosso" che fa perdere un'ora.
+$testoSorgente = [System.IO.File]::ReadAllText((Resolve-Path $sorgente))
+$mancanti = @()
+if ($testoSorgente -notmatch 'graph_bufs_moved')      { $mancanti += "graph_bufs_moved in $sorgente" }
+if ($testoSorgente -notmatch 'reserve_graph')         { $mancanti += "reserve_graph in $sorgente" }
+if (-not (Test-Path "tests\test_graph_reserve_wrappers.py")) { $mancanti += "tests\test_graph_reserve_wrappers.py" }
+if ($mancanti.Count -gt 0) {
+    $elenco = $mancanti -join ", "
+    throw ("questo checkout NON contiene la #40 (manca: $elenco). Lo script " +
+           "dimostra quella PR, quindi il working tree deve essere il suo. " +
+           "Dalla cartella c\:`n`n" +
+           "    git fetch origin claude/graph-buf-gen-invariant`n" +
+           "    git checkout claude/graph-buf-gen-invariant`n`n" +
+           "poi rilancia. (Lo script di misura non va ricopiato: tools\prova-40.ps1 " +
+           "non e' tracciato su quel branch, quindi il checkout non lo tocca.)")
+}
+
 try {
 
 "=== FASE 1: il test Python passa sul file intatto ==========================="
 $r = Esegui "python -m unittest tests.test_graph_reserve_wrappers"
 Verifica ($r.Codice -eq 0) "test_graph_reserve_wrappers verde sul sorgente intatto"
-if ($r.Codice -ne 0) { $r.Testo }
+if ($r.Codice -ne 0) { Mostra $r }
 
 ""
 "=== FASE 2: MUTAZIONE A -- reserve nuda su un buffer del grafo =============="
@@ -115,7 +166,7 @@ if (-not $SkipFullCudaTest) {
   "Lunga: compila ed esegue tutta la batteria CUDA. -SkipFullCudaTest la salta."
   $r = Esegui "make cuda-test"
   Verifica ($r.Codice -eq 0) "make cuda-test verde"
-  if ($r.Codice -ne 0) { ($r.Testo -split "`n" | Select-Object -Last 25) | ForEach-Object { "       $_" } }
+  if ($r.Codice -ne 0) { Mostra $r 25 }
   else { ($r.Testo -split "`n" | Select-String -Pattern 'grouped-g4' ) | ForEach-Object { "       $_" } }
   ""
 }
