@@ -1,0 +1,120 @@
+Qwen3.6-35B-A3B: attnproj (q ++ k ++ v fused) on the GPU.
+22 September 2026.
+
+c/qwen36.c:1443 said the offer of attnproj to the automatic placer was
+EXPLICIT ONLY "because an A/B measured them (-7.77 ms/token); this has not
+been measured, and #18's whole argument was that a default does not move on a
+prediction". docs/qwen36-cuda-tier.md:356-383 already wrote the two arms and
+closed with "No speed number is claimed here". This is that A/B.
+
+Zero lines of engine changed to produce these numbers: attnproj_fuse,
+attnproj_bytes and trunk_place_attnproj already existed. The only difference
+between the arms is the name "attnproj" inside COLI_PLACE.
+
+Host   : Ryzen 9 7950X (16 physical cores, clang/LLVM libomp), 64 GB DDR5,
+         RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA 13.4.
+Engine : qwen36_clang.exe, CUDA_DLL=1, built at e3fe408 (before #38 merged;
+         #38 is token-identical on this configuration, measured separately in
+         qwen36-xoff-fix-noop-2026-09-21-raw.txt, and BOTH arms use the same
+         binary).
+Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, prompt25.txt, N_NEW=128.
+Script : c/tools/misure-attnproj.ps1 at 3cd1fd02.
+
+  A  COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"
+  B  COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0,attnproj=0"
+
+--- what the script refused to let through ---------------------------------
+
+Three guards, each of which fired at least once during development and each
+of which would otherwise have produced a plausible, wrong number:
+
+  - COLI_CUDA_PROFILE inherited from a parent shell. It disarms the expert
+    graph and inflates every dense timing. A run with it set looks normal.
+  - cap != n_experts. The CUDA tier then disables itself (qwen36_tier.c:499)
+    and the whole engine runs on the CPU at 4.16 tok/s; COLI_PLACE places
+    nothing, both arms are identical, and the delta is a clean zero.
+  - the B arm not actually placing. The guard reads the count back from the
+    engine's own announcement (qwen36.c:1533) rather than trusting that
+    COLI_PLACE was honoured. It caught a defect in the script itself, where
+    $B (the COLI_PLACE string) and $b (a millisecond figure) turned out to be
+    the same PowerShell variable -- names there are case-insensitive -- so
+    from the second repetition the engine was handed COLI_PLACE=22.6295541977823.
+
+--- 6 repetitions, counterbalanced order, heat table frozen ----------------
+
+  rip 1 (A first)   A 30.61   B 23.09   delta -7.51
+  rip 2 (B first)   A 29.86   B 24.86   delta -5.00
+  rip 3 (A first)   A 29.99   B 26.29   delta -3.71
+  rip 4 (B first)   A 29.99   B 26.29   delta -3.70
+  rip 5 (A first)   A 30.31   B 25.11   delta -5.20
+  rip 6 (B first)   A 30.39   B 25.79   delta -4.60
+
+  median -4.80 ms/token, 6/6 negative
+  A 33.13 tok/s -> B 39.70 tok/s   (+19.8 %)
+
+Position check, which earlier records in this directory could not make
+because their arms alternated without ever inverting the order INSIDE a
+repetition:
+
+  A-first: -7.51  -3.71  -5.20     median -5.20
+  B-first: -5.00  -3.70  -4.60     median -4.60
+
+Same sign, same magnitude. This is the arm, not the position.
+
+Repetitions 3 and 4 report identical figures to the centesimo in both arms.
+Two independent runs agreeing exactly is possible at two decimals of tok/s and
+the logs are per-repetition, so nothing was reused -- but it is recorded here
+rather than smoothed over.
+
+--- where the time went (repetition 5, both arms) --------------------------
+
+  ms/token            A        B      delta
+  attention         5.77     1.94     -3.83
+  deltanet          8.77     8.01     -0.76
+  lm_head           1.54     1.11     -0.43
+  moe_total         8.02     7.83     -0.19
+  TOTAL            24.10    18.88     -5.22
+  outside phases     1.1      1.1      0
+
+  dn-sub proj       4.3      3.6      -0.7
+  qtier take       1.30     0.94     -0.36
+  cpu-miss         0.00     0.00         0
+
+The timers' TOTAL (-5.22) agrees with the paired wall-clock delta for that
+repetition (-5.20): two independent instruments, same answer.
+
+attention carries 73 % of the gain, which is the part that was predicted.
+The rest lands on dense GEMVs that were ALREADY on the GPU and were not
+touched -- dnproj inside deltanet, and lm_head.
+
+A hypothesis, not a measurement: the staging copies for every placed GEMV
+cross host memory, and attnproj on the CPU was reading 189 MB/token of that
+same bandwidth. Removing it would then speed up sites that never moved. It is
+testable -- place attnproj and watch dense_stats per site, or vary only the
+CPU-side memory traffic -- and it has not been tested. It is written down so
+that the -4.80 is not silently credited to attention alone.
+
+--- the cost that did not appear -------------------------------------------
+
+189 MB of trunk is charged to the expert budget, roughly 107 experts at
+1.80 MB each:
+
+  A  budget 13.76 GB for experts, resident 7805/10240
+  B  budget 12.09 GB for experts, resident 6859/10240
+
+  cpu-miss 0.00 ms/token and VRAM hit rate 82.6 % in BOTH arms.
+
+So on a 16 GB card at this context and this heat table, the displaced experts
+are ones the run does not ask for. That is a property of this card and this
+prompt, not of the change: on a smaller card, or a workload whose routing is
+flatter, the same 189 MB could displace experts that ARE missed. The offer is
+what the placer weighs, and qt_init's budget arithmetic still decides.
+
+--- what is NOT claimed ----------------------------------------------------
+
+The A arm sits at ~30 ms/token here against 27 in the 21 September records.
+Different session, hit rate 82.6 % instead of 100 %. This -4.80 does not add
+to any number measured on another day, and is not compared to one.
+
+Nothing here says anything about a card other than this one, about a model
+other than Qwen3.6-35B-A3B, or about prefill.
