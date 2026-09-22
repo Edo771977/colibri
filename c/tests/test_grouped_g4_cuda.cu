@@ -331,28 +331,46 @@ int main(void){
              *
              * Bitwise identity cannot test this on its own -- a stale graph
              * reading memory nothing has reused yet returns the right answer
-             * too -- which is why the capture counter exists. */
+             * too -- which is why the capture counter exists.
+             *
+             * THE GROW HAS TO ACTUALLY GROW, and the first version of this
+             * block did not. It re-issued rows1 (total=COUNT=3, xb=3*D*4)
+             * when the sync call at the top of this phase had already
+             * reserved for total=4 (rows {1,2,1}, xb=4*D*4). reserve() only
+             * grows, so nothing moved, buf_gen never changed, and the call
+             * below legitimately REPLAYED -- which the old assertion accepted
+             * as one of two allowed outcomes. It would have passed with the
+             * invalidation removed entirely: the same shape of vacuous
+             * assertion this file exists to replace. So: 2 rows per expert,
+             * total=6, strictly above every total used before it, and the
+             * outcome demanded is re-capture, not "one of the two". */
             {
                 uint64_t cap_before=g_graph_captures, rep_before=g_graph_replays;
+                int rowsg[COUNT]; for(int c=0;c<COUNT;c++) rowsg[c]=2;
+                int totalg=2*COUNT;                 /* 6 > 4, so reserve() reallocs */
+                float *xg=(float*)malloc((size_t)totalg*D*4);
+                for(int r=0;r<totalg;r++) memcpy(xg+(size_t)r*D,x,(size_t)D*4);
                 setenv("COLI_CUDA_GRAPH", "1", 1);
-                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,xd,0)){
-                    printf("FAIL grow issue\n"); return 1; }
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rowsg,COUNT,xg,0)){
+                    printf("FAIL grow issue\n"); free(xg); return 1; }
                 (void)coli_cuda_expert_group_take(0);
+                free(xg);
                 if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,1)){
                     printf("FAIL post-grow issue\n"); return 1; }
                 { const float *yg=coli_cuda_expert_group_take(0);
                   if(!yg||memcmp(ydup,yg,(size_t)COUNT*D*4)!=0){
                       printf("FAIL post-grow result\n"); api_bad++; } }
-                /* Either the buffers moved and this is a fresh capture, or
-                 * they did not and a replay was legitimate. What must NEVER
-                 * happen is a replay after a move -- and the only way to tell
-                 * is that one of the two counters advanced, never neither. */
+                /* A replay here is the bug: the buffers moved, so the graph
+                 * captured before them points at freed memory. Only a fresh
+                 * capture is correct. */
                 int recaptured = g_graph_captures>cap_before;
                 int replayed   = g_graph_replays>rep_before;
-                if(!recaptured && !replayed){
-                    printf("FAIL neither captured nor replayed after the grow\n"); api_bad++; }
-                else printf("grouped-g4 graph after a buffer grow: %s, bitwise\n",
-                            recaptured?"re-captured":"replayed (buffers did not move)");
+                if(!recaptured){
+                    printf("FAIL the grow did not re-capture (%s) -- "
+                           "buf_gen did not move when the buffers did\n",
+                           replayed?"it REPLAYED a stale graph":"neither counter advanced");
+                    api_bad++; }
+                else printf("grouped-g4 graph after a real buffer grow: re-captured, bitwise\n");
             }
 
             /* And back off cleanly: a graph left armed would follow this
