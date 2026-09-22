@@ -173,8 +173,12 @@ function Invoke-Arm([string]$Exe, [string]$Tag, [int]$Rep) {
 
     $speed  = if ($txt -match 'Speed:\s*([0-9]+\.[0-9]+)\s*tok/s') { [double]$Matches[1] } else { [double]::NaN }
     $attn   = if ($txt -match '(?m)^\s*\[timers\]\s+attention\s+[0-9.]+\s+ms\s+([0-9.]+)\s+ms/token') { [double]$Matches[1] } else { [double]::NaN }
-    $shared = if ($txt -match '(?m)^\s*\[timers\]\s+shared\s+[0-9.]+\s+ms\s+([0-9.]+)\s+ms/token') { [double]$Matches[1] } else { [double]::NaN }
-    $router = if ($txt -match '(?m)^\s*\[timers\]\s+router\s+[0-9.]+\s+ms\s+([0-9.]+)\s+ms/token') { [double]$Matches[1] } else { [double]::NaN }
+    # qwen36.c:831 stampa questi due nomi CON LE PARENTESI -- "(shared)" e
+    # "(router)", perche' sono sottoinsiemi di moe_total e non vanno sommati.
+    # La prima versione di questo script cercava il nome nudo e le due righe
+    # di controllo uscivano NaN: il controllo che promettevano non girava.
+    $shared = if ($txt -match '(?m)^\s*\[timers\]\s+\(shared\)\s+[0-9.]+\s+ms\s+([0-9.]+)\s+ms/token') { [double]$Matches[1] } else { [double]::NaN }
+    $router = if ($txt -match '(?m)^\s*\[timers\]\s+\(router\)\s+[0-9.]+\s+ms\s+([0-9.]+)\s+ms/token') { [double]$Matches[1] } else { [double]::NaN }
     $miss   = if ($txt -match 'cpu-miss\s+([0-9.]+)') { [double]$Matches[1] } else { [double]::NaN }
     $hit    = if ($txt -match 'Expert cache hit rate:\s*([0-9]+\.[0-9]+)\s*%') { [double]$Matches[1] } else { [double]::NaN }
 
@@ -236,6 +240,10 @@ $rows | Group-Object Arm | Sort-Object Name | ForEach-Object {
 
 ""
 "--- righe che NON devono muoversi ---"
+if ($rows | Where-Object { [double]::IsNaN($_.Shared) -or [double]::IsNaN($_.Router) }) {
+    "ATTENZIONE: (shared) o (router) non sono stati letti dal log. Il controllo"
+    "sotto non vale: e' un difetto di questo script, non un risultato."
+}
 $rows | Group-Object Arm | Sort-Object Name | ForEach-Object {
     "{0,-4}  shared {1,5:N2}   router {2,5:N2}   attention {3,5:N2}" -f $_.Name,
         (($_.Group | ForEach-Object { $_.Shared } | Measure-Object -Average).Average),
