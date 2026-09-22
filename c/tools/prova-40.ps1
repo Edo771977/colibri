@@ -90,7 +90,14 @@ function Muta([string]$Cerca, [string]$Sostituisci, [string]$Nome) {
 function Esegui([string]$Comando, [int]$TimeoutSec = 1800) {
     $base = [System.IO.Path]::GetTempFileName()
     $bat = "$base.cmd"; $fout = "$base.out"; $ferr = "$base.err"
-    Set-Content -LiteralPath $bat -Encoding ASCII -Value @("@echo off", $Comando)
+    # `exit /b %ERRORLEVEL%` NON e' decorativo: senza, cmd /c su un file
+    # batch ha restituito 0 anche per comandi chiaramente falliti -- il test
+    # Python stampava un AssertionError e lo script leggeva 0, quindi ogni
+    # confronto "-ne 0" era falso e le fasi stampavano OK avendo misurato un
+    # codice sbagliato. C'era nella prima versione di questa funzione ed e'
+    # andato perso nella riscrittura con Start-Process.
+    Set-Content -LiteralPath $bat -Encoding ASCII -Value @(
+        "@echo off", $Comando, "exit /b %ERRORLEVEL%")
     $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $bat) -PassThru `
                        -NoNewWindow -RedirectStandardOutput $fout -RedirectStandardError $ferr
     # -Wait senza limite trasforma un processo bloccato in uno script
@@ -104,10 +111,17 @@ function Esegui([string]$Comando, [int]$TimeoutSec = 1800) {
         try { $p.Kill($true) } catch { try { $p.Kill() } catch {} }
         try { $p.WaitForExit(15000) | Out-Null } catch {}
     }
+    # stdout e stderr separati e ETICHETTATI. Concatenandoli si perdeva
+    # l'informazione piu' utile del primo giro reale: il test mutato aveva
+    # stderr pieno e stdout VUOTO, che e' la firma di una terminazione
+    # anomala (stdout verso file e' bufferizzato e va perso, stderr no).
+    $out = ""; $err = ""
+    if (Test-Path $fout) { $c = Get-Content -Raw -LiteralPath $fout; if ($c) { $out = $c } }
+    if (Test-Path $ferr) { $c = Get-Content -Raw -LiteralPath $ferr; if ($c) { $err = $c } }
     $testo = ""
-    foreach ($f in @($fout, $ferr)) {
-        if (Test-Path $f) { $c = Get-Content -Raw -LiteralPath $f; if ($c) { $testo += $c } }
-    }
+    if ($out) { $testo += "--- stdout ---`n" + $out }
+    if ($err) { $testo += "--- stderr ---`n" + $err }
+    if (-not $testo) { $testo = "(nessun output su nessuno dei due flussi)" }
     foreach ($f in @($base, $bat, $fout, $ferr)) {
         Remove-Item -Force -LiteralPath $f -ErrorAction SilentlyContinue
     }
@@ -115,7 +129,10 @@ function Esegui([string]$Comando, [int]$TimeoutSec = 1800) {
         return @{ Testo = ("TIMEOUT dopo $TimeoutSec s. Output raccolto fino a li':`n" + $testo)
                   Codice = -1; Scaduto = $true }
     }
-    return @{ Testo = [string]$testo; Codice = [int]$p.ExitCode; Scaduto = $false }
+    $c = [int]$p.ExitCode
+    return @{ Testo = [string]$testo; Codice = $c; Scaduto = $false
+              Esa = ("0x{0:X8}" -f [uint32]([int64]$c -band 0xFFFFFFFF))
+              StdOut = [string]$out; StdErr = [string]$err }
 }
 
 # Stampa le ultime righe dell'output di un comando fallito. Una fase rossa
@@ -172,6 +189,19 @@ if ($probe.Codice -ne 0 -or $probe.Testo -notmatch "prova40harnessok") {
            "di stampare risultati costruiti sul vuoto. Riporta queste due righe.")
 }
 "  OK   l'esecutore rende codice e output (echo -> $($probe.Codice))"
+# E soprattutto: un comando che FALLISCE deve rendere un codice diverso da
+# zero. Questo e' il collaudo che mancava, ed e' esattamente il difetto che
+# ha reso falsi i risultati del primo giro: lo script leggeva 0 da comandi
+# falliti e stampava OK. Senza questa prova, ogni "OK" sotto e' indistinguibile
+# da un errore silenzioso.
+$neg = Esegui "exit 3"
+if ($neg.Codice -ne 3) {
+    throw ("l'esecutore non propaga il codice di uscita: `exit 3` ha reso " +
+           "'$($neg.Codice)'. Ogni confronto sotto sarebbe privo di significato " +
+           "e le fasi stamperebbero OK avendo misurato il numero sbagliato. " +
+           "Riporta questa riga.")
+}
+"  OK   l'esecutore propaga il fallimento (exit 3 -> $($neg.Codice))"
 
 # E gli strumenti ci sono? `python` non e' detto che sia il nome giusto.
 $python = $null
@@ -250,8 +280,16 @@ if ($r.Codice -eq 0) {
     # MOTIVO del rosso e' rimasto sconosciuto -- e un rosso di cui non si
     # conosce la causa non dimostra niente. Un crash del grafo rigiocato su
     # memoria liberata, per esempio, non stampa "FAIL": muore prima.
-    "       --- output del g4 mutato (codice $($r.Codice)) ---"
-    Mostra $r 25
+    "       --- output del g4 mutato (codice $($r.Codice) = $($r.Esa)) ---"
+    if ((-not $r.StdOut) -and $r.StdErr) {
+        "       NOTA: stdout vuoto con stderr presente. Puo' indicare una"
+        "       terminazione anomala -- stdout verso file e' bufferizzato e si"
+        "       perde, stderr no -- il che sarebbe coerente con un grafo"
+        "       rigiocato su memoria liberata, che muore prima di stampare"
+        "       FAIL. E' un'ipotesi: il codice di uscita qui sopra la conferma"
+        "       o la smentisce, e va letto insieme a questa riga."
+    }
+    Mostra $r 40
 }
 
 Ripristina
