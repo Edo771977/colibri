@@ -36,7 +36,10 @@ Checked once per invocation, at the top:
   - COLI_CUDA_PROFILE / PROF / COLI_GRAPH_DIAG inherited from a parent shell.
     Any of them disarms the expert graph or inflates the timers. This one
     FIRED FOR REAL: a first attempt was refused on COLI_GRAPH_DIAG=1, and the
-    numbers it would have produced were never taken.
+    numbers it would have produced were never taken. (That refusal is not in
+    either session's output below -- a run that throws produces no table. It
+    is recorded here because a guard that has fired is worth more than one
+    that never has, but it is narrative, not measurement.)
   - the two binaries being byte-identical.
 
 Checked per run, in every one of the twenty-four:
@@ -94,6 +97,13 @@ assume either way.
                         -5.20 -4.40 -5.00 -5.10 -5.40 -4.50
 
   median -5.00 ms/token, 12/12 negative, spread -5.40 .. -4.10
+  mean   -4.85 ms/token   (session means -4.77 and -4.93)
+
+Both are given because the median is the more favourable of the two by about
+0.15 ms/token in every cut of this data, and a file that gives two statistics
+for the percentages and invites the reader to pick either should not quote
+only the flattering one for the headline. For n = 6 a median is defensible
+against a single outlying repetition; it is not a reason to hide the mean.
 
 The two session medians agree to 0.10 ms/token, and all twelve runs are
 negative across a spread of 1.30 ms.
@@ -148,7 +158,15 @@ differ for some reason other than the placement.
 
     (shared)     3.69  ->  3.81    +0.12
     (router)     0.75  ->  0.80    +0.05
-    attention    5.54  ->  2.01    -3.53    = 70 % of the -5.05 median
+    attention    5.54  ->  2.01    -3.53
+
+  attention's share of the total: 3.53 / 4.93 = 71.6 %. BOTH NUMBERS ARE ARM
+  MEANS over the six runs -- the -3.53 above, and the session's mean paired
+  delta of -4.93. An earlier version of this file divided the mean phase delta
+  by the MEDIAN paired delta (-5.05) and published "70 %": a mean over a
+  median, which is the exact mixing this file objects to two sections above.
+  Corrected, 22 September 2026. The mean-over-mean figure is the larger one,
+  so the correction does not flatter the result.
 
   session 1: (shared) and (router) are NOT AVAILABLE.
 
@@ -164,13 +182,22 @@ differ for some reason other than the placement.
     It was fixed between the sessions (claude/misure-autoplace, commit
     43151219), which also added an explicit warning so a future NaN says it is
     the script's fault. Session 1's attention row was read by a different regex
-    and is unaffected: 5.46 -> 1.87, -3.59, 72 % of that session's -4.95 median.
+    and is unaffected: 5.46 -> 1.87, -3.59, which on the same mean-over-mean
+    basis is 3.59 / 4.77 = 75.3 % of that session's total. (An earlier version
+    divided by the median and published "72 %"; on that basis the figure was
+    in any case 72.5, not 72.)
 
   So the control exists for session 2 only. It passes: +0.12 and +0.05 both
   sit inside the arm-to-arm drift this repo has already measured and failed to
   explain on a clang binary (qwen36-place-clang-clean-2026-09-20-raw.txt:
   shared +0.19, router +0.28 at identical residency), while attention carries
-  roughly 70 % of the delta in both sessions.
+  71.6 % of the delta in session 2 and 75.3 % in session 1.
+
+  THAT PASS BAND COMES FROM ANOTHER DAY, and it is the only thing in this file
+  that does. It is also not a like-for-like band: those arms were the SAME
+  binary under two COLI_PLACE settings, where these are TWO BINARIES under
+  auto. Using one as a tolerance for the other is an assumption, stated here
+  rather than hidden.
 
 THE TWO SESSIONS DID NOT RUN THE SAME SCRIPT. The diff between them is commit
 43151219 and it is two regexes plus a warning. It does not touch how step() is
@@ -180,21 +207,61 @@ replication; what session 2 adds is the control that session 1 could not run.
 
 --- what the placer decided, and what it cost ------------------------------
 
-Identical in both sessions, mean over the six runs of each arm:
+Identical in both sessions. attnproj is the MAXIMUM over the six runs of the
+arm; every other column is the MEAN over them:
 
-  POST   attnproj 10   budget 12.09 GB   ~6859 experts   hit 82.6 %   cpu-miss 0.00
-  PRE    attnproj  0   budget 12.26 GB   ~6959 experts   hit 82.6 %   cpu-miss 0.00
+  POST   attnproj 10*  budget 12.09 GB   ~6859 experts   hit 82.6 %   cpu-miss 0.00
+  PRE    attnproj  0*  budget 12.26 GB   ~6959 experts   hit 82.6 %   cpu-miss 0.00
+                   \-- maximum, not mean
 
 So, left to itself and with no COLI_PLACE at all, auto_place TAKES attnproj on
-this card: 10 of them, 0.17 GB of budget, 100 experts. The hit rate is the same
-to the tenth of a point it is printed with, in both arms of both sessions, and
-cpu-miss reads 0.00 in every arm of both. That last figure is a mean over six
-runs, but cpu-miss cannot be negative, so a mean of 0.00 to two decimals means
-no individual run carried one either. The 100 displaced experts are ones this
-prompt does not ask for.
+this card: up to 10 of them, 0.17 GB of budget, 100 experts. THAT is what the
+explicit-COLI_PLACE record could not answer -- whether auto would take the
+offer at all -- and it is what this run adds.
 
-That is the question the explicit-COLI_PLACE record could not answer, and the
-answer is that on this card the exchange is free.
+WHAT THIS RUN DOES NOT ADD IS THE COST, and an earlier version of this section
+claimed it did. It said "the exchange is free" and "the 100 displaced experts
+are ones this prompt does not ask for". Both are withdrawn, the same day, for
+three reasons that are all visible in the numbers printed above.
+
+  THE RUN TOUCHES EVERY EXPERT. miss = 10240, and 10240 is the TOTAL number of
+  experts -- it is the denominator of the engine's own residency line,
+  `resident 6859/10240`. And the two cannot be equal by coincidence: the host
+  slot cache is per layer with cap == n_experts (the script passes -Cap 256,
+  and a cap below the expert count disables the CUDA tier outright), so no
+  slot is ever evicted and each (layer, expert) pair can miss AT MOST ONCE.
+  miss equal to the total therefore means each one missed EXACTLY once, i.e.
+  every expert is reached. "Ones this prompt does not ask for" is contradicted
+  by the figure printed beside it. What the data supports is much narrower:
+  reaching the displaced 100 cost at most 0.03 ms/token on the cpu-miss timer,
+  which is the bound on ALL misses and so bounds theirs too (see below).
+
+  THE HIT RATE CANNOT SEE THE PLACEMENT. The script reads the line `Expert
+  cache hit rate:`, which qwen36.c prints from m.hits/m.miss. Those are
+  incremented in expert_get() against m->cache[layer] -- the HOST LRU slot
+  cache, sized by the script's -Cap 256. They are not the tier's VRAM
+  counters. With cap == n_experts nothing is ever evicted from that cache, so
+  the rate is pinned by construction, and the sibling record says so itself
+  ("identical by construction"). An unchanged 82.6 % is not evidence about
+  what the GPU did.
+
+  THE BOUND ON cpu-miss IS WEAKER THAN IT WAS WRITTEN. An earlier version said
+  a mean of 0.00 to two decimals means "no individual run carried one either".
+  cpu-miss is a continuous ms/token quantity, not a count -- it reads 4.79 and
+  5.06 in qwen36-place-clang-clean-2026-09-20-raw.txt:48 -- so a six-run mean
+  below 0.005 bounds the six-run sum below 0.03 and therefore each run below
+  0.03 ms/token. Small, and not zero.
+
+So what this run establishes about cost is: displacing 100 experts cost under
+0.03 ms/token on the one timer that watches it, in a run that touched all of
+them. It does NOT establish that they were not wanted.
+
+And the cost evidence here is WEAKER than the explicit-COLI_PLACE record's,
+not stronger. That record read the per-run values from all twelve logs and
+also carried `VRAM hit rate 100.0 %, LFRU swaps 0, in all twelve`. This
+script captures neither VRAM hit rate nor LFRU swaps, and reports means rather
+than per-run values. The four cost numbers above are byte-for-byte the ones
+that record already published; this run does not improve on them.
 
 It is an answer about THIS card, THIS prompt and THIS heat table, and the heat
 table was warmed on the prompt that is then measured -- the most favourable
@@ -212,6 +279,17 @@ Stated because each one is something a reader could otherwise assume:
     hex of each sha256 and the header gives the build recipe, but nothing in
     the output ties PRE to a specific main commit or POST to a specific branch
     commit. The script should print that; it does not.
+  - AND THAT UNDERMINES THE "SAME DLL" CONTROL ABOVE. Reusing one coli_cuda.dll
+    removes a confounder only if both binaries were built from commits that
+    differ by #39 alone. #39 itself touches no CUDA source -- that part is
+    verified -- but with neither commit recorded, "the DLL is the same" cannot
+    be checked against "the sources differ by exactly the change under test".
+    The two limitations are one limitation.
+  - The hit rate this record quotes is the HOST expert cache's, not the tier's
+    VRAM hit rate, and the script captures neither the VRAM hit rate nor the
+    LFRU swap count that the explicit-COLI_PLACE record carried. The cost
+    evidence here is weaker than that record's, not stronger; see the section
+    on what the placer decided.
   - attnproj 10 is the MAXIMUM over the six runs of the arm, not a per-run
     figure. What is established per run is that every POST run placed more
     than zero (the warning never fired) and every PRE run placed exactly zero
@@ -238,7 +316,12 @@ publishes: qwen36-attnproj-place-2026-09-22-raw.txt records step() reading
 with the code unchanged between several of them.
 
 Every number above is a within-session paired delta or an arm statistic from
-the same session. Nothing here is compared with another day.
+the same session, with ONE exception, named here rather than glossed: the
+tolerance band the control rows are judged against (shared +0.19, router
++0.28) comes from 20 September. That is a threshold imported from another
+day, and an earlier version of this paragraph claimed nothing here was
+compared with another day at all, which was false while that band was doing
+the work of making the control "pass".
 
 Nothing here says anything about a card other than this one, a model other
 than Qwen3.6-35B-A3B, a context other than this prompt, or prefill.

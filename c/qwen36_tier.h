@@ -52,8 +52,13 @@ int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
  * offered and keeps following COLI_GPUS. `off` is the way back to experts
  * only, and there is NO granular way back -- naming any one component
  * switches auto off for every component, so a card that wants four of the
- * five has to list all four. attnproj was explicit-only until its A/B ran on 22 September 2026
- * (docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt).
+ * five has to list all four. attnproj was explicit-only until 22 September
+ * 2026. Two runs of that date justify the change, and they answer different
+ * questions: qwen36-attnproj-place-2026-09-22-raw.txt is the component A/B,
+ * which pinned an EXPLICIT COLI_PLACE in both arms and therefore never
+ * exercised the automatic placer this paragraph describes; and
+ * qwen36-autoplace-2026-09-22-raw.txt is the one with COLI_PLACE UNSET, which
+ * is what shows auto takes the offer at all. Both are in docs/experiments/.
  *
  * Target is `cpu` or a CUDA ordinal. A component may also be split across
  * cards by layer count, joined with '+' so it cannot be confused with the

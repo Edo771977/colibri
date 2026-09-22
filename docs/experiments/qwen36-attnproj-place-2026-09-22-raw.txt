@@ -229,8 +229,26 @@ hit/miss counts are bit-identical between the arms: the 100 displaced experts
 changed nothing about which experts the run touched.
 
 So on a 16 GB card at this context and this heat table, the displaced experts
-are ones the run does not ask for. That is a property of this card and this
-prompt, not of the change: on a smaller card, or a workload whose routing is
+are ones the run does not ask for.
+
+  WITHDRAWN 22 September 2026, later the same day, by reading this file's own
+  numbers more carefully. `hit=48640 miss=10240` sits four lines above, and
+  10240 is the TOTAL expert count -- the denominator of `resident 6859/10240`
+  on line 213. The host slot cache is per layer with cap == n_experts, so
+  nothing is ever evicted from it and each (layer, expert) pair can miss at
+  most once; miss equal to the total therefore means every expert is reached
+  exactly once. The run asks for all of them. What "bit-identical hit/miss
+  counts between the arms" establishes is that placement changed nothing about
+  WHICH experts were touched -- which is real, and is not the same claim.
+  The defensible version is the cost bound: the displaced 100 added nothing
+  measurable to cpu-miss, which reads 0.00 in both arms.
+  The caveat in the paragraph above -- that a 0.00 cpu-miss against a 17.4 %
+  miss rate means the misses are served somewhere that timer does not watch --
+  applies to that bound too. See qwen36-autoplace-2026-09-22-raw.txt, which
+  makes the same correction on its own copy of these four numbers.
+
+The rest of this paragraph stands as written. It is a property of this card
+and this prompt, not of the change: on a smaller card, or a workload whose routing is
 flatter, the same 189 MB could displace experts that ARE missed. And the heat
 table was warmed ON THE PROMPT THAT IS THEN MEASURED, which is the most
 favourable point available for the claim that nothing needed was evicted --
@@ -277,11 +295,19 @@ NOTE ADDED LATER THE SAME DAY. It has now been done, twice, and the record is
 docs/experiments/qwen36-autoplace-2026-09-22-raw.txt. The paragraph above
 stands as written for the moment it was written and is left untouched; it is
 simply no longer the current state. In one line: with COLI_PLACE unset,
-auto_place takes 10 attnproj on this card, the paired delta on step() total is
-a median of -5.00 ms/token over twelve runs in two sessions, 12/12 negative,
-and the 100 displaced experts cost 0.00 ms of cpu-miss at an unchanged expert
-hit rate. That record states its own limitations, among them that it does not
-record which commit either binary was built from.
+auto_place takes attnproj on this card (up to 10 -- that script reports a
+maximum, not a per-run count), and the paired delta on step() total is a median
+of -5.00 ms/token over twelve runs in two sessions, mean -4.85, 12/12 negative.
+
+On COST it adds nothing to what is already above in this file, and its evidence
+is WEAKER: it reports six-run means where this record read all twelve logs, and
+it captures neither the VRAM hit rate nor the LFRU swap count. It also does not
+record which commit either binary was built from. It bounds the cost of the
+displaced experts at under 0.03 ms/token on cpu-miss and claims nothing more --
+in particular not that they were unwanted, since miss = 10240 is the total
+expert count and the run reaches every one of them. The caveat two hundred
+lines above, that cpu-miss is one timer and the misses are served somewhere it
+does not watch, applies to that record exactly as it applies to this one.
 
 --- what is NOT claimed ----------------------------------------------------
 

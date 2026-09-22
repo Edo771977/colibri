@@ -1462,11 +1462,18 @@ static void trunk_offer_out(Model *m)
  * automatic placer off -- so it measured the component, not the decision this
  * comment is about. The automatic path was measured separately the same day,
  * two binaries with COLI_PLACE unset, six counterbalanced repetitions, run
- * twice: auto TAKES attnproj here (10 of them, 0.17 GB, 100 experts) for a
- * median of -5.00 ms/token over the twelve runs, 12/12 negative, with
- * cpu-miss 0.00 and the hit rate unchanged in all twenty-four.
- * docs/experiments/qwen36-autoplace-2026-09-22-raw.txt has that one, and its
- * limitations.
+ * twice: auto TAKES attnproj here (up to 10 of them -- the script prints the
+ * maximum over the six runs, not a per-run count -- for 0.17 GB and 100
+ * experts) at a median of -5.00 ms/token over the twelve runs, mean -4.85,
+ * 12/12 negative.
+ *
+ * What that run does NOT establish is that the 100 displaced experts were
+ * free. The run touches every expert (miss = 10240 = the total), and the
+ * `Expert cache hit rate` line it quotes comes from m.hits/m.miss, which
+ * expert_get() counts against the HOST slot cache, not the tier's VRAM. All
+ * that is bounded is the cost of reaching them: under 0.03 ms/token on
+ * cpu-miss. docs/experiments/qwen36-autoplace-2026-09-22-raw.txt has the run
+ * and states this itself.
  *
  * What the placer does NOT give you, and an earlier draft of this comment
  * wrongly promised: a budget that refuses the offer on a card too small for
