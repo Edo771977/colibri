@@ -1,8 +1,9 @@
 import copy
-import fnmatch
 import json
 import hashlib
 import pathlib
+import re
+import subprocess
 import tempfile
 import unittest
 
@@ -18,6 +19,76 @@ def run(config, speeds):
         "evidence": {"uri": "https://example.invalid/raw.log",
                      "sha256": "ab" * 32},
     }
+
+
+def _pattern_to_regex(pattern, anchored):
+    """git's pathspec globbing: `*` stops at `/`, `**` does not."""
+    out, i, n = [], 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if pattern[i:i + 2] == "**":
+                out.append(".*")
+                i += 2
+                if pattern[i:i + 1] == "/":
+                    i += 1
+                continue
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "[":
+            j = pattern.index("]", i) if "]" in pattern[i:] else n - 1
+            out.append(pattern[i:j + 1])
+            i = j + 1
+            continue
+        else:
+            out.append(re.escape(c))
+        i += 1
+    body = "".join(out)
+    return re.compile(("" if anchored else "(?:.*/)?") + body + r"\Z")
+
+
+def _text_attr(root, rel):
+    """What `git check-attr text` would report for a repo-relative path.
+
+    Files deeper in the tree win, and inside one file the last matching line
+    wins. Implemented here rather than shelled out so the check still means
+    something when the tests run from an export with no .git.
+    """
+    parts = pathlib.PurePosixPath(rel).parts
+    verdict = "unspecified"
+    for depth in range(len(parts)):                 # root first, deepest last
+        directory = root.joinpath(*parts[:depth])
+        attrs = directory / ".gitattributes"
+        if not attrs.is_file():
+            continue
+        below = "/".join(parts[depth:])
+        for line in attrs.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith('"'):
+                closing = line.index('"', 1)
+                pattern, rest = line[1:closing], line[closing + 1:]
+            else:
+                pattern, _, rest = line.partition(" ")
+            attributes = rest.split()
+            if not attributes:
+                continue
+            anchored = "/" in pattern.rstrip("/")
+            if pattern.startswith("/"):
+                pattern = pattern[1:]
+                anchored = True
+            if not _pattern_to_regex(pattern, anchored).match(below):
+                continue
+            for a in attributes:
+                if a == "text" or a.startswith("text=") or a.startswith("eol="):
+                    verdict = "set"
+                elif a in ("-text", "binary"):
+                    verdict = "unset"
+                elif a == "!text":
+                    verdict = "unspecified"
+    return verdict
 
 
 def manifest():
@@ -204,44 +275,25 @@ class EvidenceDigest(unittest.TestCase):
     def test_records_are_pinned_against_eol_rewriting(self):
         """The pin itself: without it the digests are not portable.
 
-        Checked by EFFECT, not by looking for a literal line. A review showed
-        the literal-string version passed with the rule commented out, passed
-        with a later rule overriding it to `eol=crlf`, and failed on three
-        spellings that pin correctly -- so it was neither necessary nor
-        sufficient. This resolves each record the manifests actually name
-        through the .gitattributes rules, last match winning, the way git
-        does.
+        Checked by EFFECT. Two earlier versions of this test did not check
+        the effect at all. The first looked for the literal line
+        `docs/experiments/*.txt -text` and passed with that rule COMMENTED
+        OUT. The second resolved it with `fnmatch`, whose `*` crosses `/`,
+        which knows nothing about .gitattributes files in subdirectories --
+        git gives those precedence -- and which ignores `!attr`; a review
+        showed three ways to unpin the records with that version still green,
+        including a `docs/experiments/.gitattributes` saying
+        `*.txt text eol=crlf`, the exact regression this test exists for.
+
+        This one implements git's own resolution: every .gitattributes from
+        the repository root down to the file's own directory, deeper files
+        winning, last matching line in each winning, `*` not crossing `/`, a
+        leading `/` anchoring, and `!text` returning the attribute to
+        unspecified. It asks git for a second opinion when git is available,
+        and fails if the two disagree -- a mismatch means this resolver has
+        drifted from the thing it models.
         """
         root = pathlib.Path(__file__).resolve().parent.parent.parent
-        attrs = root / ".gitattributes"
-        self.assertTrue(attrs.is_file(), f"{attrs} is missing: the records it "
-                                         "pins would be rewritten on checkout")
-        rules = []
-        for line in attrs.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            pattern, *attributes = line.split()
-            if attributes:
-                rules.append((pattern, attributes))
-
-        def text_attr(rel):
-            """What git would report for `text` on this path."""
-            verdict = "unspecified"
-            for pattern, attributes in rules:           # last match wins
-                if not fnmatch.fnmatch(rel, pattern):
-                    continue
-                for a in attributes:
-                    if a == "-text":
-                        verdict = "unset"
-                    elif a == "text" or a.startswith("text="):
-                        verdict = "set"
-                    elif a == "binary":
-                        verdict = "unset"
-                    elif a.startswith("eol="):
-                        verdict = "set"                 # eol implies text
-            return verdict
-
         named = set()
         for path in sorted((root / "docs" / "experiments").glob("*.json")):
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -251,12 +303,34 @@ class EvidenceDigest(unittest.TestCase):
                 if head and "://" not in head:
                     named.add(head)
         self.assertTrue(named, "no manifest names a file; this test is vacuous")
-        unpinned = sorted(r for r in named if text_attr(r) != "unset")
+
+        unpinned = sorted(r for r in named if _text_attr(root, r) != "unset")
         self.assertEqual(
             unpinned, [],
             "these records are not pinned against end-of-line rewriting, so "
             "their digests are not portable and a Windows checkout will fail "
             "every one of them: " + ", ".join(unpinned))
+
+        # Second opinion, when there is a git to ask.
+        try:
+            out = subprocess.run(
+                ["git", "check-attr", "text", "--"] + sorted(named),
+                cwd=root, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):       # pragma: no cover
+            return
+        if out.returncode != 0:
+            return                                          # not a checkout
+        for line in out.stdout.splitlines():
+            rel, _, verdict = line.rpartition(": ")
+            rel = rel.rsplit(": ", 1)[0]
+            self.assertEqual(
+                verdict, "unset",
+                f"git says `text` is {verdict!r} for {rel}, so this checkout "
+                "rewrites it and its digest cannot match")
+            self.assertEqual(
+                _text_attr(root, rel), verdict,
+                f"this test's attribute resolver disagrees with git on {rel}: "
+                f"it says {_text_attr(root, rel)!r}, git says {verdict!r}")
 
     def test_digest_comparison_ignores_hex_case(self):
         """An uppercase digest is the same digest, not a mismatch."""

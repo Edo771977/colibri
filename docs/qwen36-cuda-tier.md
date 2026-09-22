@@ -194,8 +194,11 @@ On clang the same change is −15.3 %. Both percentages come from
 `step() total`, i.e. decode only; a percentage computed from the wall-clock
 `Speed:` line is not comparable to either, because that one carries the
 prefill. For 0.31 GB of VRAM and 177 experts (7136 → 6959), hit rate
-unchanged at 100 %. The effect is 7.77 ms against a worst-case within-arm
-spread of 2.1 ms.
+unchanged at 100 %. This paragraph used to size the effect as "7.77 ms
+against a worst-case within-arm spread of 2.1 ms": the 2.1 is right (60.8 −
+58.7), the 7.77 is the figure withdrawn above, and quoting it as an effect
+size is the same citation the withdrawal forbids. On the build that ships the
+effect is **−5.05** against that spread.
 
 The table is **not a partition and does not sum to the total**: `norm+out` and
 `dn-sub proj` are sub-timers inside `deltanet`, and `shared`, `router`,
@@ -444,16 +447,37 @@ expert onto that GPU would turn a 0.36 ms wait into the whole of its work.
 > | 0.76, 0.57 | `qwen36-graph-downrows-2x2-2026-09-21-raw.txt:42,44` | g0d0, g0d4 |
 > | 1.14 | `qwen36-expert-graph-2026-09-20-raw.txt:35` | graph=0 |
 >
-> Thirteen readings from 0.27 to 1.14, eleven of them distinct, and **no two
-> share a pinned configuration**: they differ in placement, in `DOWN_ROWS`, in host compiler,
-> and one of the records carries no `Placement` line at all. So there is no
-> run in this repository that fixes one configuration and reads `take` twice,
-> and no spread over this table means anything — which is the finding, not a
-> step towards a number. With `shared` at 4 ms instead of 10 and `take`
+> Thirteen readings from 0.27 to 1.14, eleven of them distinct, across arms
+> that differ in placement, in `DOWN_ROWS` and in host compiler, and two of
+> the records (`expert-graph`, `place-clang-clean`) carry no `Placement` line
+> of their own. **No spread over the whole table means anything**, because it
+> is not one configuration.
+>
+> **But two of these records DO pin the same configuration, and that is the
+> drift figure.** `qwen36-expert-down-rows-2026-09-20-raw.txt` and
+> `qwen36-graph-downrows-2x2-2026-09-21-raw.txt` match on every axis their
+> headers declare — same box, same `qwen36_clang.exe`, same model and prompt,
+> same `COLI_PLACE=experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0`, same
+> `COLI_CUDA_I8_ROWS=2`, and the graph off in both (it was still off by
+> default on 20 September; the 2x2 pins `g0*` to 0). They read `take` at two
+> matched points:
+>
+> | `DOWN_ROWS` | 20 Sept | 21 Sept | drift |
+> |---|---|---|---|
+> | 0 | 0.53 (`:46`) | 0.76 (`:42`, g0d0) | **+0.23** |
+> | 4 | 0.33 (`:46`) | 0.57 (`:44`, g0d4) | **+0.24** |
+>
+> Two independent pairs agreeing to 0.01. **Session-to-session drift on
+> `take` is about 0.23 ms/token** — real, and roughly a third of the 0.74 the
+> graph transfers into it. (An earlier version of this note said no published
+> run pins one configuration and reads `take` twice. That was false, and it
+> was the stated reason for refusing to quote any drift at all. Retracted 22
+> September 2026: the refusal was right about the table as a whole and wrong
+> about the records.) With `shared` at 4 ms instead of 10 and `take`
 > unquotable, **this argument has to be re-run on clang before it can be
 > believed**. It has not been.
 >
-> (Three corrections inside this note itself, all from review. It first listed
+> (Four corrections inside this note itself, all from review. It first listed
 > five values "across six sessions", including a **1.30** that exists nowhere
 > in this repository as a reading of `take` — the only 1.30 in the records is
 > a paired `step()` delta in the 2x2's DOWN_ROWS list. Inventing a number
@@ -586,24 +610,46 @@ like-for-like ratio of kernel times.
 | 4 | 389 / 342 | 23.75 / 23.90 |
 | 8 | 318 / 299 | 23.70 / 23.80 |
 
-**The step gain reproduces and is large**: every `R >= 2` arm lands at
-23.3-24.7 ms/token against 27.3-27.5 for the original, with no overlap
-between the original and any of them in either session -- about **-13 % on
-the whole token**, from 36.6 to 42.5 tok/s.
+>  **The `kernel GB/s` column is SUSPENDED, 22 September 2026**, along with
+>  everything derived from it below. The same 5224 calls over the same 112.07
+>  GB read 175 GB/s in `qwen36-dense-pinned-2026-09-21-raw.txt` the next day,
+>  a factor of 2.1 from the 372 here; see the note further down and the
+>  `COLI_CUDA_I8_ROWS` row of `docs/ENVIRONMENT.md`. Note that
+>  `qwen36-dense-pinned` does not pin `COLI_CUDA_I8_ROWS` in its header
+>  either, so the objection raised against the third reading applies to it
+>  too: of the five records that pin the variable, neither of the two low
+>  readings is among them. Do not cite a GB/s figure
+>  for this kernel until a session measures R=0 and R=2 back to back with the
+>  variable explicitly pinned. The `step()` column is unaffected.
 
-**The ranking among R does not reproduce.** R=4 won session 1 on both
-metrics and R=2 won session 2 on both; their spreads overlap. R=8 was the
-slowest of the three in both sessions on both metrics, which is the one
-ordering the data does support. The default is therefore R=2: no worse than
-R=4 on anything measured, and the cheaper of the two in registers and in
-shared memory (`partial[R][256]`), which is the side to err on for an
-architecture nobody has run this on.
+**The step gain reproduces and is large**: every `R >= 2` arm lands below
+every `R = 0` arm -- about **-13 % on the whole token**, from 36.6 to 42.5
+tok/s. (This paragraph used to claim "no overlap between the original and any
+of them in either session". Only session 2 retains per-rep lines; session 1
+says "per-rep lines not retained" at `qwen36-i8-rows-2026-09-20-raw.txt:32`,
+so there the check is median-to-median. Qualified 22 September 2026.)
 
-The traffic model predicted the direction and not the curve. Measured over
-predicted is 1.17-1.22 at R=2, 0.72-0.83 at R=4, 0.47-0.51 at R=8 -- the same
-shape in both sessions. Past R=2 the `x` re-read is no longer what limits the
-kernel, and R=8 gives back in occupancy and register pressure more than it
-saves in traffic.
+**The ranking among R does not reproduce** -- and the paragraph that used to
+stand here got the direction wrong. **Withdrawn 22 September 2026.** It read
+that R=4 won session 1 on both metrics, that R=8 was the slowest of the three
+in both sessions on both metrics, and that R=2 is "no worse than R=4 on
+anything measured". The table three lines above says otherwise on `step()`:
+session 1 is R=2 24.35 / R=4 23.75 / **R=8 23.70**, so R=8 is the FASTEST and
+R=2 the slowest; session 2 is R=2 23.45 / **R=4 23.90** / R=8 23.80, so R=4 is
+the slowest. R=8 is consistently last only on the GB/s column, which is
+suspended above. On `step()` the three sit within 0.65 ms of each other in
+session 1 and 0.45 in session 2, and no ordering survives both sessions. R=2
+ships as the cheaper of the widths in registers and in shared memory
+(`partial[R][256]`), which is the side to err on for an architecture nobody
+has run this on -- not because it was measured best.
+
+The traffic model was compared against the GB/s column: measured over
+predicted 1.17-1.22 at R=2, 0.72-0.83 at R=4, 0.47-0.51 at R=8. **That
+comparison is suspended with the column**, and so are the two conclusions
+drawn from it -- that past R=2 the `x` re-read is no longer what limits the
+kernel, and that R=8 gives back in occupancy and registers more than it saves
+in traffic. A ratio whose denominator is a contaminated kernel time says
+nothing, and `step()` does not stand in for it: see the withdrawal above.
 
 ### A measurement caveat that cost a day
 
@@ -786,7 +832,8 @@ session (5224 calls over 64 tokens, `docs/experiments/qwen36-i8-rows-2026-09-20-
 | residue (launch + sync) | 71 ms | 1.11 ms | 13.6 µs |
 | **wall** | **588 ms** | **9.19 ms** | **112.6 µs** |
 
->  **This table and the one 80 lines below it are incompatible, and nothing
+>  **This table and the `COLI_CUDA_DENSE_PINNED` one further down are
+>  incompatible, and nothing
 >  on this page said so until 22 September 2026.** Same path, same
 >  configuration, same card: here the kernel column reads **301 ms** over
 >  5224 calls and 112.07 GB (372 GB/s); in the `COLI_CUDA_DENSE_PINNED`
@@ -800,7 +847,10 @@ session (5224 calls over 64 tokens, `docs/experiments/qwen36-i8-rows-2026-09-20-
 >  less like an outlier: 189 is also 1 % from the 191 GB/s that
 >  `qwen36-i8-rows-2026-09-20-raw.txt:106-107` reports for the R=0 arm, so
 >  this third reading may simply be an R=0 measurement — that record pins
->  `COLI_CUDA_I8_ROWS` nowhere. (An earlier version of this note called it a
+>  `COLI_CUDA_I8_ROWS` nowhere. **And neither does `qwen36-dense-pinned`**,
+>  the source of the 175: the same objection applies to it, and an earlier
+>  version of this note raised it against one reading only. Five records in
+>  `docs/experiments/` pin the variable; neither low reading comes from one. (An earlier version of this note called it a
 >  third reading of the same configuration that "widens the spread". Neither
 >  half survives. Retracted 22 September 2026.)
 >
