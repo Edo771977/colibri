@@ -224,13 +224,61 @@ a broken log and not noticing for a day.
 A caveat the withdrawal did not remove: cpu-miss is one timer, and a 17.4 %
 miss rate that costs 0.00 ms means the misses are served somewhere that timer
 does not watch. `take` falling 1.30 -> 0.94 is consistent with the displaced
-experts not being wanted, but it is indirect. The direct evidence is that the
-hit/miss counts are bit-identical between the arms: the 100 displaced experts
-changed nothing about which experts the run touched.
+experts not being wanted, but it is indirect. The bit-identical hit/miss
+counts between the arms establish something real and NARROWER than an earlier
+version of this sentence claimed: placement changed nothing about WHICH
+experts the run touched. They are not the direct evidence that the displaced
+experts were unwanted, and cannot be -- those are the HOST cache's counts,
+pinned by construction at cap == n_experts, identical in any arm and any
+prompt. The direct evidence is the tier's, and it is in the block below.
 
 So on a 16 GB card at this context and this heat table, the displaced experts
-are ones the run does not ask for. That is a property of this card and this
-prompt, not of the change: on a smaller card, or a workload whose routing is
+are ones the run does not ask for.
+
+  A WITHDRAWAL OF THIS SENTENCE WAS ADDED HERE ON 22 September 2026 AND IS
+  ITSELF RETRACTED, the same day, after review. The withdrawal argued that
+  `hit=48640 miss=10240` in the section above proves the run reaches every
+  expert, so the sentence was contradicted by this record's own numbers.
+  That argument is wrong, and this file had already said why: the 10240
+  misses "are the cold first touch of each expert and are identical by
+  construction". tier_warmstart in c/qwen36.c -- the omp loop under its own comment
+  "Load ALL experts into RAM, not just the planned (VRAM) set" -- calls
+  expert_get on all
+  n_layers * n_experts pairs before a single token is generated, so that
+  figure is a constant of any warmstarted run and carries no information
+  about what the prompt routes to. Quoting it as demand was the same defect
+  this directory keeps correcting: a number read off the wrong instrument.
+
+  THE SENTENCE STANDS, on evidence the withdrawal walked past. The meter that
+  bears on it is the tier's, not the host cache's: qwen36_tier.c:1073 counts
+  hits and misses PER ROUTED EXPERT PER TOKEN --
+
+      for(int k=0;k<K;k++){ QSlot *s=qs(layer,eids[k]);
+          if(s->resident){ ... G.hits[di]++; } else G.miss++; }
+
+  -- and this record carries its output in the section above: VRAM hit rate
+  100.0 %, LFRU swaps 0, in all twelve runs. The B arm ran that at resident
+  6859/10240, which is the arm with the 100 experts displaced and therefore
+  the one the claim is about; this record carries no exact residency figure
+  for the A arm at all (the only A-labelled one it ever had was 7805, and the
+  correction above withdraws it as coming from a corrupted log). Every
+  routed expert of every decode token was resident, and the resident set never
+  changed to make that so. The routed set was a subset of the resident set, so
+  the 100 displaced experts were not routed.
+
+  Two qualifications the original sentence did not carry, and which are the
+  honest correction here. The rate is printed with one decimal, so 100.0 %
+  bounds non-resident routed lookups below about 0.05 % of lookups rather than
+  at exactly zero. And the caveat in the paragraph above -- cpu-miss is one
+  timer, and a 17.4 % host miss rate costing 0.00 ms means those misses are
+  served somewhere it does not watch -- applies to the cost half regardless.
+
+  The companion record qwen36-autoplace-2026-09-22-raw.txt captures NEITHER
+  the VRAM hit rate NOR the LFRU swap count, so it can say nothing either way,
+  and says so.
+
+The rest of this paragraph stands as written. It is a property of this card
+and this prompt, not of the change: on a smaller card, or a workload whose routing is
 flatter, the same 189 MB could displace experts that ARE missed. And the heat
 table was warmed ON THE PROMPT THAT IS THEN MEASURED, which is the most
 favourable point available for the claim that nothing needed was evicted --
@@ -272,6 +320,24 @@ alone, but on a toy model with no budget under pressure.
 The measurement that would close this is a pair of runs with COLI_PLACE UNSET,
 pre-PR binary against post-PR, same discipline. It has not been done, and this
 record does not claim it has.
+
+NOTE ADDED LATER THE SAME DAY. It has now been done, twice, and the record is
+docs/experiments/qwen36-autoplace-2026-09-22-raw.txt. The paragraph above
+stands as written for the moment it was written and is left untouched; it is
+simply no longer the current state. In one line: with COLI_PLACE unset,
+auto_place takes attnproj on this card (up to 10 -- that script reports a
+maximum, not a per-run count), and the paired delta on step() total is a median
+of -5.00 ms/token over twelve runs in two sessions, mean -4.85, 12/12 negative.
+
+On COST it adds nothing to what is already above in this file, and its evidence
+is WEAKER: it reports six-run means where this record read all twelve logs, and
+it captures neither the VRAM hit rate nor the LFRU swap count. It also does not
+record which commit either binary was built from. It bounds the cost of the
+displaced experts at under 0.03 ms/token on cpu-miss and claims nothing more --
+in particular not that they were unwanted, since miss = 10240 is the total
+expert count and the run reaches every one of them. The caveat two hundred
+lines above, that cpu-miss is one timer and the misses are served somewhere it
+does not watch, applies to that record exactly as it applies to this one.
 
 --- what is NOT claimed ----------------------------------------------------
 

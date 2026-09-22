@@ -1,0 +1,383 @@
+Qwen3.6-35B-A3B: the AUTOMATIC placer, pre-PR binary against post-PR binary,
+with COLI_PLACE unset.
+22 September 2026.
+
+This is the run that qwen36-attnproj-place-2026-09-22-raw.txt says it did not
+make. That record closes with:
+
+  "The diff this record justifies opens attnproj to the AUTOMATIC placer. Both
+   arms here ran with an EXPLICIT COLI_PLACE, which switches auto off entirely.
+   ... The measurement that would close this is a pair of runs with COLI_PLACE
+   UNSET, pre-PR binary against post-PR, same discipline. It has not been done,
+   and this record does not claim it has."
+
+It has now been done, twice, and this file is both runs. The earlier record's
+sentence stands as written for the day it was written; nothing in it is
+retracted here.
+
+Host   : Ryzen 9 7950X (16 physical cores, clang/LLVM libomp), 64 GB DDR5,
+         RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA 13.4.
+Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, prompt25.txt, N_NEW=128.
+Script : c/tools/misure-autoplace.ps1 on branch claude/misure-autoplace --
+         session 1 ran it at 0602b4b5, session 2 at 43151219. The one
+         difference between them is described under the control rows below.
+Arms   : two BINARIES, same coli_cuda.dll (#39 touches no CUDA source), built
+         per the recipe in the script's header --
+           PRE  = origin/main before #39              sha256 78CF65C7A81771A1...
+           POST = claude/attnproj-auto-place          sha256 40F665D3110F2FA8...
+         COLI_PLACE is UNSET in both arms; the script throws if it is set.
+         The script prints only the first 16 hex of each hash and does not
+         record which commit each binary was built from. See LIMITATIONS.
+
+--- what the script refused to let through ---------------------------------
+
+Checked once per invocation, at the top:
+
+  - COLI_CUDA_PROFILE / PROF / COLI_GRAPH_DIAG inherited from a parent shell.
+    Any of them disarms the expert graph or inflates the timers. This one
+    FIRED FOR REAL: a first attempt was refused on COLI_GRAPH_DIAG=1, and the
+    numbers it would have produced were never taken. (That refusal is not in
+    either session's output below -- a run that throws produces no table. It
+    is recorded here because a guard that has fired is worth more than one
+    that never has, but it is narrative, not measurement.)
+  - the two binaries being byte-identical.
+
+Checked per run, in every one of the twenty-four:
+
+  - the PRE arm placing any attnproj at all. It cannot without the patch, so a
+    nonzero count means the wrong binary was copied. It did not fire, in either
+    session: all twelve PRE runs placed 0.
+  - the POST arm placing none. That is a RESULT, not a fault, so the script
+    warns instead of throwing. It did not fire either: all twelve POST runs
+    placed more than zero.
+  - "attnproj could not be fused or uploaded" -- bytes charged to the expert
+    budget for a matrix that never reached the GPU. Did not fire.
+  - a missing "step() total" line, i.e. COLI_TIMERS not taking effect.
+  - the CUDA tier failing to come up, which on a wrong cap would put the whole
+    engine on the CPU and make both arms identical.
+
+The heat table is frozen: warmed once with the PRE binary, cached in
+heat.frozen.bin, and restored before every single run. If it drifted between
+arms the comparison would be measuring residency, not the placer.
+
+The script only performs that warm-up when heat.frozen.bin is ABSENT, so if the
+file survived between the two sessions then both sessions ran on the same
+frozen heat. The output does not say whether it did, and this record does not
+assume either way.
+
+--- session 1, 6 repetitions, ABBA order -----------------------------------
+
+  step() total, ms/token (decode only)
+
+  rip 1 (PRE first)   PRE 24.10   POST 19.00   delta -5.10
+  rip 2 (POST first)  PRE 23.80   POST 19.70   delta -4.10
+  rip 3 (PRE first)   PRE 24.00   POST 19.00   delta -5.00
+  rip 4 (POST first)  PRE 23.70   POST 19.30   delta -4.40
+  rip 5 (PRE first)   PRE 24.10   POST 19.00   delta -5.10
+  rip 6 (POST first)  PRE 23.70   POST 18.80   delta -4.90
+
+  median of the paired deltas -4.95 ms/token, 6/6 negative, worst -4.10
+  arm means 23.90 -> 19.13; range PRE 0.40, POST 0.90
+
+--- session 2, same discipline, later the same day -------------------------
+
+  rip 1 (PRE first)   PRE 24.00   POST 18.80   delta -5.20
+  rip 2 (POST first)  PRE 23.30   POST 18.90   delta -4.40
+  rip 3 (PRE first)   PRE 24.70   POST 19.70   delta -5.00
+  rip 4 (POST first)  PRE 24.60   POST 19.50   delta -5.10
+  rip 5 (PRE first)   PRE 25.10   POST 19.70   delta -5.40
+  rip 6 (POST first)  PRE 23.50   POST 19.00   delta -4.50
+
+  median of the paired deltas -5.05 ms/token, 6/6 negative, worst -4.40
+  arm means 24.20 -> 19.27; range PRE 1.80, POST 0.90
+
+--- the two sessions together ----------------------------------------------
+
+  twelve paired deltas: -5.10 -4.10 -5.00 -4.40 -5.10 -4.90
+                        -5.20 -4.40 -5.00 -5.10 -5.40 -4.50
+
+  median -5.00 ms/token, 12/12 negative, spread -5.40 .. -4.10
+  mean   -4.85 ms/token   (session means -4.77 and -4.93)
+
+Both are given because the median is the more favourable of the two by about
+0.15 ms/token in every cut of this data, and a file that gives two statistics
+for the percentages and invites the reader to pick either should not quote
+only the flattering one for the headline. For n = 6 a median is defensible
+against a single outlying repetition; it is not a reason to hide the mean.
+
+The two session medians agree to 0.10 ms/token, and all twelve runs are
+negative across a spread of 1.30 ms.
+
+No claim is made here that -4.10 is "larger than the noise", because no
+within-session drift on step() at identical configuration has been measured on
+this toolchain to compare it against. The drift figures this directory does
+carry (qwen36-place-clang-clean-2026-09-20-raw.txt) are PER-PHASE -- shared
++0.19, router +0.28 -- and are used below for the per-phase control rows only,
+where they belong. What carries the headline is the pairing and the count:
+twelve paired deltas, every one negative, in two sessions run hours apart.
+
+PERCENTAGES, kept separate from the ms figures on purpose, because an earlier
+record in this directory was caught quoting a median for one and a ratio of
+arm means for the other:
+
+  ratio of arm means   session 1  23.90/19.13 = +24.9 %
+                       session 2  24.20/19.27 = +25.6 %
+  median of the per-repetition percentages
+                       session 1  +26.2 %      session 2  +25.8 %
+
+Both statistics are given for both sessions so the reader can pick either and
+see that the choice does not change the answer.
+
+--- position effect: it repeats in the means, but not cleanly ---------------
+
+  session 1  PRE-first  -5.10 -5.00 -5.10   mean -5.07
+             POST-first -4.10 -4.40 -4.90   mean -4.47   difference -0.60
+  session 2  PRE-first  -5.20 -5.00 -5.40   mean -5.20
+             POST-first -4.40 -5.10 -4.50   mean -4.67   difference -0.53
+
+The difference between the two orders reproduces in sign and size: -0.60 and
+-0.53. That is worth recording rather than averaging away, and it is the
+reason the ABBA order exists -- the median over all six is not tilted by it.
+
+What does NOT reproduce is a clean separation. In session 1 the two groups do
+not overlap. In session 2 they do: repetition 4 (POST first) reads -5.10,
+larger than repetition 3 (PRE first) at -5.00. So the honest statement is that
+the ORDER MEANS differ consistently, not that every PRE-first run beats every
+POST-first run. An earlier summary of this data said "PRE-first always larger";
+that is true of session 1 and false of session 2, and is corrected here.
+
+The effect is not attributed. Nothing here says what causes it.
+
+--- the rows that should NOT move ------------------------------------------
+
+These are the falsification: attention is where the patch acts, (shared) and
+(router) are not, and a delta that showed up everywhere would mean the arms
+differ for some reason other than the placement.
+
+  session 2, mean over the six runs of each arm, ms/token
+
+    (shared)     3.69  ->  3.81    +0.12
+    (router)     0.75  ->  0.80    +0.05
+    attention    5.54  ->  2.01    -3.53
+
+  attention's share of the total: 3.53 / 4.93 = 71.6 %. BOTH NUMBERS ARE ARM
+  MEANS over the six runs -- the -3.53 above, and the session's mean paired
+  delta of -4.93. An earlier version of this file divided the mean phase delta
+  by the MEDIAN paired delta (-5.05) and published "70 %": a mean over a
+  median, which is the exact mixing this file objects to two sections above.
+  Corrected, 22 September 2026. The mean-over-mean figure is the larger one,
+  so the correction does not flatter the result.
+
+  session 1: (shared) and (router) are NOT AVAILABLE.
+
+    They printed NaN. That was a defect in the script, not in the engine: the
+    regex looked for the bare names, and qwen36.c:831 prints them with
+    parentheses because they are subsets of moe_total and must not be summed --
+
+        static const char *nm[6]={"deltanet","attention","moe_total",
+                                  "(shared)","(router)","lm_head"};
+
+    So in session 1 the control that these two rows promise did not run at all,
+    and the script printed three letters where a verification should have been.
+    It was fixed between the sessions (claude/misure-autoplace, commit
+    43151219), which also added an explicit warning so a future NaN says it is
+    the script's fault. Session 1's attention row was read by a different regex
+    and is unaffected: 5.46 -> 1.87, -3.59, which on the same mean-over-mean
+    basis is 3.59 / 4.77 = 75.3 % of that session's total. (An earlier version
+    divided by the median and published "72 %"; on that basis the figure was
+    in any case 72.5, not 72.)
+
+  So the control exists for session 2 only. It passes: +0.12 and +0.05 both
+  sit inside the arm-to-arm drift this repo has already measured and failed to
+  explain on a clang binary (qwen36-place-clang-clean-2026-09-20-raw.txt:
+  shared +0.19, router +0.28 at identical residency), while attention carries
+  71.6 % of the delta in session 2 and 75.3 % in session 1.
+
+  THAT PASS BAND COMES FROM ANOTHER DAY, and it is the only thing in this file
+  that does. It is also not a like-for-like band: those arms were the SAME
+  binary under two COLI_PLACE settings, where these are TWO BINARIES under
+  auto. Using one as a tolerance for the other is an assumption, stated here
+  rather than hidden.
+
+THE TWO SESSIONS DID NOT RUN THE SAME SCRIPT. The diff between them is commit
+43151219 and it is two regexes plus a warning. It does not touch how step() is
+read, nor the budget, expert-count, hit-rate or cpu-miss regexes, nor the
+order, the guards or the frozen heat. So the replication of the headline is a
+replication; what session 2 adds is the control that session 1 could not run.
+
+--- what the placer decided, and what it cost ------------------------------
+
+Identical in both sessions. attnproj is the MAXIMUM over the six runs of the
+arm; every other column is the MEAN over them:
+
+  POST   attnproj 10*  budget 12.09 GB   ~6859 experts   hit 82.6 %   cpu-miss 0.00
+  PRE    attnproj  0*  budget 12.26 GB   ~6959 experts   hit 82.6 %   cpu-miss 0.00
+                   \-- maximum, not mean
+
+So, left to itself and with no COLI_PLACE at all, auto_place TAKES attnproj on
+this card: up to 10 of them, 0.17 GB of budget, 100 experts. THAT is what the
+explicit-COLI_PLACE record could not answer -- whether auto would take the
+offer at all -- and it is what this run adds.
+
+WHAT THIS RUN DOES NOT ADD IS THE COST. An earlier version of this section
+claimed it did, saying "the exchange is free" and "the 100 displaced experts
+are ones this prompt does not ask for". A SECOND correction, later the same
+day, then withdrew those on an argument that was itself wrong. Both moves are
+recorded here, because the second one is the more instructive.
+
+None of the expert counters involved is printed by THIS record: its table
+carries `hit 82.6 %` and `~6859 experts`, both six-run means, from which
+counts cannot be recovered. `hit=48640 miss=10240` and `resident 6859/10240`
+come from the explicit-COLI_PLACE record of the same day, and are quoted as
+that record's output, not as this one's.
+
+  THE WITHDRAWAL'S OWN ARGUMENT WAS FALSE. It read: "miss = 10240, and 10240
+  is the TOTAL number of experts, so every expert is reached, so 'ones this
+  prompt does not ask for' is contradicted". The premise is a warmstart
+  constant, not a measurement of routing. tier_warmstart in c/qwen36.c, under its own
+  comment "Load ALL experts into RAM, not just the planned (VRAM) set", runs
+
+      #pragma omp parallel for schedule(dynamic, 16)
+      for (int gi = 0; gi < cap_total; gi++) { ... expert_get(m, l, eidw, &e); }
+
+  over cap_total = n_layers * n_experts, under its own comment "Load ALL
+  experts into RAM, not just the planned (VRAM) set", BEFORE a single token is
+  generated. So miss reaches exactly the expert count on ANY warmstarted run
+  of this model at this cap, identical for every prompt, arm and placement.
+  The sibling record had already written this -- "the 10240 misses are the
+  cold first touch of each expert and are identical by construction" -- and
+  the withdrawal quoted that phrase while using the same number as if it
+  measured demand. It says nothing about what the prompt routes to.
+
+  Found by review, 22 September 2026. The correction is retracted; the
+  claim it retracted is reinstated in the record that can carry it (below).
+
+  THE HIT RATE THIS RECORD QUOTES CANNOT SEE THE PLACEMENT, and that half of
+  the correction STANDS. The script reads the line `Expert cache hit rate:`,
+  which qwen36.c prints from m.hits/m.miss. Those are incremented in
+  expert_get() against m->cache[layer] -- the HOST LRU slot cache. They are
+  not the tier's VRAM counters. With cap == n_experts the per-layer cache has
+  a slot for every expert, so nothing is ever evicted and the rate is pinned
+  by construction. (What guarantees cap == n_experts in these runs is that
+  the CUDA tier came up at all -- qwen36_tier.c:499 refuses any cap that
+  DIFFERS from the expert count, not merely a smaller one, and the script
+  treats the tier failing to come up as a hard stop. An explicit -Cap is not
+  by itself the guarantee: with RAM_GB set, qwen36.c lowers even an explicit
+  cap.) An unchanged 82.6 % here is not evidence about what the GPU did.
+
+  THE METER THAT DOES BEAR ON IT IS NOT IN THIS RECORD. qwen36_tier.c:1073
+  counts, per routed expert per token,
+
+      for(int k=0;k<K;k++){ QSlot *s=qs(layer,eids[k]);
+          if(s->resident){ ... G.hits[di]++; } else G.miss++; }
+
+  and prints the result as `[qtier] VRAM hit rate` with `LFRU swaps`. THAT is
+  the meter which says whether a displaced expert was ever wanted. The
+  explicit-COLI_PLACE record captured it and reads 100.0 % with 0 swaps in all
+  twelve runs, which is why its version of the claim stands there. This
+  script captures neither figure -- see LIMITATIONS -- so this record can
+  neither support nor contradict it.
+
+  THE BOUND ON cpu-miss IS WEAKER THAN FIRST WRITTEN, and that correction
+  stands too. An earlier version said a mean of 0.00 to two decimals means
+  "no individual run carried one either". cpu-miss is a continuous ms/token
+  quantity, not a count -- it reads 4.79 and 5.06 in
+  qwen36-place-clang-clean-2026-09-20-raw.txt:48 -- so a six-run mean below
+  0.005 bounds the six-run sum below 0.03 and therefore each run below 0.03
+  ms/token. Small, and not zero.
+
+So what this run establishes about cost is one thing only: displacing 100
+experts cost under 0.03 ms/token on the one timer here that watches it. It
+does not establish that they were unwanted, and -- contrary to what the first
+correction said -- it does not establish the opposite either.
+
+And the cost evidence here is WEAKER than the explicit-COLI_PLACE record's,
+not stronger. That record read the per-run values from all twelve logs and
+also carried `VRAM hit rate 100.0 %, LFRU swaps 0, in all twelve`. This
+script captures neither VRAM hit rate nor LFRU swaps, and reports means rather
+than per-run values. The four cost numbers above are byte-for-byte the ones
+that record already published; this run does not improve on them.
+
+It is an answer about THIS card, THIS prompt and THIS heat table, and the heat
+table was warmed on the prompt that is then measured -- the most favourable
+point available for the claim that nothing needed was evicted. On an 8 or 12 GB
+card, or with flatter routing, the same 100 experts could be ones the run does
+want, and the cost would appear in cpu-miss. qwen36_tier.c:310 says the placer
+will take the trunk anyway: without a heat table the marginal expert is worth
+2*topk/n_experts per byte (0.06 here) and "the trunk always wins".
+
+--- LIMITATIONS ------------------------------------------------------------
+
+Stated because each one is something a reader could otherwise assume:
+
+  - The commits behind the two binaries are NOT recorded. The script prints 16
+    hex of each sha256 and the header gives the build recipe, but nothing in
+    the output ties PRE to a specific main commit or POST to a specific branch
+    commit. The script should print that; it does not.
+  - AND THAT UNDERMINES THE "SAME DLL" CONTROL ABOVE. Reusing one coli_cuda.dll
+    removes a confounder only if both binaries were built from commits that
+    differ by #39 alone. #39 itself touches no CUDA source -- that part is
+    verified -- but with neither commit recorded, "the DLL is the same" cannot
+    be checked against "the sources differ by exactly the change under test".
+    The two limitations are one limitation.
+  - The hit rate this record quotes is the HOST expert cache's, not the tier's
+    VRAM hit rate, and the script captures neither the VRAM hit rate nor the
+    LFRU swap count that the explicit-COLI_PLACE record carried. The cost
+    evidence here is weaker than that record's, not stronger; see the section
+    on what the placer decided.
+  - attnproj 10 is the MAXIMUM over the six runs of the arm, not a per-run
+    figure. What is established per run is that every POST run placed more
+    than zero (the warning never fired) and every PRE run placed exactly zero
+    (the guard would have thrown).
+  - budget, expert count, hit rate and cpu-miss are MEANS over six runs. The
+    script does not print them per run, so "identical in every repetition" is
+    not established here the way it was in the explicit-COLI_PLACE record,
+    where the per-run values were read from all twelve logs.
+  - (shared) and (router) are missing for session 1, as described above.
+  - The per-phase rows are arm means over six runs; there are no error bars.
+  - Nothing here measures prefill. The fused GEMV is mounted only at S == 1.
+
+--- what is NOT claimed ----------------------------------------------------
+
+The PRE arm reads 23.90 and 24.20 on step() in these two sessions. The A arm of
+qwen36-attnproj-place-2026-09-22-raw.txt reads 25.20 on the same timer earlier
+the same day. THESE ARE NOT COMPARABLE and no difference between them is
+claimed: that arm ran with an explicit COLI_PLACE pinning six components, this
+one runs with none, so the two "baselines" are different configurations of the
+engine, quite apart from being different sessions. And the session-to-session
+drift on this timer is itself larger than most effects this directory
+publishes: qwen36-attnproj-place-2026-09-22-raw.txt records step() reading
+24.05, 24.25, 26.65, 27.40, 27.20 and 25.20 across six sessions of four days,
+with the code unchanged between several of them.
+
+No TIMING COMPARISON here crosses a session: every delta is paired within one
+session and every arm statistic comes from the arm's own six runs. That is the
+claim that matters, and it holds.
+
+Figures from elsewhere DO appear, and they are listed here rather than
+glossed, because an earlier version of this paragraph claimed nothing here
+came from another day, a later one claimed exactly one thing did, and a third
+narrowed it to "every timing number" -- which lands on the one category the
+paragraph above violates, since it quotes step() readings from six sessions of
+four days. Three wordings, three times wrong, each time by trying to state it
+more precisely than the data allows.
+
+  - the tolerance band the control rows are judged against (shared +0.19,
+    router +0.28) is from 20 September, and it is what makes the control
+    "pass";
+  - cpu-miss reading 4.79 and 5.06, cited to show the timer is continuous
+    rather than a count, is from the same 20 September record;
+  - hit=48640 / miss=10240, `resident 6859/10240`, and `VRAM hit rate
+    100.0 %, LFRU swaps 0` are from the explicit-COLI_PLACE record of THIS
+    day. They are quoted to say what this run does NOT measure, not as
+    results of it.
+  - the step() readings 24.05, 24.25, 26.65, 27.40, 27.20 and 25.20, quoted
+    two paragraphs above to show how far this timer drifts between sessions.
+    They are timings, and they are from six sessions across four days. They
+    are cited as the REASON not to compare across sessions, which is the
+    opposite of comparing across sessions -- but they are imported, and an
+    earlier wording of the sentence above silently excluded them.
+
+
+Nothing here says anything about a card other than this one, a model other
+than Qwen3.6-35B-A3B, a context other than this prompt, or prefill.
