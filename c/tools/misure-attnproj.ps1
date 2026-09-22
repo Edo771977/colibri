@@ -119,6 +119,43 @@ function Run-Arm([string]$Place, [string]$Tag, [int]$Rep) {
     $log = "attnproj-$Tag-r$Rep.log"
     $txt = Invoke-Engine $Place $log
 
+    # guardia: B DEVE piazzare attnproj, A non deve.
+    #
+    # NON cercare la stringa "attnproj" nel log: PowerShell trasforma ogni
+    # riga di stderr del motore in un ErrorRecord e il suo formattatore
+    # aggiunge "In C:\...\misure-attnproj.ps1:NN car:5" -- cioe' il log
+    # contiene il NOME DI QUESTO FILE, e la guardia trovava se stessa.
+    # L'unica prova che il placement sia avvenuto e' la riga che qwen36.c:1533
+    # stampa solo quando placed > 0.
+    $placed = 0
+    if ($txt -match '\[place\]\s+(\d+)\s+attnproj \(q\+\+k\+\+v fused\) on GPU') { $placed = [int]$Matches[1] }
+    if ($Tag -eq "B" -and $placed -eq 0) {
+        throw "braccio B rip ${Rep}: il motore non ha annunciato nessun attnproj piazzato. COLI_PLACE non ha avuto effetto e i due bracci sarebbero identici. Vedi $log"
+    }
+    if ($Tag -eq "A" -and $placed -gt 0) {
+        throw "braccio A rip ${Rep}: il motore ha piazzato $placed attnproj sul braccio di riferimento. Vedi $log"
+    }
+    if ($txt -match 'attnproj could not be fused or uploaded') {
+        throw "$Tag rip ${Rep}: alcuni attnproj non sono stati caricati ma i loro byte restano addebitati al budget. Il confronto non e' pulito. Vedi $log"
+    }
+
+    if ($txt -match 'tier disabled') {
+        throw "il tier CUDA si e' disabilitato da solo durante la scaldata (vedi attnproj-warmup.log): senza device questa misura non ha senso. Controlla -Cap."
+    }
+    if ($txt -notmatch 'Speed:\s*([0-9]+\.[0-9]+)\s*tok/s') {
+        throw "la scaldata non e' arrivata in fondo -- vedi attnproj-warmup.log"
+    }
+    "scaldata ok: {0} tok/s" -f $Matches[1]
+    Copy-Item heat.bin heat.frozen.bin -Force
+    "heat congelata in heat.frozen.bin"
+    ""
+}
+
+function Run-Arm([string]$Place, [string]$Tag, [int]$Rep) {
+    Copy-Item heat.frozen.bin heat.bin -Force   # heat identico in ogni run
+    $log = "attnproj-$Tag-r$Rep.log"
+    $txt = Invoke-Engine $Place $log
+
     # guardia: B DEVE piazzare attnproj, A non deve
     $named = [regex]::Matches($txt, 'attnproj').Count
     if ($Tag -eq "B" -and $named -eq 0) {
@@ -138,7 +175,7 @@ function Run-Arm([string]$Place, [string]$Tag, [int]$Rep) {
     $miss = if ($txt -match 'cpu-miss\s+([0-9.]+)') { [double]$Matches[1] } else { [double]::NaN }
     $hit  = if ($txt -match 'Expert cache hit rate:\s*([0-9]+\.[0-9]+)\s*%') { [double]$Matches[1] } else { [double]::NaN }
 
-    [pscustomobject]@{ Rep=$Rep; Arm=$Tag; Ms=(1000.0/$toks); Toks=$toks; Attn=$attn; Miss=$miss; Hit=$hit }
+    [pscustomobject]@{ Rep=$Rep; Arm=$Tag; Ms=(1000.0/$toks); Toks=$toks; Attn=$attn; Miss=$miss; Hit=$hit; Placed=$placed }
 }
 
 $rows = @()
@@ -170,11 +207,12 @@ $med = if ($Reps % 2 -eq 1) { $s[[int]($Reps/2)] } else { ($s[$Reps/2-1] + $s[$R
 ""
 "--- medie per braccio ---"
 $rows | Group-Object Arm | Sort-Object Name | % {
-    "{0}:  attention {1,5:N2}   cpu-miss {2,5:N2}   hit {3,5:N1} %   {4,5:N2} tok/s" -f $_.Name,
+    "{0}:  attention {1,5:N2}   cpu-miss {2,5:N2}   hit {3,5:N1} %   {4,5:N2} tok/s   attnproj piazzati {5}" -f $_.Name,
         (($_.Group | % { $_.Attn } | Measure-Object -Average).Average),
         (($_.Group | % { $_.Miss } | Measure-Object -Average).Average),
         (($_.Group | % { $_.Hit  } | Measure-Object -Average).Average),
-        (($_.Group | % { $_.Toks } | Measure-Object -Average).Average)
+        (($_.Group | % { $_.Toks } | Measure-Object -Average).Average),
+        (($_.Group | % { $_.Placed } | Measure-Object -Maximum).Maximum)
 }
 ""
 "Attesa: 'attention' scende di 2-3 ms in B. Se scende ma il totale no, il guadagno"
