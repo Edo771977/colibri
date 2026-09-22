@@ -37,7 +37,14 @@ param(
     [string] $Snap   = "C:\modelli\qwen36_i4_gs64",
     [string] $Exe    = ".\qwen36_clang.exe",
     [string] $Prompt = "prompt25.txt",
-    [int]    $Cap    = 16,
+    # Il primo argomento posizionale e' la cache di esperti per layer, e il
+    # tier CUDA si attiva SOLO se copre tutti gli esperti del modello:
+    # qwen36_tier.c:499 rifiuta cap != n_experts e torna 0, e da li' in poi il
+    # motore gira interamente su CPU. Con cap=16 (il default del banner) la
+    # scaldata ha fatto 4.16 tok/s contro i ~37 attesi, e COLI_PLACE non
+    # piazzava niente perche' non c'era nessun device: dodici ripetizioni
+    # sarebbero passate, con delta zero e nessun modo di accorgersene.
+    [int]    $Cap    = 256,
     [int]    $Bits   = 4,
     [int]    $Reps   = 6,
     [int]    $NNew   = 128
@@ -95,6 +102,9 @@ function Invoke-Engine([string]$Place, [string]$Log) {
 if (-not (Test-Path "heat.frozen.bin")) {
     "heat.frozen.bin non c'e': faccio la scaldata (un run, ~1 minuto)..."
     $txt = Invoke-Engine $A "attnproj-warmup.log"
+    if ($txt -match 'tier disabled') {
+        throw "il tier CUDA si e' disabilitato da solo durante la scaldata (vedi attnproj-warmup.log): senza device questa misura non ha senso. Controlla -Cap."
+    }
     if ($txt -notmatch 'Speed:\s*([0-9]+\.[0-9]+)\s*tok/s') {
         throw "la scaldata non e' arrivata in fondo -- vedi attnproj-warmup.log"
     }
@@ -118,6 +128,9 @@ function Run-Arm([string]$Place, [string]$Tag, [int]$Rep) {
         throw "braccio A rip ${Rep}: 'attnproj' compare nel log, il riferimento e' contaminato. Vedi $log"
     }
 
+    if ($txt -match 'tier disabled') {
+        throw "$Tag rip ${Rep}: il tier CUDA si e' disabilitato da solo (vedi $log). Senza device COLI_PLACE non piazza niente e i due bracci sono identici. Controlla -Cap: deve essere uguale al numero di esperti del modello."
+    }
     if ($txt -notmatch 'Speed:\s*([0-9]+\.[0-9]+)\s*tok/s') { throw "$Tag rip ${Rep}: riga Speed non trovata in $log" }
     $toks = [double]$Matches[1]
 
