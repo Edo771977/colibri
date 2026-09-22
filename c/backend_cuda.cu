@@ -1602,6 +1602,53 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
 
+/* THE EIGHT BUFFERS A CAPTURED GRAPH BAKES IN, and the only place that says
+ * so. A cudaGraph records the addresses it was captured with; reserve() and
+ * reserve_pinned() FREE the old block before allocating the new one, so any
+ * growth of one of these turns a live graph into a pointer to freed memory
+ * whose signature still matches -- buf_gen has not moved, and neither has
+ * branch_ or count.
+ *
+ * #38 widened this check from five pointers to eight and moved it in front of
+ * the early return, which made it complete INSIDE
+ * coli_cuda_expert_group_issue_x. It left standing the unwritten assumption
+ * that nothing else moves these buffers. Five functions in this file do:
+ * expert_group_impl, coli_cuda_expert_mlp, coli_cuda_shared_mlp_w4a16,
+ * coli_cuda_expert_group_resident_issue and coli_cuda_matmul_mxfp4. qwen36
+ * and qwen38 never mix those paths with the graph, which is why nothing has
+ * gone wrong; colibri.c does, behind COLI_GROUP_ASYNC=1, where a long prefill
+ * through expert_group_impl grows x/y/gate/up/host_x/host_y and the next
+ * decode replays a graph against what it freed.
+ *
+ * So the invariant gets a name and both halves of it live here. Every
+ * function that can move one of the eight brackets its reserves with these
+ * two, and the assumption is a mechanism instead of a comment. */
+#define COLI_GROUP_BUFS 8
+static void group_bufs_snapshot(const DeviceContext *ctx,const void **pre){
+    pre[0]=ctx->x;   pre[1]=ctx->y;      pre[2]=ctx->gate;   pre[3]=ctx->up;
+    pre[4]=ctx->group_desc; pre[5]=ctx->host_x; pre[6]=ctx->host_y;
+    pre[7]=ctx->host_desc;
+}
+/* Called even when the reserves FAILED: reserve() nulls what it could not
+ * grow, so a failure shows up here as a moved pointer -- but only if this is
+ * reached. That was finding 5 of #38, and it applies to every caller. */
+static void group_bufs_check(DeviceContext *ctx,const void *const *pre){
+    const void *now[COLI_GROUP_BUFS];
+    group_bufs_snapshot(ctx,now);
+    int moved=0;
+    for(int i=0;i<COLI_GROUP_BUFS;i++) if(pre[i]!=now[i]){ moved=1; break; }
+    if(!moved) return;
+    ctx->buf_gen++;
+#if COLI_GPU_HAS_GRAPH
+    /* The signature check alone would stop them being USED; they still have
+     * to be freed, or a run that keeps growing its buffers keeps a dead graph
+     * per generation. */
+    for(int gi=0;gi<9;gi++) if(ctx->graph_exec[gi]){
+        cudaGraphExecDestroy(ctx->graph_exec[gi]);
+        ctx->graph_exec[gi]=nullptr; ctx->graph_gen[gi]=0; }
+#endif
+}
+
 #ifdef COLI_ANS
 static void *ans_arena_alloc(DeviceContext *ctx,size_t bytes){
     bytes=(bytes+255)&~size_t(255);
@@ -2449,7 +2496,10 @@ extern "C" int coli_cuda_matmul_mxfp4(float *y, const float *x,
     if (!cuda_ok(cudaMalloc(&dw, wb), "mxfp4 weight alloc")) return 0;
     if (!cuda_ok(cudaMalloc(&ds, sb), "mxfp4 scale alloc")) { cudaFree(dw); return 0; }
 
-    int ok = reserve(&ctx->x, &ctx->x_cap, xb) && reserve(&ctx->y, &ctx->y_cap, yb) &&
+    const void *pre[COLI_GROUP_BUFS]; group_bufs_snapshot(ctx,pre);
+    int reserved_ = reserve(&ctx->x, &ctx->x_cap, xb) && reserve(&ctx->y, &ctx->y_cap, yb);
+    group_bufs_check(ctx,pre);        /* x and y are two of the eight */
+    int ok = reserved_ &&
              cuda_ok(cudaMemcpy(dw, q4, wb, cudaMemcpyHostToDevice), "mxfp4 weight upload") &&
              cuda_ok(cudaMemcpy(ds, e8s, sb, cudaMemcpyHostToDevice), "mxfp4 scale upload") &&
              cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "mxfp4 input upload");
@@ -2483,8 +2533,11 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     int D = gate->I, I = gate->O;
     size_t xb=(size_t)S*D*sizeof(float), ib=(size_t)S*I*sizeof(float);
     size_t yb=(size_t)S*D*sizeof(float);
-    if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
-        !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+    const void *pre[COLI_GROUP_BUFS]; group_bufs_snapshot(ctx,pre);
+    int ok_ = reserve(&ctx->x,&ctx->x_cap,xb) && reserve(&ctx->y,&ctx->y_cap,yb) &&
+              reserve(&ctx->gate,&ctx->gate_cap,ib) && reserve(&ctx->up,&ctx->up_cap,ib);
+    group_bufs_check(ctx,pre);        /* these four are baked into a captured graph */
+    if (!ok_) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
     quant_matmul_launch(ctx->gate,ctx->x,gate->weights,gate->scales,
         gate->fmt,S,D,I,row_bytes(gate->fmt,D),gate->gs,gate->ng);
@@ -2511,10 +2564,13 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
        gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
     DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||!COLI_GPU_HAS_WMMA||ctx->compute_major<7)return 0;
     int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
-    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
-       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
-       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    const void *pre[COLI_GROUP_BUFS]; group_bufs_snapshot(ctx,pre);
+    int ok_=reserve(&ctx->x,&ctx->x_cap,xb)&&reserve(&ctx->gate,&ctx->gate_cap,ib)&&
+       reserve(&ctx->up,&ctx->up_cap,ib)&&reserve(&ctx->y,&ctx->y_cap,xb)&&
+       reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)&&
+       reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb);
+    group_bufs_check(ctx,pre);        /* six of the eight */
+    if(!ok_)return 0;
     std::memcpy(ctx->host_x,x,xb);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                                "shared w4a16 input upload"))return 0;
@@ -2608,12 +2664,17 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
-    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
-       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
-       !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))) return 0;
+    const void *pre[COLI_GROUP_BUFS]; group_bufs_snapshot(ctx,pre);
+    int ok_=reserve(&ctx->x,&ctx->x_cap,xb)&&reserve(&ctx->y,&ctx->y_cap,xb)&&
+       reserve(&ctx->gate,&ctx->gate_cap,ib)&&reserve(&ctx->up,&ctx->up_cap,ib)&&
+       reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc));
     int async=!getenv("COLI_CUDA_ASYNC")||atoi(getenv("COLI_CUDA_ASYNC"));
-    if(async&&(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-               !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)))return 0;
+    if(ok_&&async) ok_=reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)&&
+                       reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb);
+    /* The sync path is what a long prefill takes while a graph captured by the
+     * decode path is still armed: this is the call that moves the buffers. */
+    group_bufs_check(ctx,pre);
+    if(!ok_) return 0;
     cudaError_t copy_desc=async?cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                                 cudaMemcpyHostToDevice,ctx->stream)
                                :cudaMemcpy(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),cudaMemcpyHostToDevice);
@@ -2890,8 +2951,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
      * that had just been freed underneath. reserve() nulls what it could not
      * grow, so a failure always shows up in this comparison -- but only if
      * the comparison is reached. */
-    const void *pre[8]={ctx->x,ctx->y,ctx->gate,ctx->up,ctx->group_desc,
-                        ctx->host_x,ctx->host_y,ctx->host_desc};
+    const void *pre[COLI_GROUP_BUFS]; group_bufs_snapshot(ctx,pre);
     int reserved_=reserve(&ctx->x,&ctx->x_cap,xb)&&reserve(&ctx->y,&ctx->y_cap,yb)&&
        reserve(&ctx->gate,&ctx->gate_cap,ib)&&reserve(&ctx->up,&ctx->up_cap,ib)&&
        reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))&&
@@ -2899,19 +2959,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
        reserve_pinned(&ctx->host_y,&ctx->host_y_cap,yb)&&
        reserve_pinned_bytes(&ctx->host_desc,&ctx->host_desc_cap,
                             (size_t)count*sizeof(GroupDesc));
-    if(pre[0]!=ctx->x||pre[1]!=ctx->y||pre[2]!=ctx->gate||pre[3]!=ctx->up||
-       pre[4]!=ctx->group_desc||pre[5]!=ctx->host_x||pre[6]!=ctx->host_y||
-       pre[7]!=ctx->host_desc){
-        ctx->buf_gen++;
-#if COLI_GPU_HAS_GRAPH
-        /* The signature check alone would stop them being USED; they still
-         * have to be freed, or a run that keeps growing its buffers keeps a
-         * dead graph per generation. */
-        for(int gi=0;gi<9;gi++) if(ctx->graph_exec[gi]){
-            cudaGraphExecDestroy(ctx->graph_exec[gi]);
-            ctx->graph_exec[gi]=nullptr; ctx->graph_gen[gi]=0; }
-#endif
-    }
+    group_bufs_check(ctx,pre);
     if(!reserved_) return 0;          /* after the invalidation, never before */
     std::memcpy(ctx->host_desc,host,(size_t)count*sizeof(GroupDesc));
     std::memcpy(ctx->host_x,x,xb);
@@ -3765,11 +3813,15 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
      * and a realloc here could free a buffer the PREVIOUS layer's still-queued
      * async work on this stream reads. Fixed caps make re-issue realloc-free. */
     size_t xb=(size_t)64*D*sizeof(float), ib=(size_t)64*I*sizeof(float);
-    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
-       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
-       !reserve(&ctx->ac,&ctx->ac_cap,(size_t)(D+64)*sizeof(float))||
-       !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)64*sizeof(GroupDesc)))
-        return 0;
+    const void *pre[COLI_GROUP_BUFS]; group_bufs_snapshot(ctx,pre);
+    int ok_=reserve(&ctx->x,&ctx->x_cap,xb)&&reserve(&ctx->y,&ctx->y_cap,xb)&&
+       reserve(&ctx->gate,&ctx->gate_cap,ib)&&reserve(&ctx->up,&ctx->up_cap,ib)&&
+       reserve(&ctx->ac,&ctx->ac_cap,(size_t)(D+64)*sizeof(float))&&
+       reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)64*sizeof(GroupDesc));
+    /* Sized for the 64-expert cap, so the FIRST call here reallocates by
+     * construction -- about 8x the decode size. */
+    group_bufs_check(ctx,pre);
+    if(!ok_) return 0;
     float *w_dev=ctx->ac+D, *partial_local=ctx->ac;
     if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                 cudaMemcpyHostToDevice,ctx->stream),"resident group desc")||
