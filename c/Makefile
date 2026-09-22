@@ -2262,3 +2262,7 @@ tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c k
 # Release owned projections and experts before CUDA teardown, then reopen safely.
 tests/test_qwen36_tier_release$(EXE): tests/test_qwen36_tier_release.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Failed gate/up/down uploads must release every unpublished CUDA tensor.
+tests/test_qwen36_tier_rollback$(EXE): tests/test_qwen36_tier_rollback.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
