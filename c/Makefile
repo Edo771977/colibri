@@ -2274,3 +2274,7 @@ tests/test_qwen36_tier_scale_budget$(EXE): tests/test_qwen36_tier_scale_budget.c
 # Async collection errors must drain all devices and reject partial output.
 tests/test_qwen36_tier_take_error$(EXE): tests/test_qwen36_tier_take_error.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Failed tier startup must release host storage and initialized synchronization.
+tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
