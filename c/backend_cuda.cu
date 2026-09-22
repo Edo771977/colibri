@@ -1603,7 +1603,10 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
 }
 
 /* THE EIGHT BUFFERS A CAPTURED GRAPH BAKES IN -- x, y, gate, up, group_desc,
- * host_x, host_y, host_desc -- and the only place that has to know it.
+ * host_x, host_y, host_desc. The list also lives in
+ * tests/test_graph_reserve_wrappers.py, which enforces what is written below;
+ * a field added or renamed here has to be renamed there too, and that test
+ * says so when it goes red.
  *
  * A cudaGraph records the addresses it was captured with, and reserve() frees
  * the old block before allocating the new one, so growing any of these turns a
@@ -1624,9 +1627,17 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
  *
  * A list that was wrong twice is the wrong mechanism. So the invalidation
  * happens at the reserve itself: reserve_graph* does the allocation and, if
- * the pointer moved, bumps buf_gen and throws the graphs away. A tenth site
- * cannot forget, because forgetting now means calling plain reserve() on a
- * field whose type says which wrapper it needs.
+ * the pointer moved, bumps buf_gen and throws the graphs away.
+ *
+ * That is a convention, not something the compiler checks: ctx->y is a float*
+ * exactly like ctx->ac and ctx->aq, plain reserve() stays legitimate on those,
+ * and a tenth site writing reserve(&ctx->y, ...) would compile in silence. An
+ * earlier version of this comment claimed the type made forgetting impossible.
+ * It does not. tests/test_graph_reserve_wrappers.py enforces it instead: it
+ * reads this file and fails, naming the line, on a bare reserve applied to any
+ * of the eight. It runs under make check on every platform, including the ones
+ * with no CUDA toolchain. What it cannot see is this function being gutted --
+ * that half is tests/test_grouped_g4_cuda.cu, which needs a card.
  *
  * A FAILED reserve invalidates too: reserve() nulls what it could not grow, so
  * the pointer has moved and the graph must not survive. That was finding 5 of
