@@ -259,7 +259,7 @@ int main(void) {
     /* Explicit-only until 22 September 2026, on the argument that kept
      * dnout/attnout out until 19 September: a default does not move on a
      * prediction. The A/B has now been run on the target hardware -- median
-     * -4.80 ms/token, 6/6 negative, 33.13 -> 39.70 tok/s, counterbalanced
+     * -5.1 ms/token on step() (decode only), 6/6 negative, counterbalanced
      * order, frozen heat table, cpu-miss 0.00 in both arms
      * (docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt) -- so the
      * offer goes in unconditionally and the placer weighs it like the others.

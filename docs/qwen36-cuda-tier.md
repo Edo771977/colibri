@@ -375,9 +375,13 @@ COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0,attnproj=0"   # B
 ```
 
 Six repetitions, order counterbalanced inside each repetition, heat table
-frozen, RTX 4070 Ti SUPER 16 GB: **median −4.80 ms/token, 6/6 negative, 33.13
-→ 39.70 tok/s (+19.8 %)**, worst of the six −3.70. The attention row goes 5.76
-→ 1.94 ms/token, which is 73 % of it; the rest lands on dense GEMVs that were
+frozen, RTX 4070 Ti SUPER 16 GB, read from `step() total` so that it is the
+same metric the −7.77 above was quoted on: **25.20 → 20.02 ms/token, median of
+the paired deltas −5.1, worst of the six −4.0, 6/6 negative, +25.9 % decode
+throughput**. (The wall-clock `Speed:` line gives −4.80 and +19.8 %, but it
+carries the prefill, which this change does not touch — `S == 1` only — so a
+percentage computed on it is not comparable to the +14.9 % above.) The
+attention row goes 5.76 → 1.94 ms/token, which is 73 % of it; the rest lands on dense GEMVs that were
 already on the GPU, and the raw record keeps the explanation for that labelled
 as an untested hypothesis. `cpu-miss` stayed at 0.00 with the same VRAM hit
 rate in both arms, so on this card the displaced experts are ones the run does
