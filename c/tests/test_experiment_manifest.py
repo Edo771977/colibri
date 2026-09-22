@@ -22,23 +22,39 @@ def run(config, speeds):
 
 
 def _pattern_to_regex(pattern, anchored):
-    """git's pathspec globbing: `*` stops at `/`, `**` does not."""
+    """git's .gitattributes globbing.
+
+    `*` and `?` stop at `/`. `**` spans whole path components: `a/**/b`
+    matches `a/b` and `a/x/y/b` but NOT `a/xb`, which is where a version of
+    this that translated `**` to `.*` silently unpinned every record.
+    `[!abc]` is a NEGATED class -- git's spelling of `[^abc]`, and reading it
+    as a positive one inverted the match.
+    """
     out, i, n = [], 0, len(pattern)
     while i < n:
         c = pattern[i]
         if c == "*":
             if pattern[i:i + 2] == "**":
-                out.append(".*")
                 i += 2
                 if pattern[i:i + 1] == "/":
+                    out.append("(?:[^/]+/)*")       # zero or more components
                     i += 1
+                else:
+                    out.append(".*")                # trailing ** : everything
                 continue
             out.append("[^/]*")
         elif c == "?":
             out.append("[^/]")
         elif c == "[":
-            j = pattern.index("]", i) if "]" in pattern[i:] else n - 1
-            out.append(pattern[i:j + 1])
+            j = pattern.find("]", i + 2)            # `]` right after `[`/`[!`
+            if j < 0:
+                out.append(re.escape(c))
+                i += 1
+                continue
+            body = pattern[i + 1:j]
+            if body.startswith("!"):
+                body = "^" + body[1:]
+            out.append("[" + body + "]")
             i = j + 1
             continue
         else:
@@ -48,18 +64,20 @@ def _pattern_to_regex(pattern, anchored):
     return re.compile(("" if anchored else "(?:.*/)?") + body + r"\Z")
 
 
-def _text_attr(root, rel):
-    """What `git check-attr text` would report for a repo-relative path.
+def _attrs_for(root, rel, wanted):
+    """Resolve `wanted` attributes for a repo-relative path, as git does.
 
-    Files deeper in the tree win, and inside one file the last matching line
-    wins. Implemented here rather than shelled out so the check still means
-    something when the tests run from an export with no .git.
+    Every .gitattributes from the repository root down to the file's own
+    directory, deeper files winning, last matching line in each winning.
+    Implemented here rather than shelled out so the check still means
+    something when the tests run from an export with no .git -- which is
+    exactly where a resolver that has drifted from git does the most damage,
+    because there is nothing to contradict it.
     """
     parts = pathlib.PurePosixPath(rel).parts
-    verdict = "unspecified"
+    verdict = {name: "unspecified" for name in wanted}
     for depth in range(len(parts)):                 # root first, deepest last
-        directory = root.joinpath(*parts[:depth])
-        attrs = directory / ".gitattributes"
+        attrs = root.joinpath(*parts[:depth]) / ".gitattributes"
         if not attrs.is_file():
             continue
         below = "/".join(parts[depth:])
@@ -71,7 +89,13 @@ def _text_attr(root, rel):
                 closing = line.index('"', 1)
                 pattern, rest = line[1:closing], line[closing + 1:]
             else:
-                pattern, _, rest = line.partition(" ")
+                # Any whitespace separates the pattern from its attributes.
+                # A TAB there is ordinary .gitattributes spelling, and
+                # partitioning on a literal space missed it -- which failed
+                # the check on a correctly pinned tree.
+                fields = line.split(None, 1)
+                pattern = fields[0]
+                rest = fields[1] if len(fields) > 1 else ""
             attributes = rest.split()
             if not attributes:
                 continue
@@ -82,12 +106,24 @@ def _text_attr(root, rel):
             if not _pattern_to_regex(pattern, anchored).match(below):
                 continue
             for a in attributes:
-                if a == "text" or a.startswith("text=") or a.startswith("eol="):
-                    verdict = "set"
-                elif a in ("-text", "binary"):
-                    verdict = "unset"
-                elif a == "!text":
-                    verdict = "unspecified"
+                if a == "binary":                   # macro: -diff -merge -text
+                    if "text" in verdict:
+                        verdict["text"] = "unset"
+                    continue
+                name, eq, value = a.partition("=")
+                unset = name.startswith("-")
+                unspecify = name.startswith("!")
+                name = name.lstrip("-!")
+                if name not in verdict:
+                    continue
+                if unspecify:
+                    verdict[name] = "unspecified"
+                elif unset:
+                    verdict[name] = "unset"
+                elif eq:
+                    verdict[name] = value           # git prints the value
+                else:
+                    verdict[name] = "set"
     return verdict
 
 
@@ -304,7 +340,15 @@ class EvidenceDigest(unittest.TestCase):
                     named.add(head)
         self.assertTrue(named, "no manifest names a file; this test is vacuous")
 
-        unpinned = sorted(r for r in named if _text_attr(root, r) != "unset")
+        # Both attributes, because either one alone can rewrite the bytes:
+        # `text` turns conversion on, and `eol=` forces a specific ending
+        # even where git reports `text` as unspecified.
+        unpinned = []
+        for rel in sorted(named):
+            attrs = _attrs_for(root, rel, ("text", "eol"))
+            if attrs["text"] != "unset" or attrs["eol"] != "unspecified":
+                unpinned.append(f"{rel} (text: {attrs['text']}, "
+                                f"eol: {attrs['eol']})")
         self.assertEqual(
             unpinned, [],
             "these records are not pinned against end-of-line rewriting, so "
@@ -327,10 +371,11 @@ class EvidenceDigest(unittest.TestCase):
                 verdict, "unset",
                 f"git says `text` is {verdict!r} for {rel}, so this checkout "
                 "rewrites it and its digest cannot match")
+            mine = _attrs_for(root, rel, ("text",))["text"]
             self.assertEqual(
-                _text_attr(root, rel), verdict,
+                mine, verdict,
                 f"this test's attribute resolver disagrees with git on {rel}: "
-                f"it says {_text_attr(root, rel)!r}, git says {verdict!r}")
+                f"it says {mine!r}, git says {verdict!r}")
 
     def test_digest_comparison_ignores_hex_case(self):
         """An uppercase digest is the same digest, not a mismatch."""

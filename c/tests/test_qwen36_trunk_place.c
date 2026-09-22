@@ -200,9 +200,11 @@ int main(void) {
     /* This assertion used to read the other way: the first version of this
      * patch withheld the offers so that a default run could not change while
      * nobody had measured whether a placed matrix pays for the driver
-     * round-trip it adds. It has been measured (-7.77 ms/token, four runs a
-     * side, spread 2.1 -- docs/qwen36-cuda-tier.md), so the offers go in and
-     * auto decides. `off` below is what withholding them now means. */
+     * round-trip it adds. It has been measured (-5.05 ms/token on the clang
+     * build that ships, per-run in
+     * docs/experiments/qwen36-place-clang-clean-2026-09-20-raw.txt; the
+     * -7.77 this used to cite is withdrawn for having no raw record), so the
+     * offers go in and auto decides. `off` below is what withholding them now means. */
     run_arm(&m, "", "tier starts in auto mode");     /* "" == unset == auto */
     ck(m.L[0].h_attnout > 0 && m.L[2].h_attnout > 0, "auto takes attnout on the attention layers");
     ck(m.L[1].h_dnout   > 0 && m.L[3].h_dnout   > 0, "auto takes dnout on the DeltaNet layers");

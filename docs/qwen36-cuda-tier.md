@@ -453,27 +453,40 @@ expert onto that GPU would turn a 0.36 ms wait into the whole of its work.
 > of their own. **No spread over the whole table means anything**, because it
 > is not one configuration.
 >
-> **But two of these records DO pin the same configuration, and that is the
-> drift figure.** `qwen36-expert-down-rows-2026-09-20-raw.txt` and
-> `qwen36-graph-downrows-2x2-2026-09-21-raw.txt` match on every axis their
-> headers declare — same box, same `qwen36_clang.exe`, same model and prompt,
-> same `COLI_PLACE=experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0`, same
-> `COLI_CUDA_I8_ROWS=2`, and the graph off in both (it was still off by
-> default on 20 September; the 2x2 pins `g0*` to 0). They read `take` at two
-> matched points:
+> Two of these records come closer than the rest —
+> `qwen36-expert-down-rows-2026-09-20-raw.txt` and
+> `qwen36-graph-downrows-2x2-2026-09-21-raw.txt` declare the same box, engine,
+> model, prompt, `COLI_PLACE` and `COLI_CUDA_I8_ROWS=2`, with the graph off in
+> both — and reading `take` across them gives +0.23 at `DOWN_ROWS=0` (0.53 →
+> 0.76) and +0.24 at `DOWN_ROWS=4` (0.33 → 0.57).
 >
-> | `DOWN_ROWS` | 20 Sept | 21 Sept | drift |
-> |---|---|---|---|
-> | 0 | 0.53 (`:46`) | 0.76 (`:42`, g0d0) | **+0.23** |
-> | 4 | 0.33 (`:46`) | 0.57 (`:44`, g0d4) | **+0.24** |
+> **That pair is not a drift measurement either, and a version of this note
+> published it as one. Withdrawn 22 September 2026**, for three reasons that
+> are worth keeping because each one is a way to fool yourself:
 >
-> Two independent pairs agreeing to 0.01. **Session-to-session drift on
-> `take` is about 0.23 ms/token** — real, and roughly a third of the 0.74 the
-> graph transfers into it. (An earlier version of this note said no published
-> run pins one configuration and reads `take` twice. That was false, and it
-> was the stated reason for refusing to quote any drift at all. Retracted 22
-> September 2026: the refusal was right about the table as a whole and wrong
-> about the records.) With `shared` at 4 ms instead of 10 and `take`
+> - **It quotes the one axis that flatters it.** The same two arms move
+>   +0.71 and +0.63 on `issue` (1.76 → 2.47, 1.84 → 2.47) and **+3.35 and
+>   +3.05 on `step()`** (24.05 → 27.40, 25.20 → 28.25). The whole token is
+>   14 % slower on the later day. +0.23 is not "the drift of `take`"; it is
+>   `take`'s share of a level shift neither header explains. And the drift on
+>   `issue` is as large as the entire effect this page attributes to the
+>   graph on `issue` (−0.68), which the note used the drift to qualify.
+> - **The two sides are different kinds of number.** The 20 September values
+>   come from a section headed `2. WHERE THE TIME WENT (rip 1, ms/token)` —
+>   **one repetition**. The 21 September values are cell aggregates over six.
+>   Three paragraphs below, this page disqualifies another figure for being
+>   exactly that: "one repetition, labelled rip 1 in that record".
+> - **They are not the same binary.** The 20 September record was committed
+>   at 14:55; `COLI_CUDA_X_BCAST` — which stops the activation vector being
+>   copied once per expert — landed at 15:22 and shipped on by default. The
+>   later session has it, the earlier one does not, and it sits on
+>   `coli_cuda_expert_group_issue*`, the call whose completion `take` waits
+>   for. No header declares the DLL, so "match on every axis their headers
+>   declare" was true and useless.
+>
+> What survives is the original finding: **no run in these records pins one
+> configuration and reads `take` twice**, and the near-match above is not a
+> substitute for one. With `shared` at 4 ms instead of 10 and `take`
 > unquotable, **this argument has to be re-run on clang before it can be
 > believed**. It has not been.
 >

@@ -1364,9 +1364,14 @@ static const int8_t *qdw_int8(const float *W, int I, int O, const float **scales
  *
  * They were explicit-only when first added, because nothing had measured
  * whether a placed matrix pays for the driver round-trip it adds to the layer
- * chain. It has now been measured (docs/qwen36-cuda-tier.md, 19 September:
- * -7.77 ms/token, four runs a side, spread 2.1) so they are offered to the
- * automatic placer like every other trunk component, and it prices them
+ * chain. It has now been measured, so they are offered to the automatic
+ * placer like every other trunk component. The figure to cite is **-5.05
+ * ms/token** (clang, both arms quiet, per-run data in
+ * docs/experiments/qwen36-place-clang-clean-2026-09-20-raw.txt). This comment
+ * used to cite -7.77 from 19 September: that number has no raw record, no
+ * per-run data and no manifest, and is withdrawn as a citable figure --
+ * see docs/qwen36-cuda-tier.md, 22 September 2026. The decision does not
+ * change; its evidence does. and it prices them
  * against the experts they displace.
  *
  * Its own function rather than more lines inside main() because main() is not
@@ -1441,7 +1446,8 @@ static void trunk_offer_out(Model *m)
  * they read. dnproj plays the same trick with qkv ++ z.
  *
  * EXPLICIT ONLY for now, unlike dnout/attnout next door. Those are offered to
- * the automatic placer because an A/B measured them (-7.77 ms/token); this has
+ * the automatic placer because an A/B measured them (-5.05 ms/token, clang;
+ * the -7.77 this used to cite is withdrawn); this has
  * not been measured, and #18's whole argument was that a default does not move
  * on a prediction. The offer therefore goes in only for the layers an explicit
  * COLI_PLACE already named -- which is still enough for qt_init to charge the
