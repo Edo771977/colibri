@@ -112,8 +112,16 @@ def _evidence_path(uri, manifest_path):
     needed.)
     """
     head = uri.split(",")[0].strip()
-    if not head or "://" in head:
+    if "://" in head:
         return None
+    if not head:
+        # A uri that is all section and no file: ", section 'SESSION 2'".
+        # validate() only checks the uri is a non-empty string, so this gets
+        # that far, and returning None here made it a SILENT SKIP -- the very
+        # hole this function was rewritten to close, entered from the other
+        # side. It is what a half-finished rename looks like.
+        raise ValueError(
+            f"evidence.uri names no file, only a section: {uri!r}")
     for parent in Path(manifest_path).resolve().parents:
         candidate = parent / head
         if candidate.is_file():

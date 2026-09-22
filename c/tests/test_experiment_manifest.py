@@ -1,4 +1,5 @@
 import copy
+import fnmatch
 import json
 import hashlib
 import pathlib
@@ -201,15 +202,61 @@ class EvidenceDigest(unittest.TestCase):
                 validate_path(path)
 
     def test_records_are_pinned_against_eol_rewriting(self):
-        """The pin itself: without it the digests are not portable."""
+        """The pin itself: without it the digests are not portable.
+
+        Checked by EFFECT, not by looking for a literal line. A review showed
+        the literal-string version passed with the rule commented out, passed
+        with a later rule overriding it to `eol=crlf`, and failed on three
+        spellings that pin correctly -- so it was neither necessary nor
+        sufficient. This resolves each record the manifests actually name
+        through the .gitattributes rules, last match winning, the way git
+        does.
+        """
         root = pathlib.Path(__file__).resolve().parent.parent.parent
         attrs = root / ".gitattributes"
         self.assertTrue(attrs.is_file(), f"{attrs} is missing: the records it "
                                          "pins would be rewritten on checkout")
-        self.assertIn("docs/experiments/*.txt -text",
-                      attrs.read_text(encoding="utf-8"),
-                      "the raw records are no longer pinned; a Windows "
-                      "checkout will rewrite them and every digest will fail")
+        rules = []
+        for line in attrs.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pattern, *attributes = line.split()
+            if attributes:
+                rules.append((pattern, attributes))
+
+        def text_attr(rel):
+            """What git would report for `text` on this path."""
+            verdict = "unspecified"
+            for pattern, attributes in rules:           # last match wins
+                if not fnmatch.fnmatch(rel, pattern):
+                    continue
+                for a in attributes:
+                    if a == "-text":
+                        verdict = "unset"
+                    elif a == "text" or a.startswith("text="):
+                        verdict = "set"
+                    elif a == "binary":
+                        verdict = "unset"
+                    elif a.startswith("eol="):
+                        verdict = "set"                 # eol implies text
+            return verdict
+
+        named = set()
+        for path in sorted((root / "docs" / "experiments").glob("*.json")):
+            record = json.loads(path.read_text(encoding="utf-8"))
+            for arm in ("baseline", "trial"):
+                uri = record.get(arm, {}).get("evidence", {}).get("uri", "")
+                head = uri.split(",")[0].strip()
+                if head and "://" not in head:
+                    named.add(head)
+        self.assertTrue(named, "no manifest names a file; this test is vacuous")
+        unpinned = sorted(r for r in named if text_attr(r) != "unset")
+        self.assertEqual(
+            unpinned, [],
+            "these records are not pinned against end-of-line rewriting, so "
+            "their digests are not portable and a Windows checkout will fail "
+            "every one of them: " + ", ".join(unpinned))
 
     def test_digest_comparison_ignores_hex_case(self):
         """An uppercase digest is the same digest, not a mismatch."""

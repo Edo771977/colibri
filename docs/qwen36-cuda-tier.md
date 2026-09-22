@@ -438,14 +438,14 @@ expert onto that GPU would turn a 0.36 ms wait into the whole of its work.
 >
 > | value | record | arm |
 > |---|---|---|
-> | 0.27, 0.69 | `qwen36-place-clang-2026-09-19-raw.txt:66` | B, A (gcc, disturbed session) |
+> | 0.27, 0.69 | `qwen36-place-clang-2026-09-19-raw.txt:66` | B, A (clang, session 2) |
 > | 0.28, 0.33, 0.33, 0.53 | `qwen36-expert-down-rows-2026-09-20-raw.txt:46` | the four DOWN_ROWS cells |
 > | 0.31, 0.31, 0.43, 0.70 | `qwen36-place-clang-clean-2026-09-20-raw.txt:44` | cB, gB, gA, cA |
-> | 0.57, 0.76 | `qwen36-graph-downrows-2x2-2026-09-21-raw.txt:42,44` | g0d0, g0d4 |
+> | 0.76, 0.57 | `qwen36-graph-downrows-2x2-2026-09-21-raw.txt:42,44` | g0d0, g0d4 |
 > | 1.14 | `qwen36-expert-graph-2026-09-20-raw.txt:35` | graph=0 |
 >
-> Eleven readings from 0.27 to 1.14, and **no two of them share a pinned
-> configuration**: they differ in placement, in `DOWN_ROWS`, in host compiler,
+> Thirteen readings from 0.27 to 1.14, eleven of them distinct, and **no two
+> share a pinned configuration**: they differ in placement, in `DOWN_ROWS`, in host compiler,
 > and one of the records carries no `Placement` line at all. So there is no
 > run in this repository that fixes one configuration and reads `take` twice,
 > and no spread over this table means anything — which is the finding, not a
@@ -476,9 +476,16 @@ expert onto that GPU would turn a 0.36 ms wait into the whole of its work.
 > value against an *unprofiled* one from a different build. Either the run is
 > produced, or they stay withdrawn.
 
-The unprofiled `take` is the number the conclusion rests on, and the way to
-unlock the shared expert is to make the expert kernels faster, not to add work
-to them.
+> **And the conclusion that rested on them has to go too, 22 September 2026.**
+> This paragraph used to read that the unprofiled `take` is the number the
+> conclusion rests on, and that the way to unlock the shared expert is to make
+> the expert kernels faster rather than add work to them. The second half was
+> carried by the 247.7 us just withdrawn -- that figure was what said the card
+> had headroom on this path. Withdrawing the evidence and keeping the
+> recommendation, in the present tense, is not a retraction. The first half
+> does not survive either: the note above establishes that no value of `take`
+> can be written in the present tense at all. What remains is a question for
+> the re-run on clang, not an answer.
 
 First calibration, one Quadro RTX 4000 (8 GB), per-row int4 container, 200-token
 decode, same prompt, output bit-identical in all four runs:
@@ -667,10 +674,21 @@ rep      off     on    delta
  4     27.60  27.20   -0.40
  5     27.00  26.70   -0.30
  6     28.10  27.00   -1.10
+             median  -0.35
              mean    -0.43     6 of 6 repetitions negative
 ```
 
 **−0.43 ms/token, 1.6 %.** Small, and the first thing to move on this path.
+
+> **Qualified 22 September 2026.** −0.43 is the MEAN. The paired median in the
+> same record is **−0.35** (`qwen36-graph-downrows-2x2-2026-09-21-raw.txt:69`,
+> printed there ABOVE the mean), and this transcription had dropped that line
+> while `docs/ENVIRONMENT.md` quoted it; it is restored above, in the record's
+> own order. Every other record of
+> that week quotes paired medians, so publishing the mean was choosing the
+> more favourable of the two. The within-cell spread (0.70–1.90) is 1.6–4.4×
+> the mean and 2.0–5.4× the median. **What the pair rests on is the 6/6 sign
+> agreement, not the distance between the two cells.**
 
 The mechanism is confirmed to within 0.06 ms: the graph takes 0.68 ms out of
 `issue` and 0.74 ms reappears in `take`. A transfer, not a saving — until the
@@ -712,7 +730,7 @@ profiled pair says the kernel really is ~1.9 ms/token cheaper on the GPU, and
 the unprofiled A/B says the token really does gain 0.43. What cannot be said
 is what fraction of one is the other. A third figure from the same record
 makes the same point without a ratio: in the best cell `take` is still 0.73
-ms/token (`qwen36-graph-downrows-2x2-2026-09-21-raw.txt:44`), so the phase
+ms/token (`qwen36-graph-downrows-2x2-2026-09-21-raw.txt:45`), so the phase
 remains GPU-bound with idle CPU inside it and there is
 still headroom that this kernel did not convert.
 
