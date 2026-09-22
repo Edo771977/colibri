@@ -2270,3 +2270,7 @@ tests/test_qwen36_tier_rollback$(EXE): tests/test_qwen36_tier_rollback.c tests/q
 # Budget separate gate/up/down scale allocations at their own size classes.
 tests/test_qwen36_tier_scale_budget$(EXE): tests/test_qwen36_tier_scale_budget.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Async collection errors must drain all devices and reject partial output.
+tests/test_qwen36_tier_take_error$(EXE): tests/test_qwen36_tier_take_error.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
