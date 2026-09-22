@@ -78,6 +78,9 @@ function Muta([string]$Cerca, [string]$Sostituisci, [string]$Nome) {
     "  mutazione applicata: $Nome"
 }
 
+# NOTA SUL FORMATO ESADECIMALE: in PowerShell il letterale 0xFFFFFFFF e' un
+# Int32 e vale -1, quindi `-band 0xFFFFFFFF` era un no-op e il cast a uint32
+# di un codice negativo sollevava un errore. Serve il suffisso L.
 # ---- ESECUZIONE DI COMANDI ESTERNI ---------------------------------------
 # Start-Process -PassThru, non `& cmd /c`. Sulla macchina di destinazione la
 # forma `& cmd /c ...` ha restituito codice di uscita VUOTO e output vuoto per
@@ -135,10 +138,15 @@ function Esegui([string]$Comando, [int]$TimeoutSec = 1800) {
     # cancellazione dei temporanei stava sopra questa lettura, quindi il file
     # non c'era mai e si ricadeva sempre su $p.ExitCode -- cioe' la
     # correzione non correggeva niente.
+    # La regex accetta il SEGNO. Senza, un codice come -1073741819
+    # (0xC0000005, access violation) non combaciava, il valore letto dal file
+    # veniva scartato e si ricadeva su $p.ExitCode -- che legge 0. E' cosi'
+    # che la fase 4 ha riportato "codice 0" per un processo che era morto di
+    # access violation: il numero giusto c'era e lo buttavo via io.
     $codice = [int]$p.ExitCode
     if (Test-Path $frc) {
         $t = (Get-Content -Raw -LiteralPath $frc).Trim()
-        if ($t -match '^\d+$') { $codice = [int]$t }
+        if ($t -match '^-?\d+$') { $codice = [int]$t }
     }
 
     foreach ($f in @($base, $bat, $fout, $ferr, $frc)) {
@@ -150,7 +158,7 @@ function Esegui([string]$Comando, [int]$TimeoutSec = 1800) {
                   StdOut = [string]$out; StdErr = [string]$err }
     }
     return @{ Testo = [string]$testo; Codice = $codice; Scaduto = $false
-              Esa = ("0x{0:X8}" -f [uint32]([int64]$codice -band 0xFFFFFFFF))
+              Esa = ("0x{0:X8}" -f [uint32]([int64]$codice -band 0xFFFFFFFFL))
               StdOut = [string]$out; StdErr = [string]$err }
 }
 
@@ -177,10 +185,15 @@ function EseguiInConsole([string]$Comando) {
         "@echo off", $Comando, "set RC=%ERRORLEVEL%",
         "> ""$frc"" echo %RC%", "exit /b %RC%")
     $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $bat) -PassThru -NoNewWindow -Wait
+    # La regex accetta il SEGNO. Senza, un codice come -1073741819
+    # (0xC0000005, access violation) non combaciava, il valore letto dal file
+    # veniva scartato e si ricadeva su $p.ExitCode -- che legge 0. E' cosi'
+    # che la fase 4 ha riportato "codice 0" per un processo che era morto di
+    # access violation: il numero giusto c'era e lo buttavo via io.
     $codice = [int]$p.ExitCode
     if (Test-Path $frc) {
         $t = (Get-Content -Raw -LiteralPath $frc).Trim()
-        if ($t -match '^\d+$') { $codice = [int]$t }
+        if ($t -match '^-?\d+$') { $codice = [int]$t }
     }
     foreach ($f in @($base, $bat, $frc)) { Remove-Item -Force -LiteralPath $f -ErrorAction SilentlyContinue }
     return $codice
@@ -235,7 +248,7 @@ if ($DiagnosiB) {
         "--- output del g4 MUTATO, non rediretto ------------------------------"
         $rc = EseguiInConsole ".\grouped_g4_test.exe"
         "----------------------------------------------------------------------"
-        "codice di uscita: $rc  (0x{0:X8})" -f [uint32]([int64]$rc -band 0xFFFFFFFF)
+        "codice di uscita: $rc  (0x{0:X8})" -f [uint32]([int64]$rc -band 0xFFFFFFFFL)
         "Ultima riga stampata sopra = il punto in cui il test si ferma."
     } finally {
         Ripristina
