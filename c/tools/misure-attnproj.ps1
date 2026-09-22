@@ -28,6 +28,12 @@ param(
     # stanno in c/: la directory di lavoro e' il PADRE dello script, non lo
     # script. Passare -WorkDir per lanciarlo da altrove.
     [string] $WorkDir = (Split-Path -Parent $PSScriptRoot),
+    # qwen36_clang.exe e' linkato contro le runtime di MSYS2 CLANG64 (libomp
+    # e compagnia). Senza quella cartella in PATH il loader di Windows uccide
+    # il processo con 0xC0000135 (STATUS_DLL_NOT_FOUND) PRIMA di main: niente
+    # output, niente log, exit -1073741515. Dipendeva dalla shell da cui si
+    # lanciava lo script, ed e' costato due tentativi a vuoto il 21/09.
+    [string] $ToolchainBin = "C:\msys64\clang64\bin",
     [string] $Snap   = "C:\modelli\qwen36_i4_gs64",
     [string] $Exe    = ".\qwen36_clang.exe",
     [string] $Prompt = "prompt25.txt",
@@ -52,6 +58,11 @@ foreach ($v in @("COLI_CUDA_PROFILE","PROF","COLI_GRAPH_DIAG")) {
     if ($val) { throw "$v=$val e' impostata: la misura non sarebbe confrontabile. Chiudi questa shell, aprine una pulita e rilancia." }
 }
 
+if ($ToolchainBin -and (Test-Path $ToolchainBin) -and ($env:PATH -notlike "*$ToolchainBin*")) {
+    $env:PATH = "$ToolchainBin;$env:PATH"
+    "aggiunto al PATH: $ToolchainBin"
+}
+
 if (-not (Test-Path $Exe))    { throw "manca $Exe -- ricostruisci: make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe" }
 if (-not (Test-Path $Prompt)) { throw "manca $Prompt" }
 if (-not (Test-Path $Snap))   { throw "modello non trovato in $Snap -- passa il percorso con -Snap <dir>" }
@@ -73,6 +84,9 @@ function Invoke-Engine([string]$Place, [string]$Log) {
     & $Exe $Cap $Bits $Prompt 2>&1 | Out-File -Encoding utf8 $Log
     $code = $LASTEXITCODE
     $ErrorActionPreference = $old
+    if ($code -eq -1073741515) {
+        throw "exit 0xC0000135 (STATUS_DLL_NOT_FOUND): a $Exe manca una DLL e il processo e' morto prima di main, quindi $Log e' vuoto. Di norma sono le runtime di MSYS2: passa -ToolchainBin <cartella bin del compilatore> se non e' $ToolchainBin."
+    }
     if ($code -ne 0) { throw "exit $code -- vedi $Log" }
     Get-Content $Log -Raw
 }
