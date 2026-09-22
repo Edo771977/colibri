@@ -29,7 +29,18 @@ def _pattern_to_regex(pattern, anchored):
     matches `a/b` and `a/x/y/b` but NOT `a/xb`, which is where a version of
     this that translated `**` to `.*` silently unpinned every record.
     `[!abc]` is a NEGATED class -- git's spelling of `[^abc]`, and reading it
-    as a positive one inverted the match.
+    as a positive one inverted the match. A class never matches `/`, whatever
+    it contains.
+
+    APPROXIMATION, in the safe direction: git strips a pattern's literal
+    prefix before matching, so in `docs/x**/a.txt` the run of stars ends up
+    at position 0 of what wildmatch sees and IS treated as a whole
+    component. This resolver applies the whole-component test to the
+    original pattern, so it reads that as an ordinary `*` and reports
+    unspecified where git says unset. That makes a pinned record look
+    unpinned -- the pin test goes red rather than quietly passing -- so it is
+    left unmodelled rather than half-modelled. Backslash escapes inside a
+    pattern are unmodelled for the same reason and in the same direction.
     """
     out, i, n = [], 0, len(pattern)
     while i < n:
@@ -74,7 +85,11 @@ def _pattern_to_regex(pattern, anchored):
             body = pattern[i + 1:j]
             if body.startswith("!"):
                 body = "^" + body[1:]
-            out.append("[" + body + "]")
+            # Una classe non attraversa MAI `/` in git (wildmatch sotto
+            # WM_PATHNAME), nemmeno se il `/` e' dentro la classe o dentro
+            # un intervallo. Copiandola nella regex tale e quale,
+            # `a[!b]c` matchava `a/c`, che git lascia unspecified.
+            out.append("(?:(?![/])[" + body + "])")
             i = j + 1
             continue
         else:
@@ -121,26 +136,49 @@ def _attrs_for(root, rel, wanted):
     """
     parts = pathlib.PurePosixPath(rel).parts
     verdict = {name: "unspecified" for name in wanted}
+    binary_ridefinita = False
     for depth in range(len(parts)):                 # root first, deepest last
         attrs = root.joinpath(*parts[:depth]) / ".gitattributes"
         if not attrs.is_file():
             continue
         below = "/".join(parts[depth:])
-        for line in attrs.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        # split("\n") e non splitlines(): quest'ultimo spezza su otto
+        # caratteri che git NON considera fine riga (\x0b \x0c \x1c \x1d
+        # \x1e \x85 U+2028 U+2029), e su uno di quelli il resolver leggeva
+        # due righe dove git ne legge una sola e la butta via -- un pin
+        # dichiarato che git non da'. utf-8-sig perche' un BOM, che su
+        # Windows e' il modo ordinario in cui arriva, non e' spazio e
+        # sopravviveva a strip() rendendo il primo pattern irriconoscibile.
+        for line in attrs.read_text(encoding="utf-8-sig").split("\n"):
+            # strip(" \t\r") e non strip(): quest'ultimo toglie anche NBSP
+            # e gli altri spazi Unicode, che per git sono parte del pattern.
+            line = line.strip(" \t\r")
             if not line or line.startswith("#"):
                 continue
-            if line.startswith('"'):
-                closing = line.index('"', 1)
+            closing = line.find('"', 1) if line.startswith('"') else -1
+            if closing >= 0:
                 pattern, rest = line[1:closing], line[closing + 1:]
             else:
                 # Any whitespace separates the pattern from its attributes.
                 # A TAB there is ordinary .gitattributes spelling, and
                 # partitioning on a literal space missed it -- which failed
                 # the check on a correctly pinned tree.
-                fields = line.split(None, 1)
+                # split(None) separa su QUALUNQUE spazio Unicode; git
+                # separa solo su spazio e tab. Con un NBSP fra pattern e
+                # attributi git non vede una riga valida, il resolver si'.
+                fields = re.split(r"[ \t]+", line, 1)
                 pattern = fields[0]
                 rest = fields[1] if len(fields) > 1 else ""
+            if pattern == "[attr]binary":
+                # git permette di RIDEFINIRE la macro predefinita. Con
+                # `[attr]binary text` il pin si inverte e git accende la
+                # conversione, mentre il trattamento fisso qui sotto
+                # continuerebbe a dichiarare `unset`: un falso verde. Non
+                # sapendo espandere le macro utente, da qui in poi `binary`
+                # non viene piu' trattato come la macro predefinita, e il
+                # risultato cade su unspecified -- la direzione sicura.
+                binary_ridefinita = True
+                continue
             if pattern.startswith("[attr]"):
                 # A macro DEFINITION, not a pattern. git applies it wherever
                 # the macro name is later used; this resolver models only the
@@ -152,7 +190,12 @@ def _attrs_for(root, rel, wanted):
                 # earlier version read `[attr]myrec` as a pattern containing
                 # a character class.
                 continue
-            attributes = rest.split()
+            # Anche QUI solo spazio e tab: rest.split() spezzava su NBSP e
+            # compagnia, cosi' `-text\u00a0x` diventava due token validi
+            # dove git ne vede uno solo, invalido, e butta via la riga.
+            # Correggere il separatore fra pattern e attributi senza
+            # correggere questo lasciava in piedi 13 falsi verdi su 900.
+            attributes = [a for a in re.split(r"[ \t]+", rest) if a]
             if not attributes:
                 continue
             # git rejects a line carrying a token that is not a valid
@@ -172,7 +215,7 @@ def _attrs_for(root, rel, wanted):
             if not _pattern_to_regex(pattern, anchored).match(below):
                 continue
             for a in attributes:
-                if a == "binary":                   # macro: -diff -merge -text
+                if a == "binary" and not binary_ridefinita:   # macro: -diff -merge -text
                     if "text" in verdict:
                         verdict["text"] = "unset"
                     continue
@@ -568,11 +611,31 @@ class EvidenceDigest(unittest.TestCase):
             (["docs/experiments/*.txt text=auto"], [], "docs/experiments/a.txt"),
             (["docs/experiments/?.txt -text"], [], "docs/experiments/a.txt"),
             (["docs/experiments/?.txt -text"], [], "docs/experiments/ab.txt"),
+            # Casi aggiunti dalla round 8. Ognuno uccide una mutazione che
+            # la lista precedente attraversava senza svegliarsi, o copre un
+            # falso verde che il fuzz da 400 casi non raggiungeva.
+            (["docs?experiments/a.txt -text"], [], "docs/experiments/a.txt"),
+            (["docs/* -text"], [], "docs/experiments/a.txt"),
+            (["x** -text"], [], "x/y/z.txt"),
+            (["a[!b]c -text"], [], "a/c"),
+            (["a[/]c -text"], [], "a/c"),
+            (['"docs/experiments/a b.txt -text'], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt\u00a0-text"], [], "docs/experiments/a.txt"),
+            # NBSP FRA GLI ATTRIBUTI, non fra pattern e attributi: git vede
+            # un token solo e invalido e butta la riga. Senza questo caso,
+            # riportare rest.split() alla versione Unicode passava inosservato.
+            (["docs/experiments/*.txt -text\u00a0x"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt -text\u2028*.txt -text"], [],
+             "docs/experiments/a.txt"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             for n, (top, deep, rel) in enumerate(cases):
                 root = pathlib.Path(tmp) / f"case{n}"
                 (root / "docs" / "experiments" / "s").mkdir(parents=True)
+                # I casi nominano percorsi arbitrari, non solo dentro
+                # docs/experiments: le cartelle intermedie vanno create o il
+                # test ERRORE invece di confrontare.
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
                 (root / rel).write_bytes(b"x\n")
                 if top:
                     (root / ".gitattributes").write_text(
@@ -599,6 +662,34 @@ class EvidenceDigest(unittest.TestCase):
                     mine, theirs,
                     f"case {n} {top!r} + {deep!r} on {rel}: this resolver "
                     f"says {mine!r}, git says {theirs!r}")
+
+    def test_a_redefined_binary_macro_is_not_trusted(self):
+        """`[attr]binary text` inverts the pin, and git honours it.
+
+        `binary` is the one macro this resolver expands, because it is
+        built in. But git lets a repository REDEFINE it, and then
+        `docs/experiments/*.txt binary` turns EOL conversion ON. Keeping
+        the built-in meaning in that case reported the records pinned when
+        git says the opposite -- a false green, in the file whose whole job
+        is to catch exactly that. Found by review, 22 September 2026.
+
+        This resolver cannot expand user macros, so once `binary` is
+        redefined it stops treating it as the built-in and the result falls
+        to unspecified: the pin test then goes RED. That is a disagreement
+        with git, which is why the case is not in the agreement list, and it
+        is in the safe direction.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "docs" / "experiments").mkdir(parents=True)
+            (root / ".gitattributes").write_text(
+                "[attr]binary text\ndocs/experiments/*.txt binary\n",
+                encoding="utf-8")
+            self.assertEqual(
+                _attrs_for(root, "docs/experiments/a.txt", ("text",))["text"],
+                "unspecified",
+                "a redefined `binary` was still expanded as the built-in, so "
+                "a tree git treats as UNPINNED was reported as pinned")
 
     def test_macro_definition_is_not_read_as_a_pattern(self):
         """`[attr]myrec` defines a macro; it is not a glob.
