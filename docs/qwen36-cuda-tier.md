@@ -164,6 +164,19 @@ A  COLI_PLACE="experts=0,lmhead=0,dnproj=0"                     (what auto did b
 B  COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"
 ```
 
+>  **RETRACTED AS A CITABLE FIGURE, 22 September 2026.** The −7.77 below is
+>  the number every later record in this directory cites as the standard of
+>  proof — and it is the worst-documented number of the set. **There is no raw
+>  record for it**: no file in `docs/experiments/`, no per-run data, no
+>  manifest, only this table. The build is an *inference from the timings*
+>  (see "Inferred from the timings" below), not a recorded command. It has
+>  been superseded twice on the build that actually ships.
+>
+>  **Cite −5.05 ms/token (−15.3 %) instead** — clang, both arms quiet,
+>  per-run data in `qwen36-place-clang-clean-2026-09-20-raw.txt`. The table
+>  below is kept as the historical record of a measurement whose *direction*
+>  survives and whose *magnitude* does not.
+
 | ms/token | A (min–max) | B (min–max) | Δ |
 |---|---:|---:|---:|
 | **`step() total`** | **59.75** (58.7–60.8) | **51.98** (51.4–53.0) | **−7.77** |
@@ -176,7 +189,11 @@ B  COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"
 | shared / router / cpu-miss | 10.18 / 2.88 / 10.19 | 10.09 / 2.89 / 10.10 | ≈0 |
 
 **16.74 → 19.24 tok/s**: −13.0 % of the time per token, which is +14.9 % of
-throughput. For 0.31 GB of VRAM and 177 experts (7136 → 6959), hit rate
+throughput — **on a build nobody should ship** (59.75 ms/token; see below).
+On clang the same change is −15.3 %. Both percentages come from
+`step() total`, i.e. decode only; a percentage computed from the wall-clock
+`Speed:` line is not comparable to either, because that one carries the
+prefill. For 0.31 GB of VRAM and 177 experts (7136 → 6959), hit rate
 unchanged at 100 %. The effect is 7.77 ms against a worst-case within-arm
 spread of 2.1 ms.
 
@@ -193,12 +210,13 @@ where the change is and nowhere else.
 `dn_out` 2048×4096 over 30 layers plus `o_proj` 2048×4096 over 10, i.e.
 335.5 MB of int8 weights read per token — what the engine's `[place]` line
 counts as `0.31 GB`; the offer charges 336.2 MB because it includes the
-per-row scales — worth 6.1 ms at this machine's measured 55.03 GB/s. The direct rows account for −4.95, the
-shortfall being GPU time that is not free. But `dn-sub proj`, `lm_head`,
-`take` and `issue` improve by a further −2.77 ms while **already residing on
-the GPU in both arms**. The likely mechanism is contention: 335 MB/token less
-CPU traffic leaves the staging copies and driver calls of the already-placed
-matrices more bus to work with. That is a hypothesis, not a measurement.
+per-row scales — worth 6.4 ms of CPU bus at the 52.5 GB/s this machine was
+actually measured at (see the note on 55.03 GB/s below). The direct rows
+account for −4.95, the shortfall being GPU time that is not free. But
+`dn-sub proj`, `lm_head`, `take` and `issue` improve by a further −2.77 ms
+while **already residing on the GPU in both arms**. The likely mechanism is
+contention: 335 MB/token less CPU traffic leaves the staging copies and
+driver calls of the already-placed matrices more bus to work with. That is a hypothesis, not a measurement.
 
 **The absolute level: this arm was a gcc build.** Arm A reads 59.75 ms/token
 where an `auto` run on 18 September read 32.1, both at 100 % hit rate, and the
@@ -232,9 +250,25 @@ followed — that −7.77 ms would shrink on clang, because placement pays by
 removing CPU reads and libgomp makes those reads cost twice what libomp
 charges — was then measured, and was **wrong**. See below.
 
-The same caveat reaches the bytes-to-time arithmetic two paragraphs up: the
-55.03 GB/s that turns 335.5 MB into 6.1 ms is this machine under libgomp, not
-this machine.
+>  **The 55.03 GB/s has no source, 22 September 2026.** It appears three
+>  times on this page, twice to turn bytes into milliseconds to four
+>  significant figures and once to defend those conversions, and **no
+>  measurement anywhere in this repository produces it**. What was measured
+>  on this machine is **52.2 / 52.5 GB/s** streaming read
+>  (`docs/qwen36.md:138`, `docs/experiments/qwen36-openmp-runtime.json:10`,
+>  from `c/tests/bench_qwen36_decode_omp`). Until someone produces the run,
+>  the byte-to-time arithmetic on this page should be redone at that rate:
+>  335.5 MB is **6.4 ms**, not the 6.1 this page printed, and 189 MB is
+>  **3.6 ms**, not 3.4. The caveat that was already here stands on top of
+>  that: whatever the number is, it is this machine under libgomp, not this
+>  machine.
+>
+>  There is one **55,03** in the records, and it is not a bandwidth:
+>  `qwen36-toolchain-2x-2026-09-19-raw.txt:56` reads
+>  `step  …  G56  55,03 (53,1-56,5)`, i.e. **ms/token** on the gcc arm of the
+>  toolchain 2×2. A comma decimal separator, a different unit and a different
+>  quantity. That is the most likely origin, and it is a warning about how
+>  this page has been assembled, not a source.
 
 #### Re-measured on clang — `qwen36-place-clang-2026-09-19-raw.txt`
 
@@ -377,31 +411,74 @@ COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0,attnproj=0"   # B
 
 **No speed number is claimed here.** The fused block is proven to return
 exactly what the three separate CPU matmuls return, in order, against the fake
-CUDA backend — not that it returns them sooner. The byte model says 189 MB at
-55.03 GB/s is 3.4 ms of CPU bus, of which the GPU will take some back.
+CUDA backend — not that it returns them sooner. The byte model says 189 MB at the
+52.5 GB/s this machine was measured at is **3.6 ms** of CPU bus, of which the
+GPU will take some back. (This page used to say 3.4 ms at 55 GB/s; see the
+note above — that denominator has no source, and unlike the 6.1 → 6.4 fix
+higher up this one was left standing for a while after the note was written.)
 
 One thing the measurement of `dnout`/`attnout` already settled, and that
-bounds what is left: the **shared expert is not worth moving**. It is the
-largest CPU item left at 10.09 ms/token, and it is computed deliberately
-between `issue` and `take` so it overlaps the GPU's expert groups.
+bounds what is left: the **shared expert was not worth moving on the build
+that measurement ran on**. It was the largest CPU item left at 10.09 ms/token,
+and it is computed deliberately between `issue` and `take` so it overlaps the
+GPU's expert groups.
 
 The evidence is **`take` = 0.36 ms/token, from a run with profiling off**:
 across 40 layers that is 9 us a layer, so the GPU finishes essentially the
 moment the CPU arrives. The two halves are balanced, and moving the shared
 expert onto that GPU would turn a 0.36 ms wait into the whole of its work.
 
-`COLI_CUDA_PROFILE` corroborates with 9.91 ms/token of expert-kernel time
-(1506 ms over 152 token positions) against the CPU's 10.09 — but that figure
-comes from a profiled run, and `backend_cuda.cu` says in as many words that
-four `cudaEventRecord` per call at 40 calls a token add launch overhead to the
-path whose launch overhead is the question. The event interval is genuine GPU
-timeline, yet a slower dispatch can widen the gaps inside it, so treat 9.91 as
-an **upper bound** on how busy the card really is. The unprofiled `take` is
-the number the conclusion rests on.
+> **Both numbers are arm B of the 19 September gcc session** — the build this
+> page calls one nobody should ship — and the conclusion is written above in
+> the present tense as though they were properties of the engine. They are
+> not. On the clang build that ships, `shared` reads **4.0–4.3 ms/token**
+> (`qwen36-place-clang-clean-2026-09-20-raw.txt`). And `take` has no value
+> that can be written in the present tense at all. Every reading in the
+> records of 19–21 September, at GRAPH=0 or on a build with no graph:
+>
+> | value | record | arm |
+> |---|---|---|
+> | 0.27, 0.69 | `qwen36-place-clang-2026-09-19-raw.txt:66` | B, A (gcc, disturbed session) |
+> | 0.28, 0.33, 0.33, 0.53 | `qwen36-expert-down-rows-2026-09-20-raw.txt:46` | the four DOWN_ROWS cells |
+> | 0.31, 0.31, 0.43, 0.70 | `qwen36-place-clang-clean-2026-09-20-raw.txt:44` | cB, gB, gA, cA |
+> | 0.57, 0.76 | `qwen36-graph-downrows-2x2-2026-09-21-raw.txt:42,44` | g0d0, g0d4 |
+> | 1.14 | `qwen36-expert-graph-2026-09-20-raw.txt:35` | graph=0 |
+>
+> Eleven readings from 0.27 to 1.14, and **no two of them share a pinned
+> configuration**: they differ in placement, in `DOWN_ROWS`, in host compiler,
+> and one of the records carries no `Placement` line at all. So there is no
+> run in this repository that fixes one configuration and reads `take` twice,
+> and no spread over this table means anything — which is the finding, not a
+> step towards a number. With `shared` at 4 ms instead of 10 and `take`
+> unquotable, **this argument has to be re-run on clang before it can be
+> believed**. It has not been.
+>
+> (Three corrections inside this note itself, all from review. It first listed
+> five values "across six sessions", including a **1.30** that exists nowhere
+> in this repository as a reading of `take` — the only 1.30 in the records is
+> a paired `step()` delta in the 2x2's DOWN_ROWS list. Inventing a number
+> inside a retraction of unsourced numbers is the defect this file exists to
+> correct. It also listed **1.50**, which is not a session of its own but the
+> GRAPH=1 cell of the same session as the 0.76. The second version then
+> listed six values and split them into "placed" and "unplaced" arms: false —
+> the 0.53 and the 0.76 come from records whose header pins the same full
+> `COLI_PLACE` as the 0.31, and the 0.43 and the 0.70 are the same arm of one
+> session differing only in host compiler. It also derived a spread of 0.61
+> and called 0.61/0.36 "1.7×"; the arithmetic was right and the subset was
+> not.) Noted 22 September 2026.
 
-The way to unlock the shared expert is to make the expert kernels faster —
-247.7 us per group call for 25M MACs is a small fraction of what the card can
-do — not to add work to them.
+> **The two figures that used to be here are withdrawn, 22 September 2026.**
+> The paragraph read that `COLI_CUDA_PROFILE` corroborates with 9.91 ms/token
+> of expert-kernel time (1506 ms over 152 positions) against the CPU's 10.09,
+> and that a group call takes 247.7 us. **Neither number has any provenance in
+> this repository** — no raw record, no log, no date, no manifest; they are
+> the only figures in this area with none. They also compared a *profiled*
+> value against an *unprofiled* one from a different build. Either the run is
+> produced, or they stay withdrawn.
+
+The unprofiled `take` is the number the conclusion rests on, and the way to
+unlock the shared expert is to make the expert kernels faster, not to add work
+to them.
 
 First calibration, one Quadro RTX 4000 (8 GB), per-row int4 container, 200-token
 decode, same prompt, output bit-identical in all four runs:
@@ -620,8 +697,24 @@ kernel does not exist.
 ### The cap has moved, not gone
 
 `DOWN_ROWS=4` removes ~1.9 ms/token of expert-group GPU work and the token
-gains 0.43: **22 % of the GPU saving reaches the token**, and `take` is still
-0.73 in the best cell. The phase is still GPU-bound with idle CPU inside it.
+gains 0.43 — a ratio this page used to quote as "22 % of the GPU saving
+reaches the token". **Withdrawn 22 September 2026**: the ratio is 0.43 / 1.9,
+and its two terms come from different worlds. The **denominator** (1.9
+ms/token, from 697 → 572 ms over 64 tokens) is the difference of two
+*profiled* passes, taken under `COLI_CUDA_PROFILE`, where by design the graph
+does not run at all; the **numerator** (0.43) is an *unprofiled* A/B over 128
+tokens. They come from two different worlds and their ratio means nothing.
+The noise is visible in the record itself: g0d4 572 against g1d4 587, two
+cells that should be identical, 15 ms apart.
+
+What each of the two does support, on its own terms, is unaffected: the
+profiled pair says the kernel really is ~1.9 ms/token cheaper on the GPU, and
+the unprofiled A/B says the token really does gain 0.43. What cannot be said
+is what fraction of one is the other. A third figure from the same record
+makes the same point without a ratio: in the best cell `take` is still 0.73
+ms/token (`qwen36-graph-downrows-2x2-2026-09-21-raw.txt:44`), so the phase
+remains GPU-bound with idle CPU inside it and there is
+still headroom that this kernel did not convert.
 
 ### What this is not
 
@@ -674,6 +767,43 @@ session (5224 calls over 64 tokens, `docs/experiments/qwen36-i8-rows-2026-09-20-
 | d2h | 120 ms | 1.88 ms | 23.0 µs |
 | residue (launch + sync) | 71 ms | 1.11 ms | 13.6 µs |
 | **wall** | **588 ms** | **9.19 ms** | **112.6 µs** |
+
+>  **This table and the one 80 lines below it are incompatible, and nothing
+>  on this page said so until 22 September 2026.** Same path, same
+>  configuration, same card: here the kernel column reads **301 ms** over
+>  5224 calls and 112.07 GB (372 GB/s); in the `COLI_CUDA_DENSE_PINNED`
+>  table further down, arm m0 — the *unmodified* arm — reads **640 ms** for
+>  the same 5224 calls and the same 112.07 GB (175 GB/s). A factor of 2.1,
+>  one day apart. A THIRD reading exists —
+>  `qwen36-place-clang-clean-2026-09-20-raw.txt:60-61` gives **593 ms / 189
+>  GB/s** on arm cB for the same 5224 calls and the same 112.07 GB — and it
+>  neither widens nor closes the gap: 189 falls inside [175, 372] and sits
+>  within 8 % of the low reading. What it does do is make the low band look
+>  less like an outlier: 189 is also 1 % from the 191 GB/s that
+>  `qwen36-i8-rows-2026-09-20-raw.txt:106-107` reports for the R=0 arm, so
+>  this third reading may simply be an R=0 measurement — that record pins
+>  `COLI_CUDA_I8_ROWS` nowhere. (An earlier version of this note called it a
+>  third reading of the same configuration that "widens the spread". Neither
+>  half survives. Retracted 22 September 2026.)
+>
+>  "Never explained" overstates it. `docs/ENVIRONMENT.md:228` already
+>  documents a mechanism of this family and prescribes how to read it: the
+>  same 2704 calls over the same 92.37 GB read 475 ms under clang and 750
+>  under gcc — **purely from the host compiler**, because a CPU slow to issue
+>  leaves the card idle inside the interval the kernel column measures. 1.58×
+>  there, 2.1× here, same axis. The better-sourced suspect is on that axis
+>  too: of the three records carrying `dense_stats`, the pinned one is the
+>  only one whose header declares `OMP_NUM_THREADS=16 (7950X physical cores),
+>  WAIT_POLICY=ACTIVE` — sixteen spinning threads against the submit thread.
+>  (An earlier version of this note named a different suspect, that the
+>  pinned record was the only one of the week not pinning
+>  `COLI_CUDA_I8_ROWS`. That is false: `place-clang-clean` and
+>  `xoff-fix-noop` do not pin it either. Retracted 22 September 2026.) Until
+>  this is resolved,
+>  **neither table's absolute figures should be cited**, and the derived
+>  "4.48 ms/token" below inherits the doubt — it also compares a profiled
+>  value against an unprofiled 25 ms token, which this page warns against
+>  elsewhere.
 
 **Half the wall clock of this path is not the kernel.** 4.48 ms/token of it
 is transfer and driver overhead, against a 25 ms token — and unlike the expert

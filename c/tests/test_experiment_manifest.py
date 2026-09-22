@@ -1,7 +1,11 @@
 import copy
+import json
+import hashlib
+import pathlib
+import tempfile
 import unittest
 
-from experiment_manifest import validate
+from experiment_manifest import validate, validate_path
 
 
 def run(config, speeds):
@@ -61,6 +65,129 @@ class ExperimentManifestTest(unittest.TestCase):
         record["baseline"]["evidence"]["sha256"] = "unknown"
         with self.assertRaisesRegex(ValueError, "64 hex"):
             validate(record)
+
+
+class ShippedManifests(unittest.TestCase):
+    """Every manifest in docs/experiments/ must actually validate.
+
+    Nothing ran the validator on them until 22 September 2026: the test above
+    exercises a synthetic record and CONTRIBUTING.md documents the CLI as a
+    manual step. The result was four of six with a sha256 that was not the
+    digest of the file it named -- three DSv4.1 records declaring DIFFERENT
+    digests for baseline and trial while both named ONE file -- and one with a
+    median that did not match its own samples. All five were found by running
+    this, which is the argument for it being a test rather than a habit.
+    """
+
+    def manifests(self):
+        here = pathlib.Path(__file__).resolve()
+        for parent in here.parents:
+            d = parent / "docs" / "experiments"
+            if d.is_dir():
+                return sorted(d.glob("*.json"))
+        self.skipTest("docs/experiments not found from the test directory")
+
+    def test_every_shipped_manifest_validates(self):
+        found = self.manifests()
+        self.assertTrue(found, "docs/experiments/ has no manifests to check")
+        for path in found:
+            with self.subTest(manifest=path.name):
+                validate_path(path)
+
+
+class EvidenceDigest(unittest.TestCase):
+    """The digest has to be the digest OF something, not 64 hex characters.
+
+    The old check accepted any well-formed hex string, so a raw record could be
+    corrected under a manifest that went on certifying the version before the
+    correction -- in one case a version that named the wrong GPU.
+    """
+
+    def _written(self, tmp, body):
+        """Write the raw record where a repo-relative uri would find it.
+
+        `_evidence_path` walks up from the manifest and joins the uri, so the
+        fixture has to reproduce that shape: manifest at the root of `tmp`,
+        record under `tmp/docs/experiments/`. A bare filename next to the
+        manifest would also resolve, but no manifest in this repository is
+        written that way.
+        """
+        d = pathlib.Path(tmp) / "docs" / "experiments"
+        d.mkdir(parents=True, exist_ok=True)
+        raw = d / "rec-raw.txt"
+        raw.write_bytes(body)
+        return raw, hashlib.sha256(body).hexdigest()
+
+    def test_matching_digest_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw, digest = self._written(tmp, b"arm A 10 tok/s\narm B 12 tok/s\n")
+            record = copy.deepcopy(manifest())
+            for arm in ("baseline", "trial"):
+                record[arm]["evidence"] = {"uri": "docs/experiments/" + raw.name, "sha256": digest}
+            path = pathlib.Path(tmp) / "m.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            validate_path(path)
+
+    def test_stale_digest_is_caught(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw, digest = self._written(tmp, b"before the correction\n")
+            record = copy.deepcopy(manifest())
+            for arm in ("baseline", "trial"):
+                record[arm]["evidence"] = {"uri": "docs/experiments/" + raw.name, "sha256": digest}
+            path = pathlib.Path(tmp) / "m.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            validate_path(path)                      # green before the edit
+            raw.write_bytes(b"after the correction\n")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                validate_path(path)                  # and red after it
+
+    def test_uri_with_a_scheme_is_skipped_not_failed(self):
+        """manifest.example.json points at an artifact URL; not a failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            record = copy.deepcopy(manifest())
+            for arm in ("baseline", "trial"):
+                record[arm]["evidence"] = {
+                    "uri": "https://example.invalid/run-artifact.txt",
+                    "sha256": "ab" * 32,
+                }
+            path = pathlib.Path(tmp) / "m.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            validate_path(path)
+
+    def test_uri_naming_a_missing_path_is_an_error_not_a_skip(self):
+        """The branch the gate exists for: a record renamed, the uri stale.
+
+        Until 22 September 2026 this was a silent skip -- `make check` stayed
+        green and nothing verified the digest, which is the exact condition a
+        chain of custody is supposed to exclude. No test covered it: the one
+        that claimed to ("artifact URL") exited on a different branch.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            raw, digest = self._written(tmp, b"arm A 10 tok/s\n")
+            record = copy.deepcopy(manifest())
+            for arm in ("baseline", "trial"):
+                record[arm]["evidence"] = {
+                    "uri": "docs/experiments/" + raw.name + "x",
+                    "sha256": digest,
+                }
+            path = pathlib.Path(tmp) / "m.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not in the tree"):
+                validate_path(path)
+
+    def test_digest_comparison_ignores_hex_case(self):
+        """An uppercase digest is the same digest, not a mismatch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            raw, digest = self._written(tmp, b"arm A 10 tok/s\n")
+            record = copy.deepcopy(manifest())
+            for arm in ("baseline", "trial"):
+                record[arm]["evidence"] = {
+                    "uri": "docs/experiments/" + raw.name,
+                    "sha256": digest.upper(),
+                }
+            path = pathlib.Path(tmp) / "m.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            validate_path(path)
 
 
 if __name__ == "__main__":

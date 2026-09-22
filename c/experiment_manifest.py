@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -90,10 +91,74 @@ def validate(record):
     }
 
 
+def _evidence_path(uri, manifest_path):
+    """The repo file an evidence uri names, or None if it names no file.
+
+    The uri is repo-relative and may carry a section after a comma
+    ("docs/experiments/x-raw.txt, section 'SESSION 2', arm r0"); only the part
+    before the first comma is a path.
+
+    Returning None means "this uri is not a path in this tree": it is empty,
+    or it carries a scheme (`manifest.example.json` points at an artifact
+    URL). EVERYTHING else is treated as a path, and a path that is not there
+    raises. That is the case the digest gate exists for: the raw records of
+    this repository get renamed and corrected, and a silent skip on a stale
+    uri would leave a manifest looking like a chain of custody while nothing
+    verified it. (Until 22 September 2026 this function returned None for
+    both, and the caller could not tell them apart. It also dropped any uri
+    containing a space -- a heuristic for the example manifest's literal
+    "artifact URL", which would equally have dropped a real path with a space
+    in it. The example now carries a real scheme instead, so no heuristic is
+    needed.)
+    """
+    head = uri.split(",")[0].strip()
+    if not head or "://" in head:
+        return None
+    for parent in Path(manifest_path).resolve().parents:
+        candidate = parent / head
+        if candidate.is_file():
+            return candidate
+    raise ValueError(
+        f"evidence.uri names a path that is not in the tree: {head!r} "
+        f"(searched upward from {Path(manifest_path).resolve().parent})")
+
+
+def verify_evidence(record, manifest_path):
+    """Check that each arm's sha256 is the digest of the file its uri names.
+
+    Until 22 September 2026 the validator checked only that the digest was 64
+    hex characters. Nothing checked that it was the digest of anything, and
+    four of the six real manifests in docs/experiments/ had drifted: three
+    DSv4.1 records declared DIFFERENT digests for baseline and trial while
+    both pointed at one file -- a file has one digest, so those values never
+    certified it -- and qwen36-i8-rows.json still carried the digest the raw
+    record had before three corrections, one of which fixed the hardware and
+    one the run duration. A manifest that certifies a version of a record that
+    said the wrong GPU is worse than no manifest, because it looks like a
+    chain of custody.
+
+    An evidence uri that does not name a path at all (an artifact URL) is
+    skipped: this verifies what it can reach, and says nothing about the rest.
+    A uri that names a path which is not in the tree is an error, not a skip.
+    """
+    for name in ("baseline", "trial"):
+        evidence = record.get(name, {}).get("evidence", {})
+        path = _evidence_path(evidence.get("uri", ""), manifest_path)
+        if path is None:
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != (evidence.get("sha256") or "").lower():
+            raise ValueError(
+                f"{name}.evidence.sha256 does not match {path.name}: "
+                f"declared {evidence.get('sha256')}, file is {digest}")
+
+
 def validate_path(path):
     path = Path(path)
     record = json.loads(path.read_text(encoding="utf-8"))
-    return validate(record)
+    summary = validate(record)
+    verify_evidence(record, path)
+    return summary
 
 
 def main(argv=None):
