@@ -1440,12 +1440,50 @@ static void trunk_offer_out(Model *m)
  * GEMV: 10 driver calls a token on this model instead of 30, for the 189 MB
  * they read. dnproj plays the same trick with qkv ++ z.
  *
- * EXPLICIT ONLY for now, unlike dnout/attnout next door. Those are offered to
- * the automatic placer because an A/B measured them (-7.77 ms/token); this has
- * not been measured, and #18's whole argument was that a default does not move
- * on a prediction. The offer therefore goes in only for the layers an explicit
- * COLI_PLACE already named -- which is still enough for qt_init to charge the
- * bytes to that device's expert budget, the thing that must not be skipped.
+ * Offered to the automatic placer, like dnout/attnout next door. It was
+ * EXPLICIT ONLY until 22 September 2026 because the A/B had never been run and
+ * #18's whole argument was that a default does not move on a prediction. It has
+ * now been run on the target hardware -- 6 alternated repetitions, counter-
+ * balanced order, frozen heat table, the placement read back from this file's
+ * own announcement rather than from COLI_PLACE:
+ *
+ *   decode (step() total, the metric the -7.77 was quoted on):
+ *     25.20 -> 20.02 ms/token, median of the paired deltas -5.1, worst -4.0,
+ *     6/6 negative, +25.9 % decode throughput
+ *   attention 5.76 -> 1.94 ms/token (the six-run mean; the per-phase
+ *     breakdown in the record is repetition 5, where it reads 5.77)
+ *   the 189 MB cost 100 experts of budget (12.26 -> 12.09 GB), and the
+ *     expert hit/miss counts are identical in all twelve runs, so the run
+ *     never touched the ones it displaced. On a smaller card it would.
+ *
+ * docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt has the run.
+ *
+ * What the placer does NOT give you, and an earlier draft of this comment
+ * wrongly promised: a budget that refuses the offer on a card too small for
+ * it. auto_place rejects only when the bytes do not physically fit, or when
+ * the displaced experts are worth more -- and qwen36_tier.c:310 says outright
+ * what that second test comes to, `the trunk always wins` without a heat
+ * table, because the marginal expert is then worth 2*topk/n_experts per byte
+ * (0.06 here). With heat it takes a marginal expert routed on more than every
+ * second token.
+ *
+ * An earlier version of this paragraph went on to say that on an int8
+ * container (cpu_factor 1.0) the clamp made refusal unreachable at all. That
+ * was false, and false in the same way as the sentence it was correcting.
+ * auto_displaced_value sums cpu_factor*p over k = ceil(bytes/exp_bytes)
+ * marginal experts with p clamped to 1, so the ceiling on `lose` is
+ * k*exp_bytes, which EXCEEDS bytes whenever bytes is not an exact multiple:
+ * a SMALL offer is refused easily. What is true is narrower, and is about
+ * this offer's size rather than the clamp -- attnproj is 18.9 MB against
+ * 1.80 MB an expert, so k = 11 and refusal would need a mean p above 0.95
+ * across eleven marginal experts. That does not happen.
+ *
+ * So on a card where these 189 MB displace experts the workload does ask for,
+ * the placer takes them anyway and the cost shows up in cpu-miss. That is
+ * already true of lmhead/dnproj/dnout/attnout; this change makes attnproj the
+ * fifth with the same behaviour, not a new hazard. The way out is
+ * COLI_PLACE=off, or an explicit list -- naming any component switches auto
+ * off for all of them.
  *
  * Returns the fused [q_out + 2*kv_out][hidden] int8 block, or NULL. The caller
  * frees it; the tier copies during upload. */
@@ -1505,10 +1543,6 @@ static void trunk_offer_attnproj(Model *m)
     for (int i = 0; i < m->c.n_layers; i++) {
         size_t b = attnproj_bytes(m, i, NULL, NULL);
         if (!b) continue;
-        /* Before qt_init, qt_place_of parses COLI_PLACE directly (G_auto_on is
-         * still 0), so an unset or `auto` run answers CPU here and offers
-         * nothing: auto_place never sees this name until it is measured. */
-        if (qt_place_of("attnproj", i) == QT_PLACE_CPU) continue;
         qt_trunk_offer("attnproj", i, b);
     }
 }

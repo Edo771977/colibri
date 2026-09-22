@@ -68,7 +68,7 @@ int main(void) {
     check(qt_place_of("lmhead", 0) == 0, "lmhead lands on device 0");
     check(qt_place_of("dnproj", 0) == 0 && qt_place_of("dnproj", 6) == 0, "offered dnproj layers land on device 0");
     check(qt_place_of("dnproj", 3) == QT_PLACE_CPU, "an attention layer (never offered) stays on the CPU");
-    check(qt_place_of("attnproj", 0) == QT_PLACE_CPU, "components not yet placed by auto stay on the CPU");
+    check(qt_place_of("attnproj", 0) == QT_PLACE_CPU, "a name nobody offered stays on the CPU");
     check(G.ndev == 1 && G.on, "one card keeps experts and trunk together (no role-split reservation in auto)");
     check(G.budget[0] == 64 * MiB - 22 * MiB, "expert budget = allowance minus the 22 MiB of trunk placed");
     check(G_lmh.dev_ok && G_lmh.dev == 0, "lm_head device is armed for qt_lmhead_init");
