@@ -219,42 +219,77 @@ this card: up to 10 of them, 0.17 GB of budget, 100 experts. THAT is what the
 explicit-COLI_PLACE record could not answer -- whether auto would take the
 offer at all -- and it is what this run adds.
 
-WHAT THIS RUN DOES NOT ADD IS THE COST, and an earlier version of this section
-claimed it did. It said "the exchange is free" and "the 100 displaced experts
-are ones this prompt does not ask for". Both are withdrawn, the same day, for
-three reasons that are all visible in the numbers printed above.
+WHAT THIS RUN DOES NOT ADD IS THE COST. An earlier version of this section
+claimed it did, saying "the exchange is free" and "the 100 displaced experts
+are ones this prompt does not ask for". A SECOND correction, later the same
+day, then withdrew those on an argument that was itself wrong. Both moves are
+recorded here, because the second one is the more instructive.
 
-  THE RUN TOUCHES EVERY EXPERT. miss = 10240, and 10240 is the TOTAL number of
-  experts -- it is the denominator of the engine's own residency line,
-  `resident 6859/10240`. And the two cannot be equal by coincidence: the host
-  slot cache is per layer with cap == n_experts (the script passes -Cap 256,
-  and a cap below the expert count disables the CUDA tier outright), so no
-  slot is ever evicted and each (layer, expert) pair can miss AT MOST ONCE.
-  miss equal to the total therefore means each one missed EXACTLY once, i.e.
-  every expert is reached. "Ones this prompt does not ask for" is contradicted
-  by the figure printed beside it. What the data supports is much narrower:
-  reaching the displaced 100 cost at most 0.03 ms/token on the cpu-miss timer,
-  which is the bound on ALL misses and so bounds theirs too (see below).
+None of the expert counters involved is printed by THIS record: its table
+carries `hit 82.6 %` and `~6859 experts`, both six-run means, from which
+counts cannot be recovered. `hit=48640 miss=10240` and `resident 6859/10240`
+come from the explicit-COLI_PLACE record of the same day, and are quoted as
+that record's output, not as this one's.
 
-  THE HIT RATE CANNOT SEE THE PLACEMENT. The script reads the line `Expert
-  cache hit rate:`, which qwen36.c prints from m.hits/m.miss. Those are
-  incremented in expert_get() against m->cache[layer] -- the HOST LRU slot
-  cache, sized by the script's -Cap 256. They are not the tier's VRAM
-  counters. With cap == n_experts nothing is ever evicted from that cache, so
-  the rate is pinned by construction, and the sibling record says so itself
-  ("identical by construction"). An unchanged 82.6 % is not evidence about
-  what the GPU did.
+  THE WITHDRAWAL'S OWN ARGUMENT WAS FALSE. It read: "miss = 10240, and 10240
+  is the TOTAL number of experts, so every expert is reached, so 'ones this
+  prompt does not ask for' is contradicted". The premise is a warmstart
+  constant, not a measurement of routing. tier_warmstart (c/qwen36.c:3847)
+  runs
 
-  THE BOUND ON cpu-miss IS WEAKER THAN IT WAS WRITTEN. An earlier version said
-  a mean of 0.00 to two decimals means "no individual run carried one either".
-  cpu-miss is a continuous ms/token quantity, not a count -- it reads 4.79 and
-  5.06 in qwen36-place-clang-clean-2026-09-20-raw.txt:48 -- so a six-run mean
-  below 0.005 bounds the six-run sum below 0.03 and therefore each run below
-  0.03 ms/token. Small, and not zero.
+      #pragma omp parallel for schedule(dynamic, 16)
+      for (int gi = 0; gi < cap_total; gi++) { ... expert_get(m, l, eidw, &e); }
 
-So what this run establishes about cost is: displacing 100 experts cost under
-0.03 ms/token on the one timer that watches it, in a run that touched all of
-them. It does NOT establish that they were not wanted.
+  over cap_total = n_layers * n_experts, under its own comment "Load ALL
+  experts into RAM, not just the planned (VRAM) set", BEFORE a single token is
+  generated. So miss reaches exactly the expert count on ANY warmstarted run
+  of this model at this cap, identical for every prompt, arm and placement.
+  The sibling record had already written this -- "the 10240 misses are the
+  cold first touch of each expert and are identical by construction" -- and
+  the withdrawal quoted that phrase while using the same number as if it
+  measured demand. It says nothing about what the prompt routes to.
+
+  Found by review, 22 September 2026. The correction is retracted; the
+  claim it retracted is reinstated in the record that can carry it (below).
+
+  THE HIT RATE THIS RECORD QUOTES CANNOT SEE THE PLACEMENT, and that half of
+  the correction STANDS. The script reads the line `Expert cache hit rate:`,
+  which qwen36.c prints from m.hits/m.miss. Those are incremented in
+  expert_get() against m->cache[layer] -- the HOST LRU slot cache. They are
+  not the tier's VRAM counters. With cap == n_experts the per-layer cache has
+  a slot for every expert, so nothing is ever evicted and the rate is pinned
+  by construction. (What guarantees cap == n_experts in these runs is that
+  the CUDA tier came up at all -- qwen36_tier.c:499 refuses any cap that
+  DIFFERS from the expert count, not merely a smaller one, and the script
+  treats the tier failing to come up as a hard stop. An explicit -Cap is not
+  by itself the guarantee: with RAM_GB set, qwen36.c lowers even an explicit
+  cap.) An unchanged 82.6 % here is not evidence about what the GPU did.
+
+  THE METER THAT DOES BEAR ON IT IS NOT IN THIS RECORD. qwen36_tier.c:1073
+  counts, per routed expert per token,
+
+      for(int k=0;k<K;k++){ QSlot *s=qs(layer,eids[k]);
+          if(s->resident){ ... G.hits[di]++; } else G.miss++; }
+
+  and prints the result as `[qtier] VRAM hit rate` with `LFRU swaps`. THAT is
+  the meter which says whether a displaced expert was ever wanted. The
+  explicit-COLI_PLACE record captured it and reads 100.0 % with 0 swaps in all
+  twelve runs, which is why its version of the claim stands there. This
+  script captures neither figure -- see LIMITATIONS -- so this record can
+  neither support nor contradict it.
+
+  THE BOUND ON cpu-miss IS WEAKER THAN FIRST WRITTEN, and that correction
+  stands too. An earlier version said a mean of 0.00 to two decimals means
+  "no individual run carried one either". cpu-miss is a continuous ms/token
+  quantity, not a count -- it reads 4.79 and 5.06 in
+  qwen36-place-clang-clean-2026-09-20-raw.txt:48 -- so a six-run mean below
+  0.005 bounds the six-run sum below 0.03 and therefore each run below 0.03
+  ms/token. Small, and not zero.
+
+So what this run establishes about cost is one thing only: displacing 100
+experts cost under 0.03 ms/token on the one timer here that watches it. It
+does not establish that they were unwanted, and -- contrary to what the first
+correction said -- it does not establish the opposite either.
 
 And the cost evidence here is WEAKER than the explicit-COLI_PLACE record's,
 not stronger. That record read the per-run values from all twelve logs and
@@ -315,13 +350,24 @@ publishes: qwen36-attnproj-place-2026-09-22-raw.txt records step() reading
 24.05, 24.25, 26.65, 27.40, 27.20 and 25.20 across six sessions of four days,
 with the code unchanged between several of them.
 
-Every number above is a within-session paired delta or an arm statistic from
-the same session, with ONE exception, named here rather than glossed: the
-tolerance band the control rows are judged against (shared +0.19, router
-+0.28) comes from 20 September. That is a threshold imported from another
-day, and an earlier version of this paragraph claimed nothing here was
-compared with another day at all, which was false while that band was doing
-the work of making the control "pass".
+Every TIMING number above is a within-session paired delta or an arm statistic
+from the same session. Several non-timing figures are imported, and they are
+listed here rather than glossed, because an earlier version of this paragraph
+claimed nothing here came from another day, and a later one claimed exactly
+one thing did. Both were false.
+
+  - the tolerance band the control rows are judged against (shared +0.19,
+    router +0.28) is from 20 September, and it is what makes the control
+    "pass";
+  - cpu-miss reading 4.79 and 5.06, cited to show the timer is continuous
+    rather than a count, is from the same 20 September record;
+  - hit=48640 / miss=10240, `resident 6859/10240`, and `VRAM hit rate
+    100.0 %, LFRU swaps 0` are from the explicit-COLI_PLACE record of THIS
+    day. They are quoted to say what this run does NOT measure, not as
+    results of it.
+
+No timing comparison crosses a session. That is the claim that matters and it
+holds; the earlier absolute wordings did not.
 
 Nothing here says anything about a card other than this one, a model other
 than Qwen3.6-35B-A3B, a context other than this prompt, or prefill.

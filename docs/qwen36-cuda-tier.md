@@ -381,11 +381,21 @@ the paired deltas −5.1, worst of the six −4.0, 6/6 negative, +25.9 % decode
 throughput**. (The wall-clock `Speed:` line gives −4.80 and +19.8 %, but it
 carries the prefill, which this change does not touch — `S == 1` only — so a
 percentage computed on it is not comparable to the +14.9 % above.) The
-attention row goes 5.76 → 1.94 ms/token, which is 73 % of it; the rest lands on dense GEMVs that were
+attention row goes 5.76 → 1.94 ms/token, which is 73 % of the timer total in
+the single repetition the record breaks down (−3.83 of −5.22 at repetition 5);
+dividing those arm means by the median of the paired deltas instead would give
+74.9 %, and mixing the two bases is the error corrected further down this page; the rest lands on dense GEMVs that were
 already on the GPU, and the raw record keeps the explanation for that labelled
-as an untested hypothesis. `cpu-miss` stayed at 0.00 with the same VRAM hit
-rate in both arms, so on this card the displaced experts are ones the run does
-not ask for — a property of this card and this workload, not of the change.
+as an untested hypothesis. On this card the displaced experts are ones the run
+does not ask for, and the meter that says so is the **tier's**: `[qtier] VRAM
+hit rate` reads 100.0 % with `LFRU swaps 0` in all twelve runs, and
+`qwen36_tier.c:1073` increments it per routed expert per token, so every
+routed expert was resident and the resident set never changed to make it so.
+(100.0 % is printed to one decimal, so it bounds non-resident routed lookups
+below ~0.05 %, not at zero. `cpu-miss` also stayed at 0.00, but that is one
+timer and the paragraph's own record notes the host misses are served
+somewhere it does not watch.) A property of this card and this workload, not
+of the change.
 Full run: `docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt`.
 
 Both arms of that run pinned an explicit `COLI_PLACE`, which switches the
@@ -402,16 +412,21 @@ not move do not — `(shared)` +0.12 and `(router)` +0.05 against `attention`
 exists **for the second session only**: in the first, a defect in the
 measuring script printed those two rows as NaN, and the record says so.
 
-**What this run does not settle is the cost.** An earlier version of this
-paragraph said the displaced experts "are ones this prompt does not ask for";
-that is withdrawn, 22 September 2026. The run touches every expert — `miss`
-reads 10240, which is the total — and the 82.6 % figure is the **host** expert
-cache's hit rate, from `m.hits`/`m.miss` in `expert_get()`, not the `[qtier]`
-VRAM hit rate the paragraph above quotes. Two different meters, and this record
-captures only the first. What is bounded is the cost of reaching the displaced
-experts: **under 0.03 ms/token on `cpu-miss`**, on this card, this prompt, and
-a heat table warmed on the prompt being measured. Full run, with its
-limitations:
+**What this run does not settle is the cost**, in either direction. The 82.6 %
+it reports is the **host** expert cache's hit rate, from `m.hits`/`m.miss` in
+`expert_get()`, not the `[qtier]` VRAM hit rate the paragraph above rests on —
+two different meters, and this run captures only the first, plus neither the
+LFRU swap count. So it neither supports nor contradicts the cost sentence
+above; that one keeps standing on the explicit run's evidence. What this run
+does bound is **under 0.03 ms/token on `cpu-miss`**, on this card, this prompt,
+and a heat table warmed on the prompt being measured.
+
+(An intermediate version of this paragraph claimed the cost sentence above was
+*withdrawn*, on the ground that `miss = 10240` shows the run reaches every
+expert. That was wrong: `tier_warmstart` touches all `n_layers × n_experts`
+before decode, so the figure is a constant of any warmstarted run and says
+nothing about routing. Retracted 22 September 2026, and the sentence above is
+reinstated.) Full run, with its limitations:
 `docs/experiments/qwen36-autoplace-2026-09-22-raw.txt`.
 
 The byte model predicted 189 MB at 55.03 GB/s ≈ 3.4 ms of CPU bus; the

@@ -231,21 +231,41 @@ changed nothing about which experts the run touched.
 So on a 16 GB card at this context and this heat table, the displaced experts
 are ones the run does not ask for.
 
-  WITHDRAWN 22 September 2026, later the same day, by reading this file's own
-  numbers more carefully. `hit=48640 miss=10240` sits four lines above, and
-  10240 is the TOTAL expert count -- the denominator of `resident 6859/10240`
-  on line 213. The host slot cache is per layer with cap == n_experts, so
-  nothing is ever evicted from it and each (layer, expert) pair can miss at
-  most once; miss equal to the total therefore means every expert is reached
-  exactly once. The run asks for all of them. What "bit-identical hit/miss
-  counts between the arms" establishes is that placement changed nothing about
-  WHICH experts were touched -- which is real, and is not the same claim.
-  The defensible version is the cost bound: the displaced 100 added nothing
-  measurable to cpu-miss, which reads 0.00 in both arms.
-  The caveat in the paragraph above -- that a 0.00 cpu-miss against a 17.4 %
-  miss rate means the misses are served somewhere that timer does not watch --
-  applies to that bound too. See qwen36-autoplace-2026-09-22-raw.txt, which
-  makes the same correction on its own copy of these four numbers.
+  A WITHDRAWAL OF THIS SENTENCE WAS ADDED HERE ON 22 September 2026 AND IS
+  ITSELF RETRACTED, the same day, after review. The withdrawal argued that
+  `hit=48640 miss=10240` four lines above proves the run reaches every
+  expert, so the sentence was contradicted by this record's own numbers.
+  That argument is wrong, and this file had already said why: the 10240
+  misses "are the cold first touch of each expert and are identical by
+  construction". tier_warmstart (c/qwen36.c:3847) calls expert_get on all
+  n_layers * n_experts pairs before a single token is generated, so that
+  figure is a constant of any warmstarted run and carries no information
+  about what the prompt routes to. Quoting it as demand was the same defect
+  this directory keeps correcting: a number read off the wrong instrument.
+
+  THE SENTENCE STANDS, on evidence the withdrawal walked past. The meter that
+  bears on it is the tier's, not the host cache's: qwen36_tier.c:1073 counts
+  hits and misses PER ROUTED EXPERT PER TOKEN --
+
+      for(int k=0;k<K;k++){ QSlot *s=qs(layer,eids[k]);
+          if(s->resident){ ... G.hits[di]++; } else G.miss++; }
+
+  -- and this record carries its output four lines above: VRAM hit rate
+  100.0 %, LFRU swaps 0, in all twelve runs, at resident 6859/10240. Every
+  routed expert of every decode token was resident, and the resident set never
+  changed to make that so. The routed set was a subset of the resident set, so
+  the 100 displaced experts were not routed.
+
+  Two qualifications the original sentence did not carry, and which are the
+  honest correction here. The rate is printed with one decimal, so 100.0 %
+  bounds non-resident routed lookups below about 0.05 % of lookups rather than
+  at exactly zero. And the caveat in the paragraph above -- cpu-miss is one
+  timer, and a 17.4 % host miss rate costing 0.00 ms means those misses are
+  served somewhere it does not watch -- applies to the cost half regardless.
+
+  The companion record qwen36-autoplace-2026-09-22-raw.txt captures NEITHER
+  the VRAM hit rate NOR the LFRU swap count, so it can say nothing either way,
+  and says so.
 
 The rest of this paragraph stands as written. It is a property of this card
 and this prompt, not of the change: on a smaller card, or a workload whose routing is

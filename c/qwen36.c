@@ -1452,9 +1452,14 @@ static void trunk_offer_out(Model *m)
  *     6/6 negative, +25.9 % decode throughput
  *   attention 5.76 -> 1.94 ms/token (the six-run mean; the per-phase
  *     breakdown in the record is repetition 5, where it reads 5.77)
- *   the 189 MB cost 100 experts of budget (12.26 -> 12.09 GB), and the
- *     expert hit/miss counts are identical in all twelve runs, so the run
- *     never touched the ones it displaced. On a smaller card it would.
+ *   the 189 MB cost 100 experts of budget (12.26 -> 12.09 GB), and the run
+ *     never touched the ones it displaced: [qtier] VRAM hit rate 100.0 %
+ *     with LFRU swaps 0 in all twelve runs, and qwen36_tier.c:1073 counts
+ *     that per ROUTED expert per token, so the routed set was inside the
+ *     resident set. (The bit-identical host hit/miss counts an earlier
+ *     version cited instead show only that placement changed nothing about
+ *     WHICH experts were touched -- true, and a different claim.) On a
+ *     smaller card it would.
  *
  * docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt has the run.
  *
@@ -1467,13 +1472,16 @@ static void trunk_offer_out(Model *m)
  * experts) at a median of -5.00 ms/token over the twelve runs, mean -4.85,
  * 12/12 negative.
  *
- * What that run does NOT establish is that the 100 displaced experts were
- * free. The run touches every expert (miss = 10240 = the total), and the
- * `Expert cache hit rate` line it quotes comes from m.hits/m.miss, which
- * expert_get() counts against the HOST slot cache, not the tier's VRAM. All
- * that is bounded is the cost of reaching them: under 0.03 ms/token on
- * cpu-miss. docs/experiments/qwen36-autoplace-2026-09-22-raw.txt has the run
- * and states this itself.
+ * That run says nothing about the COST either way. The `Expert cache hit
+ * rate` it quotes comes from m.hits/m.miss, which expert_get() counts against
+ * the HOST slot cache, not the tier's VRAM, and it captures neither the VRAM
+ * hit rate nor the LFRU swaps -- so the cost line above keeps standing on the
+ * explicit run's evidence, not on this one. What it does bound is under 0.03
+ * ms/token on cpu-miss. (An intermediate version of this comment said the
+ * cost line was withdrawn because miss = 10240 is the total expert count.
+ * Wrong: tier_warmstart touches every (layer, expert) pair before decode, so
+ * that figure is a warmstart constant. Retracted.)
+ * docs/experiments/qwen36-autoplace-2026-09-22-raw.txt has the run.
  *
  * What the placer does NOT give you, and an earlier draft of this comment
  * wrongly promised: a budget that refuses the offer on a card too small for
