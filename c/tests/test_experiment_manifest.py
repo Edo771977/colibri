@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import hashlib
 import pathlib
 import re
@@ -41,11 +42,20 @@ def _pattern_to_regex(pattern, anchored):
             # resolver call a record pinned that git leaves UNSPECIFIED -- a
             # false green, in the no-git case where nothing contradicts it.
             # Found by review, 22 September 2026.
-            whole = (pattern[i:i + 2] == "**"
+            # git's wildmatch consumes the whole RUN of asterisks and then
+            # asks whether the run is a full path component, so `***` and
+            # `****` mean `**`. A version of this that recognised only a run
+            # of exactly two left `***/*.txt` matching nothing across `/`,
+            # which reports a pinned record as unpinned. Found by review.
+            run = i
+            while run < n and pattern[run] == "*":
+                run += 1
+            stars = run - i
+            whole = (stars >= 2
                      and (i == 0 or pattern[i - 1] == "/")
-                     and pattern[i + 2:i + 3] in ("", "/"))
+                     and pattern[run:run + 1] in ("", "/"))
             if whole:
-                i += 2
+                i = run
                 if pattern[i:i + 1] == "/":
                     out.append("(?:[^/]+/)*")       # zero or more components
                     i += 1
@@ -74,7 +84,29 @@ def _pattern_to_regex(pattern, anchored):
     return re.compile(("" if anchored else "(?:.*/)?") + body + r"\Z")
 
 
-_VALID_ATTR = re.compile(r"[A-Za-z0-9][-A-Za-z0-9_.]*\Z")
+_ATTR_CHARS = re.compile(r"[-A-Za-z0-9_.]+\Z")
+
+
+def _valid_attr(token):
+    """Does git accept this token as an attribute, or throw the LINE away?
+
+    Measured against `git check-attr` rather than read off the docs, because
+    the first version of this function was written from the docs and was
+    wrong in both directions: it rejected `_x` and `.x`, which git honours,
+    and it accepted `--text` and `-!text`, which git rejects -- the second
+    being the false green the check was added to stop, since `--text` is the
+    ordinary typo for `-text`.
+
+    git strips AT MOST ONE leading `-` or `!`, then requires the rest to be
+    non-empty, to not begin with `-`, and to be made of letters, digits,
+    hyphens, underscores and dots. A `=value` suffix is not part of the name.
+    Verified on: _x .x _ ... __init__ a-b a.b_c 1abc x= -x !x x- x. A
+    (honoured) and x!y --x -!x (thrown away).
+    """
+    name = token.partition("=")[0]
+    if name[:1] in ("-", "!"):
+        name = name[1:]
+    return bool(name) and not name.startswith("-") and bool(_ATTR_CHARS.match(name))
 
 
 def _attrs_for(root, rel, wanted):
@@ -131,8 +163,7 @@ def _attrs_for(root, rel, wanted):
             # away and the records are left unpinned. Accepting it here made
             # the resolver report a pin git does not give. Found by review,
             # 22 September 2026.
-            if not all(_VALID_ATTR.match(a.lstrip("-!").partition("=")[0])
-                       for a in attributes):
+            if not all(_valid_attr(a) for a in attributes):
                 continue
             anchored = "/" in pattern.rstrip("/")
             if pattern.startswith("/"):
@@ -160,6 +191,29 @@ def _attrs_for(root, rel, wanted):
                 else:
                     verdict[name] = "set"
     return verdict
+
+
+_GIT_ISOLATED = None
+
+
+def _git_env():
+    """An environment where git reads ONLY the repository's .gitattributes.
+
+    Without this, `git check-attr` also consults core.attributesFile and the
+    system gitattributes, which _attrs_for does not model -- so a developer
+    whose global config carries the widely recommended `* text=auto` saw this
+    test fail on a correctly pinned tree with a correct resolver. That is the
+    false red the resolver exists to avoid, reintroduced by the check meant
+    to verify it. Found by review, 22 September 2026.
+    """
+    global _GIT_ISOLATED
+    if _GIT_ISOLATED is None:
+        env = dict(os.environ)
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        env["GIT_ATTR_NOSYSTEM"] = "1"
+        _GIT_ISOLATED = env
+    return _GIT_ISOLATED
 
 
 def manifest():
@@ -391,9 +445,14 @@ class EvidenceDigest(unittest.TestCase):
         the repository root down to the file's own directory, deeper files
         winning, last matching line in each winning, `*` not crossing `/`, a
         leading `/` anchoring, and `!text` returning the attribute to
-        unspecified. It asks git for a second opinion when git is available,
-        and fails if the two disagree -- a mismatch means this resolver has
-        drifted from the thing it models.
+        unspecified. Where git is available it also asks git what IT makes of
+        the records, and fails if git says they are not `unset`.
+
+        It does NOT compare the two answers here: on this tree both are
+        pinned to "unset" by the assertion above, so such a comparison could
+        never fail, and an earlier version of this test made it anyway. The
+        real comparison is test_resolver_agrees_with_git_on_constructed_cases,
+        which builds trees where the two CAN differ.
         """
         root = pathlib.Path(__file__).resolve().parent.parent.parent
         named = set()
@@ -425,7 +484,8 @@ class EvidenceDigest(unittest.TestCase):
         try:
             out = subprocess.run(
                 ["git", "check-attr", "text", "--"] + sorted(named),
-                cwd=root, capture_output=True, text=True, timeout=30)
+                cwd=root, capture_output=True, text=True, timeout=30,
+                env=_git_env())
         except (OSError, subprocess.SubprocessError):       # pragma: no cover
             return
         if out.returncode != 0:
@@ -486,6 +546,28 @@ class EvidenceDigest(unittest.TestCase):
             (["/docs/experiments/*.txt -text"], [], "docs/experiments/a.txt"),
             (["# docs/experiments/*.txt -text"], [], "docs/experiments/a.txt"),
             ([], [], "docs/experiments/a.txt"),
+            # Casi aggiunti dalla round 7, ciascuno perche' una mutazione del
+            # resolver ci dormiva dentro o perche' la regola era sbagliata.
+            (["***/*.txt -text"], [], "docs/experiments/a.txt"),
+            (["docs/*** -text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt _x -text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt .x -text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt --text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt -!text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt x!y -text"], [], "docs/experiments/a.txt"),
+            # NIENTE macro utente qui: questo resolver non le espande, lo
+            # dichiara, e fallisce nella direzione sicura (un file pinnato
+            # SOLO tramite macro risulta non pinnato e il test del pin
+            # diventa rosso). Metterlo nella lista dell'accordo con git
+            # pretenderebbe un'implementazione che non c'e'. Che la riga di
+            # DEFINIZIONE non venga letta come pattern e' verificato da
+            # test_macro_definition_is_not_read_as_a_pattern.
+            (["[attr]binary -text"], [], "docs/experiments/a.txt"),
+            (["experiments/*.txt -text"], [], "docs/experiments/a.txt"),
+            (['"docs/experiments/a b.txt" -text'], [], "docs/experiments/a b.txt"),
+            (["docs/experiments/*.txt text=auto"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/?.txt -text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/?.txt -text"], [], "docs/experiments/ab.txt"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             for n, (top, deep, rel) in enumerate(cases):
@@ -500,14 +582,16 @@ class EvidenceDigest(unittest.TestCase):
                         "\n".join(deep) + "\n", encoding="utf-8")
                 try:
                     init = subprocess.run(["git", "init", "-q"], cwd=root,
-                                          capture_output=True, timeout=30)
+                                          capture_output=True, timeout=30,
+                                          env=_git_env())
                 except (OSError, subprocess.SubprocessError):   # pragma: no cover
                     self.skipTest("no git to compare against")
                 if init.returncode != 0:                        # pragma: no cover
                     self.skipTest("git init failed")
                 out = subprocess.run(
                     ["git", "check-attr", "text", "--", rel], cwd=root,
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=30,
+                    env=_git_env())
                 self.assertEqual(out.returncode, 0, out.stderr)
                 theirs = out.stdout.rstrip("\n").rpartition(": ")[2]
                 mine = _attrs_for(root, rel, ("text",))["text"]
@@ -515,6 +599,32 @@ class EvidenceDigest(unittest.TestCase):
                     mine, theirs,
                     f"case {n} {top!r} + {deep!r} on {rel}: this resolver "
                     f"says {mine!r}, git says {theirs!r}")
+
+    def test_macro_definition_is_not_read_as_a_pattern(self):
+        """`[attr]myrec` defines a macro; it is not a glob.
+
+        Read as a pattern it is a character class -- one of a, t, r --
+        followed by the literal `myrec`, so it would match a file called
+        `amyrec` and set that file's attributes from the macro's body. The
+        skip that prevents this shipped without a test: replacing it with
+        `if False:` left the whole suite green, which is verbatim the defect
+        this PR charges elsewhere. Found by review, 22 September 2026.
+
+        This resolver does not EXPAND user macros either. That is documented
+        where the skip lives, and it fails safe: a file pinned only through a
+        macro reads unspecified here, so the pin test goes red rather than
+        quietly passing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "docs" / "experiments").mkdir(parents=True)
+            (root / ".gitattributes").write_text(
+                "[attr]myrec -text\n", encoding="utf-8")
+            for rel in ("amyrec", "docs/experiments/amyrec"):
+                self.assertEqual(
+                    _attrs_for(root, rel, ("text",))["text"], "unspecified",
+                    f"the macro DEFINITION line matched {rel} as if it were a "
+                    "glob with a character class")
 
     def test_digest_comparison_ignores_hex_case(self):
         """An uppercase digest is the same digest, not a mismatch."""

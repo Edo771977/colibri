@@ -420,7 +420,7 @@ COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0,attnproj=0"   # B
 
 Six repetitions, order counterbalanced inside each repetition, heat table
 frozen, RTX 4070 Ti SUPER 16 GB, read from `step() total` so that it is the
-same metric the −7.77 above was quoted on: **25.20 → 20.02 ms/token, median of
+same metric the withdrawn 19 September figure was quoted on: **25.20 → 20.02 ms/token, median of
 the paired deltas −5.1, worst of the six −4.0, 6/6 negative, +25.9 % decode
 throughput**. (The wall-clock `Speed:` line gives −4.80 and +19.8 %, but it
 carries the prefill, which this change does not touch — `S == 1` only — so a
