@@ -132,8 +132,10 @@ typedef struct {
      * A graph is a promise that nothing about the sequence changes except the
      * bytes in the buffers it points at. Two things can break that promise,
      * and both are checked rather than assumed: a reserve() that reallocates
-     * one of x/y/gate/up/group_desc (buf_gen counts those, and a mismatch
-     * throws the graphs away), and the profiling events, which the graph path
+     * one of the EIGHT buffers a capture bakes in -- x, y, gate, up,
+     * group_desc and the three pinned host staging buffers host_x, host_y,
+     * host_desc (buf_gen counts them, and a mismatch throws the graphs away;
+     * see the block above reserve_graph) -- and the profiling events, which the graph path
      * refuses to run under at all -- four cudaEventRecord inside a capture
      * would bake the timing branch into the graph, so COLI_CUDA_PROFILE=1
      * takes the ordinary path and measures the ordinary path. */
@@ -1637,8 +1639,9 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
  * and a tenth site writing reserve(&ctx->y, ...) would compile in silence. An
  * earlier version of this comment claimed the type made forgetting impossible.
  * It does not. tests/test_graph_reserve_wrappers.py enforces it instead: it
- * reads this file and fails, naming the line, on a bare reserve applied to any
- * of the eight. It runs under make check on every platform, including the ones
+ * reads this file and fails, naming the line, on a bare reserve spelled out
+ * at the call site against any of the eight (the test's own docstring lists
+ * what it does not see). It runs under make check on every platform, including the ones
  * with no CUDA toolchain. What it cannot see is this function being gutted --
  * that half is tests/test_grouped_g4_cuda.cu, which needs a card.
  *
@@ -2973,7 +2976,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
        reserve_graph_pinned(ctx,&ctx->host_y,&ctx->host_y_cap,yb)&&
        reserve_graph_pinned_bytes(ctx,&ctx->host_desc,&ctx->host_desc_cap,
                             (size_t)count*sizeof(GroupDesc));
-    if(!reserved_) return 0;          /* after the invalidation, never before */
+    if(!reserved_) return 0;          /* see the note above on this shape */
     std::memcpy(ctx->host_desc,host,(size_t)count*sizeof(GroupDesc));
     std::memcpy(ctx->host_x,x,xb);
     /* Timing is opt-in because measuring it changes it: four cudaEventRecord

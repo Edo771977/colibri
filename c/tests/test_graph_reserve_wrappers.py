@@ -38,6 +38,10 @@ promises more than it delivers:
     which needs a card.
   - the wrong VARIANT of wrapper (pinned where device was meant). Both
     tests pass; only the types would catch it, and they do not.
+  - a call whose target is not spelled out at the site: through a macro,
+    through a `float **p = &dc->y` alias, or written `&(*dc).y` or
+    `&*&dc->y`. All four are deliberate rather than accidental, but the
+    list is what it is, not what would be convenient.
 """
 
 import pathlib
@@ -72,6 +76,34 @@ _SUFFIX = r"(?:_bytes|_pinned|_pinned_bytes)?"
 BARE = re.compile(r"\breserve" + _SUFFIX + r"\s*" + _TARGET)
 WRAPPED = re.compile(r"\breserve_graph" + _SUFFIX + r"\s*\(\s*\w+\s*,\s*"
                      + _CAST + r"\(?\s*&\s*\(?\s*(?:" + _BASE + r")+" + _FIELD)
+
+
+def _closing_quote(text, start, n):
+    """Index of the quote that closes the literal opened at `start`.
+
+    None if it does not close before the end of the line (allowing for a
+    backslash continuation), which means `start` was not opening a literal.
+    """
+    quote = text[start]
+    i = start + 1
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == quote:
+            return i
+        if c == "\n":
+            # A continuation keeps the literal alive across this newline.
+            j = i - 1
+            while j >= start and text[j] in " \t":
+                j -= 1
+            if j >= start and text[j] == "\\":
+                i += 1
+                continue
+            return None
+        i += 1
+    return None
 
 
 def strip_if_zero(text):
@@ -133,24 +165,24 @@ def strip_comments_and_strings(text):
                 i += 2
                 break
         elif c in "\"'":
-            quote = c
-            i += 1
-            while i < n and text[i] != quote:
-                if text[i] == "\\":
-                    out[i] = " "
-                    i += 1
-                    if i < n:
-                        # Not the newline: a line continuation inside a
-                        # literal must keep its newline or every line after
-                        # it is reported one short.
-                        if text[i] != "\n":
-                            out[i] = " "
-                        i += 1
-                    continue
-                if text[i] != "\n":
-                    out[i] = " "
+            end = _closing_quote(text, i, n)
+            if end is None:
+                # Not a literal after all. A C string or char literal cannot
+                # cross a line without a backslash continuation, so a quote
+                # with no partner before the newline is something else -- and
+                # the something else that matters here is the C++14 digit
+                # separator: `10'000` is legal under -std=c++17, which this
+                # repo compiles with (c/Makefile:381). Treating that lone
+                # apostrophe as an opening quote blanked everything up to the
+                # next apostrophe anywhere in the file -- `engine's` in some
+                # later comment -- and a review planted a real bare reserve
+                # inside that window where NEITHER test could see it.
                 i += 1
-            i += 1
+                continue
+            for k in range(i, end + 1):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = end + 1
         else:
             i += 1
     return "".join(out)
