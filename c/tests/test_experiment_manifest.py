@@ -34,7 +34,17 @@ def _pattern_to_regex(pattern, anchored):
     while i < n:
         c = pattern[i]
         if c == "*":
-            if pattern[i:i + 2] == "**":
+            # `**` is special ONLY where it is a whole path component: at the
+            # start or after a `/`, AND at the end or before a `/`. Anywhere
+            # else git reads consecutive asterisks as an ordinary `*`, which
+            # does not cross `/`. Treating `docs/**.txt` as `.*` made this
+            # resolver call a record pinned that git leaves UNSPECIFIED -- a
+            # false green, in the no-git case where nothing contradicts it.
+            # Found by review, 22 September 2026.
+            whole = (pattern[i:i + 2] == "**"
+                     and (i == 0 or pattern[i - 1] == "/")
+                     and pattern[i + 2:i + 3] in ("", "/"))
+            if whole:
                 i += 2
                 if pattern[i:i + 1] == "/":
                     out.append("(?:[^/]+/)*")       # zero or more components
@@ -62,6 +72,9 @@ def _pattern_to_regex(pattern, anchored):
         i += 1
     body = "".join(out)
     return re.compile(("" if anchored else "(?:.*/)?") + body + r"\Z")
+
+
+_VALID_ATTR = re.compile(r"[A-Za-z0-9][-A-Za-z0-9_.]*\Z")
 
 
 def _attrs_for(root, rel, wanted):
@@ -96,8 +109,30 @@ def _attrs_for(root, rel, wanted):
                 fields = line.split(None, 1)
                 pattern = fields[0]
                 rest = fields[1] if len(fields) > 1 else ""
+            if pattern.startswith("[attr]"):
+                # A macro DEFINITION, not a pattern. git applies it wherever
+                # the macro name is later used; this resolver models only the
+                # built-in `binary` and cannot expand a user macro, so it
+                # skips the definition. A file pinned ONLY through a user
+                # macro therefore reads unspecified here and the pin test
+                # FAILS -- the safe direction, and the reason this is a
+                # documented non-model rather than a silent wrong parse. An
+                # earlier version read `[attr]myrec` as a pattern containing
+                # a character class.
+                continue
             attributes = rest.split()
             if not attributes:
+                continue
+            # git rejects a line carrying a token that is not a valid
+            # attribute name -- letters, digits, hyphens, underscores and
+            # dots, starting with a letter or digit. This matters for the
+            # ordinary mistake `*.txt -text # note`: there is NO inline
+            # comment syntax in .gitattributes, so git throws the whole line
+            # away and the records are left unpinned. Accepting it here made
+            # the resolver report a pin git does not give. Found by review,
+            # 22 September 2026.
+            if not all(_VALID_ATTR.match(a.lstrip("-!").partition("=")[0])
+                       for a in attributes):
                 continue
             anchored = "/" in pattern.rstrip("/")
             if pattern.startswith("/"):
@@ -246,8 +281,39 @@ class EvidenceDigest(unittest.TestCase):
             path.write_text(json.dumps(record), encoding="utf-8")
             validate_path(path)                      # green before the edit
             raw.write_bytes(b"after the correction\n")
-            with self.assertRaisesRegex(ValueError, "does not match"):
+            with self.assertRaises(ValueError) as caught:
                 validate_path(path)                  # and red after it
+            # NOT just "does not match": the CRLF diagnostic below ALSO says
+            # "does not match", so a regex that loose was satisfied by either
+            # branch. With it, `if <crlf-check>:` could be replaced by
+            # `if True:` and this test stayed green -- which is the failure
+            # where a genuinely edited record is reported as an intact record
+            # in a bad working copy, and the reader is told to re-checkout
+            # instead of to investigate. Found by review, 22 September 2026.
+            self.assertRegex(str(caught.exception), r"declared \w+, file is \w+")
+            self.assertNotIn("REWROTE THE LINE ENDINGS", str(caught.exception))
+
+    def test_uri_that_is_all_section_and_no_file_is_an_error(self):
+        """", section 'SESSION 2'" names no file. That is a half-finished
+        rename, not a uri to skip.
+
+        `validate()` only checks the uri is a non-empty string, so this gets
+        as far as `_evidence_path`, which used to return None for it -- a
+        SILENT SKIP, the hole the digest gate exists to close, entered from
+        the other side. The raise that closes it shipped without a test, so
+        replacing it with `return None` left the whole suite green. Found by
+        review, 22 September 2026.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            raw, digest = self._written(tmp, b"arm A 10 tok/s\n")
+            record = copy.deepcopy(manifest())
+            for arm in ("baseline", "trial"):
+                record[arm]["evidence"] = {
+                    "uri": ", section 'SESSION 2', arm r0", "sha256": digest}
+            path = pathlib.Path(tmp) / "m.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "names no file, only a section"):
+                validate_path(path)
 
     def test_uri_with_a_scheme_is_skipped_not_failed(self):
         """manifest.example.json points at an artifact URL; not a failure."""
@@ -371,11 +437,84 @@ class EvidenceDigest(unittest.TestCase):
                 verdict, "unset",
                 f"git says `text` is {verdict!r} for {rel}, so this checkout "
                 "rewrites it and its digest cannot match")
-            mine = _attrs_for(root, rel, ("text",))["text"]
-            self.assertEqual(
-                mine, verdict,
-                f"this test's attribute resolver disagrees with git on {rel}: "
-                f"it says {mine!r}, git says {verdict!r}")
+        # There used to be a second assertion here, comparing _attrs_for's
+        # answer on these same paths with git's. It could not fail: the loop
+        # above has already asserted _attrs_for says "unset" for every one of
+        # them, and the line above asserts git says "unset" too, so both
+        # operands were pinned to the same constant. Four separate drifts of
+        # the resolver -- `*` crossing `/`, `**` read as `.*`, `[!abc]` read
+        # as a positive class, and only the root .gitattributes being read --
+        # all left it green. The real comparison lives in
+        # test_resolver_agrees_with_git_on_constructed_cases below, which
+        # builds trees where the two CAN differ. Found by review, 22
+        # September 2026.
+
+    def test_resolver_agrees_with_git_on_constructed_cases(self):
+        """_attrs_for against real `git check-attr`, on trees built to differ.
+
+        The pin test resolves .gitattributes by hand rather than shelling
+        out, so that it still means something when the suite runs from an
+        export with no .git -- which is exactly where a drifted resolver does
+        the most damage, because nothing can contradict it. That only helps
+        if the reimplementation is checked against git SOMEWHERE, on inputs
+        where the two can actually disagree. The repository's own tree is not
+        such an input: one rule, one shape, everything `unset`.
+
+        Every case below is one a previous version of this resolver got
+        wrong, or one a review constructed to break it.
+        """
+        cases = [
+            # (lines for <root>/.gitattributes, lines for docs/experiments/,
+            #  path to ask about)
+            (["docs/experiments/*.txt -text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt -text"], [], "docs/experiments/s/a.txt"),
+            (["*.txt -text"], [], "docs/experiments/a.txt"),
+            (["docs/**/*.txt -text"], [], "docs/experiments/a.txt"),
+            (["docs/**/*.txt -text"], [], "docs/xexperiments.txt"),
+            (["docs/**.txt -text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt -text # note"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt\t-text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt -text", "docs/experiments/*.txt text"],
+             [], "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt -text"], ["*.txt text eol=crlf"],
+             "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt -text"], ["*.txt !text"],
+             "docs/experiments/a.txt"),
+            (["docs/experiments/*.txt binary"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/[!x]*.txt -text"], [], "docs/experiments/a.txt"),
+            (["docs/experiments/[!x]*.txt -text"], [], "docs/experiments/x.txt"),
+            (["/docs/experiments/*.txt -text"], [], "docs/experiments/a.txt"),
+            (["# docs/experiments/*.txt -text"], [], "docs/experiments/a.txt"),
+            ([], [], "docs/experiments/a.txt"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, (top, deep, rel) in enumerate(cases):
+                root = pathlib.Path(tmp) / f"case{n}"
+                (root / "docs" / "experiments" / "s").mkdir(parents=True)
+                (root / rel).write_bytes(b"x\n")
+                if top:
+                    (root / ".gitattributes").write_text(
+                        "\n".join(top) + "\n", encoding="utf-8")
+                if deep:
+                    (root / "docs" / "experiments" / ".gitattributes").write_text(
+                        "\n".join(deep) + "\n", encoding="utf-8")
+                try:
+                    init = subprocess.run(["git", "init", "-q"], cwd=root,
+                                          capture_output=True, timeout=30)
+                except (OSError, subprocess.SubprocessError):   # pragma: no cover
+                    self.skipTest("no git to compare against")
+                if init.returncode != 0:                        # pragma: no cover
+                    self.skipTest("git init failed")
+                out = subprocess.run(
+                    ["git", "check-attr", "text", "--", rel], cwd=root,
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                theirs = out.stdout.rstrip("\n").rpartition(": ")[2]
+                mine = _attrs_for(root, rel, ("text",))["text"]
+                self.assertEqual(
+                    mine, theirs,
+                    f"case {n} {top!r} + {deep!r} on {rel}: this resolver "
+                    f"says {mine!r}, git says {theirs!r}")
 
     def test_digest_comparison_ignores_hex_case(self):
         """An uppercase digest is the same digest, not a mismatch."""

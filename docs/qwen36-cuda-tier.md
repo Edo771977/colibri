@@ -190,6 +190,13 @@ B  COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"
 
 **16.74 → 19.24 tok/s**: −13.0 % of the time per token, which is +14.9 % of
 throughput — **on a build nobody should ship** (59.75 ms/token; see below).
+THOSE TWO PERCENTAGES ARE THE WITHDRAWN MAGNITUDE RESTATED: −13.0 % is
+7.77/59.75 and +14.9 % is 59.75/51.98, i.e. the same 59.75 → 51.98 pair the
+box above withdraws. They carry the withdrawal with them and must not be
+cited as an effect size either. An earlier version of this page withdrew the
+ms figure and left its percentage form standing as a live comparator, which
+is the citation the withdrawal forbids, performed on the same page that
+forbids it. Repaired 22 September 2026.
 On clang the same change is −15.3 %. Both percentages come from
 `step() total`, i.e. decode only; a percentage computed from the wall-clock
 `Speed:` line is not comparable to either, because that one carries the
@@ -417,7 +424,8 @@ same metric the −7.77 above was quoted on: **25.20 → 20.02 ms/token, median 
 the paired deltas −5.1, worst of the six −4.0, 6/6 negative, +25.9 % decode
 throughput**. (The wall-clock `Speed:` line gives −4.80 and +19.8 %, but it
 carries the prefill, which this change does not touch — `S == 1` only — so a
-percentage computed on it is not comparable to the +14.9 % above.) The
+percentage computed on it is not comparable to the decode percentages quoted
+earlier on this page.) The
 attention row goes 5.76 → 1.94 ms/token, which is 73 % of it; the rest lands on dense GEMVs that were
 already on the GPU, and the raw record keeps the explanation for that labelled
 as an untested hypothesis. `cpu-miss` stayed at 0.00 with the same VRAM hit

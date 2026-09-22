@@ -1452,7 +1452,8 @@ static void trunk_offer_out(Model *m)
  * balanced order, frozen heat table, the placement read back from this file's
  * own announcement rather than from COLI_PLACE:
  *
- *   decode (step() total, the metric the -7.77 was quoted on):
+ *   decode (step() total, the metric the withdrawn 19 September figure
+ *   was quoted on):
  *     25.20 -> 20.02 ms/token, median of the paired deltas -5.1, worst -4.0,
  *     6/6 negative, +25.9 % decode throughput
  *   attention 5.76 -> 1.94 ms/token (the six-run mean; the per-phase
