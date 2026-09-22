@@ -25,14 +25,15 @@
       "dense_kernel_ms": [588],
       "dense_kernel_gb_s": [191]
     },
-    "median_tok_s": 36.5,
+    "median_tok_s": 36.495,
     "quality": {
       "method": "Not a numerical arm: quant_matmul_i8r keeps the original summation order (i = t, t+256, ... ascending), the same 256-wide reduction tree and the same trailing f32 scale, so its output is bitwise identical to this arm's and the comparison cannot be confounded by a quality difference. c/tests/test_int8_rows_cuda.cu asserts exactly that with memcmp on trunk geometry, on S > 1 and on the short-block shapes (O = 13, 5, 17, 3, 1), against a double-precision CPU reference, with a mutated-weight probe so that identity between two kernels that read nothing would fail, and a launch counter so that it cannot be satisfied by a branch that never fires. EXECUTED on the merged code (RTX 4070 Ti SUPER, CUDA 13.4, `make cuda-test`): all seven shapes bitwise identical at R = 2, 4 and 8, reference rms 0.00e+00 to 1.05e-07, dispatch probe confirming the branch fires when unset and not at ROWS=0.",
       "passed": true
     },
     "evidence": {
       "uri": "docs/experiments/qwen36-i8-rows-2026-09-20-raw.txt, section 'SESSION 2', arm r0",
-      "sha256": "48113d4da1491d7e81ed521013f062ef42766ec3037d9fa0e40f952dbd5ebff8"
+      "sha256": "147742d8966dea3284f9a3b138aeb6205ac1cbe0b1527981f80e8955541b86e8",
+      "sha256_note": "sha256 digests the whole raw record file named in uri, not a per-arm log: no per-arm logs exist for this experiment. Corrected 22 September 2026, when experiment_manifest.py began verifying the digest instead of only its shape. Was 48113d4da1491d7e81ed521013f062ef42766ec3037d9fa0e40f952dbd5ebff8: the digest was the raw record's value before three later corrections, one of which fixed the GPU model and one the run duration: it certified a version that named the wrong hardware."
     }
   },
   "trial": {
@@ -45,14 +46,15 @@
       "dense_kernel_ms": [301],
       "dense_kernel_gb_s": [372]
     },
-    "median_tok_s": 42.65,
+    "median_tok_s": 42.645,
     "quality": {
       "method": "Same as the baseline: the two arms are bitwise identical by construction and by test, and that test has now been executed on the merged code -- see the baseline's method field. No open quality item remains.",
       "passed": true
     },
     "evidence": {
       "uri": "docs/experiments/qwen36-i8-rows-2026-09-20-raw.txt, section 'SESSION 2', arm r2",
-      "sha256": "48113d4da1491d7e81ed521013f062ef42766ec3037d9fa0e40f952dbd5ebff8"
+      "sha256": "147742d8966dea3284f9a3b138aeb6205ac1cbe0b1527981f80e8955541b86e8",
+      "sha256_note": "sha256 digests the whole raw record file named in uri, not a per-arm log: no per-arm logs exist for this experiment. Corrected 22 September 2026, when experiment_manifest.py began verifying the digest instead of only its shape. Was 48113d4da1491d7e81ed521013f062ef42766ec3037d9fa0e40f952dbd5ebff8: the digest was the raw record's value before three later corrections, one of which fixed the GPU model and one the run duration: it certified a version that named the wrong hardware."
     }
   },
   "outcome": "improvement",
