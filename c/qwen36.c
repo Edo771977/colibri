@@ -1458,6 +1458,16 @@ static void trunk_offer_out(Model *m)
  *
  * docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt has the run.
  *
+ * That run pinned an explicit COLI_PLACE in BOTH arms, which switches the
+ * automatic placer off -- so it measured the component, not the decision this
+ * comment is about. The automatic path was measured separately the same day,
+ * two binaries with COLI_PLACE unset, six counterbalanced repetitions, run
+ * twice: auto TAKES attnproj here (10 of them, 0.17 GB, 100 experts) for a
+ * median of -5.00 ms/token over the twelve runs, 12/12 negative, with
+ * cpu-miss 0.00 and the hit rate unchanged in all twenty-four.
+ * docs/experiments/qwen36-autoplace-2026-09-22-raw.txt has that one, and its
+ * limitations.
+ *
  * What the placer does NOT give you, and an earlier draft of this comment
  * wrongly promised: a budget that refuses the offer on a card too small for
  * it. auto_place rejects only when the bytes do not physically fit, or when

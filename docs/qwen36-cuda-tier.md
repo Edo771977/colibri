@@ -388,6 +388,23 @@ rate in both arms, so on this card the displaced experts are ones the run does
 not ask for — a property of this card and this workload, not of the change.
 Full run: `docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt`.
 
+Both arms of that run pinned an explicit `COLI_PLACE`, which switches the
+automatic placer off entirely, so it measured the component and not the
+decision. **The automatic path was measured separately, the same day**: two
+binaries, pre-PR against post-PR, `COLI_PLACE` unset, six counterbalanced
+repetitions each, run twice. Left to itself the placer **takes** attnproj on
+this card — 10 of them, 0.17 GB, 100 experts — and the paired delta on
+`step() total` is a **median of −5.00 ms/token over the twelve runs, 12/12
+negative**, session medians −4.95 and −5.05. The rows that should not move do
+not — `(shared)` +0.12 and `(router)` +0.05 against `attention` −3.53, which is
+70 % of the delta — though that control exists **for the second session only**:
+in the first, a defect in the measuring script printed those two rows as NaN,
+and the record says so. `cpu-miss` reads 0.00 in every arm of both sessions at
+an unchanged 82.6 % hit rate, so the 100 displaced experts are ones this prompt
+does not ask for — again a property of this card, this prompt and a heat table warmed
+on the prompt being measured. Full run, with its limitations:
+`docs/experiments/qwen36-autoplace-2026-09-22-raw.txt`.
+
 The byte model predicted 189 MB at 55.03 GB/s ≈ 3.4 ms of CPU bus; the
 measurement came in above that, and the record says where the surplus lands
 without claiming to have proved why.

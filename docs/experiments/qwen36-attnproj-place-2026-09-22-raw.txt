@@ -273,6 +273,16 @@ The measurement that would close this is a pair of runs with COLI_PLACE UNSET,
 pre-PR binary against post-PR, same discipline. It has not been done, and this
 record does not claim it has.
 
+NOTE ADDED LATER THE SAME DAY. It has now been done, twice, and the record is
+docs/experiments/qwen36-autoplace-2026-09-22-raw.txt. The paragraph above
+stands as written for the moment it was written and is left untouched; it is
+simply no longer the current state. In one line: with COLI_PLACE unset,
+auto_place takes 10 attnproj on this card, the paired delta on step() total is
+a median of -5.00 ms/token over twelve runs in two sessions, 12/12 negative,
+and the 100 displaced experts cost 0.00 ms of cpu-miss at an unchanged expert
+hit rate. That record states its own limitations, among them that it does not
+record which commit either binary was built from.
+
 --- what is NOT claimed ----------------------------------------------------
 
 The A arm sits at ~30 ms/token of WALL-CLOCK here against 27 in the 21
