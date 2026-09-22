@@ -2247,12 +2247,20 @@ static int f8_warp_mode(void) {
  * default rather than silently rounding to a neighbouring width.
  *
  * Default 2 is measured on one GPU only (RTX 4070 Ti SUPER, sm_89, qwen36
- * i4 gs64): the R>=2 kernels run the placed dense GEMVs at 342-381 GB/s
- * against the original's 187-191. R=2 and R=4 landed inside each other's
- * spread across two sessions, R=8 was the slowest of the three in both, so R=2 is the pick
- * for being no worse on the measurements and the cheapest in registers and
- * shared memory -- the side to err on for an architecture nobody has
- * measured. COLI_CUDA_I8_ROWS=0 restores the original kernel; the outputs
+ * i4 gs64), and what it rests on is narrower than this comment used to say.
+ * What holds: every R>=2 arm beats R=0 on step(), about -13 % on the token,
+ * in both sessions. What does NOT: this comment claimed 342-381 GB/s against
+ * the original's 187-191, and that R=8 was the slowest of the three in both.
+ * The GB/s column is SUSPENDED (the same calls over the same bytes read 175
+ * GB/s the next day, a factor of 2.1), and "R=8 slowest in both" is false on
+ * step() -- session 1 reads R=8 as the FASTEST of the three. See the
+ * COLI_CUDA_I8_ROWS row of docs/ENVIRONMENT.md, 22 September 2026.
+ *
+ * So R=2 is NOT the pick for being measured best. On step() the three widths
+ * sit within 0.65 ms of each other and their order does not replicate. It is
+ * the pick for being the cheapest of them in registers and shared memory --
+ * the side to err on for an architecture nobody has measured.
+ * COLI_CUDA_I8_ROWS=0 restores the original kernel; the outputs
  * are bitwise identical either way (tests/test_int8_rows_cuda.cu). */
 #ifndef COLI_I8_ROWS_DEFAULT
 #define COLI_I8_ROWS_DEFAULT 2

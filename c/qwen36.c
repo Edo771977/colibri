@@ -1364,10 +1364,15 @@ static const int8_t *qdw_int8(const float *W, int I, int O, const float **scales
  *
  * They were explicit-only when first added, because nothing had measured
  * whether a placed matrix pays for the driver round-trip it adds to the layer
- * chain. It has now been measured (docs/qwen36-cuda-tier.md, 19 September:
- * -7.77 ms/token, four runs a side, spread 2.1) so they are offered to the
- * automatic placer like every other trunk component, and it prices them
- * against the experts they displace.
+ * chain. It has now been measured, so they are offered to the automatic
+ * placer like every other trunk component, and it prices them against the
+ * experts they displace. The figure to cite is **-5.05 ms/token** (clang,
+ * both arms quiet, per-run data in
+ * docs/experiments/qwen36-place-clang-clean-2026-09-20-raw.txt). This comment
+ * used to cite -7.77 from 19 September: that number has no raw record, no
+ * per-run data and no manifest, and is withdrawn as a citable figure -- see
+ * docs/qwen36-cuda-tier.md, 22 September 2026. The decision does not change;
+ * its evidence does.
  *
  * Its own function rather than more lines inside main() because main() is not
  * callable from a test; tests/test_qwen36_trunk_place.c drives this. */
@@ -1447,7 +1452,8 @@ static void trunk_offer_out(Model *m)
  * balanced order, frozen heat table, the placement read back from this file's
  * own announcement rather than from COLI_PLACE:
  *
- *   decode (step() total, the metric the -7.77 was quoted on):
+ *   decode (step() total, the metric the withdrawn 19 September figure
+ *   was quoted on):
  *     25.20 -> 20.02 ms/token, median of the paired deltas -5.1, worst -4.0,
  *     6/6 negative, +25.9 % decode throughput
  *   attention 5.76 -> 1.94 ms/token (the six-run mean; the per-phase
