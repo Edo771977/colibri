@@ -47,10 +47,13 @@ int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
  * nothing asks about is a setting that parses and does nothing. qwen36 asks
  * about: experts, lmhead, dnproj (DeltaNet in_proj, qkv ++ z fused), dnout
  * (DeltaNet out_proj), attnout (attention o_proj) and attnproj (attention
- * q ++ k ++ v fused). The first five are offered to the automatic placer, so
- * an unset COLI_PLACE lets it decide; `off` is the way back to experts only.
- * attnproj is EXPLICIT ONLY until an A/B measures it -- name it in COLI_PLACE
- * or it stays on the CPU, whatever `auto` would have done.
+ * q ++ k ++ v fused). The five TRUNK matrices are all offered to the
+ * automatic placer, so an unset COLI_PLACE lets it decide; `experts` is never
+ * offered and keeps following COLI_GPUS. `off` is the way back to experts
+ * only, and there is NO granular way back -- naming any one component
+ * switches auto off for every component, so a card that wants four of the
+ * five has to list all four. attnproj was explicit-only until its A/B ran on 22 September 2026
+ * (docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt).
  *
  * Target is `cpu` or a CUDA ordinal. A component may also be split across
  * cards by layer count, joined with '+' so it cannot be confused with the

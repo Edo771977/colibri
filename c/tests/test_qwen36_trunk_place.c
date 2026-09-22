@@ -128,6 +128,7 @@ static void tier_up(const char *place) {
 
 static size_t attn_bytes(void) { return (size_t)D * O_IN      + (size_t)D * sizeof(float); }
 static size_t dn_bytes(void)   { return (size_t)D * VALUE_DIM + (size_t)D * sizeof(float); }
+static size_t qkv_bytes(void)  { return (size_t)D * QKV_OUT   + (size_t)QKV_OUT * sizeof(float); }
 
 /* One arm: bring the tier up under `place`, offer, init, place. */
 static void run_arm(Model *m, const char *place, const char *what) {
@@ -208,8 +209,13 @@ int main(void) {
     run_arm(&m, "", "tier starts in auto mode");     /* "" == unset == auto */
     ck(m.L[0].h_attnout > 0 && m.L[2].h_attnout > 0, "auto takes attnout on the attention layers");
     ck(m.L[1].h_dnout   > 0 && m.L[3].h_dnout   > 0, "auto takes dnout on the DeltaNet layers");
-    ck(qt_dense_count() == NL, "one resident matrix per layer");
-    ck(G_trunk_bytes[0] == 2 * attn_bytes() + 2 * dn_bytes(),
+    /* Since 22 September attnproj is offered too, so auto holds one output
+     * projection per layer PLUS one fused input projection per attention
+     * layer. Counting NL here would pass again the day someone withdraws the
+     * attnproj offer, which is exactly the regression this should catch. */
+    ck(m.L[0].h_attnproj > 0 && m.L[2].h_attnproj > 0, "auto takes attnproj on the attention layers");
+    ck(qt_dense_count() == NL + 2, "one output projection per layer, plus attnproj on the two attention layers");
+    ck(G_trunk_bytes[0] == 2 * attn_bytes() + 2 * dn_bytes() + 2 * qkv_bytes(),
        "auto charges the same bytes an explicit placement charges");
     qt_shutdown(); free_model(&m);
 
@@ -219,8 +225,8 @@ int main(void) {
      * word in a table. */
     run_arm(&m, "off", "tier starts with COLI_PLACE=off");
     for (int i = 0; i < NL; i++)
-        ck(m.L[i].h_attnout == 0 && m.L[i].h_dnout == 0,
-           "off places no output projection");
+        ck(m.L[i].h_attnout == 0 && m.L[i].h_dnout == 0 && m.L[i].h_attnproj == 0,
+           "off places nothing, attnproj included");
     ck(qt_dense_count() == 0, "no resident matrix taken");
     ck(G_trunk_bytes[0] == 0, "and no trunk bytes charged");
     qt_shutdown(); free_model(&m);
@@ -231,8 +237,7 @@ int main(void) {
     ck(m.L[1].h_attnproj == 0 && m.L[3].h_attnproj == 0, "and on neither DeltaNet layer");
     ck(m.L[0].h_attnout == 0 && m.L[1].h_dnout == 0,
        "naming attnproj alone places nothing else");
-    ck(G_trunk_bytes[0] == 2 * ((size_t)D * QKV_OUT + (size_t)QKV_OUT * sizeof(float)),
-       "the fused bytes are charged to the trunk");
+    ck(G_trunk_bytes[0] == 2 * qkv_bytes(), "the fused bytes are charged to the trunk");
     {
         /* The fused GEMV must answer exactly what the three separate CPU
          * matmuls answer, in that order. This is the assertion the fusion
@@ -252,13 +257,25 @@ int main(void) {
     }
     qt_shutdown(); free_model(&m);
 
-    printf(" 7. attnproj is explicit-only: auto does not take it\n");
-    /* dnout/attnout are offered to auto because an A/B measured them. This one
-     * has not been measured, so a default run must not move it -- the same
-     * argument that kept those two out until 19 September. */
+    printf(" 7. attnproj is offered to auto, on attention layers only\n");
+    /* Explicit-only until 22 September 2026, on the argument that kept
+     * dnout/attnout out until 19 September: a default does not move on a
+     * prediction. The A/B has now been run on the target hardware -- median
+     * -5.1 ms/token on step() (decode only), 6/6 negative, counterbalanced
+     * order, frozen heat table, cpu-miss 0.00 in both arms
+     * (docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt) -- so the
+     * offer goes in unconditionally and the placer weighs it like the others.
+     *
+     * What must NOT change is the shape of the offer: attnproj_bytes returns 0
+     * for a DeltaNet layer, so those are still never offered and still never
+     * placed. That half of the old assertion is the half worth keeping. */
     run_arm(&m, "", "tier starts in auto mode");
-    for (int i = 0; i < NL; i++)
-        ck(m.L[i].h_attnproj == 0, "auto places no attnproj (nothing offers it)");
+    for (int i = 0; i < NL; i++) {
+        if (KIND[i])
+            ck(m.L[i].h_attnproj != 0, "auto takes attnproj on an attention layer");
+        else
+            ck(m.L[i].h_attnproj == 0, "auto leaves DeltaNet layers alone");
+    }
     qt_shutdown(); free_model(&m);
 
     printf(fails ? "FAILED\n" : "OK\n");
