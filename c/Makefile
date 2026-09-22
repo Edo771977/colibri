@@ -2266,3 +2266,7 @@ tests/test_qwen36_tier_release$(EXE): tests/test_qwen36_tier_release.c tests/qwe
 # Failed gate/up/down uploads must release every unpublished CUDA tensor.
 tests/test_qwen36_tier_rollback$(EXE): tests/test_qwen36_tier_rollback.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Budget separate gate/up/down scale allocations at their own size classes.
+tests/test_qwen36_tier_scale_budget$(EXE): tests/test_qwen36_tier_scale_budget.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
