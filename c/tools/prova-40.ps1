@@ -40,7 +40,8 @@
 
 param(
     [string] $WorkDir = (Split-Path -Parent $PSScriptRoot),
-    [switch] $SkipFullCudaTest    # salta la FASE 3 (lunga) e tiene le altre
+    [switch] $SkipFullCudaTest,   # salta la FASE 3 (lunga) e tiene le altre
+    [switch] $DiagnosiB           # solo la mutazione B, con output SULLA CONSOLE
 )
 
 $ErrorActionPreference = "Stop"
@@ -162,6 +163,29 @@ function Mostra($Risultato, [int]$Righe = 12) {
         ForEach-Object { "       $_" }
 }
 
+# Esegue un comando SENZA redirigere l'output: lo eredita dalla console.
+# Serve perche' su Windows printf verso un FILE e' bufferizzato a blocchi e
+# in una terminazione anomala il buffer va perso -- ed e' esattamente cio'
+# che e' successo al g4 mutato, che ha mostrato stdout vuoto nascondendo
+# tutto quello che aveva stampato prima di morire. Verso una console il
+# buffer si svuota subito, quindi si vede DOVE si ferma.
+# Il codice di uscita passa comunque dal file scritto dal batch.
+function EseguiInConsole([string]$Comando) {
+    $base = [System.IO.Path]::GetTempFileName()
+    $bat = "$base.cmd"; $frc = "$base.rc"
+    Set-Content -LiteralPath $bat -Encoding ASCII -Value @(
+        "@echo off", $Comando, "set RC=%ERRORLEVEL%",
+        "> ""$frc"" echo %RC%", "exit /b %RC%")
+    $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $bat) -PassThru -NoNewWindow -Wait
+    $codice = [int]$p.ExitCode
+    if (Test-Path $frc) {
+        $t = (Get-Content -Raw -LiteralPath $frc).Trim()
+        if ($t -match '^\d+$') { $codice = [int]$t }
+    }
+    foreach ($f in @($base, $bat, $frc)) { Remove-Item -Force -LiteralPath $f -ErrorAction SilentlyContinue }
+    return $codice
+}
+
 $fallite = @()
 function Verifica([bool]$Condizione, [string]$Cosa) {
     if ($Condizione) { "  OK   $Cosa" }
@@ -189,6 +213,35 @@ if ($mancanti.Count -gt 0) {
            "    git checkout claude/graph-buf-gen-invariant`n`n" +
            "poi rilancia. (Lo script di misura non va ricopiato: tools\prova-40.ps1 " +
            "non e' tracciato su quel branch, quindi il checkout non lo tocca.)")
+}
+
+if ($DiagnosiB) {
+    "=== DIAGNOSI B: il g4 mutato, con l'output sulla console ==================="
+    "La fase 4 ha mostrato il g4 mutato uscire con codice 0 e stdout VUOTO,"
+    "il che non torna: un processo che torna da main scarica il buffer. Qui"
+    "l'output non viene rediretto, quindi si vede fin dove arriva davvero."
+    ""
+    try {
+        Muta "ctx->buf_gen++;" `
+             "if(1){(void)ctx;return;}  /* MUTAZIONE B */ ctx->buf_gen++;" `
+             "B (graph_bufs_moved svuotata)"
+        $dry = Esegui "make -n cuda-test"
+        $riga = ($dry.Testo -split "`r?`n") | Where-Object { $_ -match 'grouped_g4_test' -and $_ -match 'test_grouped_g4_cuda\.cu' } | Select-Object -First 1
+        if (-not $riga) { Mostra $dry 15; throw "riga di compilazione non trovata" }
+        "compilo..."
+        $rc = EseguiInConsole $riga
+        if ($rc -ne 0) { throw "la compilazione e' fallita (codice $rc)" }
+        ""
+        "--- output del g4 MUTATO, non rediretto ------------------------------"
+        $rc = EseguiInConsole ".\grouped_g4_test.exe"
+        "----------------------------------------------------------------------"
+        "codice di uscita: $rc  (0x{0:X8})" -f [uint32]([int64]$rc -band 0xFFFFFFFF)
+        "Ultima riga stampata sopra = il punto in cui il test si ferma."
+    } finally {
+        Ripristina
+        "sorgente ripristinato"
+    }
+    exit 0
 }
 
 try {
