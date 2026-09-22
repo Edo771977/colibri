@@ -175,6 +175,42 @@ class EvidenceDigest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not in the tree"):
                 validate_path(path)
 
+    def test_crlf_checkout_is_named_as_the_cause(self):
+        """The Windows failure mode, reported as itself and not as tampering.
+
+        `make check` went red on the Windows UCRT64 runner for all six real
+        manifests the moment digests started being verified: git had rewritten
+        the records to CRLF, so the bytes -- and the digest -- changed. The
+        bytes are pinned in .gitattributes now; this covers the case where
+        that pin is lost, because a bare "does not match" would read as a
+        corrupted record.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            body = b"arm A 10 tok/s\narm B 12 tok/s\n"
+            raw, digest = self._written(tmp, body)
+            raw.write_bytes(body.replace(b"\n", b"\r\n"))   # what Windows checks out
+            record = copy.deepcopy(manifest())
+            for arm in ("baseline", "trial"):
+                record[arm]["evidence"] = {
+                    "uri": "docs/experiments/" + raw.name,
+                    "sha256": digest,
+                }
+            path = pathlib.Path(tmp) / "m.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "REWROTE THE LINE ENDINGS"):
+                validate_path(path)
+
+    def test_records_are_pinned_against_eol_rewriting(self):
+        """The pin itself: without it the digests are not portable."""
+        root = pathlib.Path(__file__).resolve().parent.parent.parent
+        attrs = root / ".gitattributes"
+        self.assertTrue(attrs.is_file(), f"{attrs} is missing: the records it "
+                                         "pins would be rewritten on checkout")
+        self.assertIn("docs/experiments/*.txt -text",
+                      attrs.read_text(encoding="utf-8"),
+                      "the raw records are no longer pinned; a Windows "
+                      "checkout will rewrite them and every digest will fail")
+
     def test_digest_comparison_ignores_hex_case(self):
         """An uppercase digest is the same digest, not a mismatch."""
         with tempfile.TemporaryDirectory() as tmp:

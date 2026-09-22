@@ -1,0 +1,11 @@
+# The manifests in docs/experiments/*.json carry a sha256 of these records,
+# and a digest is over BYTES. A checkout that rewrites line endings -- which
+# is what git does on Windows unless told otherwise -- changes the bytes and
+# the digest cannot match. It did not match: `make check` went red on the
+# Windows UCRT64 runner for all six manifests the moment the digests started
+# being verified, 22 September 2026.
+#
+# So the records are pinned. `-text` disables end-of-line conversion in both
+# directions while leaving them diffable, which is what a file whose bytes
+# are certified needs.
+docs/experiments/*.txt -text

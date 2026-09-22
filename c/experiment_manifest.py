@@ -146,11 +146,28 @@ def verify_evidence(record, manifest_path):
         path = _evidence_path(evidence.get("uri", ""), manifest_path)
         if path is None:
             continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest != (evidence.get("sha256") or "").lower():
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        declared = (evidence.get("sha256") or "").lower()
+        if digest == declared:
+            continue
+        # A digest is over bytes, so a checkout that rewrote the line endings
+        # fails here with nothing to distinguish it from a tampered record.
+        # .gitattributes pins these files with `-text` for exactly that
+        # reason; if the pin is ever lost, say so instead of accusing the
+        # record. The comparison stays byte-exact -- this only names the
+        # cause.
+        if hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest() == declared:
             raise ValueError(
-                f"{name}.evidence.sha256 does not match {path.name}: "
-                f"declared {evidence.get('sha256')}, file is {digest}")
+                f"{name}.evidence.sha256 does not match {path.name} BECAUSE "
+                f"THIS CHECKOUT REWROTE THE LINE ENDINGS: the file matches "
+                f"the declared digest once CRLF is folded back to LF. The "
+                f"record is intact; the working copy is not. Check that "
+                f".gitattributes still carries `docs/experiments/*.txt "
+                f"-text`, then re-checkout the file.")
+        raise ValueError(
+            f"{name}.evidence.sha256 does not match {path.name}: "
+            f"declared {evidence.get('sha256')}, file is {digest}")
 
 
 def validate_path(path):
