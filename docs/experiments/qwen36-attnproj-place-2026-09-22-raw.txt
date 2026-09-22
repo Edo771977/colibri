@@ -61,6 +61,18 @@ repetition:
 
 Same sign, same magnitude. This is the arm, not the position.
 
+The spread is not symmetric between the arms, and that is worth recording:
+
+  A  29.86 .. 30.61   range 0.75 ms   (2.5 % of the mean)
+  B  23.09 .. 26.29   range 3.20 ms   (12.7 %)
+
+Generic system load would hit both arms, and would hit A first, since A is the
+one doing more work on the CPU. Instead the variance sits almost entirely in
+the arm with more work on the GPU. That points at the card -- clocks, thermals,
+something else contending for it -- rather than at background processes, and it
+argues for quoting the worst of the six (-3.70) as an observed floor rather
+than leaning on the median alone. It has not been investigated.
+
 Repetitions 3 and 4 report identical figures to the centesimo in both arms.
 Two independent runs agreeing exactly is possible at two decimals of tok/s and
 the logs are per-repetition, so nothing was reused -- but it is recorded here
@@ -96,19 +108,50 @@ that the -4.80 is not silently credited to attention alone.
 
 --- the cost that did not appear -------------------------------------------
 
-189 MB of trunk is charged to the expert budget, roughly 107 experts at
-1.80 MB each:
+189 MB of trunk is charged to the expert budget, which at 1.80 MB per expert
+is on the order of a hundred experts.
+
+  cpu-miss 0.00 ms/token and VRAM hit rate 82.6 % in BOTH arms, across all six
+  repetitions.
+
+CORRECTION, same day. An earlier version of this file printed two budget
+lines here as "A" and "B":
 
   A  budget 13.76 GB for experts, resident 7805/10240
   B  budget 12.09 GB for experts, resident 6859/10240
 
-  cpu-miss 0.00 ms/token and VRAM hit rate 82.6 % in BOTH arms.
+They are not the two arms. The 12.09 figure is from attnproj-B-r1.log; the
+13.76 is from attnproj-B-r2.log, which is the run the $B/$b variable collision
+corrupted -- it was handed COLI_PLACE=22.6295541977823, placed NOTHING at all,
+and logs "0.00 GB trunk". So the second line is not arm A, it is a run with no
+trunk placement whatsoever, and the 946-expert difference between them is
+mostly the other five components, not attnproj's 189 MB. The comparison was
+fabricated from a broken log and is withdrawn.
+
+What survives is what the six-repetition summary measured directly and what
+the claim actually rests on: cpu-miss 0.00 and the same hit rate in both arms.
+A real per-arm budget comparison needs the A-arm logs and is not in this file.
 
 So on a 16 GB card at this context and this heat table, the displaced experts
 are ones the run does not ask for. That is a property of this card and this
 prompt, not of the change: on a smaller card, or a workload whose routing is
-flatter, the same 189 MB could displace experts that ARE missed. The offer is
-what the placer weighs, and qt_init's budget arithmetic still decides.
+flatter, the same 189 MB could displace experts that ARE missed.
+
+And the placer will NOT stop that. An earlier version of this file, and of the
+comment in qwen36.c, said the budget arithmetic decides. It does not, and
+qwen36_tier.c:309 says so in the placer's own words: without a heat table the
+marginal expert is worth 2*topk/n_experts per byte (0.06 here) and `the trunk
+always wins`. With heat it takes a marginal expert routed on more than every
+second token; on an int8 container the clamp makes even that unreachable. So a
+small card takes these 189 MB too, and pays in cpu-miss.
+
+That is not new with this change -- lmhead, dnproj, dnout and attnout have
+behaved this way since they were offered -- and it is not what this run
+measured, which was a 16 GB card where nothing was missed. It is written here
+because the claim that a budget protects the small card was made in this
+file and in the source, and was wrong. The only way out is COLI_PLACE=off or
+an explicit list, and naming any one component switches auto off for all of
+them.
 
 --- what is NOT claimed ----------------------------------------------------
 

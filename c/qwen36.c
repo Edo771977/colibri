@@ -1449,12 +1449,26 @@ static void trunk_offer_out(Model *m)
  *
  *   median -4.80 ms/token, 6/6 negative, 33.13 -> 39.70 tok/s (+19.8 %)
  *   attention 5.76 -> 1.94 ms/token; cpu-miss 0.00 and VRAM hit rate 82.6 %
- *   in BOTH arms, so the ~107 displaced experts cost nothing at this size
+ *   in BOTH arms, so whatever these bytes displaced, the run never asked for
  *
  * docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt has the run.
- * The offer is what the placer weighs; it still decides per device, and on a
- * card where 189 MB of trunk would displace experts that are actually missed,
- * the budget arithmetic in qt_init is what says no.
+ *
+ * What the placer does NOT give you, and an earlier draft of this comment
+ * wrongly promised: a budget that refuses the offer on a card too small for
+ * it. auto_place rejects only when the bytes do not physically fit, or when
+ * the displaced experts are worth more -- and qwen36_tier.c:309 says outright
+ * what that second test comes to, `the trunk always wins` without a heat
+ * table, because the marginal expert is then worth 2*topk/n_experts per byte
+ * (0.06 here). With heat it takes a marginal expert routed on more than every
+ * second token, and on an int8 container (cpu_factor 1.0) the clamp at
+ * auto_displaced_value makes that unreachable at all.
+ *
+ * So on a card where these 189 MB displace experts the workload does ask for,
+ * the placer takes them anyway and the cost shows up in cpu-miss. That is
+ * already true of lmhead/dnproj/dnout/attnout; this change makes attnproj the
+ * fifth with the same behaviour, not a new hazard. The way out is
+ * COLI_PLACE=off, or an explicit list -- naming any component switches auto
+ * off for all of them.
  *
  * Returns the fused [q_out + 2*kv_out][hidden] int8 block, or NULL. The caller
  * frees it; the tier copies during upload. */

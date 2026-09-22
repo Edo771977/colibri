@@ -366,19 +366,27 @@ individually and so are not contiguous. The fused result therefore lands in a
 scratch row and is split with three `memcpy` — about 36 KB a layer against the
 18.9 MB the GEMV reads.
 
-**Explicit only**, and that is the point: `dnout` and `attnout` are offered to
-the automatic placer because an A/B measured them, and this has not been
-measured. Name it or it stays on the CPU:
+**Measured on 22 September 2026**, and offered to the automatic placer since.
+These are the two arms this section wrote before anyone had run them:
 
 ```
 COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"              # A
 COLI_PLACE="experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0,attnproj=0"   # B
 ```
 
-**No speed number is claimed here.** The fused block is proven to return
-exactly what the three separate CPU matmuls return, in order, against the fake
-CUDA backend — not that it returns them sooner. The byte model says 189 MB at
-55.03 GB/s is 3.4 ms of CPU bus, of which the GPU will take some back.
+Six repetitions, order counterbalanced inside each repetition, heat table
+frozen, RTX 4070 Ti SUPER 16 GB: **median −4.80 ms/token, 6/6 negative, 33.13
+→ 39.70 tok/s (+19.8 %)**, worst of the six −3.70. The attention row goes 5.76
+→ 1.94 ms/token, which is 73 % of it; the rest lands on dense GEMVs that were
+already on the GPU, and the raw record keeps the explanation for that labelled
+as an untested hypothesis. `cpu-miss` stayed at 0.00 with the same VRAM hit
+rate in both arms, so on this card the displaced experts are ones the run does
+not ask for — a property of this card and this workload, not of the change.
+Full run: `docs/experiments/qwen36-attnproj-place-2026-09-22-raw.txt`.
+
+The byte model predicted 189 MB at 55.03 GB/s ≈ 3.4 ms of CPU bus; the
+measurement came in above that, and the record says where the surplus lands
+without claiming to have proved why.
 
 One thing the measurement of `dnout`/`attnout` already settled, and that
 bounds what is left: the **shared expert is not worth moving**. It is the
