@@ -54,10 +54,14 @@ if (-not (Test-Path $Exe))    { throw "manca $Exe -- ricostruisci: make -B qwen3
 if (-not (Test-Path $Prompt)) { throw "manca $Prompt" }
 if (-not (Test-Path $Snap))   { throw "modello non trovato in $Snap -- passa -Snap <dir>" }
 
-$A = "experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"
-$B = "experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0,attnproj=0"
+# ATTENZIONE: in PowerShell i nomi di variabile NON distinguono maiuscole e
+# minuscole. Questi si chiamavano $A e $B, e le due variabili di comodo a fine
+# ripetizione si chiamavano $a e $b: erano LE STESSE DUE VARIABILI, quindi dopo
+# la prima ripetizione COLI_PLACE valeva un numero ("[place] COLI_PLACE=22.62955").
+$PlaceA = "experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0"
+$PlaceB = "experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0,attnproj=0"
 
-function Invoke-Engine([string]$Place, [string]$Log) {
+function Invoke-Engine([string]$Place, [string]$LogPath) {
     $env:SNAP        = $Snap
     $env:COLI_PLACE  = $Place
     $env:COLI_CUDA   = "1"
@@ -68,14 +72,14 @@ function Invoke-Engine([string]$Place, [string]$Log) {
 
     $old = $ErrorActionPreference
     $ErrorActionPreference = "Continue"        # il motore scrive tutto su stderr
-    & $Exe $Cap $Bits $Prompt 2>&1 | Out-File -Encoding utf8 $Log
+    & $Exe $Cap $Bits $Prompt 2>&1 | Out-File -Encoding utf8 $LogPath
     $code = $LASTEXITCODE
     $ErrorActionPreference = $old
     if ($code -eq -1073741515) {
-        throw "exit 0xC0000135 (STATUS_DLL_NOT_FOUND): a $Exe manca una DLL e il processo e' morto prima di main, quindi $Log e' vuoto. Di norma sono le runtime di MSYS2: passa -ToolchainBin <cartella bin>."
+        throw "exit 0xC0000135 (STATUS_DLL_NOT_FOUND): a $Exe manca una DLL e il processo e' morto prima di main, quindi $LogPath e' vuoto. Di norma sono le runtime di MSYS2: passa -ToolchainBin <cartella bin>."
     }
-    if ($code -ne 0) { throw "exit $code -- vedi $Log" }
-    Get-Content $Log -Raw
+    if ($code -ne 0) { throw "exit $code -- vedi $LogPath" }
+    Get-Content $LogPath -Raw
 }
 
 # Quanti attnproj il MOTORE dice di aver piazzato. NON cercare la stringa
@@ -83,21 +87,21 @@ function Invoke-Engine([string]$Place, [string]$Log) {
 # ErrorRecord e il formattatore ci aggiunge "In ...\misure-attnproj.ps1:NN",
 # cioe' il log contiene il nome di questo file e la guardia trova se stessa.
 # L'unica prova e' la riga che qwen36.c:1533 stampa solo se placed > 0.
-function Get-Placed([string]$Txt) {
-    if ($Txt -match '\[place\]\s+(\d+)\s+attnproj \(q\+\+k\+\+v fused\) on GPU') { return [int]$Matches[1] }
+function Get-Placed([string]$Text) {
+    if ($Text -match '\[place\]\s+(\d+)\s+attnproj \(q\+\+k\+\+v fused\) on GPU') { return [int]$Matches[1] }
     return 0
 }
 
-function Assert-TierUp([string]$Txt, [string]$Where, [string]$Log) {
-    if ($Txt -match 'tier disabled') {
-        throw "${Where}: il tier CUDA si e' disabilitato da solo (vedi $Log). Senza device COLI_PLACE non piazza niente e i due bracci sarebbero identici. Controlla -Cap: deve valere quanto il numero di esperti del modello."
+function Assert-TierUp([string]$Text, [string]$Where, [string]$LogPath) {
+    if ($Text -match 'tier disabled') {
+        throw "${Where}: il tier CUDA si e' disabilitato da solo (vedi $LogPath). Senza device COLI_PLACE non piazza niente e i due bracci sarebbero identici. Controlla -Cap: deve valere quanto il numero di esperti del modello."
     }
 }
 
 # ---- scaldata + congelamento della heat table ----------------------------
 if (-not (Test-Path "heat.frozen.bin")) {
     "heat.frozen.bin non c'e': faccio la scaldata..."
-    $txt = Invoke-Engine $A "attnproj-warmup.log"
+    $txt = Invoke-Engine $PlaceA "attnproj-warmup.log"
     Assert-TierUp $txt "scaldata" "attnproj-warmup.log"
     if ($txt -notmatch 'Speed:\s*([0-9]+\.[0-9]+)\s*tok/s') {
         throw "la scaldata non e' arrivata in fondo -- vedi attnproj-warmup.log"
@@ -141,12 +145,12 @@ function Run-Arm([string]$Place, [string]$Tag, [int]$Rep) {
 # indistinguibile dall'effetto del braccio. Dispari A-poi-B, pari B-poi-A.
 $rows = @()
 for ($r = 1; $r -le $Reps; $r++) {
-    if ($r % 2 -eq 1) { $rows += Run-Arm $A "A" $r; $rows += Run-Arm $B "B" $r }
-    else              { $rows += Run-Arm $B "B" $r; $rows += Run-Arm $A "A" $r }
-    $a = ($rows | Where-Object { $_.Rep -eq $r -and $_.Arm -eq "A" }).Ms
-    $b = ($rows | Where-Object { $_.Rep -eq $r -and $_.Arm -eq "B" }).Ms
+    if ($r % 2 -eq 1) { $rows += Run-Arm $PlaceA "A" $r; $rows += Run-Arm $PlaceB "B" $r }
+    else              { $rows += Run-Arm $PlaceB "B" $r; $rows += Run-Arm $PlaceA "A" $r }
+    $msA = ($rows | Where-Object { $_.Rep -eq $r -and $_.Arm -eq "A" }).Ms
+    $msB = ($rows | Where-Object { $_.Rep -eq $r -and $_.Arm -eq "B" }).Ms
     "rip {0} ({1})  A {2,6:N2}  B {3,6:N2}  delta {4,6:N2} ms/token" -f `
-        $r, $(if ($r % 2 -eq 1) { "A prima" } else { "B prima" }), $a, $b, ($b - $a) | Write-Host
+        $r, $(if ($r % 2 -eq 1) { "A prima" } else { "B prima" }), $msA, $msB, ($msB - $msA) | Write-Host
 }
 
 $deltas = 1..$Reps | ForEach-Object { $r=$_

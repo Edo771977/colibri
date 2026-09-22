@@ -27,3 +27,16 @@ $used = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.Var
 $unknown = $used | Where-Object { $_ -notin $assigned -and $_ -notin $params -and $_ -notin $loops -and $_ -notin $auto -and $_ -notlike 'env:*' }
 if ($unknown) { "MAI ASSEGNATE: {0}" -f ($unknown -join ', '); exit 1 }
 "variabili: nessuna lettura di variabile mai assegnata"
+# I nomi di variabile in PowerShell NON distinguono maiuscole e minuscole:
+# $B e $b sono la stessa variabile. Due nomi che differiscono solo per il
+# caso sono quasi sempre due variabili DIVERSE nell'intenzione di chi scrive,
+# e una sovrascrive l'altra in silenzio.
+# -CaseSensitive: senza, Sort-Object -Unique e' esso stesso insensibile al
+# caso e collassa $A e $a prima che il controllo possa vederli.
+$all = @($assigned + $params + $loops) | Sort-Object -Unique -CaseSensitive
+$collide = $all | Group-Object { $_.ToLowerInvariant() } | Where-Object Count -gt 1
+if ($collide) {
+    $collide | ForEach-Object { "COLLISIONE DI CASO: {0} -- in PowerShell sono la STESSA variabile" -f ($_.Group -join ' / ') }
+    exit 1
+}
+"nomi: nessuna collisione fra maiuscole e minuscole"
