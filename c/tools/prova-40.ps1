@@ -47,7 +47,7 @@ $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $WorkDir
 
 $sorgente = "backend_cuda.cu"
-if (-not (Test-Path $sorgente)) { throw "non trovo $sorgente: lanciami dalla cartella c\ o passa -WorkDir" }
+if (-not (Test-Path $sorgente)) { throw "non trovo ${sorgente}: lanciami dalla cartella c\ o passa -WorkDir" }
 
 $backup = Join-Path ([System.IO.Path]::GetTempPath()) "backend_cuda.cu.prova40"
 Copy-Item $sorgente $backup -Force
@@ -72,7 +72,7 @@ function Ripristina {
 function Muta([string]$Cerca, [string]$Sostituisci, [string]$Nome) {
     $testo = [System.IO.File]::ReadAllText((Resolve-Path $sorgente))
     $n = ([regex]::Matches($testo, [regex]::Escape($Cerca))).Count
-    if ($n -ne 1) { throw "$Nome: il testo da mutare compare $n volte, non 1. Il sorgente e' cambiato: aggiorna questo script invece di forzarlo." }
+    if ($n -ne 1) { throw "${Nome}: il testo da mutare compare $n volte, non 1. Il sorgente e' cambiato: aggiorna questo script invece di forzarlo." }
     [System.IO.File]::WriteAllText((Resolve-Path $sorgente), $testo.Replace($Cerca, $Sostituisci))
     "  mutazione applicata: $Nome"
 }
