@@ -89,15 +89,22 @@ function Muta([string]$Cerca, [string]$Sostituisci, [string]$Nome) {
 # Start-Process non li sa unire, e vengono poi concatenati.
 function Esegui([string]$Comando, [int]$TimeoutSec = 1800) {
     $base = [System.IO.Path]::GetTempFileName()
-    $bat = "$base.cmd"; $fout = "$base.out"; $ferr = "$base.err"
-    # `exit /b %ERRORLEVEL%` NON e' decorativo: senza, cmd /c su un file
-    # batch ha restituito 0 anche per comandi chiaramente falliti -- il test
-    # Python stampava un AssertionError e lo script leggeva 0, quindi ogni
-    # confronto "-ne 0" era falso e le fasi stampavano OK avendo misurato un
-    # codice sbagliato. C'era nella prima versione di questa funzione ed e'
-    # andato perso nella riscrittura con Start-Process.
+    $bat = "$base.cmd"; $fout = "$base.out"; $ferr = "$base.err"; $frc = "$base.rc"
+    # IL BATCH SCRIVE IL PROPRIO CODICE DI USCITA IN UN FILE, e quel file e'
+    # l'autorita'. $p.ExitCode di Start-Process -PassThru ha restituito 0 su
+    # comandi chiaramente falliti (il test Python stampava un AssertionError
+    # accanto a un codice 0), e `exit /b %ERRORLEVEL%` da solo non l'ha
+    # risolto: la lettura resta 0. Un file scritto da dentro il processo non
+    # dipende da come PowerShell sincronizza l'oggetto processo.
+    #
+    # L'ordine conta: %ERRORLEVEL% va catturato PRIMA di scriverlo, perche'
+    # l'echo stesso lo azzererebbe.
     Set-Content -LiteralPath $bat -Encoding ASCII -Value @(
-        "@echo off", $Comando, "exit /b %ERRORLEVEL%")
+        "@echo off",
+        $Comando,
+        "set RC=%ERRORLEVEL%",
+        "> ""$frc"" echo %RC%",
+        "exit /b %RC%")
     $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $bat) -PassThru `
                        -NoNewWindow -RedirectStandardOutput $fout -RedirectStandardError $ferr
     # -Wait senza limite trasforma un processo bloccato in uno script
@@ -116,22 +123,33 @@ function Esegui([string]$Comando, [int]$TimeoutSec = 1800) {
     # stderr pieno e stdout VUOTO, che e' la firma di una terminazione
     # anomala (stdout verso file e' bufferizzato e va perso, stderr no).
     $out = ""; $err = ""
-    if (Test-Path $fout) { $c = Get-Content -Raw -LiteralPath $fout; if ($c) { $out = $c } }
-    if (Test-Path $ferr) { $c = Get-Content -Raw -LiteralPath $ferr; if ($c) { $err = $c } }
+    if (Test-Path $fout) { $t = Get-Content -Raw -LiteralPath $fout; if ($t) { $out = $t } }
+    if (Test-Path $ferr) { $t = Get-Content -Raw -LiteralPath $ferr; if ($t) { $err = $t } }
     $testo = ""
     if ($out) { $testo += "--- stdout ---`n" + $out }
     if ($err) { $testo += "--- stderr ---`n" + $err }
     if (-not $testo) { $testo = "(nessun output su nessuno dei due flussi)" }
-    foreach ($f in @($base, $bat, $fout, $ferr)) {
+
+    # IL CODICE VA LETTO PRIMA DELLA PULIZIA. In una stesura intermedia la
+    # cancellazione dei temporanei stava sopra questa lettura, quindi il file
+    # non c'era mai e si ricadeva sempre su $p.ExitCode -- cioe' la
+    # correzione non correggeva niente.
+    $codice = [int]$p.ExitCode
+    if (Test-Path $frc) {
+        $t = (Get-Content -Raw -LiteralPath $frc).Trim()
+        if ($t -match '^\d+$') { $codice = [int]$t }
+    }
+
+    foreach ($f in @($base, $bat, $fout, $ferr, $frc)) {
         Remove-Item -Force -LiteralPath $f -ErrorAction SilentlyContinue
     }
     if ($scaduto) {
         return @{ Testo = ("TIMEOUT dopo $TimeoutSec s. Output raccolto fino a li':`n" + $testo)
-                  Codice = -1; Scaduto = $true }
+                  Codice = -1; Scaduto = $true; Esa = "TIMEOUT"
+                  StdOut = [string]$out; StdErr = [string]$err }
     }
-    $c = [int]$p.ExitCode
-    return @{ Testo = [string]$testo; Codice = $c; Scaduto = $false
-              Esa = ("0x{0:X8}" -f [uint32]([int64]$c -band 0xFFFFFFFF))
+    return @{ Testo = [string]$testo; Codice = $codice; Scaduto = $false
+              Esa = ("0x{0:X8}" -f [uint32]([int64]$codice -band 0xFFFFFFFF))
               StdOut = [string]$out; StdErr = [string]$err }
 }
 
@@ -194,7 +212,10 @@ if ($probe.Codice -ne 0 -or $probe.Testo -notmatch "prova40harnessok") {
 # ha reso falsi i risultati del primo giro: lo script leggeva 0 da comandi
 # falliti e stampava OK. Senza questa prova, ogni "OK" sotto e' indistinguibile
 # da un errore silenzioso.
-$neg = Esegui "exit 3"
+# `cmd /c exit 3` e NON `exit 3`: quest'ultimo chiuderebbe il batch prima
+# dell'epilogo che scrive il codice, e la sonda fallirebbe su uno strumento
+# sano. Un processo figlio che esce 3 lascia %ERRORLEVEL% a 3 e prosegue.
+$neg = Esegui "cmd /c exit 3"
 if ($neg.Codice -ne 3) {
     throw ("l'esecutore non propaga il codice di uscita: `exit 3` ha reso " +
            "'$($neg.Codice)'. Ogni confronto sotto sarebbe privo di significato " +
