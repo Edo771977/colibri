@@ -77,31 +77,33 @@ function Muta([string]$Cerca, [string]$Sostituisci, [string]$Nome) {
     "  mutazione applicata: $Nome"
 }
 
+# ---- ESECUZIONE DI COMANDI ESTERNI ---------------------------------------
+# Start-Process -PassThru, non `& cmd /c`. Sulla macchina di destinazione la
+# forma `& cmd /c ...` ha restituito codice di uscita VUOTO e output vuoto per
+# OGNI comando -- python, make, tutti -- e le fasi hanno continuato a girare
+# su quei vuoti: `$null -ne 0` e' vero, quindi una fase ha perfino stampato OK.
+# Un risultato falso e' peggio di un errore.
+#
+# $p.ExitCode viene dall'oggetto processo e non dipende da $LASTEXITCODE, che
+# e' quello che si era svuotato. I due flussi vanno su file separati perche'
+# Start-Process non li sa unire, e vengono poi concatenati.
 function Esegui([string]$Comando) {
-    # Il comando viene SCRITTO IN UN .cmd ed eseguito, invece di essere
-    # passato a `cmd /c "..."`. Due ragioni, entrambe gia' costate tempo:
-    # catturare la pipeline restituiva output vuoto proprio quando il
-    # comando falliva, cioe' quando serve leggerlo; e annidare le virgolette
-    # (`cmd /c "x > ""y"" 2>&1"`) mette PowerShell, cmd e il comando stesso
-    # a litigare sul riquotaggio. Un file non ha nessuno dei due problemi e
-    # regge qualunque riga di comando, comprese quelle che nvcc produce.
     $base = [System.IO.Path]::GetTempFileName()
-    $bat  = "$base.cmd"
-    $log  = "$base.log"
-    Set-Content -LiteralPath $bat -Encoding ASCII -Value @(
-        "@echo off",
-        "$Comando > ""$log"" 2>&1",
-        "exit /b %ERRORLEVEL%")
-    & cmd /c $bat
-    $codice = $LASTEXITCODE
-    $testo = if (Test-Path $log) { Get-Content -Raw -LiteralPath $log } else { "" }
-    foreach ($f in @($base, $bat, $log)) {
+    $bat = "$base.cmd"; $fout = "$base.out"; $ferr = "$base.err"
+    Set-Content -LiteralPath $bat -Encoding ASCII -Value @("@echo off", $Comando)
+    $p = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", $bat) -Wait -PassThru `
+                       -NoNewWindow -RedirectStandardOutput $fout -RedirectStandardError $ferr
+    $testo = ""
+    foreach ($f in @($fout, $ferr)) {
+        if (Test-Path $f) { $c = Get-Content -Raw -LiteralPath $f; if ($c) { $testo += $c } }
+    }
+    foreach ($f in @($base, $bat, $fout, $ferr)) {
         Remove-Item -Force -LiteralPath $f -ErrorAction SilentlyContinue
     }
-    return @{ Testo = [string]$testo; Codice = $codice }
+    return @{ Testo = [string]$testo; Codice = [int]$p.ExitCode }
 }
 
-# Stampa le prime righe dell'output di un comando fallito. Una fase rossa
+# Stampa le ultime righe dell'output di un comando fallito. Una fase rossa
 # senza il motivo obbliga a rifare tutto a mano.
 function Mostra($Risultato, [int]$Righe = 12) {
     $t = $Risultato.Testo
@@ -141,8 +143,35 @@ if ($mancanti.Count -gt 0) {
 
 try {
 
+"=== FASE 0: lo strumento funziona? ========================================="
+"PowerShell $($PSVersionTable.PSVersion)  |  $sorgente su $(Split-Path -Leaf (Get-Location))"
+# Collaudo dell'esecutore PRIMA di credergli. La corsa precedente ha visto
+# ogni comando restituire codice vuoto e output vuoto, e le fasi hanno
+# continuato lo stesso: una ha stampato OK confrontando il vuoto con zero.
+# Se l'esecutore non sa eseguire `echo`, niente sotto vale nulla.
+$probe = Esegui "echo prova40harnessok"
+if ($probe.Codice -ne 0 -or $probe.Testo -notmatch "prova40harnessok") {
+    throw ("l'esecutore di comandi non funziona su questa macchina: " +
+           "`echo` ha reso codice '$($probe.Codice)' e output '$($probe.Testo)'. " +
+           "Nessuna fase sotto sarebbe attendibile, quindi mi fermo qui invece " +
+           "di stampare risultati costruiti sul vuoto. Riporta queste due righe.")
+}
+"  OK   l'esecutore rende codice e output (echo -> $($probe.Codice))"
+
+# E gli strumenti ci sono? `python` non e' detto che sia il nome giusto.
+$python = $null
+foreach ($c in @("python", "python3", "py -3")) {
+    $v = Esegui "$c --version"
+    if ($v.Codice -eq 0) { $python = $c; "  OK   interprete Python: $c ($($v.Testo.Trim()))"; break }
+}
+if (-not $python) { throw "nessuno fra python, python3 e py -3 risponde a --version. Senza Python le fasi 1, 2 e 4 non possono girare." }
+$mk = Esegui "make --version"
+if ($mk.Codice -ne 0) { throw "make non risponde a --version (codice $($mk.Codice)). Serve per le fasi 3 e 4." }
+"  OK   make presente"
+""
+
 "=== FASE 1: il test Python passa sul file intatto ==========================="
-$r = Esegui "python -m unittest tests.test_graph_reserve_wrappers"
+$r = Esegui "$python -m unittest tests.test_graph_reserve_wrappers"
 Verifica ($r.Codice -eq 0) "test_graph_reserve_wrappers verde sul sorgente intatto"
 if ($r.Codice -ne 0) { Mostra $r }
 
@@ -153,7 +182,7 @@ if ($r.Codice -ne 0) { Mostra $r }
 Muta "ob=(size_t)S*proj->O*sizeof(float);if(!reserve_graph(dc,&dc->y,&dc->y_cap,ob))return 0;" `
      "ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;" `
      "A (reserve nuda su dc->y in attention_absorb_batch_run)"
-$r = Esegui "python -m unittest tests.test_graph_reserve_wrappers"
+$r = Esegui "$python -m unittest tests.test_graph_reserve_wrappers"
 Verifica ($r.Codice -ne 0) "il test diventa rosso sulla reserve nuda"
 Verifica ($r.Testo -match 'backend_cuda\.cu:\d+:\s*reserve\(&dc->y') "e NOMINA la riga colpevole"
 ($r.Testo -split "`n" | Select-String -Pattern 'backend_cuda\.cu:\d+' | Select-Object -First 2) | ForEach-Object { "       $_" }
@@ -180,12 +209,20 @@ Muta "ctx->buf_gen++;" `
      "B (graph_bufs_moved svuotata)"
 
 "-- il test Python deve RESTARE VERDE: e' il buco che dichiara di avere"
-$r = Esegui "python -m unittest tests.test_graph_reserve_wrappers"
+$r = Esegui "$python -m unittest tests.test_graph_reserve_wrappers"
 Verifica ($r.Codice -eq 0) "il test Python NON vede la funzione svuotata (buco dichiarato, confermato)"
 
 "-- il test g4 deve diventare ROSSO: e' l'unico che la vede"
-$riga = (& cmd /c "make -n cuda-test 2>&1") | Where-Object { $_ -match 'grouped_g4_test' -and $_ -match 'test_grouped_g4_cuda\.cu' } | Select-Object -First 1
-if (-not $riga) { throw "non riesco a ricavare da 'make -n cuda-test' la riga che compila test_grouped_g4_cuda.cu. Compila a mano e rilancia con -SkipFullCudaTest." }
+# Anche questa passava per `& cmd /c "...2>&1"`, la forma che non rendeva
+# nulla: la fase 4 moriva qui dicendo di non trovare la riga di compilazione,
+# quando il problema era che `make -n` non veniva letto affatto.
+$dryrun = Esegui "make -n cuda-test"
+$riga = ($dryrun.Testo -split "`r?`n") | Where-Object { $_ -match 'grouped_g4_test' -and $_ -match 'test_grouped_g4_cuda\.cu' } | Select-Object -First 1
+if (-not $riga) {
+    "  la riga di compilazione non e' stata trovata. 'make -n cuda-test' ha reso codice $($dryrun.Codice):"
+    Mostra $dryrun 15
+    throw "non riesco a ricavare da 'make -n cuda-test' la riga che compila test_grouped_g4_cuda.cu (vedi sopra)."
+}
 "       compilo con: $riga"
 $r = Esegui $riga
 Verifica ($r.Codice -eq 0) "il g4 mutato compila"
