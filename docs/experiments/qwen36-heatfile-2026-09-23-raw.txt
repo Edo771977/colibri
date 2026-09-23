@@ -142,7 +142,7 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script --
   for numbers that were observed. Run 7 is the same command captured in
   full; it is the cold figure for prompt-caldo. It enters no mean below, but
   it is not idle either, and two of its jobs are load-bearing. It supplies
-  the -0.26 of moe_total movement at constant miss load that sets the
+  the -0.26 of moe_total movement at equal WHOLE-RUN miss load that sets the
   pessimistic end of the headline range; the entire prompt-caldo side of
   the layer-27 inversion (the 68.28 % and the p = 31.3 % are run 7 alone);
   the third point of the regression note; and a row of the cpu-miss table.
@@ -154,8 +154,14 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script --
 On prompt25.txt:
 
   COLD  mean step() 32.35   (runs 1,2)
-  CROSS mean step() 27.55   (runs 6,8)      -4.80 ms/token   +15 % tok/s
-  SELF  mean step() 24.00   (runs 3,4,9)    -8.35 ms/token   +28 % tok/s
+  CROSS mean step() 27.55   (runs 6,8)      -4.80 ms/token
+  SELF  mean step() 24.00   (runs 3,4,9)    -8.35 ms/token
+
+  As percentages, and the two are NOT the same quantity: on step(), which
+  is per decode token, +17.4 % and +34.8 %; on the engine's Speed line,
+  which is whole-run wall clock including prefill and TTFT, +15.0 % and
+  +27.9 %. The tok/s figures in the run table are the Speed line. Mixing
+  the two would be the denominator error this file polices further down.
 
 The transferable gain is -4.80 ms/token as measured, range -3.8 to -5.8
 across the four pairings of the two cold runs with the two cross runs. That
@@ -203,8 +209,10 @@ test. All three arms, means over their runs:
   mechanism -- a dense trunk matrix moving into or out of the attention
   timer -- different component and different decision path.
 
-  What makes attention a control is EMPIRICAL: every captured run printed a
-  byte-identical pair of placement lines, `[place] auto: dev 0 holds 1527.7
+  What makes attention a control is EMPIRICAL: every run whose header was
+  captured -- eight of nine, run 5's paste being cut off before them --
+  printed a byte-identical pair of placement lines, `[place] auto: dev 0 holds
+  1527.7
   MB of trunk (lmhead yes, 30 dnproj layers)` and `[place] 10 attnout + 30
   dnout on GPU (0.31 GB VRAM)`. Placement did not move, so attention is a
   phase the varied condition did not act on.
@@ -258,11 +266,21 @@ test. All three arms, means over their runs:
   The four cover 92.2 % of moe_total cold and 89.2 % warm; about 1.17
   ms/token sits outside all of them, in every one of the eight timed runs
   (1.11 to 1.28). Adding the (shared) or (router) phase timers does not
-  close it -- (router) leaves 0.285, (shared) overshoots -- so the
-  components overlap and no exact decomposition is available from this
-  output. What DOES hold is the delta: the unaccounted remainder is
-  near-constant across the arms, moving 0.005, which is why the four
-  deltas sum to within 0.005 of moe_total's.
+  close it -- (router) leaves 0.285 cold and 0.325 warm, (shared)
+  overshoots -- so the components overlap and no exact decomposition is
+  available from this output. The remainder is the same size in both arms
+  to within the ~0.1 of per-run scatter; an earlier version said it "moves
+  0.005", which reads precision into noise, and then said that was "why"
+  the deltas sum to within 0.005 of moe_total's -- circular, since the
+  difference between those sums IS the change in the remainder.
+
+  TWO OF THE FOUR DELTAS ARE INSIDE THEIR OWN SCATTER and are not effects.
+  take is 1.59/1.21 cold and 1.45/0.70 warm -- pair spreads of 0.38 and
+  0.75 against a delta of -0.325 -- and shared-ovl is 3.41/3.52 and
+  3.43/3.65, spreads 0.11 and 0.22 against +0.075. Only cpu-miss (-4.450,
+  spreads 0.13 and 0.23) and issue (+0.485, spreads 0.07 and 0.18) survive
+  the test this file applies to attention's -0.015. Run 8's take of 0.70,
+  half of run 6's 1.45, is unexplained.
 
   cpu-miss alone is -4.45, more than the whole -4.21, and `issue` RISES
   44 %. That is a real offsetting cost of a warm table. Not because more
@@ -285,13 +303,22 @@ test. All three arms, means over their runs:
 
   The assumption: moe_total is per DECODE token while those miss rates span
   the whole run, and run 7 has 29 prefill tokens against 25. Equal
-  whole-run rates imply equal decode-window miss load only if prefill and
-  decode miss at the same rate -- which is exactly what this record says
-  twice that no counter can establish. If the assumption fails it fails in
-  one direction: run 7's decode window would then carry FEWER misses, part
-  of its -0.26 would be miss load rather than position, and charging the
-  whole -0.26 to position would over-charge. So the pessimistic end below
-  is conservative, not optimistic.
+  whole-run rates imply equal decode-window load if prefill and decode miss
+  at the same per-token rate, which no counter here can check.
+
+  There is one way to get at it. Assume instead that the TWO PROMPTS share
+  a prefill rate p and a decode rate d. Then 25p + 63d = 8916 and
+  29p + 63d = 9338 solve to p = 105.5 and d = 99.7 -- prefill missing about
+  6 % more per token than decode -- and both decode windows carry
+  63d = 6278 misses, equal by construction. Under that assumption "constant
+  miss load" is exact rather than approximate.
+
+  It is a different assumption, not a weaker one: two prompts on unrelated
+  subjects need not share either rate. An earlier version of this file
+  claimed the error could only fall one way. That is unsupported -- the
+  direction turns on sign(p - d), which the solve assumes rather than
+  measures. Read the -0.26 charge as unresolved, neither conservative nor
+  optimistic.
 
   Nor is position the only difference: run 7 is a different prompt, 29
   prefill tokens instead of 25, 92 tokens instead of 88, 9338 misses
@@ -303,7 +330,8 @@ test. All three arms, means over their runs:
 So, stated as a range with both ends derived rather than asserted:
 
   -4.80   as measured.
-  -3.95   the most pessimistic defensible accounting: charge run 7's -0.26
+  -3.95   the most pessimistic accounting the data permits, and not the one
+          this record argues for: charge run 7's -0.26
           of moe movement AND the whole -0.59 non-MoE residual to session
           position.
 
@@ -580,10 +608,21 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     qt_lfru_tick_locked compares the halved G.slot[].heat (:1042-1046) and
     tier_should_promote is hot > cold + cold/4 + 4 (c/tier.h:9-12), whose
     fixed +4 is NOT scale-invariant: halving both sides makes admission
-    strictly harder in file units. Four swaps are reported in every
-    captured COLD run; the file records no swap count for the CROSS or SELF
-    arms, and their SELF miss(CPU) of 0 sits awkwardly with the asynchronous
-    swap window described in counterbalancing item 1. And it is not harmless
+    strictly harder in file units. Whether it bites is NOT settled by the
+    swap counts, which the engine prints for every captured run and an
+    earlier version of this file wrongly said it did not record:
+
+        COLD   4 swaps (runs 1, 2, 7)    no table loaded
+        CROSS  4 swaps (runs 6, 8)       table loaded and halved
+        SELF   0 swaps (runs 3, 4, 9)    table loaded and halved
+
+    CROSS takes the same four as COLD, so the halved threshold did not
+    visibly suppress admission there. SELF's zero is explained without it:
+    at a 100 % hit rate every routed expert is already resident, so no
+    non-resident slot accrues heat and tier_should_promote never has a
+    candidate -- and with no swap taken, no asynchronous window opens,
+    which is what counterbalancing item 1 predicts for miss(CPU) 0. And it is
+    not harmless
     afterwards either, because what :1241
     writes back at exit
     is G.slot[].heat, the halved copy plus this session's increments, and
@@ -601,9 +640,10 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     68 % of the expert set in VRAM; the value of a heat table must depend on
     that fraction and only one value of it was tested.
   - Anything about the OTHER hit-rate counter, which moves the OPPOSITE
-    way. Every run also prints a host `Expert cache hit rate`: 78.4 % in
-    the cold runs and 79.1 % in run 7, against 75.3 % in CROSS and 73.3 %
-    in SELF. A warm table makes that number look WORSE. It counts something
+    way. Every captured run also prints a host `Expert cache hit rate`:
+    78.4 % in the cold prompt25 runs and 79.1 % in run 7, itself COLD,
+    against 75.3 % in CROSS and 73.3 % in SELF. A warm table makes that number
+    look WORSE. It counts something
     else -- host RAM cache lookups, whose denominator falls when the CPU
     fallback path stops running -- and this record does not analyse it.
     The run table's `hit rate` column is the [qtier] VRAM figure throughout.
