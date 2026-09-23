@@ -1125,19 +1125,47 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     return mask;
 }
 
+/* qt_take is TWO things: a blocking wait on the expert group, and the
+ * accumulation of its rows into `out`. Reported as one number it cannot
+ * answer the question the shared-expert overlap turns on -- whether the GPU
+ * or the CPU is the critical path of the issue..take window. If the wait is
+ * near zero the CPU is critical and making the shared expert cheaper pays
+ * back one for one; if the wait dominates, the same saving would only grow
+ * the wait and pay nothing. Split here, gated on g_qt_time_take so the
+ * inference build pays nothing: with COLI_TIMERS off not one clock is read.
+ *
+ * The accumulation is not bookkeeping either -- it is K rows of D floats per
+ * layer per token, and at the measured hit rates that is most of the 1.2
+ * ms/token `take` currently reports. */
+/* Defined by the engine next to g_qt_iss and friends, like every other
+ * qtier timer: this translation unit is compiled only with CUDA, and the
+ * non-CUDA build still has to link the report that reads them. */
+extern int    g_qt_time_take;
+extern double g_qt_wait, g_qt_acc;
+static double qt_ms(void){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return ts.tv_sec*1e3 + ts.tv_nsec/1e6;
+}
+
 void qt_take(uint32_t mask,const float *val,int K,float *out){
     (void)K;
     if(!G.on) return;
     if(mask) for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
+        double _w0 = g_qt_time_take ? qt_ms() : 0.0;
         const float *y=coli_cuda_expert_group_take(G.dev[di]);
+        double _w1 = g_qt_time_take ? qt_ms() : 0.0;
+        if(g_qt_time_take) g_qt_wait += _w1-_w0;   /* before the !y bail-out:
+                                                      a group that returns
+                                                      nothing still waited */
         if(!y) continue;
         for(int j=0;j<c;j++){
             float w=val[G.is_k[di][j]];
             const float *row=y+(size_t)j*G.D;
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
         }
+        if(g_qt_time_take) g_qt_acc += qt_ms()-_w1;
         G.is_cnt[di]=0;
     }
     pthread_mutex_lock(&G.mx);
