@@ -3,34 +3,56 @@ transfers to a prompt the table has never seen.
 23 September 2026.
 
 c/qwen36_tier.c:609 loads a heat table from HEAT_FILE and c/qwen36_tier.c:1235
-writes it back at shutdown. The variable is not set by default, so in ordinary
-use the table is built during a run and thrown away at exit. The one record
-in this directory that quotes the tier's own hit rate --
-qwen36-attnproj-place-2026-09-22-raw.txt:203 -- reports "VRAM hit rate
-100.0 %, LFRU swaps 0, in all twelve" runs, measured with a frozen heat
-table. That is the favourable extreme and says nothing about a session that
-starts cold. The other records do not capture the figure at all;
-qwen36-autoplace-2026-09-22-raw.txt:297 says so of itself.
+writes it back at shutdown. The engine does not set the variable itself, but
+the repository's own launch instructions do -- ISTRUZIONI.md:102 has
+`set HEAT_FILE=heat.bin` in the recommended Qwen3.6 block and explains why at
+:109, and docs/qwen36-cuda-tier.md:44 carries it in the usage line. So this
+is NOT a measurement of something nobody has; it is a measurement of what
+those two lines are worth, and of what a user who skips them pays.
 
-This is the measurement of the gap between those two states, plus the part
-that matters: how much of the warm state survives a change of subject.
+The records that quote the tier's own VRAM hit rate all report it at or near
+100 % with a heat table in place:
+
+  qwen36-attnproj-place-2026-09-22-raw.txt:203   100.0 %, all twelve runs
+  qwen36-dense-pinned-2026-09-21-raw.txt:126-140 100,0 %, per run, fifteen
+  qwen36-place-clang-2026-09-19-raw.txt:18       98.1-98.2 %
+
+That is the favourable extreme, and it is the only state the directory has
+ever recorded. This record measures the gap between it and a cold start,
+plus the part that matters: how much of the warm state survives a change of
+subject.
 
 Host   : Ryzen 9 7950X (16 physical cores, clang/LLVM libomp), 64 GB DDR5,
          RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA 13.4. This line is
          carried over from qwen36-attnproj-place-2026-09-22-raw.txt, the same
          machine; the engine's own output confirms only the GPU and sm_89.
-Engine : qwen36_clang.exe, CUDA_DLL=1. THE BINARY PREDATES #39: no attnproj
-         line appears in the [place] output of any run below and `attention`
-         reads 5.26-5.45 ms/token in the eight runs whose timers were
-         captured, which is the unplaced value (1.94 in the #39 record).
-         All three arms therefore carry the same missing optimisation and
-         the comparison between them is unaffected;
-         the ABSOLUTE numbers are not those of current main.
+Engine : qwen36_clang.exe, CUDA_DLL=1. No attnproj line appears in the
+         [place] output of any run below, and `attention` reads 5.26-5.45
+         ms/token in the eight runs whose timers were captured -- the
+         UNPLACED value; the #39 record reads 5.77 unplaced and 1.94 placed
+         (qwen36-attnproj-place-2026-09-22-raw.txt:126, arms defined at
+         :23-24). The binary therefore carries no attnproj placement, which
+         means it predates #39. That is an INFERENCE from an absent output
+         line: no build date, commit or digest was recorded, unlike
+         qwen36-autoplace-2026-09-22-raw.txt:27. All three arms carry the
+         same missing optimisation, so the comparison BETWEEN THEM is
+         unaffected; the absolute numbers are not those of current main, and
+         are higher than main's, not lower.
 Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, N_NEW=64.
 Prompts: prompt25.txt       (25 tokens, operating-system memory management)
          prompt-caldo.txt   (29 tokens, chlorophyll photosynthesis)
          The two share no subject matter. The second exists only to build a
          heat table that cannot contain the first one's answer.
+Place  : the automatic placer, not an explicit COLI_PLACE string -- every
+         run prints `[place] auto: dev 0 holds 1527.7 MB of trunk (lmhead
+         yes, 30 dnproj layers), 12.26 GB left for experts`, identical in all
+         nine. CUDA_EXPERT_GB unset (the budget line reads the 12.26 GB left
+         after trunk), COLI_GPUS unset (`selecting 1 visible device(s)`).
+OMP    : OMP_NUM_THREADS unset -- every run prints the 16-physical-core
+         fallback warning. OMP_WAIT_POLICY not recorded.
+Decode : greedy argmax (c/qwen36.c:3355), which is what makes the routing
+         counters below repeatable. Not a setting; stated because an
+         argument depends on it.
 Runs   : typed by hand at an interactive cmd.exe prompt, no script.
 
 --- the three states ------------------------------------------------------
@@ -130,9 +152,16 @@ to see which argument was withdrawn and why.
      `uploads` and `miss(CPU)` rather than `hits`, because run 1's
      `dev 0: hits` line was not captured.
 
-     Greedy decoding on a fixed prompt with a fixed resident set produces
-     identical routing, so the hit rate has ZERO measurement variance. All
-     the scatter in the table above is timing scatter.
+     This is an OBSERVATION at n=2 and n=3, not a property that follows
+     from the mechanism. Greedy argmax decoding on a fixed prompt is the
+     likely reason, but the cold arm's resident set is NOT fixed: it takes
+     four LFRU swaps per run, and those are asynchronous -- the victim is
+     marked non-resident immediately (c/qwen36_tier.c:1047) while the
+     promotion is queued for the uploader thread, so the window in which the
+     newcomer is still missing is scheduler-dependent and lookups inside it
+     count as misses. That the counters came out equal anyway is a result,
+     not a guarantee. What follows from it is only that the scatter in the
+     timing columns is timing scatter.
 
   2. THE COLD-ARM SPREAD BOUNDS THE SHORT-RANGE NOISE. 32.8 vs 31.9 on
      identical configuration, back to back, is 0.9 ms/token. The cross-topic
@@ -150,30 +179,63 @@ to see which argument was withdrawn and why.
 
 --- three findings that are not the headline ------------------------------
 
-WITHOUT A HEAT TABLE THE RESIDENT SET CARRIES NO INFORMATION.
+WITHOUT A HEAT TABLE THE RESIDENT SET IS A LAYER PREFIX, AND ITS HIT RATE IS
+ARITHMETIC RATHER THAN EVIDENCE.
 
   resident 6959 / 10240 = 67.96 %
   cold hit rate         = 68.34 %  on prompt25   (19244 / 28160)
                         = 68.28 %  on prompt-caldo (20102 / 29440)
 
-  The hit rate matches the residency fraction to within 0.4 points -- not
-  exactly, and the counters have no measurement variance, so the gap is real
-  and unexplained rather than scatter. It is what picking experts at random
-  would give, and it does so on two prompts with nothing in common.
-  Natural order is not a bad heuristic here; it is no heuristic at all.
+  An earlier version of this file read that near-equality as proof that
+  routing is unpredictable -- "what picking experts at random would give".
+  That is wrong, and the code says why. With no heat table, qt_plan_fill
+  sets fill_order[i]=i (c/qwen36_tier.c:961) and decodes it as
+  l = gi/G.ne (:969), so the budget is consumed in strict global index
+  order: a LAYER-MAJOR PREFIX. 6959 = 27*256 + 47, so layers 0-26 are
+  entirely resident, layer 27 holds 47 of 256, and layers 28-39 hold
+  NOTHING. Every token routes topk experts in every layer, so the hit rate
+  is forced to (27 + 47/256)/40 = 67.96 % -- the residency fraction, for any
+  routing distribution and any prompt. The measurement could not have
+  produced another number, and the agreement across two unrelated prompts is
+  an identity, not a coincidence.
 
-"LFRU swaps 4" IS THE POLICY CEILING, NOT A PROPERTY OF THE WORKLOAD.
+  The 0.4-point excess over that floor is the only informative part and is
+  unexplained: it must come from layer 27's routing favouring low-index
+  experts slightly, or from the four LFRU swaps.
+
+  The conclusion that natural order is worth nothing still holds, but the
+  evidence for it is elsewhere in this record: heat order reaches 89.2 % on
+  a prompt it has never seen, at the SAME 6959 slots. That is a comparison
+  at fixed residency, and it is the one that carries the claim.
+
+"LFRU swaps 4" IS BOUNDED BY THE POLICY AT 5, NOT BY THE WORKLOAD.
 
   qt_lfru_tick_locked (c/qwen36_tier.c:1030) is called once per token
-  (qt_issue, layer 0, c/qwen36_tier.c:1071) and does
+  (qt_issue, layer 0, c/qwen36_tier.c:1071). Lines :1032-1036 verbatim, with
+  nothing elided -- an earlier version of this file quoted only the last two
+  and dropped the tick counter and the 1024-tick decay without an ellipsis:
 
-        if(G.tick%16) return;            /* one attempt every 16 tokens   */
-        for(int di=0;di<G.ndev;di++)     /* at most ONE swap per device   */
+    G.tick++;
+    if(!(G.tick%1024))
+        for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
+    if(G.tick%16) return;
+    for(int di=0;di<G.ndev;di++){
+
+  So: one attempt every 16 tokens, and the loop body below it admits at most
+  one swap per device. Those two readings are this record's; the source's own
+  comment is at :1027-1029 and says the same in its own words.
 
   88 tokens of work on prompt25 (25 prefill + 63 decode), 92 on prompt-caldo,
-  gives 5 attempts, and every cold run captured reports 4 swaps. With 3281
-  experts non-resident and 8916 lookups missing on prompt25, the adaptive
-  tier moves four of them. At one expert per 16 tokens
+  gives 5 attempts on one device. Every cold run captured reports 4 swaps, so
+  THE CEILING IS 5 AND ONE ATTEMPT DECLINED. The record cannot say which of
+  the three exits took it: no eligible cold/hot pair on the device, the
+  admission test tier_should_promote requiring hot > cold + cold/4 + 4
+  (c/tier.h:9-12, a comparison of heat values and therefore of the
+  workload), or the queue-full revert at :1050. So 4 is jointly determined
+  by policy and workload; only the 5 is pure policy.
+
+  With 3281 experts non-resident and 8916 lookups missing on prompt25, the
+  adaptive tier moves four of them. At one expert per 16 tokens
   it would need on the order of 52,000 tokens to repair a bad initial set, so
   in a short session the online policy cannot compensate for the cold start.
   This is a ceiling, not a bug report: whether it SHOULD move faster is a
@@ -203,9 +265,14 @@ CPU FALLBACK COST RISES WITH MISSES. NO COST-PER-MISS CAN BE READ OFF HERE.
 
 --- what this run did NOT measure -----------------------------------------
 
-  - Anything about current main. The binary predates #39. A rebuild should
-    move all nine rows by roughly the same amount and leave the deltas
-    standing, but that is an expectation, not a measurement.
+  - Anything about current main, and the deltas are NOT expected to carry
+    over unchanged. Placing attnproj does not only make attention faster: it
+    charges 0.17 GB of trunk to the expert budget, 6959 residents down to
+    6859 (qwen36-attnproj-place-2026-09-22-raw.txt:196-197), moving the
+    residency fraction from 67.96 % to 66.98 %. Residency is precisely the
+    variable this record says its result must depend on, two bullets below.
+    A rebuild therefore changes the measured quantity, not just the baseline
+    it is measured against. How much is unknown.
   - Longer generations. N_NEW=64 with a 25-token prompt is 88 tokens of
     routing. A longer answer touches more experts and the cross-topic hit
     rate at 512 or 2048 tokens is unknown; it could fall (more subject
@@ -213,17 +280,31 @@ CPU FALLBACK COST RISES WITH MISSES. NO COST-PER-MISS CAN BE READ OFF HERE.
   - An accumulated heat table. The warm arms here are built from very little
     history: runs 3 and 6 load a table written by a single ~88- or ~92-token
     run, while run 4's table also carries run 3 and run 9's carries runs 7
-    and 8 (two subjects). The file is halved on load (heat0[i] >> 1) and
-    rewritten at every exit, so it behaves as a decaying average over
-    sessions; a table
-    grown across many unrelated prompts is the obvious next experiment and
-    was not run.
+    and 8 (two subjects). What the file does on load is easy to get wrong,
+    so precisely: c/qwen36_tier.c:617 halves it into the runtime slots
+    (G.slot[i].heat = G.heat0[i] >> 1), but G.heat0 itself keeps the file's
+    UNDECAYED values, and G.heat0 is what orders the warmstart (:962,
+    cmp_heat_desc) and what auto_place receives (:625). The resident set --
+    the only thing this record measures -- is therefore chosen from the
+    undecayed table; the halving touches only the LFRU comparisons, which
+    halve again every 1024 ticks (tier_decay_value, c/tier.h:14, applied at
+    :1034). What is written back at exit is a geometrically decaying SUM of
+    per-session routing counts, not an average: nothing normalises by the
+    number of sessions. A table grown across many unrelated prompts is the
+    obvious next experiment and was not run.
   - Run 9 is worth noting for that reason: its heat table contained BOTH
     subjects and still reached 100.0 % on prompt25. One prior exposure was
     enough, mixed with another topic's history. A single data point.
   - Any other model, quantisation, GPU, or residency fraction. 6959/10240 is
     68 % of the expert set in VRAM; the value of a heat table must depend on
     that fraction and only one value of it was tested.
+  - Whether the COLD arm is the state it is named after. It is not static:
+    four LFRU swaps mutate the resident set inside every cold run, so the
+    68.3 % is an average over a set that changed four times, and the fifth
+    declined attempt is unexplained.
+  - Anything that would let decode be separated from prefill. step() and
+    cpu-miss are per decode token; hits, miss(CPU), uploads and the swap
+    count span the whole run. No counter splits them.
   - Cold NVMe. Every run loaded from a filesystem cache warmed by the
     previous ones. Run 1 is the closest to cold and is also the slowest of
     the cold runs (22.83 tok/s vs 24.07); it is included in the mean, which
@@ -232,9 +313,22 @@ CPU FALLBACK COST RISES WITH MISSES. NO COST-PER-MISS CAN BE READ OFF HERE.
 
 --- no manifest -----------------------------------------------------------
 
-docs/experiments/*.json manifests are not written for this record, for the
-same reason given in issue #44: the validator's schema expects a single
-config with a samples/tok_s triple and a median, and this measurement has
-three arms whose arms cannot be alternated. Recording it as one config would
-misrepresent it. The three most recent qwen36 records are raw-only on the
-same grounds.
+No docs/experiments/*.json manifest is written for this record, and the
+reason is specific rather than a general exemption. c/experiment_manifest.py
+validates exactly TWO arms -- _run(record,"baseline") and
+_run(record,"trial") -- whose configs must differ in exactly one key named by
+changed_variables, and it requires at least three tok/s samples per arm
+(`len(speeds) < 3`). This measurement has THREE arms, and two of them (COLD
+runs 1-2, CROSS runs 6-8) have two samples each. It cannot be expressed in
+that schema without dropping an arm or inventing samples.
+
+The validator does NOT check alternation or run order; an earlier version of
+this paragraph said it did, which was wrong. Nor is this the same case as
+issue #44, which is about a metric in ms/token and a changed_variables that
+names a binary rather than a config key; here the metric is available as
+tok/s and the variable is HEAT_FILE, an environment key. The three-arm shape
+and the two-sample arms are what block it.
+
+Most qwen36 records in this directory are raw-only -- eleven of about
+fourteen, everything since 19 September except qwen36-i8-rows. None of them
+states a reason, so no shared grounds are claimed here on their behalf.
