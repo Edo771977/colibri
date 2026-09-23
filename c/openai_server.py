@@ -3350,13 +3350,9 @@ class Engine:
         arch = family.id
         self.family = family
         self.model_dir = str(model)
-        # Capability gating of the extended SUBMIT namespace (logprobs=/ids=),
-        # established once here at launch, not per request, and never via an
-        # engine-version handshake -- only the glm engine (c/colibri.c)
-        # implements the U7a numeric channel and token-id intake; every other
-        # engine's mux_data/prefill loop never reads sub.logprobs or
-        # sub.tok_ids at all, so sending them would be silently wrong (an
-        # accepted-but-ignored request), not just unsupported.
+        # OpenAI-compatible top-k logprobs and token-id prompts still use the
+        # GLM-only capability gate. Brio's one-token prefill scoring channel
+        # is available on the other updated engines through on_echo below.
         self.supports_logprobs_echo = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
@@ -3636,14 +3632,15 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None, image=None, logprobs=0, echo=False, tok_ids=False):
+                 on_tool=None, image=None, logprobs=0, echo=False, tok_ids=False,
+                 pin=False, on_echo=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
-        if (logprobs or tok_ids) and not self.supports_logprobs_echo:
+        if (tok_ids or (logprobs and on_echo is None)) and not self.supports_logprobs_echo:
             # Defense in depth: APIHandler's logprobs_options()/generation()/
-            # completion() already refuse the HTTP request with a named 400
-            # before ever reaching here. Reaching this with the gate false is
-            # a caller bug, not a bad request.
+            # completion() already refuse the OpenAI-compatible HTTP request
+            # with a named 400. Brio supplies on_echo and uses the one-token
+            # prefill scoring channel on all updated engine families.
             raise RuntimeError("logprobs/token-id intake requested against an engine "
                                "that does not support the U7a extension")
         payload = prompt.encode("utf-8")
@@ -3702,19 +3699,16 @@ class Engine:
                 if cut > 0:
                     prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
             # SUBMIT's key=value extension namespace (decode_batch.h
-            # coli_submit_ext) -- logprobs=k opts into U7a's per-token numeric
-            # channel (ECHO + extended DATA frames), ids=1 marks the payload as
-            # pre-tokenized ASCII decimal ids rather than raw text. Only ever
-            # built when the capability gate above already passed, so this never
-            # reaches an engine that would mis-parse or silently ignore it. The
-            # extension arm requires the 7th (gbytes) field to be present even
-            # when it's 0 -- coli_submit_parse expects exactly 7 numeric fields
-            # before the first key=value token.
+            # coli_submit_ext): logprobs=k requests prefill scoring, ids=1
+            # marks a pre-tokenized prompt, and pin=1 saves the prefix state.
+            # The extension arm requires the 7th (gbytes) field even when 0.
             ext_parts = []
             if logprobs:
                 ext_parts.append(f"logprobs={logprobs}")
             if tok_ids:
                 ext_parts.append("ids=1")
+            if pin:
+                ext_parts.append("pin=1")
             ext_field = (" " + " ".join(ext_parts)) if ext_parts else ""
             gbytes_field = f" {len(xpayload)}" if (xpayload or ext_parts) else ""
             header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
@@ -3859,6 +3853,11 @@ class Engine:
                     pos, data, record = value
                     if echo:
                         prompt_logprobs.append((pos, data, record))
+                    if on_echo is not None:
+                        lp = record["lp"]
+                        on_echo({"pos": pos,
+                                 "logprob": None if math.isnan(lp) else lp,
+                                 "text": data.decode("utf-8", "replace")})
                 elif kind == "tool":
                     _accept({"prompt_tokens": None})
                     if not cancel_sent and not stop_sent:
@@ -4413,6 +4412,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
+            elif path == "/v1/brio":
+                self.brio(body, request_id)
             elif path == "/v1/messages":
                 self.anthropic_messages(body, request_id)
             else:
@@ -4430,6 +4431,259 @@ class APIHandler(BaseHTTPRequestHandler):
                                     None, "engine_error", "server_error"), request_id)
             except OSError:
                 pass
+
+
+    # ---------------------------------------------------------------- modalita brio
+    #
+    # Il modello non genera: si legge il logprob di ogni opzione ammessa e si
+    # normalizza sulle sole opzioni. Torna una distribuzione, non una stringa.
+    #
+    # PERCHE' IL CICLO STA QUI E NON NEL CLIENT. Servono tre cose facili da
+    # sbagliare: fotografare il prefisso condiviso (pin) cosi ogni opzione paga
+    # solo i propri token; NON mettere l'elenco delle opzioni nel prompt (su
+    # qwen36 erano 48 token su 123, meta del risparmio); e normalizzare per
+    # lunghezza, perche' sommare i logprob penalizza le opzioni da piu token --
+    # misurato, la somma diceva "merge" dove la generazione greedy dello stesso
+    # modello diceva "request changes". Un client che rifacesse questo ciclo
+    # sbaglierebbe una di queste tre, e il risultato resterebbe plausibile.
+    #
+    # COSA TORNA. Non solo il vincitore: la probabilita di OGNI opzione e
+    # l'entropia. E' la differenza con la generazione, che una risposta la da
+    # sempre e con la stessa faccia: qui "non lo so" e' un numero.
+    # TRE FORME, UN ENDPOINT. `options` e' la domanda singola. `questions` e'
+    # un elenco di domande sullo stesso stato, ognuna con le sue opzioni: lo
+    # stato viene fotografato una volta e ogni domanda paga solo se stessa,
+    # che e' dove sta il 5,7x misurato. `schema` e' un oggetto campo -> valori
+    # ammessi: il server scrive lo scheletro JSON, casella per casella, e per
+    # ognuna legge il logprob di ciascun valore. Il JSON non puo' uscire
+    # malformato perche' non lo scrive il modello. Prima queste due forme
+    # esistevano solo come script di misura: chi integrava doveva riscriverle.
+    @staticmethod
+    def _brio_options(options, where):
+        if not isinstance(options, list) or not options:
+            raise APIError(400, f"`{where}` must be a non-empty array of strings.", where)
+        if len(options) > 64:
+            raise APIError(400, f"`{where}` accepts at most 64 entries.", where)
+        seen = set()
+        for option in options:
+            if not isinstance(option, str) or not option.strip():
+                raise APIError(400, f"Every entry of `{where}` must be a non-empty string.", where)
+            if option in seen:
+                raise APIError(400, f"Duplicate option in `{where}`: {option!r}.", where)
+            seen.add(option)
+        if len(options) < 2:
+            raise APIError(400, f"`{where}` needs at least two options to choose between.", where)
+        return options
+
+    def brio(self, body, request_id):
+        forms = [k for k in ("options", "questions", "schema") if body.get(k) is not None]
+        if len(forms) != 1:
+            raise APIError(400, "Provide exactly one of `options`, `questions` or `schema`.",
+                           forms[0] if forms else "options")
+        form = forms[0]
+        question = body.get("question")
+        if question is not None and not isinstance(question, str):
+            raise APIError(400, "`question` must be a string.", "question")
+        options = questions = schema = None
+        if form == "options":
+            options = self._brio_options(body["options"], "options")
+        elif form == "questions":
+            raw = body["questions"]
+            if not isinstance(raw, list) or not raw:
+                raise APIError(400, "`questions` must be a non-empty array.", "questions")
+            if len(raw) > 64:
+                raise APIError(400, "`questions` accepts at most 64 entries.", "questions")
+            questions = []
+            for i, entry in enumerate(raw):
+                if not isinstance(entry, dict):
+                    raise APIError(400, f"`questions[{i}]` must be an object.", "questions")
+                text = entry.get("question")
+                if not isinstance(text, str) or not text.strip():
+                    raise APIError(400, f"`questions[{i}].question` must be a non-empty string.",
+                                   "questions")
+                per = entry.get("normalize", body.get("normalize", "mean"))
+                if per not in ("mean", "sum"):
+                    raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
+                questions.append((text, self._brio_options(entry.get("options"),
+                                                           f"questions[{i}].options"), per))
+        else:
+            raw = body["schema"]
+            if not isinstance(raw, dict) or not raw:
+                raise APIError(400, "`schema` must be a non-empty object of field: [values].",
+                               "schema")
+            if len(raw) > 64:
+                raise APIError(400, "`schema` accepts at most 64 fields.", "schema")
+            schema = []
+            for field, values in raw.items():
+                if not isinstance(field, str) or not field.strip():
+                    raise APIError(400, "Every `schema` field name must be a non-empty string.",
+                                   "schema")
+                if any(ch in field for ch in '"\\\n'):
+                    raise APIError(400, f"`schema` field {field!r} cannot contain quotes, "
+                                        "backslashes or newlines.", "schema")
+                schema.append((field, self._brio_options(values, f"schema.{field}")))
+            task = body.get("task")
+            if task is not None and not isinstance(task, str):
+                raise APIError(400, "`task` must be a string.", "task")
+        state = body.get("state")
+        messages = body.get("messages")
+        if state is not None and not isinstance(state, str):
+            raise APIError(400, "`state` must be a string.", "state")
+        if state is None and isinstance(messages, list):
+            # La conversazione in corso FA da stato: e' quello che la TUI manda
+            # quando si scrive /brio a meta chat.
+            parts = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise APIError(400, "Every message must be an object.", "messages")
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "".join(piece.get("text", "") for piece in content
+                                      if isinstance(piece, dict))
+                if content:
+                    parts.append(f"{message.get('role', 'user')}: {content}")
+            state = "\n".join(parts)
+        if not state and not question and form == "options":
+            raise APIError(400, "Provide `state`, `messages` or `question`.", "state")
+        if not state and form != "options":
+            raise APIError(400, f"`{form}` needs a `state` (or `messages`) to decide on.", "state")
+        normalize = body.get("normalize", "mean")
+        if normalize not in ("mean", "sum"):
+            raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
+        # Lo slot si sceglie dallo STATO, non dalla domanda: mille domande
+        # diverse sullo stesso contesto devono cadere sullo stesso slot, o la
+        # fotografia del prefisso condiviso non le serve a niente. E' la stessa
+        # regola di conversation_cache_slot per la chat, con la chiave presa
+        # dalla parte che non cambia.
+        cache_slot = body.get("cache_slot")
+        if cache_slot is None:
+            cache_slot = conversation_cache_slot(
+                [{"role": "system", "content": state or ""}], self.server.kv_slots)
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) \
+                or not 0 <= cache_slot < self.server.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+
+        state_prefix = f"Context:\n{state}\n\n" if state else ""
+        started = time.time()
+        read_total = 0
+        prompt_max = 0
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
+
+            def score(text, pin):
+                """Un giro sul motore: niente generazione, solo la lettura.
+
+                max_tokens=0 vale solo con logprobs>0 e vuol dire "leggi il
+                prompt e fermati". Chiedere un token costerebbe un passo di
+                decodifica completo per opzione, buttato via."""
+                echoes = []
+                accepted = {}
+
+                def on_accept(value):
+                    accepted.update(value)
+
+                self.server.engine.generate(
+                    text, 0, 0.0, 1.0, lambda _chunk: None, cache_slot,
+                    self.client_disconnected, logprobs=1, pin=pin,
+                    on_echo=echoes.append, on_accept=on_accept)
+                n = accepted.get("prompt_tokens")
+                if n is None:                        # motore senza ACCEPT (olmoe)
+                    n = max((e["pos"] for e in echoes), default=-1) + 1
+                return n, echoes
+
+            def choose(prefix, choices, norm):
+                """Fotografa `prefix`, poi un giro per opzione: ognuna paga solo
+                i propri token. Torna (scored, entropia, token del prefisso)."""
+                nonlocal read_total, prompt_max
+                n_prefix, _ = score(prefix, True)
+                prompt_max = max(prompt_max, n_prefix)
+                scored = []
+                for option in choices:
+                    # Il cliente se n'e andato: smettere subito invece di
+                    # macinare le opzioni restanti per nessuno. Con una sola
+                    # slot KV un menu lungo abbandonato la terrebbe occupata
+                    # per minuti, e le richieste dietro andrebbero in coda fino
+                    # al timeout -- e' cosi che sono usciti i primi 429.
+                    if self.client_disconnected():
+                        raise ClientCancelled()
+                    _, tail = score(prefix + " " + option, False)
+                    rows = [e for e in tail if e["pos"] >= n_prefix and e["logprob"] is not None]
+                    total = sum(e["logprob"] for e in rows)
+                    count = max(len(rows), 1)
+                    scored.append({"option": option, "logprob": total, "tokens": len(rows),
+                                   "mean_logprob": total / count})
+                if not any(entry["tokens"] for entry in scored):
+                    raise APIError(502, "The engine returned no log probabilities for the "
+                                        "options.", None, "engine_error", "server_error")
+                key = "mean_logprob" if norm == "mean" else "logprob"
+                top = max(entry[key] for entry in scored)
+                weights = [math.exp(entry[key] - top) for entry in scored]
+                total_weight = sum(weights) or 1.0
+                for entry, weight in zip(scored, weights):
+                    entry["p"] = weight / total_weight
+                scored.sort(key=lambda entry: -entry["p"])
+                entropy = -sum(e["p"] * math.log(max(e["p"], 1e-12)) for e in scored)
+                entropy /= math.log(max(len(scored), 2))
+                read_total += sum(e["tokens"] for e in scored)
+                return scored, round(entropy, 6), n_prefix
+
+            # Lo stato da solo, fotografato per primo: e' il livello che tutte
+            # le domande (o tutte le caselle) condividono. Con un livello solo
+            # la domanda si rilegge una volta per opzione; con due, 176 token
+            # invece di 496 su quattro item (misurato).
+            if state_prefix and form != "options":
+                n_state, _ = score(state_prefix, True)
+                prompt_max = max(prompt_max, n_state)
+
+            if form == "options":
+                prefix = state_prefix
+                if question:
+                    prefix += f"Question: {question}\n"
+                prefix += "Answer:"
+                scored, entropy, _ = choose(prefix, options, normalize)
+                result = {"object": "brio.choice", "answer": scored[0]["option"],
+                          "entropy": entropy, "normalize": normalize, "choices": scored}
+
+            elif form == "questions":
+                answers = []
+                for text, choices, norm in questions:
+                    prefix = state_prefix + f"Question: {text}\nAnswer:"
+                    scored, entropy, _ = choose(prefix, choices, norm)
+                    answers.append({"question": text, "answer": scored[0]["option"],
+                                    "entropy": entropy, "normalize": norm,
+                                    "choices": scored})
+                result = {"object": "brio.answers", "answers": answers}
+
+            else:
+                # Lo scheletro JSON e' DATO: parentesi, virgolette e nomi dei
+                # campi li scriviamo noi, il modello sceglie solo il valore. Ogni
+                # casella si fotografa con dentro le scelte gia fatte, cosi il
+                # campo dopo vede quelli prima, come nella generazione.
+                head = state_prefix + (f"Task: {task}\n" if task else "")
+                filled, fields = {}, []
+                for field, values in schema:
+                    skeleton = "{" + "".join(
+                        f'"{k}": {json.dumps(v)}, ' for k, v in filled.items())
+                    prefix = head + skeleton + f'"{field}": "'
+                    scored, entropy, _ = choose(prefix, values, normalize)
+                    filled[field] = scored[0]["option"]
+                    fields.append({"field": field, "value": scored[0]["option"],
+                                   "p": scored[0]["p"], "entropy": entropy,
+                                   "choices": scored})
+                result = {"object": "brio.schema", "json": filled, "fields": fields,
+                          "normalize": normalize}
+
+        result.update({
+            "id": "brio-" + uuid.uuid4().hex,
+            "created": int(time.time()),
+            "model": self.server.model_id,
+            "usage": {"prompt_tokens": prompt_max, "completion_tokens": 0,
+                      "read_tokens": read_total,
+                      "total_tokens": prompt_max + read_total},
+        })
+        self.send_json(200, result, request_id,
+                       {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
+                        "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))})
 
     def _fail(self, error, request_id):
         """Report an error, unless the response is already on the wire. Once a streaming 200

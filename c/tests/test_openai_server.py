@@ -1553,6 +1553,34 @@ class DispatcherTest(unittest.TestCase):
         self.assertIsNone(engine.dispatcher_error)
         engine.close()
 
+    def test_brio_scoring_on_qwen36_preserves_fork_echo_records(self):
+        prompt = "Hi!"
+        expected = b"SUBMIT 1 0 3 0 0 1 0 logprobs=1 pin=1\nHi!\n"
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 2\n"
+                b"ECHO 1 2 0 nan 0\nHi\n"
+                b"ECHO 1 1 1 -0.25 1 7 -0.25\n!\n"
+                b"DONE 1 STAT 0 1.0 0 1.0 2 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "qwen36"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("qwen36", "model")
+        echoes = []
+        stats = engine.generate(prompt, 0, 0.0, 1.0, lambda _: None,
+                                logprobs=1, pin=True, on_echo=echoes.append)
+        engine.close()
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(echoes, [
+            {"pos": 0, "logprob": None, "text": "Hi"},
+            {"pos": 1, "logprob": -0.25, "text": "!"},
+        ])
+        self.assertEqual(stats["completion_tokens"], 0)
+
     def test_legacy_data_frame_dispatches_bare_bytes_no_record(self):
         # A DATA frame WITHOUT a tail dispatches exactly as on the
         # predecessor dispatcher -- the same event tuple, same bytes, no
