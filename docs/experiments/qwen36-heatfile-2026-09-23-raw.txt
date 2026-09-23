@@ -1,0 +1,183 @@
+Qwen3.6-35B-A3B: what a persisted heat table is worth, and what of it
+transfers to a prompt the table has never seen.
+23 September 2026.
+
+c/qwen36_tier.c:609 loads a heat table from HEAT_FILE and c/qwen36_tier.c:1235
+writes it back at shutdown. The variable is not set by default, so in ordinary
+use the table is built during a run and thrown away at exit. The one record
+in this directory that quotes the tier's own hit rate --
+qwen36-attnproj-place-2026-09-22-raw.txt:203 -- reports "VRAM hit rate
+100.0 %, LFRU swaps 0, in all twelve" runs, measured with a frozen heat
+table. That is the favourable extreme and says nothing about a session that
+starts cold. The other records do not capture the figure at all;
+qwen36-autoplace-2026-09-22-raw.txt:297 says so of itself.
+
+This is the measurement of the gap between those two states, plus the part
+that matters: how much of the warm state survives a change of subject.
+
+Host   : Ryzen 9 7950X (16 physical cores, clang/LLVM libomp), 64 GB DDR5,
+         RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA 13.4.
+Engine : qwen36_clang.exe, CUDA_DLL=1. THE BINARY PREDATES #39: no attnproj
+         line appears in the [place] output of any run below and `attention`
+         reads 5.3-5.5 ms/token in all of them, which is the unplaced value
+         (1.94 in the #39 record). All three arms therefore carry the same
+         missing optimisation and the comparison between them is unaffected;
+         the ABSOLUTE numbers are not those of current main.
+Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, N_NEW=64.
+Prompts: prompt25.txt       (25 tokens, operating-system memory management)
+         prompt-caldo.txt   (29 tokens, chlorophyll photosynthesis)
+         The two share no subject matter. The second exists only to build a
+         heat table that cannot contain the first one's answer.
+Runs   : typed by hand at an interactive cmd.exe prompt, no script.
+
+--- the three states ------------------------------------------------------
+
+  COLD   HEAT_FILE unset, or set with no file present. The resident set is
+         chosen in natural order.
+  CROSS  HEAT_FILE built by one prior run on prompt-caldo.txt, measured on
+         prompt25.txt. This is the honest number.
+  SELF   HEAT_FILE built by a prior run on prompt25.txt itself, measured on
+         prompt25.txt. Self-fulfilling by construction; reported as a
+         CEILING, never as a gain.
+
+--- every run, in the order it was executed -------------------------------
+
+                                      step()  hit rate  cpu-miss   tok/s
+  1  COLD   prompt25                   32.8     68.3 %     7.83    22.83
+  2  COLD   prompt25                   31.9     68.3 %     7.96    24.07
+  3  SELF   prompt25                   23.7    100.0 %     0.00    30.17
+  4  SELF   prompt25                   23.8    100.0 %     0.00    30.14
+     --- heat.bin deleted ---
+  5  COLD   prompt-caldo                 -        -          -        -
+  6  CROSS  prompt25                   28.1     89.2 %     3.33    26.77
+     --- heat.bin deleted ---
+  7  COLD   prompt-caldo               31.2     68.3 %     7.91    23.81
+  8  CROSS  prompt25                   27.0     89.2 %     3.56    27.18
+  9  SELF   prompt25                   24.5    100.0 %     0.00    29.68
+
+  step() and cpu-miss in ms/token, from the engine's own [timers] block.
+
+  The heat table runs 3 and 4 load was built by an earlier prompt25 run in
+  the same shell, before the transcript this record is written from begins;
+  that building run is not in the table. Every run in the shell up to that
+  point was on prompt25.txt, which is what makes 3 and 4 SELF.
+
+  Run 5 exists only to build the heat table run 6 consumes. Its terminal
+  output was truncated after the [meta] lines and its timers were never
+  captured, so no figures are given for it; the dashes are not a placeholder
+  for numbers that were observed. Run 7 is the same command captured in
+  full and is the cold figure used below.
+
+--- the result ------------------------------------------------------------
+
+On prompt25.txt:
+
+  COLD  mean step() 32.35   (runs 1,2)
+  CROSS mean step() 27.55   (runs 6,8)      -4.80 ms/token   +15 % tok/s
+  SELF  mean step() 24.00   (runs 3,4,9)    -8.35 ms/token   +28 % tok/s
+
+The transferable gain is -4.8 ms/token, range -3.8 to -5.8 across the four
+pairings of the two cold runs with the two cross runs. That is 57 % of the
+ceiling; the other 43 % is specific to the prompt and is not available to a
+session that has not already answered it.
+
+--- why the number is trustworthy despite an unscripted, unalternated run --
+
+The arms CANNOT be alternated. A heat table has to be built before it can be
+used, so the order cold -> warm is forced by the mechanism. Three things
+stand in for counterbalancing:
+
+  1. THE ROUTING COUNTERS ARE EXACTLY REPRODUCIBLE. Not close: equal.
+
+       COLD  prompt25       uploads 6963  miss(CPU) 8916   runs 1, 2
+       CROSS prompt25       hits 25114    miss(CPU) 3046   runs 6, 8
+       SELF  prompt25       hits 28160    miss(CPU)    0   runs 3, 4, 9
+       COLD  prompt-caldo   hits 20102    miss(CPU) 9338   run 7
+
+     Greedy decoding on a fixed prompt with a fixed resident set produces
+     identical routing, so the hit rate has ZERO measurement variance. All
+     the scatter in the table above is timing scatter.
+
+  2. THE COLD ARM WAS MEASURED ON BOTH SIDES OF THE WARM ONE. Runs 1-2 come
+     before the warm runs and run 7 after; 32.8, 31.9 then 31.2. The machine
+     did not drift between the arms, so the 4.8 is not a warm-up artefact of
+     the session. Run 7 is on the other prompt, so it bounds the drift of
+     the COLD STATE rather than repeating the cold arm of the comparison.
+
+  3. THE COLD-ARM SPREAD BOUNDS THE NOISE. 32.8 vs 31.9 on identical
+     configuration is 0.9 ms/token. The cross-topic gap is 4.8, about five
+     times that. The DeltaNet sub-timers are tighter still (conv 0.4-0.5,
+     l2n+rec 1.9-2.0 in all nine runs).
+
+--- three findings that are not the headline ------------------------------
+
+WITHOUT A HEAT TABLE THE RESIDENT SET CARRIES NO INFORMATION.
+
+  resident 6959 / 10240 = 67.96 %
+  cold hit rate         = 68.3 %   on prompt25 AND on prompt-caldo
+
+  The hit rate equals the residency fraction, which is what picking experts
+  at random would give, and it does so on two prompts with nothing in common.
+  Natural order is not a bad heuristic here; it is no heuristic at all.
+
+"LFRU swaps 4" IS THE POLICY CEILING, NOT A PROPERTY OF THE WORKLOAD.
+
+  qt_lfru_tick_locked (c/qwen36_tier.c:1030) is called once per token
+  (qt_issue, layer 0, c/qwen36_tier.c:1071) and does
+
+        if(G.tick%16) return;            /* one attempt every 16 tokens   */
+        for(int di=0;di<G.ndev;di++)     /* at most ONE swap per device   */
+
+  88 tokens of work (25 prefill + 63 decode) gives 5 attempts, and every cold
+  run captured reports 4 swaps. With 3281 experts non-resident and 8916 lookups
+  missing, the adaptive tier moves four of them. At one expert per 16 tokens
+  it would need on the order of 52,000 tokens to repair a bad initial set, so
+  in a short session the online policy cannot compensate for the cold start.
+  This is a ceiling, not a bug report: whether it SHOULD move faster is a
+  question about upload bandwidth and ping-pong that this record does not
+  answer.
+
+CPU FALLBACK COST RISES WITH MISSES BUT NOT IN PROPORTION TO THEM.
+
+  8916 misses -> 7.90 ms/token   (56 us per miss)
+  3046 misses -> 3.45 ms/token   (71 us per miss)
+     0 misses -> 0.00 ms/token
+
+  Fewer misses are individually more expensive. Batching within a layer is
+  the obvious suspect and is not measured here. Do not extrapolate a
+  cost-per-miss from either row.
+
+--- what this run did NOT measure -----------------------------------------
+
+  - Anything about current main. The binary predates #39. A rebuild should
+    move all nine rows by roughly the same amount and leave the deltas
+    standing, but that is an expectation, not a measurement.
+  - Longer generations. N_NEW=64 with a 25-token prompt is 88 tokens of
+    routing. A longer answer touches more experts and the cross-topic hit
+    rate at 512 or 2048 tokens is unknown; it could fall (more subject
+    matter) or rise (more of the generic hot core).
+  - An accumulated heat table. Every warm arm here was built from ONE run of
+    about 93 tokens. The file is halved on load (heat0[i] >> 1) and rewritten
+    at every exit, so it behaves as a decaying average over sessions; a table
+    grown across many unrelated prompts is the obvious next experiment and
+    was not run.
+  - Run 9 is worth noting for that reason: its heat table contained BOTH
+    subjects and still reached 100.0 % on prompt25. One prior exposure was
+    enough, mixed with another topic's history. A single data point.
+  - Any other model, quantisation, GPU, or residency fraction. 6959/10240 is
+    68 % of the expert set in VRAM; the value of a heat table must depend on
+    that fraction and only one value of it was tested.
+  - Cold NVMe. Every run loaded from a filesystem cache warmed by the
+    previous ones. Run 1 is the closest to cold and is also the slowest of
+    the cold runs (22.83 tok/s vs 24.07); it is included in the mean, which
+    makes the reported gain slightly larger than it would be without it.
+    Excluding run 1 gives COLD 31.9 and a gain of -4.35 ms/token.
+
+--- no manifest -----------------------------------------------------------
+
+docs/experiments/*.json manifests are not written for this record, for the
+same reason given in issue #44: the validator's schema expects a single
+config with a samples/tok_s triple and a median, and this measurement has
+three arms whose arms cannot be alternated. Recording it as one config would
+misrepresent it. The three most recent qwen36 records are raw-only on the
+same grounds.
