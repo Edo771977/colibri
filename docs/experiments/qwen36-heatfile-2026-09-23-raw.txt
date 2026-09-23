@@ -2,6 +2,14 @@ Qwen3.6-35B-A3B: what a persisted heat table is worth, and what of it
 transfers to a prompt the table has never seen.
 23 September 2026.
 
+SUPERSEDED ON THE NUMBER, the same day, by qwen36-heatfile-6rep-2026-09-23
+-raw.txt: six paired repetitions with an alternated cold arm give
+-4.92 ms/token, 95 % interval [-5.60, -4.23]. That measurement confirms
+this record's -4.80 and REFUTES the floor of -3.65 published below, which
+charged run 7's whole step() deficit to session position. Everything else
+here -- the mechanism, the layer prefix, the per-miss question, the
+limitations -- stands, and the per-miss non-constancy is settled there.
+
 c/qwen36_tier.c:609 loads a heat table from HEAT_FILE and c/qwen36_tier.c:1235
 writes it back at shutdown. The engine does not set the variable itself, but
 the repository's own launch instructions do -- ISTRUZIONI.md:102 has
@@ -10,15 +18,15 @@ the repository's own launch instructions do -- ISTRUZIONI.md:102 has
 is NOT a measurement of something nobody has; it is a measurement of what
 those two lines are worth, and of what a user who skips them pays.
 
-Three records quote the tier's own VRAM hit rate with a heat table in
-place, all at or near 100 %:
+Four records quote the tier's own VRAM hit rate with a heat table in
+place. Three are at or near 100 %:
 
   qwen36-attnproj-place-2026-09-22-raw.txt:203   100.0 %, all twelve runs
   qwen36-dense-pinned-2026-09-21-raw.txt:126-143 100,0 %, per run, eighteen
   qwen36-place-clang-2026-09-19-raw.txt:18       98.1-98.2 %
 
-One record quotes a lower figure: qwen36-x-broadcast-2026-09-20-raw.txt:85
-reports 90.4 %, also with a frozen heat table. It is excluded here because
+The fourth, qwen36-x-broadcast-2026-09-20-raw.txt:85, reports 90.4 %, also
+with a frozen heat table. It is excluded from the three because
 that record's own point is that the reading came from a readback bug which
 had diverged the generation onto different experts -- but the directory has
 recorded a non-100 % state, and an earlier version of this file said it
@@ -37,9 +45,14 @@ Host   : Ryzen 9 7950X (16 physical cores, clang/LLVM libomp), 64 GB DDR5,
 Engine : qwen36_clang.exe, CUDA_DLL=1. No attnproj line appears in the
          [place] output of any run below, and `attention` reads 5.26-5.45
          ms/token in the eight runs whose timers were captured -- the
-         UNPLACED value; the #39 record reads 5.77 unplaced and 1.94 placed
-         (qwen36-attnproj-place-2026-09-22-raw.txt:126, arms defined at
-         :23-24). The binary therefore carries no attnproj placement, which
+         UNPLACED value. The #39 record reads 5.77 unplaced and 1.94 placed
+         in its ONE timed repetition (qwen36-attnproj-place-2026-09-22-raw
+         .txt:126, headed "repetition 5, both arms" at :123 and flagged as
+         "a single repetition, with no error bars" at :165; arms at :23-24).
+         Its six-run attention mean is 5.76 -> 1.94, and c/qwen36.c:1459
+         makes exactly this distinction, which an earlier version of this
+         file dropped -- the n-mixing repo issue #44 section 5 is open
+         about. The binary therefore carries no attnproj placement, which
          means it predates #39. That is an INFERENCE from an absent output
          line: no build date, commit or digest was recorded. The nearest
          precedent, qwen36-autoplace-2026-09-22-raw.txt:27, records a
@@ -62,8 +75,14 @@ Place  : the automatic placer, not an explicit placement string -- the eight
          runs whose header was captured all print, identically, `[place]
          auto: dev 0 holds 1527.7 MB of trunk (lmhead yes, 30 dnproj
          layers), 12.26 GB left for experts`. Run 5's header was cut off, so
-         it is eight and not nine. Consistent with COLI_PLACE unset or
-         COLI_PLACE=auto; the output does not distinguish them.
+         it is eight and not nine. COLI_PLACE was unset or EMPTY, not
+         "auto": place_parse prints `[place] COLI_PLACE=<value>`
+         (c/qwen36_tier.c:277) whenever the variable is set and non-empty,
+         reached from qt_place_of (:338) through the device-folding loop at
+         :533-543, which runs before G_auto_on is set at :446. No such line
+         appears in any captured header. So ISTRUZIONI.md:101, `set
+         COLI_PLACE=auto`, was not followed either -- an earlier version of
+         this file noted only that :103 (OMP) was not.
 Budget : CUDA_EXPERT_GB unset, "auto", or ANY value that does not parse to
          a positive number -- qwen36_tier.c:601-603 gates the explicit
          branch on `bg && strcmp(bg,"auto") && atof(bg)>0`, so "0", "off"
@@ -94,12 +113,15 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script --
 
   COLD   No heat table loaded. This covers TWO configurations and the arm
          contains both: runs 1 and 2 ran with HEAT_FILE unset, runs 5 and 7
-         with it set and no file present. The difference matters for
-         provenance, not for the run: qt_shutdown writes the table only when
-         HEAT_FILE is set (c/qwen36_tier.c:1235), which is why runs 5 and 7
-         could build the tables runs 6 and 8 consume while runs 1 and 2 left
-         nothing behind -- and that is what makes run 2 cold despite
-         following run 1. The resident set is chosen in natural order in all
+         with it set and no file present. Two different gates are involved
+         and an earlier version of this file named the wrong one. The LOAD
+         gate is c/qwen36_tier.c:609-610: with HEAT_FILE unset nothing is
+         read whatever is on disk, which is what makes runs 1 and 2 cold --
+         and it has to be, because a heat.bin from before this transcript
+         was sitting there throughout (the first deletion is only after run
+         4). The WRITE gate is :1235, and it explains something else: runs 1
+         and 2 left nothing behind, while runs 5 and 7 built the tables runs
+         6 and 8 consume. The resident set is chosen in natural order in all
          four.
   CROSS  HEAT_FILE built by one prior run on prompt-caldo.txt, measured on
          prompt25.txt. This is the honest number.
@@ -198,8 +220,8 @@ test. All three arms, means over their runs:
   heat distribution otherwise. attnout is offered by trunk_offer_out
   (c/qwen36.c:1425-1440) and lands in the attention timer (:2544). So a
   heat table can decide whether attnout sits on the CPU, and that is inside
-  attention. The file cites :625 itself, 250 lines further down, and
-  contradicted it here.
+  attention. This file cites :625 itself further down, in the heat-decay
+  bullet, and contradicted it here.
 
   An earlier version of this correction called that "precisely the
   mechanism" behind the #39 record's attention 5.77 -> 1.94. It is not. That
@@ -231,24 +253,36 @@ test. All three arms, means over their runs:
   a trend, but they are not nothing either, and a cold arm alternated back
   in after every warm run would have settled it.
 
-  THE NON-MoE RESIDUAL TRACKS THE MISS COUNT, NOT THE RUN POSITION. Take
-  step() minus moe_total, i.e. everything the heat table cannot reach:
+  THE NON-MoE RESIDUAL DOES NOT TRACK THE MISS COUNT. An earlier version of
+  this file said it did, on a three-row table that left out the one row
+  which decides the question. Take step() minus moe_total, i.e. everything
+  the heat table cannot reach, with run 7 restored:
 
-        8916 misses   residual  0       runs 1,2     mean position 1.5
-        3046 misses   residual -0.59    runs 6,8     mean position 7.0
-           0 misses   residual -1.24    runs 3,4,9   mean position 5.3
+      miss(CPU)   residual   runs      mean position
+        8916        0        1,2        1.5     baseline, zero by construction
+        9338      -0.89      7          7.0     COLD, same miss rate per token
+        3046      -0.59      6,8        7.0
+           0      -1.24      3,4,9      5.3
 
-  The first row is zero by construction: it is the baseline the other two
-  are differences from. The comparison is between the second and the third.
+  Run 7 has MORE misses than the baseline and a residual MORE negative than
+  the 3046-miss arm. There is no monotone relation to the miss count, and
+  the argument built on one is withdrawn.
 
-  A session warm-up predicts the residual grows with position. It does the
-  opposite: the arm with the LARGER residual sits EARLIER in the session.
-  What it does track, monotonically, is the number of experts served from
-  the CPU -- which is what contention for CPU and PCIe from the fallback
-  path would produce. So the residual is part of the effect, not a rival
-  explanation for it.
+  Worse for the result, run 7 is the only point in the dataset that varies
+  position while holding the whole-run miss load fixed -- 101.50 misses per
+  token against 101.32, the file's own figure -- and it moves exactly the
+  way a session warm-up predicts. Its whole step() deficit against the cold
+  baseline is 32.35 - 31.2 = 1.15 ms/token, of which the -0.26 charged to
+  moe_total elsewhere is only a part. The earlier version charged run 7's
+  moe movement to position and silently declined to charge the -0.89
+  outside moe that the same run shows.
 
-  INSIDE moe_total, cpu-miss OVERSHOOTS AND TWO OTHER TIMERS PAY FOR IT.
+  So the session trend is not refuted here. It is evidenced, at n=1, on the
+  other prompt, at one position. That is thin, but it is the only direct
+  measurement of it in the file and it points the wrong way for the
+  headline.
+
+  INSIDE moe_total, cpu-miss OVERSHOOTS AND ONE OTHER TIMER PAYS FOR IT.
   All four [timers] qtier sub-timers are inside moe_total, but they do NOT
   account for all of it, and an earlier version of this file said they
   reconciled "exactly":
@@ -267,8 +301,16 @@ test. All three arms, means over their runs:
   ms/token sits outside all of them, in every one of the eight timed runs
   (1.11 to 1.28). Adding the (shared) or (router) phase timers does not
   close it -- (router) leaves 0.285 cold and 0.325 warm, (shared)
-  overshoots -- so the components overlap and no exact decomposition is
-  available from this output. The remainder is the same size in both arms
+  overshoots -- but "the components overlap", which an earlier version
+  concluded here, does not follow: (router) leaving a remainder is
+  UNDER-coverage, and (shared) overshooting is one specific nesting this
+  file explains below, not a general property. The remainder is
+  identifiable from source: moe_total brackets the whole moe() call
+  (c/qwen36.c:3069-3071) while the four sub-timers start at _q0 (:2751), so
+  softmax_row, the group-limited top-k loop (:2694-2730) and the
+  expert_get / tier_offer_slot loop (:2742-2750) are covered by no timer at
+  all. No exact decomposition is available from this output. The remainder is
+  the same size in both arms
   to within the ~0.1 of per-run scatter; an earlier version said it "moves
   0.005", which reads precision into noise, and then said that was "why"
   the deltas sum to within 0.005 of moe_total's -- circular, since the
@@ -289,10 +331,12 @@ test. All three arms, means over their runs:
   (68.3 % -> 89.2 %), so each issued group carries more rows -- and an earlier
   version of this
   file named only the +0.075 term, a third of what it had to account for,
-  and never mentioned `issue` or `take` at all. It also offered the
+  and never mentioned `issue` or `take` at all -- though that reproach is
+  itself only two thirds fair, since the +0.075 it named is one of the two
+  terms this file now classes as noise. It also offered the
   (shared) phase timer's +0.075 as a separate corroborating datum. It is
   not separate: in the use_qt path (shared) times _ts2 -> c/qwen36.c:2789
-  and shared-ovl is _q2 - _qm (:2771 to :2790), the same region nested, two
+  and shared-ovl is _q2 - _qm (:2771 to :2791), the same region nested, two
   tm_now() calls apart -- which is why they read 3.455/3.465 and
   3.53/3.540. One observation, counted twice.
 
@@ -330,19 +374,30 @@ test. All three arms, means over their runs:
 So, stated as a range with both ends derived rather than asserted:
 
   -4.80   as measured.
-  -3.95   the most pessimistic accounting the data permits, and not the one
-          this record argues for: charge run 7's -0.26
+  -3.65   the most pessimistic accounting the data permits: charge run 7's
+          WHOLE step() deficit at equal whole-run miss load, 1.15 ms/token,
+          to session position. An earlier version put this floor at -3.95
+          by charging only the -0.26 inside moe_total and leaving the -0.89
+          outside it uncharged, which cannot be justified once run 7's
+          residual is in the table.
+  -3.95   the same accounting restricted to moe_total: charge run 7's -0.26
           of moe movement AND the whole -0.59 non-MoE residual to session
           position.
 
-The evidence leans to the high end on ONE argument: the residual's
-ordering is reversed from what a trend predicts. An earlier version added
-a second, "attention is flat across all eight runs", and withdrew it here:
-that slope pools three arms at different levels and cannot speak to
-within-arm drift, and the only position-controlled subset -- the three COLD
-runs -- goes the other way, as this file says two paragraphs above. The
-three-point cold arm cannot settle it. TAKE -4.0 TO -4.8, and the
-reason the range is not narrower is a protocol choice, not the mechanism.
+THERE IS NO SURVIVING ARGUMENT FOR THE HIGH END. Two were offered and both
+are withdrawn: "attention is flat across all eight runs" (that slope pools
+three arms at different levels and cannot speak to within-arm drift, and
+the only position-controlled subset goes the other way), and "the residual
+tracks the miss count" (refuted by run 7 above). What is left is a measured
+-4.80 with a session trend that the data evidences rather than excludes.
+
+TAKE -3.7 TO -4.8 FROM THIS RECORD, and then do not: the alternated
+measurement in qwen36-heatfile-6rep-2026-09-23-raw.txt gives -4.92 +-0.69,
+and the -3.65 end derived above falls outside its interval. The range is
+this wide because of a protocol choice -- no cold arm was alternated back
+in after each warm run -- and the position charge that set its floor was
+too conservative rather than too generous. c/tools/misure-heatfile.ps1 runs
+the alternated version.
 
 A regression on the three cold points is NOT a usable bound and is recorded
 only so nobody redoes it: all three by run position gives slope -0.226 and
@@ -382,8 +437,9 @@ to see which argument was withdrawn and why.
 
      This is an OBSERVATION at n=2 and n=3, not a property that follows
      from the mechanism. Greedy argmax decoding on a fixed prompt is the
-     likely reason, but the cold arm's resident set is NOT fixed: it takes
-     four LFRU swaps per run, and those are asynchronous -- the victim is
+     likely reason, but the resident set is NOT fixed in the COLD or the
+     CROSS arm: both take four LFRU swaps per run (SELF takes none), and
+     those are asynchronous -- the victim is
      marked non-resident immediately (c/qwen36_tier.c:1048) while the
      promotion is queued for the uploader thread, so the window in which the
      newcomer is still missing is scheduler-dependent and lookups inside it
@@ -561,9 +617,14 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
   less cost. Monotonicity survives only against the run 1-2 mean, by
   0.01 ms/token, against 0.13 of scatter inside that same pair.
 
-  What the table supports is only this: 2.9x the misses per token costs 2.3x
-  the time, so the relationship is sublinear. Separating prefill from decode
-  misses would need a counter that does not exist yet.
+  What the table appears to support is 2.9x the misses per token costing
+  2.3x the time, i.e. a sublinear relationship -- but it carries the same
+  hidden assumption this file refuses for run 7's -0.26: the miss rates are
+  whole-run and the cost is per decode token, so the ratio transfers to the
+  decode window only if the prefill/decode split is the same in both arms.
+  No counter here can check that, so read the sublinearity as unresolved
+  too. Separating prefill from decode misses would need a counter that does
+  not exist yet.
 
 --- what this run did NOT measure -----------------------------------------
 
@@ -576,6 +637,13 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     beginning "Any other model, quantisation, GPU, or residency fraction".
     A rebuild therefore changes the measured quantity, not just the baseline
     it is measured against. How much is unknown.
+  - Whether attention would still be a control on another configuration.
+    It is one here because the placer happened to produce identical [place]
+    lines in every captured run. But this file establishes that a heat
+    table CAN move attnout into or out of the attention timer through
+    auto_place. On a different budget, card or residency fraction the
+    placement could move with the arm, and the control would break without
+    announcing itself. Nothing here bounds how likely that is.
   - More than one device. The layer-major prefix that the whole cold-arm
     analysis rests on requires G.ndev==1; with two devices qt_plan_fill
     skips a full device and keeps going (:972), giving a per-device prefix
@@ -583,6 +651,12 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     docs/qwen36-cuda-tier.md:44 -- one of the two documented lines this
     record set out to value -- is itself a TWO-device usage line
     (COLI_GPUS=0,1). Nothing here measures that case.
+  - THE DIRECT MEASURE OF TRANSFER, which cost nothing and was not taken.
+    The session held both a caldo-built and a prompt25-built heat.bin. The
+    overlap between their top-6959 sets IS "how much of the hot set
+    survives a change of subject", stated in experts rather than inferred
+    from milliseconds, and it needs no extra run -- only the two files,
+    which were overwritten instead. Any repeat should keep them.
   - Any other prompt pair, or the other direction. "How much survives a
     change of subject" was measured on one topic pair, in one direction
     (caldo -> prompt25), n=2. No reverse CROSS was run, although runs 5 and
@@ -617,10 +691,18 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
         SELF   0 swaps (runs 3, 4, 9)    table loaded and halved
 
     CROSS takes the same four as COLD, so the halved threshold did not
-    visibly suppress admission there. SELF's zero is explained without it:
-    at a 100 % hit rate every routed expert is already resident, so no
-    non-resident slot accrues heat and tier_should_promote never has a
-    candidate -- and with no swap taken, no asynchronous window opens,
+    visibly suppress admission there. SELF's zero is explained without it,
+    though not the way an earlier version of this file said: it claimed no
+    non-resident slot accrues heat, which contradicts :617 three sentences
+    earlier -- that loop gives EVERY slot the file's halved heat. The gate
+    is s->g4. qt_lfru_tick_locked picks its hot candidate at :1043, which
+    requires !s->resident && !s->queued && s->g4, and g4 reaches a slot only
+    through qt_note (:896) on a ROUTED expert. At a 100 % hit rate no
+    non-resident expert is ever routed, so hot stays -1 and the tick exits
+    at :1045 before tier_should_promote is reached at all. A second reason
+    would have applied anyway: the warmstart ordered residency by G.heat0
+    descending (:962), so the hottest non-resident cannot outrank the
+    coldest resident. And with no swap taken no asynchronous window opens,
     which is what counterbalancing item 1 predicts for miss(CPU) 0. And it is
     not harmless
     afterwards either, because what :1241
@@ -690,8 +772,15 @@ The validator does NOT check alternation or run order; an earlier version of
 this paragraph said it did, which was wrong. Nor is this the same case as
 issue #44, which is about a metric in ms/token and a changed_variables that
 names a binary rather than a config key; here the metric is available as
-tok/s and the variable is HEAT_FILE, an environment key. The three-arm shape
-and the two-sample arms are what block it.
+tok/s. But "the variable is HEAT_FILE, an environment key" is true only of
+the COLD-runs-1-and-2 against CROSS pair. Between CROSS and SELF nothing in
+the environment differs at all -- HEAT_FILE is heat.bin in both -- and what
+differs is the PROVENANCE OF THE FILE'S CONTENTS, which no config key
+expresses. validate() requires actual == declared on a one-key config diff
+(:76-82), so for that pair `actual` would be empty and this record would
+hit #44's blocker shape after all. Three blockers, then: the arm count, the
+two-sample arms, and a variable that is not a config key for two of the
+three comparisons.
 
 Most qwen36 records in this directory are raw-only -- eleven of about
 fourteen, everything since 19 September except qwen36-i8-rows. None of the

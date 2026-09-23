@@ -1,0 +1,159 @@
+Qwen3.6-35B-A3B: the heat-table gain, measured six times instead of twice.
+23 September 2026.
+
+qwen36-heatfile-2026-09-23-raw.txt reports -4.80 ms/token from two runs per
+arm. Two runs per arm give a 95 % interval of [1.74, 7.86]: the sign is safe
+and the size is not, and that figure gets multiplied by millions of tokens.
+This is the same comparison with six paired repetitions and an alternated
+cold arm, which is what the earlier record says it should have done.
+
+Host   : Ryzen 9 7950X (16 physical cores, clang/LLVM libomp), 64 GB DDR5,
+         RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA 13.4. Carried over
+         from qwen36-attnproj-place-2026-09-22-raw.txt, same machine.
+Engine : qwen36_clang.exe, rebuilt with CUDA_DLL=1 immediately before this
+         session. STILL NO attnproj: `attention` reads 5.40 and 5.36 in the
+         two arms, which is the unplaced value, and no attnproj line appears
+         in any [place] output. The rebuild was taken from a working tree
+         that is not on main, so it predates #39 like the earlier record's.
+         Both arms share the binary, so the paired delta is unaffected; the
+         absolute numbers are not those of current main.
+Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, N_NEW=128.
+Prompts: prompt25.txt (25 tokens, operating-system memory management) and
+         prompt-caldo.txt (29 tokens, photosynthesis). Subjects with nothing
+         in common; prompt25's subject is operator testimony, corroborated
+         by its generated text.
+Script : c/tools/misure-heatfile.ps1.
+
+--- the two arms -----------------------------------------------------------
+
+  COLD   HEAT_FILE removed from the environment. Nothing is loaded, and --
+         the reason it must be removed rather than blanked -- nothing is
+         written either (qt_shutdown gates the write on the variable,
+         c/qwen36_tier.c:1235), so a cold run cannot contaminate the warm
+         run after it.
+  CROSS  HEAT_FILE=heat.bin, with a copy of a frozen table built on
+         prompt-caldo.txt, recopied before every run because each run
+         rewrites it.
+
+ABBA: the order within a repetition alternates, so a position effect inside
+the session is separable from the arm.
+
+--- the six paired deltas, ms/token on step() -------------------------------
+
+  rip 1 (COLD first)    COLD 31.80   CROSS 27.90   -3.90
+  rip 2 (CROSS first)   COLD 32.60   CROSS 27.40   -5.20
+  rip 3 (COLD first)    COLD 31.70   CROSS 27.30   -4.40
+  rip 4 (CROSS first)   COLD 32.40   CROSS 27.10   -5.30
+  rip 5 (COLD first)    COLD 32.50   CROSS 26.80   -5.70
+  rip 6 (CROSS first)   COLD 32.00   CROSS 27.00   -5.00
+
+  mean -4.92   sd 0.66   se 0.27   df 5
+  95 % interval  [-5.60, -4.23]     width +-0.69
+  6 of 6 negative
+
+THE RESULT IS -4.92 ms/token, +-0.69. The earlier record's -4.80 sits inside
+the interval. Its published floor of -3.65 does NOT: that floor came from
+charging run 7's whole step() deficit to session position, and the
+alternated measurement shows that charge was too conservative rather than
+too generous.
+
+Sensitivity: repetition 1 is the coldest run of the session and gives the
+only delta above -4.4. Excluding it gives -5.12 [-5.71, -4.53] at df 4. The
+interval is quoted from all six.
+
+--- the position control passed --------------------------------------------
+
+  COLD first    -3.90  -4.40  -5.70     mean -4.67
+  CROSS first   -5.20  -5.30  -5.00     mean -5.17
+
+Same sign, and the 0.50 between the group means is smaller than the 0.66
+scatter of the deltas themselves. The session-trend question that the
+earlier record could not close -- it had three cold points, one of them on
+the other prompt -- does not survive alternation.
+
+--- two invariants the earlier record could only hope for ------------------
+
+  [place] auto: BYTE-IDENTICAL IN ALL TWELVE RUNS, and residency identical
+  at 6959/10240 in all twelve.
+
+That is what makes `attention` a control rather than just another phase.
+The earlier record established that a heat table CAN move attnout into or
+out of the attention timer through auto_place (c/qwen36_tier.c:625,
+:434-440), so the control is empirical, not structural -- and here it is
+confirmed at n=12 rather than assumed. attention moves -0.04.
+
+--- the accounting closes, again -------------------------------------------
+
+                 COLD     CROSS    delta
+    deltanet      8.90     8.54    -0.36
+    attention     5.40     5.36    -0.04
+    moe_total    15.15    10.83    -4.32
+    lm_head       1.67     1.50    -0.17
+                                   -----
+                                   -4.89   against step()'s -4.92
+
+0.03 ms/token outside the phases. moe_total is 88 % of the gain, the same
+share the two-run record found. Inside moe_total:
+
+    issue         1.14     1.44    +0.30
+    cpu-miss      7.84     3.69    -4.15
+    take          1.68     1.16    -0.52
+    shared-ovl    3.41     3.45    +0.04
+                                   -----
+                                   -4.33   against moe_total's -4.32
+
+`take` moves -0.52 here. At n=2 the earlier record classed it as noise,
+correctly for its own data: its pair spreads were 0.38 and 0.75 against a
+delta of -0.325. At n=6 it is an effect. `shared-ovl` remains inside its
+scatter.
+
+--- the per-miss question is settled, and the answer is "not constant" -----
+
+The earlier record found the cost per miss differing by 28 % between the
+arms at n=2 and could not say whether that was real batching behaviour or a
+contaminated number. Dividing cpu-miss by the same run's miss count gives an
+index, not a cost -- the numerator is per decode token and the denominator
+spans the whole run -- but the index is comparable across arms:
+
+    COLD    0.519    range 0.515 to 0.523   six runs
+    CROSS   0.629    range 0.619 to 0.635   six runs
+
+THE RANGES DO NOT OVERLAP, across six runs each. The 21 % gap is real and
+reproducible. Fewer misses are individually more expensive, which is what
+smaller CPU fallback groups would produce, and it means no per-miss cost
+from either arm extrapolates to the other.
+
+--- hit rate at a longer generation ----------------------------------------
+
+At N_NEW=128 rather than 64 the CROSS arm reaches 87.9 % rather than 89.2 %,
+and COLD 68.9 % rather than 68.3 %. The earlier record listed the behaviour
+of the cross-topic hit rate at longer generations as unmeasured and said it
+could fall (more subject matter) or rise (more of the generic hot core). It
+falls, by 1.3 points over a doubling. One data point on one pair.
+
+The swap count rises from 4 to 8 in both arms, which is the policy ceiling
+again: 152 token positions give 9 attempts at one per 16 tokens, and 8 were
+taken. See issue #47.
+
+--- what this run did NOT measure ------------------------------------------
+
+  - Anything about current main, for the same reason as the earlier record:
+    the binary carries no attnproj. Placing it also charges 0.17 GB to the
+    expert budget (6959 residents down to 6859), which moves the residency
+    fraction this result depends on.
+  - More than one device, one prompt pair, one direction, one model, one
+    residency fraction -- all as in the earlier record.
+  - The direct measure of transfer. The overlap between the two prompts'
+    top-6959 sets is still not computed, and this session overwrote the
+    tables again.
+  - Whether the SELF ceiling moves. Not re-measured here; the earlier
+    record's 100 % / -8.35 stands unrepeated.
+
+--- no manifest ------------------------------------------------------------
+
+Two arms rather than three, and six samples each, so this record clears the
+shape and the sample-count blockers the earlier one hit. It still cannot
+carry a manifest: c/experiment_manifest.py requires a full 40-character
+commit SHA (:58-66), and no commit or digest was recorded for this binary --
+which, given that it was rebuilt from a tree whose branch is unknown, is a
+gap in the measurement and not only in the schema.
