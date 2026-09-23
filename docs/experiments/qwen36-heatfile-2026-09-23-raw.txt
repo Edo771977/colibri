@@ -10,8 +10,8 @@ the repository's own launch instructions do -- ISTRUZIONI.md:102 has
 is NOT a measurement of something nobody has; it is a measurement of what
 those two lines are worth, and of what a user who skips them pays.
 
-The records that quote the tier's own VRAM hit rate all report it at or near
-100 % with a heat table in place:
+Three records quote the tier's own VRAM hit rate with a heat table in
+place, all at or near 100 %:
 
   qwen36-attnproj-place-2026-09-22-raw.txt:203   100.0 %, all twelve runs
   qwen36-dense-pinned-2026-09-21-raw.txt:126-143 100,0 %, per run, eighteen
@@ -92,8 +92,15 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script --
 
 --- the three states ------------------------------------------------------
 
-  COLD   HEAT_FILE unset, or set with no file present. The resident set is
-         chosen in natural order.
+  COLD   No heat table loaded. This covers TWO configurations and the arm
+         contains both: runs 1 and 2 ran with HEAT_FILE unset, runs 5 and 7
+         with it set and no file present. The difference matters for
+         provenance, not for the run: qt_shutdown writes the table only when
+         HEAT_FILE is set (c/qwen36_tier.c:1235), which is why runs 5 and 7
+         could build the tables runs 6 and 8 consume while runs 1 and 2 left
+         nothing behind -- and that is what makes run 2 cold despite
+         following run 1. The resident set is chosen in natural order in all
+         four.
   CROSS  HEAT_FILE built by one prior run on prompt-caldo.txt, measured on
          prompt25.txt. This is the honest number.
   SELF   HEAT_FILE built by a prior run on prompt25.txt itself, measured on
@@ -178,12 +185,23 @@ test. All three arms, means over their runs:
 
   ATTENTION IS THE CONTROL, BUT NOT FOR THE REASON AN EARLIER VERSION OF
   THIS FILE GAVE. It said "a heat table cannot touch attention". It can:
-  G.heat0 is handed to auto_place (c/qwen36_tier.c:625), auto_place decides
+  G.heat0 is handed to auto_place (c/qwen36_tier.c:625); auto_place decides
   from it whether each offered dense component stays on the CPU (:434-440),
-  and attnout is one of the offered components (:534) whose placement lands
-  in the attention timer -- which is precisely the mechanism this record
-  invokes when it reads attention 5.77 -> 1.94 off the #39 record. The file
-  cites :625 itself, 250 lines further down, and contradicted it here.
+  the decision running through auto_displaced_value (:376-408), which
+  branches on heat0 at :386 -- a flat topk/ne share when it is NULL, the
+  heat distribution otherwise. attnout is offered by trunk_offer_out
+  (c/qwen36.c:1425-1440) and lands in the attention timer (:2544). So a
+  heat table can decide whether attnout sits on the CPU, and that is inside
+  attention. The file cites :625 itself, 250 lines further down, and
+  contradicted it here.
+
+  An earlier version of this correction called that "precisely the
+  mechanism" behind the #39 record's attention 5.77 -> 1.94. It is not. That
+  record moves attnproj, not attnout, under an EXPLICIT COLI_PLACE string
+  (arms at qwen36-attnproj-place-2026-09-22-raw.txt:23-24, where attnout=0
+  is identical in both), so it bypasses auto_place entirely. Same kind of
+  mechanism -- a dense trunk matrix moving into or out of the attention
+  timer -- different component and different decision path.
 
   What makes attention a control is EMPIRICAL: every captured run printed a
   byte-identical pair of placement lines, `[place] auto: dev 0 holds 1527.7
@@ -247,19 +265,40 @@ test. All three arms, means over their runs:
   deltas sum to within 0.005 of moe_total's.
 
   cpu-miss alone is -4.45, more than the whole -4.21, and `issue` RISES
-  44 %. That is a real offsetting cost of a warm table -- more resident
-  experts means larger GPU groups to issue -- and an earlier version of this
+  44 %. That is a real offsetting cost of a warm table. Not because more
+  experts are resident -- the count is 6959 in every arm, same budget, same
+  [place] line -- but because more of the ROUTED experts are found resident
+  (68.3 % -> 89.2 %), so each issued group carries more rows -- and an earlier
+  version of this
   file named only the +0.075 term, a third of what it had to account for,
-  and never mentioned `issue` or `take` at all. The separate (shared) phase
-  timer also moves +0.075 in CROSS and +0.41 in SELF, unexplained.
+  and never mentioned `issue` or `take` at all. It also offered the
+  (shared) phase timer's +0.075 as a separate corroborating datum. It is
+  not separate: in the use_qt path (shared) times _ts2 -> c/qwen36.c:2789
+  and shared-ovl is _q2 - _qm (:2771 to :2790), the same region nested, two
+  tm_now() calls apart -- which is why they read 3.455/3.465 and
+  3.53/3.540. One observation, counted twice.
 
-  AND moe_total ITSELF CAN BE PARTLY BOUNDED. Run 7 is a COLD run at
-  position 7 whose per-token miss load matches runs 1 and 2 to 0.18 %
-  (101.50 against 101.32). Its moe_total reads 14.77 against the COLD mean
-  of 15.03: -0.26 of moe movement at constant miss load, with only position
-  differing. That is 6 % of the -4.21, on n=1 and a different prompt, but
-  it is the only handle this dataset offers on position INSIDE moe_total,
-  and an earlier version of this section did not look for one.
+  AND moe_total ITSELF CAN BE PARTLY BOUNDED, under an assumption that has
+  to be stated. Run 7 is a COLD run at position 7 whose WHOLE-RUN per-token
+  miss load matches runs 1 and 2 to 0.18 % (101.50 against 101.32), and its
+  moe_total reads 14.77 against the COLD mean of 15.03: -0.26.
+
+  The assumption: moe_total is per DECODE token while those miss rates span
+  the whole run, and run 7 has 29 prefill tokens against 25. Equal
+  whole-run rates imply equal decode-window miss load only if prefill and
+  decode miss at the same rate -- which is exactly what this record says
+  twice that no counter can establish. If the assumption fails it fails in
+  one direction: run 7's decode window would then carry FEWER misses, part
+  of its -0.26 would be miss load rather than position, and charging the
+  whole -0.26 to position would over-charge. So the pessimistic end below
+  is conservative, not optimistic.
+
+  Nor is position the only difference: run 7 is a different prompt, 29
+  prefill tokens instead of 25, 92 tokens instead of 88, 9338 misses
+  instead of 8916, and n=1. An earlier version of this section said "with
+  only position differing", three lines above admitting the prompt differs.
+  It is the only handle this dataset offers on position INSIDE moe_total,
+  and it is a weak one.
 
 So, stated as a range with both ends derived rather than asserted:
 
@@ -268,9 +307,13 @@ So, stated as a range with both ends derived rather than asserted:
           of moe movement AND the whole -0.59 non-MoE residual to session
           position.
 
-The evidence leans to the high end -- the residual's ordering is reversed
-from what a trend predicts, and attention is flat across all eight runs --
-but the three-point cold arm cannot settle it. TAKE -4.0 TO -4.8, and the
+The evidence leans to the high end on ONE argument: the residual's
+ordering is reversed from what a trend predicts. An earlier version added
+a second, "attention is flat across all eight runs", and withdrew it here:
+that slope pools three arms at different levels and cannot speak to
+within-arm drift, and the only position-controlled subset -- the three COLD
+runs -- goes the other way, as this file says two paragraphs above. The
+three-point cold arm cannot settle it. TAKE -4.0 TO -4.8, and the
 reason the range is not narrower is a protocol choice, not the mechanism.
 
 A regression on the three cold points is NOT a usable bound and is recorded
@@ -329,10 +372,15 @@ to see which argument was withdrawn and why.
      the three cold values fall monotonically. The claim is withdrawn and
      replaced by the range in the result section.
 
-  3. THE SUB-TIMERS ARE TIGHTER THAN THE TOTALS. conv 0.4-0.5 and l2n+rec
-     1.8-2.0 across the eight runs that have a dn-sub line, against 0.9 of
-     scatter on step() in the cold pair alone. Whatever moves the totals
-     between runs is not moving DeltaNet's CPU work.
+  3. TWO OF DELTANET'S FOUR SUB-TIMERS ARE TIGHTER THAN THE TOTALS. conv
+     0.4-0.5 and l2n+rec 1.8-2.0 across the eight runs that have a dn-sub
+     line, against 0.9 of scatter on step() in the cold pair alone. That is
+     a claim about DeltaNet's CPU work only. The other two, proj and
+     norm+out, are on the GPU and are NOT quoted here -- deltanet as a whole
+     moves -0.28 and -0.82 in the phase table, so that movement sits in
+     them. Quoting the two steady ones as if they characterised the phase
+     would be the same selective accounting this file reproaches itself for
+     over `issue` and `take`.
 
 --- three findings that are not the headline ------------------------------
 
@@ -384,9 +432,13 @@ COLD HIT RATE; IT DOES NOT DETERMINE IT.
   of this file claimed they were, by comparing 107 against 704 -- a ratio
   that says nothing about swap capacity. Computed properly: attempts land at
   tokens 16, 32, 48, 64 and 80, four are taken, and a promoted expert is
-  resident for the rest of the run, so four promotions cover between 128 and
-  192 subsequent lookups depending on which attempts took, and 144 to 208
-  on the 92-token prompt. The smallest of those exceeds both excesses.
+  resident for the rest of the run, so four promotions see AT MOST 128 to
+  192 subsequent tokens depending on which attempts took, and 144 to 208 on
+  the 92-token prompt. Those are ceilings, not counts: a promoted expert
+  yields a hit only on tokens where it is in its layer's routed top-8, and
+  nothing here measures how often that is. The ceiling exceeds both
+  excesses, which is enough to stop ruling the swaps out and not enough to
+  rule them in.
   Since LFRU promotes the hottest non-resident experts, the swaps are a
   live candidate, and the promotions are not confined to layer
   27 -- a promoted expert in layers 28-39 would add hits that this inversion
@@ -496,6 +548,18 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     beginning "Any other model, quantisation, GPU, or residency fraction".
     A rebuild therefore changes the measured quantity, not just the baseline
     it is measured against. How much is unknown.
+  - More than one device. The layer-major prefix that the whole cold-arm
+    analysis rests on requires G.ndev==1; with two devices qt_plan_fill
+    skips a full device and keeps going (:972), giving a per-device prefix
+    and different arithmetic. Worth flagging because
+    docs/qwen36-cuda-tier.md:44 -- one of the two documented lines this
+    record set out to value -- is itself a TWO-device usage line
+    (COLI_GPUS=0,1). Nothing here measures that case.
+  - Any other prompt pair, or the other direction. "How much survives a
+    change of subject" was measured on one topic pair, in one direction
+    (caldo -> prompt25), n=2. No reverse CROSS was run, although runs 5 and
+    7 produced cold caldo tables that would have allowed one. The 89.2 %
+    may be a property of this pairing.
   - Longer generations. N_NEW=64 with a 25-token prompt is 88 tokens of
     routing (25 prefill + 63 decode: the first generated token comes out
     of prefill, which is why the engine's block reads "decode: 63
@@ -516,8 +580,11 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     qt_lfru_tick_locked compares the halved G.slot[].heat (:1042-1046) and
     tier_should_promote is hot > cold + cold/4 + 4 (c/tier.h:9-12), whose
     fixed +4 is NOT scale-invariant: halving both sides makes admission
-    strictly harder in file units. Four swaps happened in every captured
-    run. And it is not harmless afterwards either, because what :1241
+    strictly harder in file units. Four swaps are reported in every
+    captured COLD run; the file records no swap count for the CROSS or SELF
+    arms, and their SELF miss(CPU) of 0 sits awkwardly with the asynchronous
+    swap window described in counterbalancing item 1. And it is not harmless
+    afterwards either, because what :1241
     writes back at exit
     is G.slot[].heat, the halved copy plus this session's increments, and
     that file becomes the next session's undecayed G.heat0. So the halving
