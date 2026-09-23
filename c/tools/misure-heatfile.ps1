@@ -61,6 +61,14 @@ foreach ($v in @("COLI_CUDA_PROFILE","PROF","COLI_GRAPH_DIAG")) {
     if ($val) { throw "$v=$val e' impostata: la misura non sarebbe confrontabile. Apri una shell pulita." }
 }
 if (-not (Test-Path $Exe))         { throw "manca $Exe -- make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe" }
+# Un .exe che esiste ma e' vuoto o minuscolo da' "non e' un'applicazione valida
+# per questo sistema operativo" con una traccia PowerShell illeggibile. Succede
+# davvero: incollare in cmd un transcript che contiene il prompt "C:\...\c>"
+# fa leggere quel ">" come redirezione e TRONCA il file che segue.
+$exeLen = (Get-Item -LiteralPath $Exe).Length
+if ($exeLen -lt 1MB) {
+    throw "$Exe e' $exeLen byte: non e' un eseguibile valido. Se e' 0, qualcosa lo ha troncato -- ricostruisci: make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe"
+}
 if (-not (Test-Path $Prompt))      { throw "manca $Prompt" }
 if (-not (Test-Path $PromptCaldo)) { throw "manca $PromptCaldo -- serve un prompt di argomento DIVERSO da $Prompt" }
 if (-not (Test-Path $Snap))        { throw "modello non trovato in $Snap -- passalo con -Snap <dir>" }
