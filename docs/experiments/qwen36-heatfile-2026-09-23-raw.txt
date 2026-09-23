@@ -134,11 +134,13 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script --
   captured, so no figures are given for it; the dashes are not a placeholder
   for numbers that were observed. Run 7 is the same command captured in
   full; it is the cold figure for prompt-caldo. It enters no mean below, but
-  it is not idle either: it supplies the third point of the regression note,
-  a row of the cpu-miss table, its own row in counterbalancing item 1, AND
-  the entire prompt-caldo side of the layer-27 inversion -- the 68.28 % and
-  the p = 31.3 % there are run 7 alone, n=1, on the other prompt, at a
-  different position in the session.
+  it is not idle either, and two of its jobs are load-bearing. It supplies
+  the -0.26 of moe_total movement at constant miss load that sets the
+  pessimistic end of the headline range; the entire prompt-caldo side of
+  the layer-27 inversion (the 68.28 % and the p = 31.3 % are run 7 alone);
+  the third point of the regression note; and a row of the cpu-miss table.
+  All four are n=1, on the other prompt, at a different session position.
+  It is explicitly NOT in counterbalancing item 1's table, which says so.
 
 --- the result ------------------------------------------------------------
 
@@ -221,8 +223,9 @@ test. All three arms, means over their runs:
   explanation for it.
 
   INSIDE moe_total, cpu-miss OVERSHOOTS AND TWO OTHER TIMERS PAY FOR IT.
-  All four [timers] qtier sub-timers are inside moe_total, and they
-  reconcile to it exactly:
+  All four [timers] qtier sub-timers are inside moe_total, but they do NOT
+  account for all of it, and an earlier version of this file said they
+  reconciled "exactly":
 
                   COLD (1,2)   CROSS (6,8)   delta
       issue           1.105       1.590      +0.485
@@ -230,7 +233,18 @@ test. All three arms, means over their runs:
       take            1.400       1.075      -0.325
       shared-ovl      3.465       3.540      +0.075
                                              ------
-                                             -4.215   ( = moe_total -4.21)
+      sum of four    13.865       9.650      -4.215
+      moe_total      15.03       10.82       -4.21
+      unaccounted     1.165       1.170      +0.005
+
+  The four cover 92.2 % of moe_total cold and 89.2 % warm; about 1.17
+  ms/token sits outside all of them, in every one of the eight timed runs
+  (1.11 to 1.28). Adding the (shared) or (router) phase timers does not
+  close it -- (router) leaves 0.285, (shared) overshoots -- so the
+  components overlap and no exact decomposition is available from this
+  output. What DOES hold is the delta: the unaccounted remainder is
+  near-constant across the arms, moving 0.005, which is why the four
+  deltas sum to within 0.005 of moe_total's.
 
   cpu-miss alone is -4.45, more than the whole -4.21, and `issue` RISES
   44 %. That is a real offsetting cost of a warm table -- more resident
@@ -361,17 +375,20 @@ COLD HIT RATE; IT DOES NOT DETERMINE IT.
         prompt-caldo   p = 31.3 %      against 18.4 % uniform, +70 %
 
   and an earlier version of this file called that margin "slight". The
-  prompt25 excess is about 107 extra hits out of 704 layer-27 lookups; the
-  prompt-caldo one about 91 out of 736.
+  prompt25 excess is about 107 extra hits out of 704 layer-27 lookups
+  (8 x 88 tokens); the prompt-caldo one about 95 out of 736 (8 x 92). An
+  earlier version of this file printed 91 there, which is the prompt-caldo
+  excess share against the prompt25 denominator.
 
   THE FOUR LFRU SWAPS ARE NOT RULED OUT AS THE CAUSE, and an earlier version
   of this file claimed they were, by comparing 107 against 704 -- a ratio
   that says nothing about swap capacity. Computed properly: attempts land at
   tokens 16, 32, 48, 64 and 80, four are taken, and a promoted expert is
   resident for the rest of the run, so four promotions cover between 128 and
-  192 subsequent lookups depending on which attempts took. Either figure
-  exceeds 107. Since LFRU promotes the hottest non-resident experts, the
-  swaps are a live candidate, and the promotions are not confined to layer
+  192 subsequent lookups depending on which attempts took, and 144 to 208
+  on the 92-token prompt. The smallest of those exceeds both excesses.
+  Since LFRU promotes the hottest non-resident experts, the swaps are a
+  live candidate, and the promotions are not confined to layer
   27 -- a promoted expert in layers 28-39 would add hits that this inversion
   charges to p.
 
@@ -480,8 +497,10 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     A rebuild therefore changes the measured quantity, not just the baseline
     it is measured against. How much is unknown.
   - Longer generations. N_NEW=64 with a 25-token prompt is 88 tokens of
-    routing. A longer answer touches more experts and the cross-topic hit
-    rate at 512 or 2048 tokens is unknown; it could fall (more subject
+    routing (25 prefill + 63 decode: the first generated token comes out
+    of prefill, which is why the engine's block reads "decode: 63
+    tokens"). A longer answer touches more experts and the cross-topic
+    hit rate at 512 or 2048 tokens is unknown; it could fall (more subject
     matter) or rise (more of the generic hot core).
   - An accumulated heat table. The warm arms here are built from very little
     history: runs 3 and 6 load a table written by a single ~88- or ~92-token
@@ -536,7 +555,11 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     previous ones. Run 1 is the closest to cold and is also the slowest of
     the cold runs (22.83 tok/s vs 24.07); it is included in the mean, which
     makes the reported gain slightly larger than it would be without it.
-    Excluding run 1 gives COLD 31.9 and a gain of -4.35 ms/token.
+    Excluding run 1 gives COLD 31.9 and a gain of -4.35 ms/token. That
+    figure is NOT stacked with the -0.85 of position charges that set the
+    range's pessimistic end: run 1's slowness and a session warm-up are
+    plausibly the same thing, so charging both would count it twice. The
+    range's low end is derived under the position reading alone.
 
 --- no manifest -----------------------------------------------------------
 
