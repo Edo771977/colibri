@@ -1137,11 +1137,12 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
  * The accumulation is not bookkeeping either -- it is K rows of D floats per
  * layer per token, and at the measured hit rates that is most of the 1.2
  * ms/token `take` currently reports. */
-/* Defined by the engine next to g_qt_iss and friends, like every other
- * qtier timer: this translation unit is compiled only with CUDA, and the
- * non-CUDA build still has to link the report that reads them. */
-extern int    g_qt_time_take;
-extern double g_qt_wait, g_qt_acc;
+/* Defined HERE, not in the engine next to g_qt_iss: tests/test_qwen36_tier
+ * _int8.c does #include "../qwen36_tier.c" and links without qwen36.c, so
+ * this translation unit has to stand on its own. Putting them in the engine
+ * built the binary fine and broke that test at link time. */
+int    g_qt_time_take = 0;             /* armed by the engine from tm_on() */
+double g_qt_wait = 0, g_qt_acc = 0;
 static double qt_ms(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     return ts.tv_sec*1e3 + ts.tv_nsec/1e6;

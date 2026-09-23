@@ -812,13 +812,6 @@ static int tm_on(void){ if(g_timers<0){ const char *e=getenv("COLI_TIMERS"); g_t
  * reading of the profile: 4.95 looked like the price of a 1.9 % miss rate
  * and was mostly the shared expert. */
 double g_qt_iss=0, g_qt_cpu=0, g_qt_shr=0, g_qt_tak=0;
-/* take, split: the blocking wait on the expert group against the
- * accumulation of its rows. One number cannot say whether the GPU or the CPU
- * is the critical path of the issue..take window, which is the question the
- * shared-expert overlap turns on. Read by qt_take only when g_qt_time_take
- * is armed, so the inference build reads no clock it did not read before. */
-int    g_qt_time_take=0;
-double g_qt_wait=0, g_qt_acc=0;
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
 double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
@@ -861,13 +854,14 @@ static void tm_report(void){
         fprintf(stderr,"[timers]   qtier: issue %.2f | cpu-miss %.2f | take %.2f | shared-ovl %.2f ms/token\n",
                 g_qt_iss/g_tm_dec_tokens, g_qt_cpu/g_tm_dec_tokens,
                 g_qt_tak/g_tm_dec_tokens, g_qt_shr/g_tm_dec_tokens);
-    {   /* take, split. `wait` is how long the GPU group was still running
-         * after the CPU finished its misses and the shared expert, so it is
-         * the answer to which side is the critical path of that window. */
-        if(g_qt_wait+g_qt_acc>0)
-            fprintf(stderr,"[timers]   take split: wait %.2f | accum %.2f ms/token\n",
-                    g_qt_wait/g_tm_dec_tokens, g_qt_acc/g_tm_dec_tokens);
-    }
+#ifdef COLI_CUDA
+    /* take, split. `wait` is how long the GPU group was still running after
+     * the CPU finished its misses and the shared expert, so it is the answer
+     * to which side is the critical path of that window. */
+    if(g_qt_wait+g_qt_acc>0)
+        fprintf(stderr,"[timers]   take split: wait %.2f | accum %.2f ms/token\n",
+                g_qt_wait/g_tm_dec_tokens, g_qt_acc/g_tm_dec_tokens);
+#endif
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
 }
@@ -4114,7 +4108,9 @@ int main(int argc, char **argv) {
         /* Arm the take split only when the timers are on; qt_take reads no
          * clock otherwise, so the inference build is byte-for-byte the same
          * work it was. */
+#ifdef COLI_CUDA
         g_qt_time_take = tm_on() ? 1 : 0;
+#endif
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * qdw entry keyed by m.lm_head holds the int8 rows + per-row scales
          * the CPU path uses; the GPU applies the identical semantics. */
