@@ -143,6 +143,11 @@ void qt_fill_wait(void);   /* blocks until every enqueued upload is resident (no
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
 
+/* take, split into the GPU wait and the row accumulation. Defined in
+ * qwen36_tier.c; only meaningful when the tier is compiled at all. */
+extern int    g_qt_time_take;
+extern double g_qt_wait, g_qt_acc;
+
 #else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}

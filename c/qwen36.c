@@ -854,6 +854,14 @@ static void tm_report(void){
         fprintf(stderr,"[timers]   qtier: issue %.2f | cpu-miss %.2f | take %.2f | shared-ovl %.2f ms/token\n",
                 g_qt_iss/g_tm_dec_tokens, g_qt_cpu/g_tm_dec_tokens,
                 g_qt_tak/g_tm_dec_tokens, g_qt_shr/g_tm_dec_tokens);
+#ifdef COLI_CUDA
+    /* take, split. `wait` is how long the GPU group was still running after
+     * the CPU finished its misses and the shared expert, so it is the answer
+     * to which side is the critical path of that window. */
+    if(g_qt_wait+g_qt_acc>0)
+        fprintf(stderr,"[timers]   take split: wait %.2f | accum %.2f ms/token\n",
+                g_qt_wait/g_tm_dec_tokens, g_qt_acc/g_tm_dec_tokens);
+#endif
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
 }
@@ -2770,7 +2778,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
              * two things inside it. */
             double _qm = tm_now();
             /* Compute the shared expert NOW so it overlaps with the GPU
-             * groups; the common block below is skipped. */
+             * groups; the common block below is skipped.
+             *
+             * MEASURED, and the overlap is complete: at an 87 % hit rate
+             * the CPU side of this window costs 7.53 ms/token (cpu-miss
+             * 4.01 + this 3.52) and the GPU is still running 0.84 after it,
+             * so the window is the GPU's 8.37 either way. Making this
+             * cheaper -- moving it to the device, fusing it, anything --
+             * returns ZERO and only grows `wait`. See
+             * docs/experiments/qwen36-take-split-2026-09-23-raw.txt. The
+             * margin is 0.84 ms/token at that hit rate and nothing measures
+             * where it crosses, so this stops being free at some lower
+             * residency. */
             {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
@@ -2789,6 +2808,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
+#ifdef COLI_CUDA
+            /* Arm the split for THIS call only when the enclosing `take`
+             * counter is also running. qt_take does not see S, so armed once
+             * at init it also charged the 25 prefill positions to a divisor
+             * of decode tokens: measured wait+accum 2.75 against a take of
+             * 1.31, i.e. more than the whole of what it is a part of. The
+             * same mixed-denominator error the experiment records spend
+             * pages on, made in the instrumentation itself. */
+            g_qt_time_take = (tm_on() && S==1) ? 1 : 0;
+#endif
             qt_take(qmask, val, K, out + (int64_t)s*D);
             if (tm_on() && S==1) {
                 extern double g_qt_iss, g_qt_cpu, g_qt_shr, g_qt_tak;
@@ -4097,6 +4126,10 @@ int main(int argc, char **argv) {
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
+        /* Arm the take split only when the timers are on; qt_take reads no
+         * clock otherwise, so the inference build is byte-for-byte the same
+         * work it was. */
+
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * qdw entry keyed by m.lm_head holds the int8 rows + per-row scales
          * the CPU path uses; the GPU applies the identical semantics. */
