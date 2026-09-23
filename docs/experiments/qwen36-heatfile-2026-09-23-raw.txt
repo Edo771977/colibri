@@ -116,7 +116,9 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script.
   output was truncated after the [meta] lines and its timers were never
   captured, so no figures are given for it; the dashes are not a placeholder
   for numbers that were observed. Run 7 is the same command captured in
-  full; it is the cold figure for prompt-caldo and enters no mean below.
+  full; it is the cold figure for prompt-caldo. It enters no mean below, but
+  it is not idle either: it supplies the third point of the regression note
+  and a row of the cpu-miss table, and both sections say what it does there.
 
 --- the result ------------------------------------------------------------
 
