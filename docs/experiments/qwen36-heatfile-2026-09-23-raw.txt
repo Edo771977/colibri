@@ -2,6 +2,14 @@ Qwen3.6-35B-A3B: what a persisted heat table is worth, and what of it
 transfers to a prompt the table has never seen.
 23 September 2026.
 
+SUPERSEDED ON THE NUMBER, the same day, by qwen36-heatfile-6rep-2026-09-23
+-raw.txt: six paired repetitions with an alternated cold arm give
+-4.92 ms/token, 95 % interval [-5.60, -4.23]. That measurement confirms
+this record's -4.80 and REFUTES the floor of -3.65 published below, which
+charged run 7's whole step() deficit to session position. Everything else
+here -- the mechanism, the layer prefix, the per-miss question, the
+limitations -- stands, and the per-miss non-constancy is settled there.
+
 c/qwen36_tier.c:609 loads a heat table from HEAT_FILE and c/qwen36_tier.c:1235
 writes it back at shutdown. The engine does not set the variable itself, but
 the repository's own launch instructions do -- ISTRUZIONI.md:102 has
@@ -383,9 +391,12 @@ the only position-controlled subset goes the other way), and "the residual
 tracks the miss count" (refuted by run 7 above). What is left is a measured
 -4.80 with a session trend that the data evidences rather than excludes.
 
-TAKE -3.7 TO -4.8. The range is this wide because of a protocol choice --
-no cold arm was alternated back in after each warm run -- and this record
-should not be read as having narrowed it. c/tools/misure-heatfile.ps1 runs
+TAKE -3.7 TO -4.8 FROM THIS RECORD, and then do not: the alternated
+measurement in qwen36-heatfile-6rep-2026-09-23-raw.txt gives -4.92 +-0.69,
+and the -3.65 end derived above falls outside its interval. The range is
+this wide because of a protocol choice -- no cold arm was alternated back
+in after each warm run -- and the position charge that set its floor was
+too conservative rather than too generous. c/tools/misure-heatfile.ps1 runs
 the alternated version.
 
 A regression on the three cold points is NOT a usable bound and is recorded
