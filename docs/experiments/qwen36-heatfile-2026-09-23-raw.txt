@@ -45,8 +45,11 @@ Engine : qwen36_clang.exe, CUDA_DLL=1. No attnproj line appears in the
 Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, N_NEW=64.
 Prompts: prompt25.txt       (25 tokens, operating-system memory management)
          prompt-caldo.txt   (29 tokens, chlorophyll photosynthesis)
-         The two share no subject matter. The second exists only to build a
-         heat table that cannot contain the first one's answer.
+         The two share no subject matter, and the whole CROSS arm depends on
+         that. The token counts are in the output and prompt-caldo's subject
+         is visible in its generated text; PROMPT25'S SUBJECT IS OPERATOR
+         TESTIMONY, corroborated only by the generated text reading as an
+         answer about memory management.
 Place  : the automatic placer, not an explicit placement string -- the eight
          runs whose header was captured all print, identically, `[place]
          auto: dev 0 holds 1527.7 MB of trunk (lmhead yes, 30 dnproj
@@ -71,7 +74,8 @@ OMP    : OMP_NUM_THREADS unset. Every run prints the `[OMP] qwen36: 16
 Decode : greedy argmax (c/qwen36.c:3355), which is what makes the routing
          counters below repeatable. Not a setting; stated because an
          argument depends on it.
-Runs   : typed by hand at an interactive cmd.exe prompt, no script.
+Runs   : typed by hand at an interactive cmd.exe prompt, no script --
+         operator testimony; the captured output shows only the command.
 
 --- the three states ------------------------------------------------------
 
@@ -117,8 +121,11 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script.
   captured, so no figures are given for it; the dashes are not a placeholder
   for numbers that were observed. Run 7 is the same command captured in
   full; it is the cold figure for prompt-caldo. It enters no mean below, but
-  it is not idle either: it supplies the third point of the regression note
-  and a row of the cpu-miss table, and both sections say what it does there.
+  it is not idle either: it supplies the third point of the regression note,
+  a row of the cpu-miss table, its own row in counterbalancing item 1, AND
+  the entire prompt-caldo side of the layer-27 inversion -- the 68.28 % and
+  the p = 31.3 % there are run 7 alone, n=1, on the other prompt, at a
+  different position in the session.
 
 --- the result ------------------------------------------------------------
 
@@ -138,35 +145,62 @@ BUT THE COLD RUNS DECLINE MONOTONICALLY ACROSS THE SESSION: 32.8 at position
 shape a session-long warm-up produces. Three cold points, one of them on the
 other prompt, cannot establish or exclude a trend.
 
-The phase timers settle it better than any fit, because a session-wide trend
-would move every phase and the mechanism can only move one:
+The phase timers answer it, and the SELF arm -- which the earlier version of
+this section left out -- is what turns the answer from a plausibility into a
+test. All three arms, means over their runs:
 
-                     COLD (1,2)   CROSS (6,8)   delta
-    deltanet             9.21         8.93       -0.28
-    attention            5.36         5.345      -0.015
-    moe_total           15.03        10.82       -4.21
-    lm_head              1.68         1.43       -0.25
-                                                 -----
-                                                 -4.755   (step() delta 4.80)
+                   COLD (1,2)  CROSS (6,8)  SELF (3,4,9)  d CROSS  d SELF
+    deltanet           9.21        8.93         8.39       -0.28    -0.82
+    attention          5.36        5.345        5.417      -0.015   +0.057
+    moe_total         15.03       10.82         7.92       -4.21    -7.11
+    lm_head            1.68        1.43         1.23       -0.25    -0.45
+    (shared)           3.455       3.53         3.863      +0.075   +0.41
+    (router)           0.88        0.845        0.92       -0.035   +0.04
+    step()            32.35       27.55        24.00       -4.80    -8.35
+    miss(CPU)          8916        3046            0
 
-  ATTENTION MOVES BY 0.015 ms/token, THREE TENTHS OF ONE PERCENT. A heat
-  table cannot touch attention -- it decides which routed experts are
-  resident -- so attention is the control, and it says the machine did not
-  get uniformly faster. 88 % of the gain is in moe_total, and inside
-  moe_total the cpu-miss timer alone falls 7.90 -> 3.45, i.e. -4.45, which
-  is the whole of it. That is where the mechanism lives.
+  (shared) and (router) are inside moe_total, not additional to it.
 
-So: -4.80 ms/token measured, of which -4.21 is in the one phase the heat
-table acts on. The remaining -0.53, spread over deltanet and lm_head, is
-what a session trend could account for -- or reduced GPU contention once
-the expert uploads stop. THE DEFENSIBLE RANGE IS -4.2 TO -4.8 ms/token.
+  ATTENTION DOES NOT FALL IN EITHER WARM ARM. A heat table cannot touch
+  attention -- it decides which routed experts are resident -- so attention
+  is the control. Its own scatter is 0.19 across the eight timed runs, so
+  neither -0.015 nor +0.057 is distinguishable from zero; the point is the
+  sign and the size next to moe_total's -4.21 and -7.11. If the machine had
+  simply got faster during the session, attention would have come down too.
+  It does not, and in the SELF arm it goes the other way.
+
+  THE NON-MoE RESIDUAL TRACKS THE MISS COUNT, NOT THE RUN POSITION. Take
+  step() minus moe_total, i.e. everything the heat table cannot reach:
+
+        8916 misses   residual  0       runs 1,2     mean position 1.5
+        3046 misses   residual -0.59    runs 6,8     mean position 7.0
+           0 misses   residual -1.24    runs 3,4,9   mean position 5.3
+
+  The first row is zero by construction: it is the baseline the other two
+  are differences from. The comparison is between the second and the third.
+
+  A session warm-up predicts the residual grows with position. It does the
+  opposite: the arm with the LARGER residual sits EARLIER in the session.
+  What it does track, monotonically, is the number of experts served from
+  the CPU -- which is what contention for CPU and PCIe from the fallback
+  path would produce. So the residual is part of the effect, not a rival
+  explanation for it.
+
+  Inside moe_total, cpu-miss falls 7.895 -> 3.445, i.e. -4.45 against
+  moe_total's -4.21. It OVERSHOOTS: (shared) moves +0.075 the wrong way in
+  the CROSS arm and +0.41 in the SELF arm, unexplained and printed here
+  rather than smoothed over.
+
+So: -4.80 ms/token, and this record does not discount it for drift. The
+monotone cold decline is real and unexplained, but it cannot be the
+explanation, because it predicts an ordering the SELF arm reverses.
 
 A regression on the three cold points is NOT a usable bound and is recorded
-here only so nobody redoes it: fitting all three by run position gives slope
--0.226 and adjusted deltas -3.26 and -3.91, but fitting runs 1 and 2 alone
-gives slope -0.9 and adjusted deltas of +0.2 and -0.5, which erases the
-effect. One cross-prompt point carries the entire estimate. The trend is
-unidentified, and the phase decomposition above is what the claim rests on.
+only so nobody redoes it: all three by run position gives slope -0.226 and
+adjusted deltas -3.26 (run 6) and -3.91 (run 8); runs 1 and 2 alone give
+slope -0.9 and adjusted deltas -0.2 (run 6) and +0.5 (run 8), which erases
+the effect. One cross-prompt point carries the entire estimate, so the
+trend is unidentified either way.
 
 The clean fix is cheap and was not done: delete heat.bin between runs so a
 cold arm alternates back in after every warm one.
@@ -224,8 +258,8 @@ to see which argument was withdrawn and why.
 
 --- three findings that are not the headline ------------------------------
 
-WITHOUT A HEAT TABLE THE RESIDENT SET IS A LAYER PREFIX, AND ITS HIT RATE IS
-ARITHMETIC RATHER THAN EVIDENCE.
+WITHOUT A HEAT TABLE THE RESIDENT SET IS A LAYER PREFIX. THAT BOUNDS THE
+COLD HIT RATE; IT DOES NOT DETERMINE IT.
 
   resident 6959 / 10240 = 67.96 %
   cold hit rate         = 68.34 %  on prompt25   (19244 / 28160)
@@ -240,25 +274,42 @@ ARITHMETIC RATHER THAN EVIDENCE.
   and decodes it as l = gi/G.ne (:969), so the budget is consumed in strict
   global index order: a LAYER-MAJOR PREFIX. 6959 = 27*256 + 47, so layers
   0-26 are entirely resident, layer 27 holds 47 of 256, and layers 28-39
-  hold NOTHING. Every token routes topk experts in every layer, so 27 layers
-  always hit and 12 always miss, and the hit rate is
+  hold NOTHING -- at the start. Four LFRU swaps mutate the set during the
+  run (uploads 6963 against resident 6959 is exactly four promotions), so
+  everything below describes the INITIAL fill and is approximate to that
+  extent. On that fill 27 layers hit and 12 miss, and the hit rate is
 
         (27 + p) / 40,   p = share of layer-27 routes landing in expert 0-46
 
-  BOUNDED TO [67.5 %, 70.0 %] whatever the routing does, and equal to the
-  residency fraction only when p = 47/256 = 18.4 %, which is a claim about
-  the routing distribution rather than a structural fact.
+  BOUNDED TO [67.5 %, 70.0 %] whatever the routing does -- on the initial
+  fill -- and equal to the residency fraction only when p = 47/256 = 18.4 %,
+  which is a claim about the routing distribution rather than a structural
+  fact.
 
   It does not hold. Inverting the two measured rates gives
 
         prompt25       p = 33.5 %      against 18.4 % uniform, +83 %
         prompt-caldo   p = 31.3 %      against 18.4 % uniform, +70 %
 
-  so layer 27's routing concentrates on low expert indices by a wide margin,
-  and an earlier version of this file called that "slight". Four LFRU swaps
-  cannot produce it: the excess is about 107 extra hits out of 704 layer-27
-  lookups. It is a real, unexplained property of the routing and nothing
-  here measures it further.
+  and an earlier version of this file called that margin "slight". The
+  prompt25 excess is about 107 extra hits out of 704 layer-27 lookups; the
+  prompt-caldo one about 91 out of 736.
+
+  THE FOUR LFRU SWAPS ARE NOT RULED OUT AS THE CAUSE, and an earlier version
+  of this file claimed they were, by comparing 107 against 704 -- a ratio
+  that says nothing about swap capacity. Computed properly: attempts land at
+  tokens 16, 32, 48, 64 and 80, four are taken, and a promoted expert is
+  resident for the rest of the run, so four promotions cover between 128 and
+  192 subsequent lookups depending on which attempts took. Either figure
+  exceeds 107. Since LFRU promotes the hottest non-resident experts, the
+  swaps are a live candidate, and the promotions are not confined to layer
+  27 -- a promoted expert in layers 28-39 would add hits that this inversion
+  charges to p.
+
+  So p is an upper bound on layer-27 index skew, not a measurement of it.
+  Something makes the cold hit rate exceed the uniform-routing floor by
+  0.3-0.4 points on both prompts; whether it is routing skew, the four
+  swaps, or both, nothing here separates them.
 
   What survives is that the near-agreement of 68.34 % and 68.28 % across two
   unrelated prompts is mostly structural -- the prefix pins 27 of the 40
@@ -309,7 +360,8 @@ ARITHMETIC RATHER THAN EVIDENCE.
   question about upload bandwidth and ping-pong that this record does not
   answer.
 
-CPU FALLBACK COST RISES WITH MISSES. NO COST-PER-MISS CAN BE READ OFF HERE.
+CPU FALLBACK COST RISES BETWEEN THE TWO MISS LEVELS. NEITHER A COST PER MISS
+NOR A MONOTONE RELATION CAN BE READ OFF HERE.
 
   miss(CPU)                          cpu-miss, ms/token
     9338   run 7                       7.91
@@ -384,7 +436,8 @@ CPU FALLBACK COST RISES WITH MISSES. NO COST-PER-MISS CAN BE READ OFF HERE.
     68 % of the expert set in VRAM; the value of a heat table must depend on
     that fraction and only one value of it was tested.
   - Whether the COLD arm is the state it is named after. It is not static:
-    four LFRU swaps mutate the resident set inside every cold run, so the
+    four LFRU swaps mutate the resident set inside each of the three cold
+    runs whose [qtier] block was captured (run 5's was not), so the
     68.3 % is an average over a set that changed four times, and the fifth
     declined attempt is unexplained.
   - Anything that would let decode be separated from prefill. step() and
