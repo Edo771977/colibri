@@ -833,7 +833,7 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c cli_args.h lora.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h exact_dot.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c pin_pool.h cli_args.h lora.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h exact_dot.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
@@ -1186,7 +1186,7 @@ fp8-bench: fp8_bench$(EXE)
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h kv_prefix.h route_trace.h serve_codec.h edge_adapters.h edge_runtime.h edge_tok_internal.h fused_simd.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
+olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h kv_prefix.h pin_pool.h route_trace.h serve_codec.h edge_adapters.h edge_runtime.h edge_tok_internal.h fused_simd.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
@@ -1220,13 +1220,13 @@ qwen36: qwen36$(EXE)
 endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h simd_i8f.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
+qwen36$(EXE): qwen36.c decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h simd_i8f.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
 # are, so there is no conversion target here to go with it.
-deepseek_v41$(EXE): deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h compat.h omp_tune.h kv_prefix.h quant.h \
+deepseek_v41$(EXE): deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h compat.h omp_tune.h kv_prefix.h pin_pool.h quant.h \
 	sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h .build-config
 	$(CC) $(CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(LDFLAGS)
 
@@ -1234,7 +1234,7 @@ deepseek_v41$(EXE): deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h co
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
 # qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
 # without it the tier header's inline stubs keep the build toolkit-free.
-qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h omp_tune.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+qwen38$(EXE): qwen38.c pin_pool.h cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h omp_tune.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
@@ -1317,7 +1317,7 @@ tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c 
 tests/bench_qwen36_decode_omp$(EXE): tests/bench_qwen36_decode_omp.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
-inkling$(EXE): inkling.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda_ink.h backend_metal.h edge_adapters.h edge_runtime.h edge_tok_internal.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+inkling$(EXE): inkling.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h pin_pool.h serve_codec.h backend_cuda_ink.h backend_metal.h edge_adapters.h edge_runtime.h edge_tok_internal.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
@@ -1334,10 +1334,10 @@ NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
 
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
 # METAL=1 accelerates resident matrices and routed MoE; CPU remains fallback.
-glm53$(EXE): glm53.c cli_args.h st.h json.h stop_ids.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h serve_poll.h route_trace.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_metal.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
+glm53$(EXE): glm53.c decode_batch.h pin_pool.h cli_args.h st.h json.h stop_ids.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h serve_poll.h route_trace.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_metal.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
 	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
-kimi_k3$(EXE): kimi_k3.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
+kimi_k3$(EXE): kimi_k3.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h pin_pool.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
@@ -1491,6 +1491,9 @@ tests/test_spec_decode_state$(EXE): tests/test_spec_decode_state.c colibri.c st.
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_pin_pool$(EXE): tests/test_pin_pool.c pin_pool.h kv_prefix.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_serve_codec$(EXE): tests/test_serve_codec.c serve_codec.h compat.h

@@ -71,6 +71,7 @@
 #include "lora.h"                                 /* ADAPTER=<dir>: LoRA residual on frozen base */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "pin_pool.h"   /* piu scatti annidati dello stato */
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
 #include "kv_fp8.h"                               /* KV8=1: cache latente in fp8 e4m3 + scala per-riga */
 #include "kv_tq.h"                                /* KV_TQ=3|4: cache latente PolarQuant (rot+polare) */
@@ -8734,7 +8735,17 @@ static void repin_pass_limit(Model *m,int limit){
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
 
-typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
+/* Scatti dello stato (modalita jev, SUBMIT pin=1), PER SLOT. Qui il
+ * riavvolgimento e gia nativo -- le righe KV sono indicizzate per posizione e
+ * lo slot le tiene -- ma mancava il predittore del PRIMO token fresco, che
+ * senza fotografia costringerebbe a rifare tutto il prompt.
+ *
+ * Sono piu di uno perche i prefissi utili sono annidati: le istruzioni,
+ * condivise da mille richieste, e istruzioni+domanda, condivise dalle
+ * alternative di una sola. Con uno scatto solo si e costretti a scegliere, e
+ * l'altro livello lo si ripaga ogni volta. Vedi pin_pool.h. */
+typedef struct { KVState kv; int *hist, len, first;
+                 ColiPinPool pins; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
@@ -8759,6 +8770,7 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
     free(k->Lc); free(k->Rc); free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
     free(k->Ic); free(k->kv_start); free(s->hist);
+    coli_pin_pool_clear(&s->pins, NULL);   /* questo motore non ha stato ricorrente */
 }
 
 typedef struct {
@@ -8848,22 +8860,28 @@ static void mux_echo(Tok *T, unsigned long long id, int pos, int token,
  * needs logits at EVERY position, so this path takes no cached-prefix skip
  * and no cross-slot KV adoption (KV rows [0,nt) are rewritten in full). */
 static float *mux_prefill_echo(Model *m, Tok *T, unsigned long long id,
-                               const int *ids, int nt, int topk){
+                               const int *ids, int nt, int topk,
+                               int from, const float *pin_lo){
     Cfg *c=&m->c; int D=c->hidden, V=c->vocab;
-    float *x=falloc((int64_t)nt*D);
-    for(int s=0;s<nt;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-    layers_forward(m,x,nt,0);
-    if(m->hlast) memcpy(m->hlast, x+(int64_t)(nt-1)*D, D*sizeof(float));
-    if(m->has_mtp && nt>=2 && g_draft>0) mtp_absorb(m, ids+1, x, nt-1, 0);  /* same as step() */
+    if(from<0 || from>=nt) from=0;
+    int add=nt-from;
+    float *x=falloc((int64_t)add*D);
+    for(int s=0;s<add;s++) embed_row(m, ids[from+s], x+(int64_t)s*D);
+    layers_forward(m,x,add,from);
+    if(m->hlast) memcpy(m->hlast, x+(int64_t)(add-1)*D, D*sizeof(float));
+    if(m->has_mtp && add>=2 && g_draft>0) mtp_absorb(m, ids+from+1, x, add-1, from);  /* same as step() */
     float *lo=falloc(V), *row=falloc(D);
-    mux_echo(T,id,0,ids[0],NULL,V,0);
+    /* La prima posizione emessa non ha un predittore fra le x appena calcolate:
+     * lo porta la fotografia. Senza (from==0, o nessun pin) resta " nan 0",
+     * esattamente come prima. */
+    mux_echo(T,id,from,ids[from], (from>0?pin_lo:NULL), V, (from>0&&pin_lo)?topk:0);
     double th0=now_s();
-    for(int pos=1; pos<nt; pos++){
-        rmsnorm(row, x+(int64_t)(pos-1)*D, m->final_norm, D, c->eps);
+    for(int pos=from+1; pos<nt; pos++){
+        rmsnorm(row, x+(int64_t)(pos-1-from)*D, m->final_norm, D, c->eps);
         matmul_qt(lo, row, &m->lm_head, 1);
         mux_echo(T,id,pos,ids[pos],lo,V,topk);
     }
-    rmsnorm(row, x+(int64_t)(nt-1)*D, m->final_norm, D, c->eps);
+    rmsnorm(row, x+(int64_t)(add-1)*D, m->final_norm, D, c->eps);
     matmul_qt(lo, row, &m->lm_head, 1);
     m->t_head += now_s()-th0;
     free(x); free(row);
@@ -9085,8 +9103,38 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * prompt re-prefills from position 0 -- no cached-prefix skip and no
      * cross-slot adoption below (either would leave positions with no logits). */
     int echo = sub.logprobs>0;
+    /* Il salto del prefisso nell'eco vale quando lo slot PORTA una fotografia,
+     * non quando questa richiesta la richiede: in un menu chiuso la foto la
+     * chiede la passata di riscaldamento e le opzioni che seguono non la
+     * ridichiarano. Legarlo a sub.pin faceva rifare il prompt intero a ogni
+     * opzione -- i numeri restavano giusti e il risparmio spariva, che e' il
+     * modo peggiore di sbagliare.
+     *
+     * Una fotografia esiste solo perche qualcuno l'ha chiesta su QUESTO slot,
+     * e uno slot e' una conversazione: un client OpenAI con echo=true che non
+     * ha mai chiesto niente non ne trova nessuna e rifa tutto da posizione 0,
+     * frame per frame, come prima. */
+    /* Lo scatto piu profondo che sia un prefisso di questo prompt. */
+    int pin_slot = echo ? coli_pin_best(&sc->pins, tmp, nt) : -1;
+    int pin_len  = pin_slot >= 0 ? sc->pins.slot[pin_slot].len : 0;
+    const float *pin_lo = pin_slot >= 0 ? sc->pins.slot[pin_slot].logit : NULL;
+    int echo_pin = echo && pin_len > 0 && pin_lo;
     int prefix=0;
-    if(!echo) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    if(!echo || echo_pin) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    /* L'eco comincia ESATTAMENTE dove finisce la fotografia, non dove finisce
+     * il prefisso condiviso: i soli logit che abbiamo sono quelli della
+     * posizione fotografata, e sono il predittore del token che viene subito
+     * dopo. Se il prefisso condiviso va piu in la -- due opzioni di un menu
+     * condividono anche lo spazio che le precede, quindi capita sempre -- si
+     * torna indietro alla fotografia e si rifanno quei pochi token: si perde
+     * una posizione di riuso e si guadagna che ogni token dell'opzione ha il
+     * suo logprob. Pretendere che i due numeri combaciassero faceva ricadere
+     * ogni opzione dopo la prima sul ricalcolo completo: numeri giusti,
+     * risparmio zero. */
+    if(echo_pin){
+        if(pin_len>0 && pin_len<=prefix){ prefix=pin_len; coli_pin_touch(&sc->pins,pin_slot); }
+        else prefix=0;
+    }
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
@@ -9138,10 +9186,17 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
-    float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs)
+    float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs,
+                                          echo_pin?prefix:0,
+                                          echo_pin?pin_lo:NULL)
                         : add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                                 : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
+    if(sub.pin && logit){
+        coli_pin_pool_init(&sc->pins,m->c.vocab);
+        if(coli_pin_store(&sc->pins,sc->hist,nt,logit))
+            fprintf(stderr,"[PIN] slot %d: scatto a %d token\n",sub.slot,nt);
+    }
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->logprobs=sub.logprobs;
