@@ -16,12 +16,15 @@ This is the measurement of the gap between those two states, plus the part
 that matters: how much of the warm state survives a change of subject.
 
 Host   : Ryzen 9 7950X (16 physical cores, clang/LLVM libomp), 64 GB DDR5,
-         RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA 13.4.
+         RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA 13.4. This line is
+         carried over from qwen36-attnproj-place-2026-09-22-raw.txt, the same
+         machine; the engine's own output confirms only the GPU and sm_89.
 Engine : qwen36_clang.exe, CUDA_DLL=1. THE BINARY PREDATES #39: no attnproj
          line appears in the [place] output of any run below and `attention`
-         reads 5.3-5.5 ms/token in all of them, which is the unplaced value
-         (1.94 in the #39 record). All three arms therefore carry the same
-         missing optimisation and the comparison between them is unaffected;
+         reads 5.26-5.45 ms/token in the eight runs whose timers were
+         captured, which is the unplaced value (1.94 in the #39 record).
+         All three arms therefore carry the same missing optimisation and
+         the comparison between them is unaffected;
          the ABSOLUTE numbers are not those of current main.
 Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, N_NEW=64.
 Prompts: prompt25.txt       (25 tokens, operating-system memory management)
@@ -38,7 +41,10 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script.
          prompt25.txt. This is the honest number.
   SELF   HEAT_FILE built by a prior run on prompt25.txt itself, measured on
          prompt25.txt. Self-fulfilling by construction; reported as a
-         CEILING, never as a gain.
+         CEILING, never as a gain. Run 9 is the impure member: its table was
+         written by run 7 (prompt-caldo) and then run 8 (prompt25), so it
+         satisfies the definition and carries the other subject as well. The
+         result section states what excluding it would change.
 
 --- every run, in the order it was executed -------------------------------
 
@@ -66,7 +72,7 @@ Runs   : typed by hand at an interactive cmd.exe prompt, no script.
   output was truncated after the [meta] lines and its timers were never
   captured, so no figures are given for it; the dashes are not a placeholder
   for numbers that were observed. Run 7 is the same command captured in
-  full and is the cold figure used below.
+  full; it is the cold figure for prompt-caldo and enters no mean below.
 
 --- the result ------------------------------------------------------------
 
@@ -76,48 +82,84 @@ On prompt25.txt:
   CROSS mean step() 27.55   (runs 6,8)      -4.80 ms/token   +15 % tok/s
   SELF  mean step() 24.00   (runs 3,4,9)    -8.35 ms/token   +28 % tok/s
 
-The transferable gain is -4.8 ms/token, range -3.8 to -5.8 across the four
-pairings of the two cold runs with the two cross runs. That is 57 % of the
-ceiling; the other 43 % is specific to the prompt and is not available to a
-session that has not already answered it.
+The transferable gain is -4.80 ms/token as measured, range -3.8 to -5.8
+across the four pairings of the two cold runs with the two cross runs. That
+is 57 % of the self-warmed ceiling; the rest is specific to the prompt and is
+not available to a session that has not already answered it.
 
---- why the number is trustworthy despite an unscripted, unalternated run --
+BUT THE COLD RUNS DECLINE MONOTONICALLY ACROSS THE SESSION: 32.8 at position
+1, 31.9 at position 2, 31.2 at position 7. That is 1.6 ms/token, a third of
+the claimed effect, and it is the shape a session-long warm-up produces. With
+three cold points -- one of them on the other prompt -- a trend cannot be
+told apart from scatter. Fitting a straight line to the three by run position
+(slope -0.226 ms per position) and comparing each CROSS run against the cold
+value predicted for ITS position gives:
+
+  run 6 (position 6)   predicted cold 31.36   measured 28.1   -3.26
+  run 8 (position 8)   predicted cold 30.91   measured 27.0   -3.91
+
+So the honest statement is a RANGE, not a number: the transferable gain is
+between about -3.3 and -4.8 ms/token, -3.6 if the entire cold decline is
+session trend and -4.8 if none of it is. This record cannot narrow it
+further; a run that alternates a cold arm back in after every warm one, which
+is possible by deleting heat.bin between runs, could.
+
+The SELF mean includes run 9, whose heat table was built by runs 7 and 8 and
+so carries both subjects. Excluding it gives SELF 23.75, a ceiling of -8.60
+and a transferable fraction of 55.8 % rather than 57.5 %. Run 9 is kept
+because it reached 100.0 % like runs 3 and 4; the sensitivity is stated
+rather than resolved.
+
+--- what stands in for counterbalancing, and what does not ----------------
 
 The arms CANNOT be alternated. A heat table has to be built before it can be
-used, so the order cold -> warm is forced by the mechanism. Three things
-stand in for counterbalancing:
+used, so the order cold -> warm is forced by the mechanism. Three things were
+offered in its place. The second does not survive; it is left here, struck
+through in words, because a reader who wants to trust the range above needs
+to see which argument was withdrawn and why.
 
   1. THE ROUTING COUNTERS ARE EXACTLY REPRODUCIBLE. Not close: equal.
 
        COLD  prompt25       uploads 6963  miss(CPU) 8916   runs 1, 2
        CROSS prompt25       hits 25114    miss(CPU) 3046   runs 6, 8
        SELF  prompt25       hits 28160    miss(CPU)    0   runs 3, 4, 9
-       COLD  prompt-caldo   hits 20102    miss(CPU) 9338   run 7
+
+     Run 7 (COLD prompt-caldo, hits 20102, miss 9338) is NOT listed with
+     them: run 5 was its only possible repeat and was never captured, so it
+     is n=1 and has nothing to be equal to. Runs 1 and 2 are compared on
+     `uploads` and `miss(CPU)` rather than `hits`, because run 1's
+     `dev 0: hits` line was not captured.
 
      Greedy decoding on a fixed prompt with a fixed resident set produces
      identical routing, so the hit rate has ZERO measurement variance. All
      the scatter in the table above is timing scatter.
 
-  2. THE COLD ARM WAS MEASURED ON BOTH SIDES OF THE WARM ONE. Runs 1-2 come
-     before the warm runs and run 7 after; 32.8, 31.9 then 31.2. The machine
-     did not drift between the arms, so the 4.8 is not a warm-up artefact of
-     the session. Run 7 is on the other prompt, so it bounds the drift of
-     the COLD STATE rather than repeating the cold arm of the comparison.
+  2. THE COLD-ARM SPREAD BOUNDS THE SHORT-RANGE NOISE. 32.8 vs 31.9 on
+     identical configuration, back to back, is 0.9 ms/token. The cross-topic
+     gap is 4.8. What this does NOT bound is the session-long drift dealt
+     with above; an earlier version of this section claimed the cold arm
+     bracketed the warm one and that the machine did not drift. Both were
+     false: runs 8 and 9 come after run 7, so nothing brackets anything, and
+     the three cold values fall monotonically. The claim is withdrawn and
+     replaced by the range in the result section.
 
-  3. THE COLD-ARM SPREAD BOUNDS THE NOISE. 32.8 vs 31.9 on identical
-     configuration is 0.9 ms/token. The cross-topic gap is 4.8, about five
-     times that. The DeltaNet sub-timers are tighter still (conv 0.4-0.5,
-     l2n+rec 1.9-2.0 in all nine runs).
+  3. THE SUB-TIMERS ARE TIGHTER THAN THE TOTALS. conv 0.4-0.5 and l2n+rec
+     1.8-2.0 across the eight runs that have a dn-sub line, against 0.9 of
+     scatter on step() in the cold pair alone. Whatever moves the totals
+     between runs is not moving DeltaNet's CPU work.
 
 --- three findings that are not the headline ------------------------------
 
 WITHOUT A HEAT TABLE THE RESIDENT SET CARRIES NO INFORMATION.
 
   resident 6959 / 10240 = 67.96 %
-  cold hit rate         = 68.3 %   on prompt25 AND on prompt-caldo
+  cold hit rate         = 68.34 %  on prompt25   (19244 / 28160)
+                        = 68.28 %  on prompt-caldo (20102 / 29440)
 
-  The hit rate equals the residency fraction, which is what picking experts
-  at random would give, and it does so on two prompts with nothing in common.
+  The hit rate matches the residency fraction to within 0.4 points -- not
+  exactly, and the counters have no measurement variance, so the gap is real
+  and unexplained rather than scatter. It is what picking experts at random
+  would give, and it does so on two prompts with nothing in common.
   Natural order is not a bad heuristic here; it is no heuristic at all.
 
 "LFRU swaps 4" IS THE POLICY CEILING, NOT A PROPERTY OF THE WORKLOAD.
@@ -128,24 +170,36 @@ WITHOUT A HEAT TABLE THE RESIDENT SET CARRIES NO INFORMATION.
         if(G.tick%16) return;            /* one attempt every 16 tokens   */
         for(int di=0;di<G.ndev;di++)     /* at most ONE swap per device   */
 
-  88 tokens of work (25 prefill + 63 decode) gives 5 attempts, and every cold
-  run captured reports 4 swaps. With 3281 experts non-resident and 8916 lookups
-  missing, the adaptive tier moves four of them. At one expert per 16 tokens
+  88 tokens of work on prompt25 (25 prefill + 63 decode), 92 on prompt-caldo,
+  gives 5 attempts, and every cold run captured reports 4 swaps. With 3281
+  experts non-resident and 8916 lookups missing on prompt25, the adaptive
+  tier moves four of them. At one expert per 16 tokens
   it would need on the order of 52,000 tokens to repair a bad initial set, so
   in a short session the online policy cannot compensate for the cold start.
   This is a ceiling, not a bug report: whether it SHOULD move faster is a
   question about upload bandwidth and ping-pong that this record does not
   answer.
 
-CPU FALLBACK COST RISES WITH MISSES BUT NOT IN PROPORTION TO THEM.
+CPU FALLBACK COST RISES WITH MISSES. NO COST-PER-MISS CAN BE READ OFF HERE.
 
-  8916 misses -> 7.90 ms/token   (56 us per miss)
-  3046 misses -> 3.45 ms/token   (71 us per miss)
-     0 misses -> 0.00 ms/token
+  miss(CPU)                          cpu-miss, ms/token
+    9338   run 7                       7.91
+    8916   runs 1, 2                   7.83 and 7.96 (mean 7.90)
+    3046   runs 6, 8                   3.33 and 3.56 (mean 3.45)
+       0   runs 3, 4, 9                0.00
 
-  Fewer misses are individually more expensive. Batching within a layer is
-  the obvious suspect and is not measured here. Do not extrapolate a
-  cost-per-miss from either row.
+  An earlier version of this file divided the second column by the first and
+  printed a cost per miss. That is wrong, and the transcript says why: the
+  [timers] figures are per DECODE token (the block is headed
+  "decode: 63 tokens"), while miss(CPU) counts the whole run. hits+miss is
+  28160 on prompt25 and 29440 on prompt-caldo, which is exactly 320 per token
+  -- 40 layers x topk 8 -- over 88 and 92 tokens, prefill included. The two
+  columns have different denominators and their ratio means nothing.
+
+  What the table does show is that the cost is monotone in the miss count and
+  that the three miss levels are 2.9x apart while the cost is 2.3x apart, so
+  it is not simple proportionality either. Separating prefill from decode
+  misses would need a counter that does not exist yet.
 
 --- what this run did NOT measure -----------------------------------------
 
@@ -156,9 +210,12 @@ CPU FALLBACK COST RISES WITH MISSES BUT NOT IN PROPORTION TO THEM.
     routing. A longer answer touches more experts and the cross-topic hit
     rate at 512 or 2048 tokens is unknown; it could fall (more subject
     matter) or rise (more of the generic hot core).
-  - An accumulated heat table. Every warm arm here was built from ONE run of
-    about 93 tokens. The file is halved on load (heat0[i] >> 1) and rewritten
-    at every exit, so it behaves as a decaying average over sessions; a table
+  - An accumulated heat table. The warm arms here are built from very little
+    history: runs 3 and 6 load a table written by a single ~88- or ~92-token
+    run, while run 4's table also carries run 3 and run 9's carries runs 7
+    and 8 (two subjects). The file is halved on load (heat0[i] >> 1) and
+    rewritten at every exit, so it behaves as a decaying average over
+    sessions; a table
     grown across many unrelated prompts is the obvious next experiment and
     was not run.
   - Run 9 is worth noting for that reason: its heat table contained BOTH
