@@ -1,0 +1,116 @@
+Qwen3.6-35B-A3B: which side of the expert overlap is the critical path.
+23 September 2026.
+
+c/qwen36.c:2775-2777 computes the shared expert on the CPU deliberately
+inside the issue..take window, "so it overlaps the GPU groups". Whether that
+overlap actually hides it was never measured, and the counters could not
+say: `take` reported the blocking wait on the expert group and the
+accumulation of its rows as one number. This is the split.
+
+The question mattered because the shared expert is the second largest single
+item in moe_total -- 3.52 ms/token against cpu-miss 4.01 in the warm arm --
+so if it were on the critical path it would be the obvious next target.
+
+Host   : Ryzen 9 7950X, RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA
+         13.4. Carried over from qwen36-attnproj-place-2026-09-22-raw.txt.
+Engine : qwen36_clang.exe from claude/take-split at 0a6bcd91, WITH attnproj
+         (attention reads 1.94-2.27, residency 6859/10240 -- the 100 experts
+         attnproj charges to the expert budget, which is the second
+         confirmation that the binary is post-#39).
+Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, N_NEW=128, prompt25.txt.
+Script : c/tools/misure-heatfile.ps1, whose CROSS arm is the realistic warm
+         state: a heat table built on an unrelated prompt.
+
+--- the split, CROSS repetition 1, same run ------------------------------
+
+  [timers]   qtier: issue 1.43 | cpu-miss 4.01 | take 0.94 | shared-ovl 3.52
+  [timers]   take split: wait 0.84 | accum 0.09
+
+  0.84 + 0.09 = 0.93 against take 0.94. The missing 0.01 is the mutex tail
+  after the device loop -- lock, issue_open=0, broadcast, unlock. The split
+  accounts for take to one hundredth of a millisecond.
+
+  THE ACCUMULATION IS 10 % OF take. The instrumentation was written on the
+  premise that it was most of it; that premise was wrong, and the physics
+  says so independently: K rows of D floats at an 87 % hit rate is about
+  7 x 2048 multiply-adds per layer per token, 40 layers, which lands near
+  0.1 ms/token. `take` is a wait.
+
+--- what that settles ----------------------------------------------------
+
+  CPU after _q1:  cpu-miss 4.01 + shared 3.52 = 7.53
+  then the wait:  0.84                  -> the GPU finishes 8.37 after _q1
+
+  window = max(CPU 7.53, GPU 8.37) = 8.37
+
+  With the shared expert costing ZERO the CPU side would be 4.01, the GPU
+  would still finish at 8.37, and the window would still be 8.37.
+
+  MAKING THE SHARED EXPERT CHEAPER RETURNS NOTHING. Its 3.52 ms/token are
+  already free: the overlap the comment at c/qwen36.c:2775 claims is real
+  and complete, with 0.84 ms/token to spare. Moving it to the GPU, fusing
+  it, or speeding it up would move time into `wait` and leave step()
+  unchanged. This removes a target rather than adding one.
+
+  The critical path of that window is the GPU at 8.37 ms/token.
+
+--- an anomaly this record cannot explain --------------------------------
+
+The COLD arm goes the other way and should not:
+
+              hit rate   experts on GPU   CPU in window   wait
+  COLD         67.9 %       5.4 of 8          11.64       1.17
+  CROSS        87.2 %       7.0 of 8           7.53       0.84
+
+The cold arm gives the GPU LESS expert work and waits LONGER for it. If the
+wait were GPU compute alone that is backwards. Something in the cold window
+costs the GPU time independently of how many experts it runs; contention
+for PCIe or memory bandwidth with the CPU fallback path is the obvious
+suspect and is not measured here. The CROSS conclusion above does not
+depend on it -- that arm's arithmetic closes on its own -- but no
+cost-per-expert on the GPU can be read off these two rows.
+
+--- the heat-table gain on this binary -----------------------------------
+
+The same twelve runs, as a by-product:
+
+  -6.10  -6.30  -6.40  -6.20  -6.70  -5.70
+  mean -6.23   sd 0.33   se 0.14   95 % [-6.58, -5.88]   6/6 negative
+
+  [place] auto: byte-identical in all twelve runs; residency 6859/10240 in
+  all twelve; COLD-first -6.40 against CROSS-first -6.07.
+
+qwen36-heatfile-6rep-2026-09-23-raw.txt measured -4.92 [-5.60, -4.23] on a
+pre-#39 binary, and an earlier run of this same binary gave -5.62 [-6.48,
+-4.76]. The three intervals overlap; the gain is larger once attnproj is
+placed, which is what a smaller denominator does.
+
+ATTENTION IS NO LONGER A CLEAN CONTROL. It moves -0.33 here against -0.02
+on the pre-#39 binary. Placement did not change -- the [place] line is
+identical in all twelve runs -- so the cause is that attnproj and attnout
+now sit on the GPU, which puts the attention timer on the same contended
+path as deltanet and lm_head. The non-MoE residual is -1.93 against -0.60
+before, and it is those three phases: deltanet -1.08, lm_head -0.51,
+attention -0.33. The phase sum closes on step() to 0.01. The control that the
+earlier records
+lean on is a property of a configuration, not of the phase, and this
+configuration no longer has it.
+
+--- where decode stands --------------------------------------------------
+
+  cold, no attnproj (this morning)   32.35 ms/token   30.9 tok/s
+  warm, with attnproj (this run)     22.82 ms/token   43.8 tok/s
+
+--- what this run did NOT measure ----------------------------------------
+
+  - The cold-arm wait anomaly, above.
+  - Any GPU-side number. The 8.37 ms/token is inferred from the CPU side
+    plus the wait, not read from a GPU timer. COLI_CUDA_PROFILE would
+    record group timings but it also disarms the expert graph, so it
+    measures a different engine.
+  - Whether the balance holds at other residency fractions. At 87.2 % the
+    GPU leads by 0.84; nothing here says where the crossover is, and below
+    it the shared expert would start costing again.
+  - Prefill. The split is armed only for S==1, after a first version
+    charged the 25 prefill positions to a divisor of 127 decode tokens and
+    reported a part larger than its whole.

@@ -2778,7 +2778,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
              * two things inside it. */
             double _qm = tm_now();
             /* Compute the shared expert NOW so it overlaps with the GPU
-             * groups; the common block below is skipped. */
+             * groups; the common block below is skipped.
+             *
+             * MEASURED, and the overlap is complete: at an 87 % hit rate
+             * the CPU side of this window costs 7.53 ms/token (cpu-miss
+             * 4.01 + this 3.52) and the GPU is still running 0.84 after it,
+             * so the window is the GPU's 8.37 either way. Making this
+             * cheaper -- moving it to the device, fusing it, anything --
+             * returns ZERO and only grows `wait`. See
+             * docs/experiments/qwen36-take-split-2026-09-23-raw.txt. The
+             * margin is 0.84 ms/token at that hit rate and nothing measures
+             * where it crosses, so this stops being free at some lower
+             * residency. */
             {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
