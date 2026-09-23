@@ -2797,6 +2797,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
+#ifdef COLI_CUDA
+            /* Arm the split for THIS call only when the enclosing `take`
+             * counter is also running. qt_take does not see S, so armed once
+             * at init it also charged the 25 prefill positions to a divisor
+             * of decode tokens: measured wait+accum 2.75 against a take of
+             * 1.31, i.e. more than the whole of what it is a part of. The
+             * same mixed-denominator error the experiment records spend
+             * pages on, made in the instrumentation itself. */
+            g_qt_time_take = (tm_on() && S==1) ? 1 : 0;
+#endif
             qt_take(qmask, val, K, out + (int64_t)s*D);
             if (tm_on() && S==1) {
                 extern double g_qt_iss, g_qt_cpu, g_qt_shr, g_qt_tak;
@@ -4108,9 +4118,7 @@ int main(int argc, char **argv) {
         /* Arm the take split only when the timers are on; qt_take reads no
          * clock otherwise, so the inference build is byte-for-byte the same
          * work it was. */
-#ifdef COLI_CUDA
-        g_qt_time_take = tm_on() ? 1 : 0;
-#endif
+
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * qdw entry keyed by m.lm_head holds the int8 rows + per-row scales
          * the CPU path uses; the GPU applies the identical semantics. */
