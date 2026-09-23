@@ -17,10 +17,16 @@ The records that quote the tier's own VRAM hit rate all report it at or near
   qwen36-dense-pinned-2026-09-21-raw.txt:126-143 100,0 %, per run, eighteen
   qwen36-place-clang-2026-09-19-raw.txt:18       98.1-98.2 %
 
-That is the favourable extreme, and it is the only state the directory has
-ever recorded. This record measures the gap between it and a cold start,
-plus the part that matters: how much of the warm state survives a change of
-subject.
+One record quotes a lower figure: qwen36-x-broadcast-2026-09-20-raw.txt:85
+reports 90.4 %, also with a frozen heat table. It is excluded here because
+that record's own point is that the reading came from a readback bug which
+had diverged the generation onto different experts -- but the directory has
+recorded a non-100 % state, and an earlier version of this file said it
+never had.
+
+The warm state is the favourable extreme. This record measures the gap
+between it and a cold start, plus the part that matters: how much of the
+warm state survives a change of subject.
 
 Host   : Ryzen 9 7950X (16 physical cores, clang/LLVM libomp), 64 GB DDR5,
          RTX 4070 Ti SUPER 16 GB sm_89, Windows 11, CUDA 13.4. This line is
@@ -40,8 +46,10 @@ Engine : qwen36_clang.exe, CUDA_DLL=1. No attnproj line appears in the
          DIGEST; :29-30 of that record says it does not capture the commit
          either. All three arms carry the
          same missing optimisation, so the comparison BETWEEN THEM is
-         unaffected; the absolute numbers are not those of current main, and
-         are higher than main's, not lower.
+         unaffected; the absolute numbers are not those of current main,
+         and are higher than main's, not lower --
+         qwen36-autoplace-2026-09-22-raw.txt:72 measures PRE 24.10 against
+         POST 19.00 ms/token on this box, PRE being origin/main before #39.
 Model  : C:\modelli\qwen36_i4_gs64, cap=256 bits=4, N_NEW=64.
 Prompts: prompt25.txt       (25 tokens, operating-system memory management)
          prompt-caldo.txt   (29 tokens, chlorophyll photosynthesis)
@@ -56,16 +64,21 @@ Place  : the automatic placer, not an explicit placement string -- the eight
          layers), 12.26 GB left for experts`. Run 5's header was cut off, so
          it is eight and not nine. Consistent with COLI_PLACE unset or
          COLI_PLACE=auto; the output does not distinguish them.
-Budget : CUDA_EXPERT_GB unset OR "auto" -- qwen36_tier.c:601-603 takes the
-         same free-minus-1-GB branch for both and prints the same line, and
-         ISTRUZIONI.md:100 recommends "auto", so "auto" is the likelier.
-         Earlier versions of this file said "unset", which the evidence
-         does not support.
+Budget : CUDA_EXPERT_GB unset, "auto", or ANY value that does not parse to
+         a positive number -- qwen36_tier.c:601-603 gates the explicit
+         branch on `bg && strcmp(bg,"auto") && atof(bg)>0`, so "0", "off"
+         and "" all take the same free-minus-1-GB path. Nor does the printed
+         line exclude an explicit value that happens to coincide:
+         CUDA_EXPERT_GB=13.8 would print the same allowance. ISTRUZIONI.md
+         :100 recommends "auto", so "auto" is the likeliest. Earlier
+         versions of this file said "unset", and then "unset or auto";
+         neither was what the code supports.
 Devices: every captured header prints `[qtier] COLI_GPUS unset: selecting 1
          visible device(s)` and `[CUDA] device 0: NVIDIA GeForce RTX 4070 Ti
          SUPER, 17.2 GB VRAM, sm_89`.
 OMP    : OMP_NUM_THREADS unset. Every run prints the `[OMP] qwen36: 16
-         physical-core threads instead of 32 logical CPUs` notice, which
+         physical-core threads instead of 32 logical CPUs; ...` notice
+         (truncated here; it continues with the SMT advice and #718), which
          coli_omp_tune_threads suppresses when the variable is set
          (c/omp_tune.h:150). It is the engine's active sizing notice, not a
          fallback warning. OMP_WAIT_POLICY not recorded. Note that
@@ -161,13 +174,34 @@ test. All three arms, means over their runs:
 
   (shared) and (router) are inside moe_total, not additional to it.
 
-  ATTENTION DOES NOT FALL IN EITHER WARM ARM. A heat table cannot touch
-  attention -- it decides which routed experts are resident -- so attention
-  is the control. Its own scatter is 0.19 across the eight timed runs, so
-  neither -0.015 nor +0.057 is distinguishable from zero; the point is the
-  sign and the size next to moe_total's -4.21 and -7.11. If the machine had
-  simply got faster during the session, attention would have come down too.
-  It does not, and in the SELF arm it goes the other way.
+  ATTENTION IS THE CONTROL, BUT NOT FOR THE REASON AN EARLIER VERSION OF
+  THIS FILE GAVE. It said "a heat table cannot touch attention". It can:
+  G.heat0 is handed to auto_place (c/qwen36_tier.c:625), auto_place decides
+  from it whether each offered dense component stays on the CPU (:434-440),
+  and attnout is one of the offered components (:534) whose placement lands
+  in the attention timer -- which is precisely the mechanism this record
+  invokes when it reads attention 5.77 -> 1.94 off the #39 record. The file
+  cites :625 itself, 250 lines further down, and contradicted it here.
+
+  What makes attention a control is EMPIRICAL: every captured run printed a
+  byte-identical pair of placement lines, `[place] auto: dev 0 holds 1527.7
+  MB of trunk (lmhead yes, 30 dnproj layers)` and `[place] 10 attnout + 30
+  dnout on GPU (0.31 GB VRAM)`. Placement did not move, so attention is a
+  phase the varied condition did not act on.
+
+  It does not fall in either warm arm: -0.015 and +0.057, against
+  moe_total's -4.21 and -7.11. Neither is distinguishable from zero --
+  attention spans 5.26-5.45 over the eight timed runs -- and that is the
+  claim: it did not move, while moe_total moved by two orders more.
+
+  A caveat that cuts the other way, and is not resolvable here. Taken alone
+  the three COLD runs give attention 5.45, 5.27, 5.26 at positions 1, 2 and
+  7 -- monotone down, a slope of -0.022 per position, the same shape as the
+  step() decline. Over all eight timed runs the slope is -0.005 per
+  position, essentially flat, and the series bounces (5.45, 5.27, 5.45,
+  5.36, 5.39, 5.26, 5.30, 5.44). Three points of a bouncing series are not
+  a trend, but they are not nothing either, and a cold arm alternated back
+  in after every warm run would have settled it.
 
   THE NON-MoE RESIDUAL TRACKS THE MISS COUNT, NOT THE RUN POSITION. Take
   step() minus moe_total, i.e. everything the heat table cannot reach:
@@ -186,14 +220,44 @@ test. All three arms, means over their runs:
   path would produce. So the residual is part of the effect, not a rival
   explanation for it.
 
-  Inside moe_total, cpu-miss falls 7.895 -> 3.445, i.e. -4.45 against
-  moe_total's -4.21. It OVERSHOOTS: (shared) moves +0.075 the wrong way in
-  the CROSS arm and +0.41 in the SELF arm, unexplained and printed here
-  rather than smoothed over.
+  INSIDE moe_total, cpu-miss OVERSHOOTS AND TWO OTHER TIMERS PAY FOR IT.
+  All four [timers] qtier sub-timers are inside moe_total, and they
+  reconcile to it exactly:
 
-So: -4.80 ms/token, and this record does not discount it for drift. The
-monotone cold decline is real and unexplained, but it cannot be the
-explanation, because it predicts an ordering the SELF arm reverses.
+                  COLD (1,2)   CROSS (6,8)   delta
+      issue           1.105       1.590      +0.485
+      cpu-miss        7.895       3.445      -4.450
+      take            1.400       1.075      -0.325
+      shared-ovl      3.465       3.540      +0.075
+                                             ------
+                                             -4.215   ( = moe_total -4.21)
+
+  cpu-miss alone is -4.45, more than the whole -4.21, and `issue` RISES
+  44 %. That is a real offsetting cost of a warm table -- more resident
+  experts means larger GPU groups to issue -- and an earlier version of this
+  file named only the +0.075 term, a third of what it had to account for,
+  and never mentioned `issue` or `take` at all. The separate (shared) phase
+  timer also moves +0.075 in CROSS and +0.41 in SELF, unexplained.
+
+  AND moe_total ITSELF CAN BE PARTLY BOUNDED. Run 7 is a COLD run at
+  position 7 whose per-token miss load matches runs 1 and 2 to 0.18 %
+  (101.50 against 101.32). Its moe_total reads 14.77 against the COLD mean
+  of 15.03: -0.26 of moe movement at constant miss load, with only position
+  differing. That is 6 % of the -4.21, on n=1 and a different prompt, but
+  it is the only handle this dataset offers on position INSIDE moe_total,
+  and an earlier version of this section did not look for one.
+
+So, stated as a range with both ends derived rather than asserted:
+
+  -4.80   as measured.
+  -3.95   the most pessimistic defensible accounting: charge run 7's -0.26
+          of moe movement AND the whole -0.59 non-MoE residual to session
+          position.
+
+The evidence leans to the high end -- the residual's ordering is reversed
+from what a trend predicts, and attention is flat across all eight runs --
+but the three-point cold arm cannot settle it. TAKE -4.0 TO -4.8, and the
+reason the range is not narrower is a protocol choice, not the mechanism.
 
 A regression on the three cold points is NOT a usable bound and is recorded
 only so nobody redoes it: all three by run position gives slope -0.226 and
@@ -272,7 +336,12 @@ COLD HIT RATE; IT DOES NOT DETERMINE IT.
 
   With no heat table qt_plan_fill sets fill_order[i]=i (c/qwen36_tier.c:961)
   and decodes it as l = gi/G.ne (:969), so the budget is consumed in strict
-  global index order: a LAYER-MAJOR PREFIX. 6959 = 27*256 + 47, so layers
+  global index order: a LAYER-MAJOR PREFIX. THAT REQUIRES ONE DEVICE, which
+  this run has. Experts are homed by eid % G.ndev (:72), and with more than
+  one device qt_plan_fill skips (:972) an expert whose home is full while
+  filling the others, breaking only when every device is full (:966-967) --
+  a per-device prefix, not a contiguous global one, and the arithmetic below
+  would not hold. 6959 = 27*256 + 47, so layers
   0-26 are entirely resident, layer 27 holds 47 of 256, and layers 28-39
   hold NOTHING -- at the start. Four LFRU swaps mutate the set during the
   run (uploads 6963 against resident 6959 is exactly four promotions), so
@@ -315,10 +384,14 @@ COLD HIT RATE; IT DOES NOT DETERMINE IT.
   unrelated prompts is mostly structural -- the prefix pins 27 of the 40
   layers -- and only partly a coincidence of p.
 
-  The conclusion that natural order is worth nothing still holds, but the
-  evidence for it is elsewhere in this record: heat order reaches 89.2 % on
-  a prompt it has never seen, at the SAME 6959 slots. That is a comparison
-  at fixed residency, and it is the one that carries the claim.
+  What can be said about natural order is narrower than "worth nothing",
+  which an earlier version of this file claimed after withdrawing the only
+  argument that could have supported it. NO ARBITRARY-ORDER BASELINE WAS
+  EVER MEASURED, so nothing here compares natural order to a shuffle. What
+  is measured is that heat order reaches 89.2 % on a prompt it has never
+  seen at the SAME 6959 slots, against 68.3 %: natural order leaves about
+  21 points of hit rate on the table. That is a comparison at fixed
+  residency, and it is the one that carries the claim.
 
 "LFRU swaps 4" IS BOUNDED BY THE POLICY AT 5, NOT BY THE WORKLOAD.
 
@@ -419,8 +492,14 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
     UNDECAYED values, and G.heat0 is what orders the warmstart (:962,
     cmp_heat_desc) and what auto_place receives (:625). The resident set --
     the only thing this record measures -- is therefore chosen from the
-    undecayed table. The halving does not touch THIS session's resident set
-    -- but it is not harmless either, because what :1241 writes back at exit
+    undecayed table. The halving does not touch this session's INITIAL
+    resident set -- but it governs every change to it, because
+    qt_lfru_tick_locked compares the halved G.slot[].heat (:1042-1046) and
+    tier_should_promote is hot > cold + cold/4 + 4 (c/tier.h:9-12), whose
+    fixed +4 is NOT scale-invariant: halving both sides makes admission
+    strictly harder in file units. Four swaps happened in every captured
+    run. And it is not harmless afterwards either, because what :1241
+    writes back at exit
     is G.slot[].heat, the halved copy plus this session's increments, and
     that file becomes the next session's undecayed G.heat0. So the halving
     is exactly what makes an accumulated table a geometrically decaying SUM
@@ -435,6 +514,16 @@ NOR A MONOTONE RELATION CAN BE READ OFF HERE.
   - Any other model, quantisation, GPU, or residency fraction. 6959/10240 is
     68 % of the expert set in VRAM; the value of a heat table must depend on
     that fraction and only one value of it was tested.
+  - Anything about the OTHER hit-rate counter, which moves the OPPOSITE
+    way. Every run also prints a host `Expert cache hit rate`: 78.4 % in
+    the cold runs and 79.1 % in run 7, against 75.3 % in CROSS and 73.3 %
+    in SELF. A warm table makes that number look WORSE. It counts something
+    else -- host RAM cache lookups, whose denominator falls when the CPU
+    fallback path stops running -- and this record does not analyse it.
+    The run table's `hit rate` column is the [qtier] VRAM figure throughout.
+    Flagged because issue #44 section 2 is open about exactly this
+    two-counter confusion and qwen36-autoplace-2026-09-22-raw.txt:266 warns
+    that the host counter "is not evidence about what the GPU did".
   - Whether the COLD arm is the state it is named after. It is not static:
     four LFRU swaps mutate the resident set inside each of the three cold
     runs whose [qtier] block was captured (run 5's was not), so the
