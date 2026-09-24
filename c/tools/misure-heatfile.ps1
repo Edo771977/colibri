@@ -19,7 +19,7 @@
 # I DUE BRACCI:
 #   COLD   HEAT_FILE NON impostata. Il motore non carica niente e, cosa che
 #          conta per l'alternanza, non SCRIVE niente in uscita: qt_shutdown
-#          (c/qwen36_tier.c:1235) scrive solo se la variabile c'e'. Se il
+#          (c/qwen36_tier.c:1264) scrive solo se la variabile c'e'. Se il
 #          braccio freddo scrivesse, contaminerebbe il caldo successivo.
 #   CROSS  HEAT_FILE=heat.bin, con dentro una copia della tabella congelata
 #          costruita su prompt-caldo.txt -- argomento senza niente in comune
@@ -54,6 +54,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Questo script esiste per produrre un intervallo di confidenza su delta
+# appaiati in ordine ABBA. Con -Reps 1 stampava "media -0.41  sd NaN  se NaN
+# df 0  intervallo [NaN ; NaN]" -- un blocco pronto da incollare con la
+# statistica interamente assente -- e df 0 cadeva nel ramo z=1.96 su una sola
+# osservazione. Con un numero dispari l'alternanza ABBA non si chiude.
+if ($Reps -lt 2 -or ($Reps % 2) -ne 0) {
+    throw "-Reps $Reps non e' valido: servono almeno 2 ripetizioni e un numero PARI, altrimenti l'alternanza ABBA non si chiude e l'intervallo non esiste."
+}
 # Lo script sta in c\tools\, l'eseguibile e i prompt in c\. Una versione
 # precedente faceva Set-Location $PSScriptRoot e poi cercava .\qwen36_clang.exe
 # nella cartella sbagliata.
@@ -77,20 +86,40 @@ Set-Location -LiteralPath $WorkDir
 # tranne quelle che lo script imposta lui stesso e quelle che l'operatore
 # dichiara innocue con -AllowEnv.
 $EnvOwn = @("SNAP","COLI_CUDA","COLI_GPUS","COLI_TIMERS","COLI_PLACE","HEAT_FILE","N_NEW")
-# CUDA_PATH / CUDA_HOME le scrive l'installer del toolkit e non toccano la
-# misura: sono percorsi, non interruttori.
-$EnvBenign = '^CUDA_(PATH|HOME)'
-$EnvSuspect = '^(COLI_|COLIBRI_|QWEN_|QWEN36_|QWEN38_|QT_|CUDA_|GOMP_|KMP_|OMP_|HEAT_)|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB)$'
+# Con -File, PowerShell passa "-AllowEnv A,B" come UN SOLO elemento di
+# [string[]]: la valvola di sfogo era rotta per il modo d'uso documentato in
+# testa a questo file. Va quindi rispezzata a mano.
+$AllowEnv = @($AllowEnv | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+# CUDA_PATH e la sua famiglia le scrive l'installer del toolkit: sono percorsi,
+# non interruttori. CUDA_VISIBLE_DEVICES non e' fra queste e viene rifiutata a
+# ragione, perche' rimapperebbe il COLI_GPUS=0 che lo script imposta.
+$EnvBenign = '^CUDA_(PATH|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH|MODULE_LOADING_MODE)'
+# I prefissi non bastano: QT_ collide con il namespace del framework Qt, che
+# Anaconda e vari installer impostano, quindi si nominano le due sole variabili
+# QT_ che il motore legge davvero; e una quindicina di getenv del motore non ha
+# alcun prefisso riconoscibile. Fra quelle, WIDE non e' marginale: entra in
+# max_cand = topk * g_wide (c/qwen36.c:3289 e :4215), cioe' moltiplica per 1..4
+# i candidati esperti e muove miss, swap e moe_total, che sono le metriche che
+# il record confronta.
+$EnvSuspect = '^(COLI_|COLIBRI_|QWEN_|QWEN36_|QWEN38_|CUDA_|GOMP_|KMP_|OMP_|HEAT_|Q36_)' +
+              '|^(QT_NO_WARMSTART|QT_UPLOAD_SYNC)$' +
+              '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW)$'
 $EnvHits = @()
 foreach ($e in Get-ChildItem Env: ) {
     $n = $e.Name
-    if ($EnvOwn -contains $n)     { continue }
-    if ($AllowEnv -contains $n)   { continue }
-    if ($n -match $EnvBenign)     { continue }
-    if ($n -match $EnvSuspect)    { $EnvHits += "$n=$($e.Value)" }
+    if ($EnvOwn -contains $n)   { continue }
+    if ($AllowEnv -contains $n) { continue }
+    if ($n -match $EnvBenign)   { continue }
+    if ($n -match $EnvSuspect)  { $EnvHits += "$n=$($e.Value)" }
+}
+# Un nome in -AllowEnv che non corrisponde a niente e' probabilmente un errore
+# di battitura, e un typo non deve essere indistinguibile da una deroga.
+$AllowUnused = @($AllowEnv | Where-Object { -not (Test-Path "Env:\$_") })
+if ($AllowUnused.Count) {
+    throw ("-AllowEnv nomina variabili che non sono impostate: {0}. Se e' un errore di battitura, la deroga che credevi di dare non c'e'." -f ($AllowUnused -join ", "))
 }
 if ($EnvHits.Count) {
-    throw ("queste variabili d'ambiente possono cambiare la misura e sono impostate:`n  {0}`nApri una shell pulita, oppure dichiarale innocue con -AllowEnv <nome>,<nome>." -f ($EnvHits -join "`n  "))
+    throw ("queste variabili d'ambiente possono cambiare la misura e sono impostate:`n  {0}`nApri una shell pulita, oppure dichiarale innocue con -AllowEnv <nome> (piu' nomi: separali con la virgola, senza spazi)." -f ($EnvHits -join "`n  "))
 }
 
 if (-not (Test-Path -LiteralPath $Exe)) { throw "manca $Exe -- make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe" }
@@ -125,6 +154,15 @@ if ($b0 -ne 0x4D -or $b1 -ne 0x5A) {
 # casi che la soglia lasciava passare -- il "copy /Y" dimenticato (binario
 # stantio, numeri attribuiti a un commit mai eseguito) e il "copy /Y"
 # interrotto a meta' (PE tronco ma con la firma MZ intatta).
+# I sorgenti e .build-config si leggono relativi a $WorkDir, $Exe no: con un
+# eseguibile fuori dall'albero lo script stampava la sua impronta e, subito
+# sotto, la build-config di un ALTRO albero, come se appartenessero allo stesso
+# binario. La riga sulla toolchain non vale nulla se non e' legata al file
+# misurato.
+$wdFull = (Get-Item -LiteralPath $WorkDir).FullName.TrimEnd([IO.Path]::DirectorySeparatorChar)
+if ($exeItem.DirectoryName.TrimEnd([IO.Path]::DirectorySeparatorChar) -ne $wdFull) {
+    throw "$Exe non sta nella cartella di lavoro ($WorkDir): .build-config e i sorgenti verrebbero letti da un albero diverso da quello dell'eseguibile, e la toolchain stampata non sarebbe la sua."
+}
 $exeHash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash
 if ($Built) {
     if (-not (Test-Path -LiteralPath $Built)) {
@@ -132,8 +170,11 @@ if ($Built) {
     }
     $builtItem = Get-Item -LiteralPath $Built
     if ($builtItem.PSIsContainer) { throw "${Built} e' una cartella, non un file." }
-    # $Exe e $Built devono essere due file DISTINTI: se sono lo stesso file, o
-    # un hardlink, l'hash coincide per costruzione e la guardia si autoconferma.
+    # $Exe e $Built devono essere due file DISTINTI: se sono lo stesso file
+    # l'hash coincide per costruzione e la guardia si autoconferma. Un hardlink
+    # o un symlink sfuggono a questo confronto (FullName differisce) e NON sono
+    # coperti: in compenso rendono impossibile dimenticare la copia, che e' il
+    # caso per cui la guardia esiste.
     if ($builtItem.FullName -eq $exeItem.FullName) {
         throw "$Exe e ${Built} sono lo stesso file: il confronto di provenienza si autoconfermerebbe. Passa -Built con il vero output della build, o -Built '' dichiarando che non e' verificato."
     }
@@ -161,6 +202,11 @@ $QwenSrc = @(
     "omp_tune.h","kv_prefix.h","pin_pool.h",
     "edge_adapter_internal.h","edge_adapters.h","edge_runtime.h",
     "segment_adapter_internal.h","segment_adapters.h","segment_runtime.h",
+    # $(CUDA_OBJ) sotto CUDA_DLL=1 e' backend_loader.o (c/Makefile:596-598), che
+    # dipende da backend_loader.c e backend_cuda.h (c/Makefile:847). Ometterli
+    # lasciava fuori dal controllo proprio il pezzo che carica la DLL dove sta
+    # tutto il calcolo esperti.
+    "backend_loader.c","backend_cuda.h",
     ".build-config"
 )
 foreach ($src in $QwenSrc) {
@@ -230,7 +276,12 @@ if ((Get-FileHash -LiteralPath $Prompt -Algorithm SHA256).Hash -eq
 
 # I parametri della corsa vanno nel record insieme ai numeri: -Cap 64 o
 # -NNew 16 da riga di comando non lasciavano alcuna traccia nell'output.
-$ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps | snap=$Snap | prompt=$Prompt caldo=$PromptCaldo"
+# Le deroghe devono comparire nel record come tutto il resto: -Built "" e
+# -AllowEnv disattivano controlli, e affidare all'operatore il compito di
+# dichiararlo a voce e' esattamente cio' che questo script non fa per nient'altro.
+$ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps | snap=$Snap | prompt=$Prompt caldo=$PromptCaldo" +
+    ("  | built={0}" -f $(if ($Built) { $Built } else { "'' -- PROVENIENZA NON VERIFICATA" })) +
+    ("  | allow-env={0}" -f $(if ($AllowEnv.Count) { ($AllowEnv -join ",") + " -- DEROGA" } else { "nessuna" }))
 $ParamStamp
 
 # ---- motore --------------------------------------------------------------
@@ -254,7 +305,7 @@ function Invoke-Engine([bool]$WithHeat, [string]$PromptFile, [string]$Log) {
     # l'ESISTENZA del log passava tutti i controlli e Get-Content restituiva la
     # misura di DUE GIORNI PRIMA come risultato di questo run. Verificare che il
     # log esista non basta: bisogna garantire che sia di questa corsa.
-    Remove-Item -LiteralPath $Log -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Log -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $Log) {
         throw "non riesco a rimuovere $Log prima del run: non posso garantire che il log appartenga a questa corsa."
     }
@@ -266,14 +317,16 @@ function Invoke-Engine([bool]$WithHeat, [string]$PromptFile, [string]$Log) {
         & $Exe $Cap $Bits $PromptFile 2>&1 | Out-File -Encoding utf8 $Log
         $code = $LASTEXITCODE
     } catch {
-        # Con ErrorActionPreference = Continue il fallimento di lancio resta un
-        # errore non terminante: PowerShell riversa sulla console il blocco
-        # "ResourceUnavailable ... failed to run ... Exec format error" con la
-        # traccia illeggibile, e un throw successivo si AGGIUNGE a quello
-        # invece di sostituirlo. Catturandolo qui, il messaggio leggibile
-        # prende il posto della traccia.
+        # Fuori da un try, con ErrorActionPreference = Continue, il fallimento di
+        # lancio del nativo prosegue lasciando $LASTEXITCODE non impostato e la
+        # traccia "ResourceUnavailable ... failed to run ... Exec format error"
+        # sulla console. Dentro un try viene catturato in entrambe le
+        # preferenze, e il messaggio leggibile prende il posto della traccia.
+        # Il testo .NET originale porta ancora in coda la posizione nel file:
+        # la taglio, altrimenti la traccia rientra dalla finestra.
         $ErrorActionPreference = $old
-        throw "$Exe non e' partito: $($_.Exception.Message)"
+        $m = ($_.Exception.Message -split '\r?\nAt |At ' )[0].Trim()
+        throw "$Exe non e' partito: $m"
     }
     $ErrorActionPreference = $old
 
@@ -331,17 +384,40 @@ function Read-Run([string]$Text, [string]$Log) {
     # sull'ASSENZA del dato invece che sulla sua costanza. Un invariante che
     # passa a vuoto e' peggio di un invariante che manca, perche' viene
     # ricopiato nel record come se avesse verificato qualcosa.
+    # Il motore dichiara la propria configurazione in una riga sola
+    # (c/qwen36.c:4236). Leggerla e pretenderla identica fra i run copre in un
+    # colpo WIDE, CTX, PILOT, HOT, SMOOTH, CONF_LIMIT, cap e bits -- cioe' la
+    # meta' delle leve che nessuna lista di variabili d'ambiente riesce a
+    # inseguire, perche' qui non si indovina cosa l'ambiente abbia fatto: si
+    # legge cosa il motore ha deciso.
+    if ($Text -notmatch '(?m)^(== qwen36 Phase-2 engine \|.*==)$') {
+        throw "$Log : il banner '== qwen36 Phase-2 engine |' non c'e'. Il motore non e' arrivato a dichiarare la sua configurazione, oppure non e' qwen36."
+    }
+    $banner = $Matches[1].Trim()
+
     if (-not $place) { throw "$Log : riga '[place] auto:' non trovata. L'invariante sul piazzamento del trunk passerebbe a vuoto." }
     if ($res -eq "?") { throw "$Log : riga 'resident N/M experts' non trovata. L'invariante sulla residenza passerebbe a vuoto." }
 
     [pscustomobject]@{
         Step=$step; Dn=$g["deltanet"]; Attn=$g["attention"]; Moe=$g["moe_total"]; Head=$g["lm_head"]
         Issue=$g["issue"]; CpuMiss=$g["cpu-miss"]; Take=$g["take"]; ShOvl=$g["shared-ovl"]
-        Vram=$vram; Swaps=$swaps; Miss=$miss; Resident=$res; Toks=$toks; Place=$place
+        Vram=$vram; Swaps=$swaps; Miss=$miss; Resident=$res; Toks=$toks; Place=$place; Banner=$banner
     }
 }
 
 # ---- fase 0: tabella caldo congelata -------------------------------------
+# Invoke-Engine rimuove il log del run che sta per fare, ma una corsa
+# interrotta lasciava nella cartella i log della sessione PRECEDENTE accanto a
+# quelli nuovi, indistinguibili, mentre la riga finale invita a trattarli come
+# un insieme unico: la stessa trappola del log stantio, spostata dal run
+# all'archiviazione.
+$oldLogs = @(Get-ChildItem -LiteralPath $WorkDir -Filter "heatfile-*.log" -ErrorAction SilentlyContinue)
+if ($oldLogs.Count) {
+    "rimuovo {0} log della corsa precedente" -f $oldLogs.Count
+    $oldLogs | Remove-Item -Force
+}
+
+$HeatStamp = ""
 if (-not (Test-Path "heat.caldo.bin")) {
     "heat.caldo.bin non c'e': la costruisco su $PromptCaldo (un run)..."
     Remove-Item heat.bin -ErrorAction SilentlyContinue
@@ -351,7 +427,23 @@ if (-not (Test-Path "heat.caldo.bin")) {
     Copy-Item heat.bin heat.caldo.bin -Force
     "scaldata ok ({0:N2} tok/s, hit {1:N1} %), tabella congelata in heat.caldo.bin" -f $r0.Toks, $r0.Vram
     ""
+    $HeatStamp = "COSTRUITA in questa corsa su $PromptCaldo"
+} else {
+    # Una heat.caldo.bin preesistente veniva riusata senza alcuna verifica e
+    # senza comparire da nessuna parte. E' la variabile INDIPENDENTE
+    # dell'esperimento -- l'unico input che differisce fra i bracci -- e il
+    # motore ne valida solo magic, n_layers e n_experts, quindi qualunque
+    # tabella per questa forma di modello si carica e stampa "HEAT_FILE
+    # loaded", superando anche quel controllo. Non posso provare da dove
+    # venga; posso impedirle di restare invisibile.
+    $HeatStamp = "RIUSATA da una corsa precedente -- la sua provenienza NON e' verificata"
 }
+$hc = Get-Item -LiteralPath "heat.caldo.bin"
+$HeatStamp = "heat.caldo.bin: {0} byte | {1} | sha256 {2} | {3}" -f `
+    $hc.Length, $hc.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"),
+    (Get-FileHash -LiteralPath "heat.caldo.bin" -Algorithm SHA256).Hash.Substring(0,16), $HeatStamp
+$HeatStamp
+""
 
 # ---- un braccio ----------------------------------------------------------
 function Invoke-Arm([string]$Tag, [int]$Rep) {
@@ -395,12 +487,19 @@ for ($rep = 1; $rep -le $Reps; $rep++) {
 $ExeStamp
 $CfgStamp
 $DllStamp
+$HeatStamp
 $ParamStamp
 # Un invariante VIOLATO era un avviso, e lo script proseguiva fino a stampare
 # l'intero blocco statistico pronto da incollare: la riga ATTENZIONE si perde
 # in quaranta righe di output, mentre dice essa stessa che in quel caso
 # 'attention' non e' piu' un controllo. Se un invariante non tiene, i numeri
 # non vanno prodotti in forma incollabile.
+$banners = @($rows | ForEach-Object { $_.Banner } | Sort-Object -Unique)
+if ($banners.Count -ne 1) {
+    throw ("il motore NON ha girato con la stessa configurazione in tutti i run:`n  {0}" -f ($banners -join "`n  "))
+}
+"configurazione motore identica in tutti i run:"
+"  {0}" -f $banners[0]
 $places = @($rows | ForEach-Object { $_.Place } | Sort-Object -Unique)
 if ($places.Count -ne 1) {
     throw ("la riga [place] auto: NON e' identica in tutti i run -- il piazzamento del trunk e' cambiato fra i bracci, quindi 'attention' non e' piu' un controllo e i bracci non sono confrontabili:`n  {0}" -f ($places -join "`n  "))
