@@ -68,19 +68,30 @@ if ($Reps -lt 2 -or ($Reps % 2) -ne 0) {
 # nella cartella sbagliata.
 if (-not $WorkDir) { $WorkDir = Split-Path -Parent $PSScriptRoot }
 if (-not (Test-Path -LiteralPath $WorkDir)) { throw "cartella di lavoro non trovata: $WorkDir" }
+# Normalizzato PRIMA del Set-Location: piu' sotto $WorkDir viene riusato, e un
+# valore relativo (-WorkDir ..) si risolverebbe rispetto alla cwd NUOVA, cioe'
+# alla cartella sbagliata.
+$WorkDir = (Get-Item -LiteralPath $WorkDir).FullName
 Set-Location -LiteralPath $WorkDir
 "cartella di lavoro: {0}" -f (Get-Location).Path
 
 # ---- guardie ambiente ----------------------------------------------------
-# Una allowlist scritta a mano non regge: il motore legge una cinquantina di
-# variabili e la lista sarebbe sempre indietro. La versione precedente ne
-# elencava tre, poi tredici, e conteneva voci morte (COLI_GRAPH_DIAG non e'
-# letta da nessun file dell'albero; PROF solo da c/colibri.c, che non entra in
-# questo eseguibile; QWEN_EXPERT_KERNEL e' forzata a 0 sotto COLI_CUDA=1, che
-# questo script imposta sempre) mentre ometteva le leve di timing piu' grandi
-# documentate nel repo -- fra tutte OMP_WAIT_POLICY, che c/colibri.c:11024
-# quantifica in "+122% decode" da sola, e che per qwen36.exe arriva
-# interamente dalla shell perche' qwen36.c non fa alcun setenv.
+# Una DENYLIST scritta a mano non regge: il motore legge 55 variabili
+# d'ambiente e l'elenco sarebbe sempre indietro. La versione committata
+# precedente ne nominava tre, e due erano morte per questo eseguibile:
+# COLI_GRAPH_DIAG non e' letta da nessun file C dell'albero, e PROF solo da
+# c/colibri.c, che non entra in questa riga di link. La terza,
+# COLI_CUDA_PROFILE, e' viva ma la legge coli_cuda.dll (c/backend_cuda.cu), non
+# l'host: sfuggiva quindi a chi cercasse i getenv del solo qwen36.c.
+#
+# Omesse invece le variabili del runtime OpenMP. OMP_WAIT_POLICY e compagne le
+# imposta deliberatamente c/colibri.c sulle piattaforme non-Apple, e qwen36.c
+# non fa alcun setenv (verificato: zero occorrenze), quindi per qwen36.exe
+# arrivano interamente dalla shell: il valore dell'operatore vince e non lascia
+# traccia. NON si cita qui una cifra: il "+122% decode" a c/colibri.c:11024 e'
+# un REGRESSO misurato su macOS/Apple Silicon con libomp LLVM sul motore
+# GLM-5.2 int4, e su Windows/x86/CUDA quel dato non si trasferisce -- il repo
+# li' considera la stessa variabile benefica.
 #
 # Quindi si rovescia: fallisce QUALUNQUE variabile che possa toccare il motore,
 # tranne quelle che lo script imposta lui stesso e quelle che l'operatore
@@ -96,11 +107,15 @@ $AllowEnv = @($AllowEnv | ForEach-Object { $_ -split ',' } | ForEach-Object { $_
 $EnvBenign = '^CUDA_(PATH|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH|MODULE_LOADING_MODE)'
 # I prefissi non bastano: QT_ collide con il namespace del framework Qt, che
 # Anaconda e vari installer impostano, quindi si nominano le due sole variabili
-# QT_ che il motore legge davvero; e una quindicina di getenv del motore non ha
-# alcun prefisso riconoscibile. Fra quelle, WIDE non e' marginale: entra in
-# max_cand = topk * g_wide (c/qwen36.c:3289 e :4215), cioe' moltiplica per 1..4
-# i candidati esperti e muove miss, swap e moe_total, che sono le metriche che
-# il record confronta.
+# QT_ che il motore legge davvero; e sedici getenv del motore non hanno alcun
+# prefisso riconoscibile. Fra quelle la piu' grave e' MODEL (c/qwen36.c), che
+# cambia il modello misurato senza che nulla nel confronto fra i bracci lo
+# riveli; poi CTX e Q36_MAXT, che muovono il tetto di contesto e
+# l'allocazione KV, e SERVE/PPL/CONSIST, che cambiano modalita'.
+# WIDE invece NON e' un buon esempio, contrariamente a quanto diceva una
+# versione precedente di questo commento: g_wide compare solo dentro
+# pilot_prefetch (c/qwen36.c), che gira solo con PILOT >= 1, e PILOT vale 0 per
+# default ed e' rifiutata qui sopra -- quindi con questo script WIDE e' inerte.
 $EnvSuspect = '^(COLI_|COLIBRI_|QWEN_|QWEN36_|QWEN38_|CUDA_|GOMP_|KMP_|OMP_|HEAT_|Q36_)' +
               '|^(QT_NO_WARMSTART|QT_UPLOAD_SYNC)$' +
               '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW)$'
@@ -138,7 +153,7 @@ $exeLen = $exeItem.Length
 # fare questo lavoro: non distingue un eseguibile da un file di testo e non sa
 # quanto debba essere grande un binario legittimo, che dipende dai flag di link
 # (c/Makefile:142: WIN_STATIC aggiunge -static ai build gcc e non a quelli
-# clang, e questo da solo cambia la taglia di un ordine di grandezza).
+# clang, e questo da solo la porta da 368 128 a 1 083 842 byte, 2,94 volte).
 #
 # Il test giusto e' la struttura, non la taglia: i due byte 'MZ' che aprono
 # ogni PE.
@@ -228,8 +243,8 @@ foreach ($src in $QwenSrc) {
 $ExeStamp = "eseguibile: {0} | {1} byte | {2} | sha256 {3}" -f `
     $Exe, $exeLen, $exeItem.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"), $exeHash.Substring(0,16)
 
-# c/Makefile:823 scrive .build-config con CC|CFLAGS|LDFLAGS|CUDA|CUDA_DLL|ARCH|...
-# e $(CC) e' il primo campo: e' l'unico posto dell'albero che registra CHI ha
+# c/Makefile:823 definisce BUILD_CONFIG come CC|CFLAGS|LDFLAGS|CUDA|CUDA_DLL|
+# ARCH|... e :832 lo scrive in .build-config; $(CC) e' il primo campo: e' l'unico posto dell'albero che registra CHI ha
 # compilato. Il nome qwen36_clang.exe e' il nome di una copia fatta a mano e non
 # prova nulla da solo. Senza questa riga un record non puo' dichiarare la
 # toolchain, quindi l'assenza e' un errore e non una nota.
@@ -314,7 +329,13 @@ function Invoke-Engine([bool]$WithHeat, [string]$PromptFile, [string]$Log) {
     $ErrorActionPreference = "Continue"      # il motore scrive tutto su stderr
     $code = $null
     try {
-        & $Exe $Cap $Bits $PromptFile 2>&1 | Out-File -Encoding utf8 $Log
+        # $exeItem.FullName, non $Exe: per un comando nativo PowerShell NON
+        # cerca nella cartella corrente, risolve un nome nudo sul PATH. Con un
+        # omonimo sul PATH tutte le guardie validavano il file nella work dir e
+        # la misura veniva da un altro binario, con lo stamp di provenienza che
+        # dichiarava il primo -- esattamente lo scenario che le guardie esistono
+        # per chiudere.
+        & $exeItem.FullName $Cap $Bits $PromptFile 2>&1 | Out-File -Encoding utf8 $Log
         $code = $LASTEXITCODE
     } catch {
         # Fuori da un try, con ErrorActionPreference = Continue, il fallimento di
@@ -325,7 +346,11 @@ function Invoke-Engine([bool]$WithHeat, [string]$PromptFile, [string]$Log) {
         # Il testo .NET originale porta ancora in coda la posizione nel file:
         # la taglio, altrimenti la traccia rientra dalla finestra.
         $ErrorActionPreference = $old
-        $m = ($_.Exception.Message -split '\r?\nAt |At ' )[0].Trim()
+        # -csplit, non -split: -split e' case-insensitive per default e la sua
+        # alternativa 'At ' combacia con l'"at " dentro "form-at error",
+        # lasciando "... Exec form" e buttando via la DIAGNOSI invece della
+        # posizione nel file. Verificato eseguendolo.
+        $m = ($_.Exception.Message -csplit '\r?\nAt |At ' )[0].Trim()
         throw "$Exe non e' partito: $m"
     }
     $ErrorActionPreference = $old
@@ -370,13 +395,29 @@ function Read-Run([string]$Text, [string]$Log) {
     # esistere di questo script -- filtra su Miss -gt 0, trova il gruppo vuoto
     # e stampa "nessun miss" proseguendo: il controllo principale evaporerebbe
     # senza un errore se il formato di quella riga cambiasse.
+    # I token di decode: il motore li stampa e nessuno li leggeva. L'indice per
+    # miss qui sotto e' 1000*(ms per token di DECODE)/(miss di TUTTA la corsa):
+    # se i due bracci decodificano un numero diverso di token -- e possono, per
+    # esempio fermandosi a un EOS diverso -- l'indice si muove per quel solo
+    # motivo. E' il confondimento che il record rifiuta esplicitamente, con un
+    # contatore che era nel log tutto il tempo.
+    if ($Text -notmatch '(?m)^\s*\[timers\]\s+decode:\s*([0-9]+)\s+tokens') {
+        throw "$Log : riga '[timers] decode: N tokens' non trovata. Senza il numero di token di decode l'indice per miss non e' confrontabile fra i bracci."
+    }
+    $dtok = [int]$Matches[1]
     if ($Text -notmatch 'miss\(CPU\)\s+([0-9]+)') { throw "$Log : riga 'miss(CPU) N' non trovata. Il controllo sul costo per miss passerebbe a vuoto." }
     $miss  = [int]$Matches[1]
     if ($Text -notmatch 'LFRU swaps\s+([0-9]+)')   { throw "$Log : riga 'LFRU swaps N' non trovata." }
     $swaps = [int]$Matches[1]
     $res   = if ($Text -match 'resident\s+([0-9]+)/([0-9]+)\s+experts')     { "$($Matches[1])/$($Matches[2])" } else { "?" }
     $toks  = if ($Text -match 'Speed:\s*([0-9.]+)\s*tok/s')                 { [double]$Matches[1] } else { [double]::NaN }
-    $place = if ($Text -match '(?m)^(\[place\] auto:.*)$')                  { $Matches[1].Trim() }  else { "" }
+    # TUTTE le righe [place] auto:, non solo la prima. Il motore ne stampa una
+    # per layer che resta sulla CPU e una di riepilogo del trunk
+    # (c/qwen36_tier.c): prendendo la prima, l'invariante che il commento chiama
+    # "il piazzamento del trunk" poteva confrontare una riga per-layer e non
+    # vedere affatto il riepilogo.
+    $place = (([regex]::Matches($Text, '(?m)^\[place\] auto:.*$') |
+               ForEach-Object { $_.Value.Trim() }) -join ' ;; ')
 
     # Questi due alimentano gli invarianti in coda. Se il regex non trova
     # nulla, Place resta "" e Resident resta "?" per TUTTI i run: l'elenco
@@ -385,12 +426,21 @@ function Read-Run([string]$Text, [string]$Log) {
     # passa a vuoto e' peggio di un invariante che manca, perche' viene
     # ricopiato nel record come se avesse verificato qualcosa.
     # Il motore dichiara la propria configurazione in una riga sola
-    # (c/qwen36.c:4236). Leggerla e pretenderla identica fra i run copre in un
-    # colpo WIDE, CTX, PILOT, HOT, SMOOTH, CONF_LIMIT, cap e bits -- cioe' la
-    # meta' delle leve che nessuna lista di variabili d'ambiente riesce a
-    # inseguire, perche' qui non si indovina cosa l'ambiente abbia fatto: si
-    # legge cosa il motore ha deciso.
-    if ($Text -notmatch '(?m)^(== qwen36 Phase-2 engine \|.*==)$') {
+    # (c/qwen36.c:4236: cap, bits, ctx, pilot, wide, hot, smooth, conf).
+    # Pretenderla identica fra i run copre cap, bits, Q36_MAXT (il campo ctx e'
+    # qwen36_max_ctx(), che legge Q36_MAXT e NON la variabile CTX), PILOT, WIDE,
+    # HOT, SMOOTH e CONF_LIMIT. Delle sedici variabili che sfuggivano alla
+    # denylist precedente il banner ne aggiunge tre: PILOT, WIDE e Q36_MAXT --
+    # le altre erano gia' coperte per nome. Il guadagno non e' il numero: e' che
+    # qui non si indovina cosa l'ambiente abbia fatto, si legge cosa il motore
+    # ha deciso, e nessuna lista di nomi puo' dare la stessa cosa.
+    # \s*$ e non $: in .NET, in modalita' multiline, $ aggancia la posizione
+    # PRIMA del \n, quindi un letterale come "==" davanti a $ non puo' essere
+    # seguito dal \r di un log CRLF -- e Out-File scrive Environment.NewLine,
+    # che su Windows e' CRLF. Senza \s* questo invariante non combaciava MAI
+    # sulla piattaforma di questo script e la corsa moriva al primo run. Il
+    # pattern di [place] sopravvive perche' finisce in .*, che assorbe il \r.
+    if ($Text -notmatch '(?m)^(== qwen36 Phase-2 engine \|.*==)\s*$') {
         throw "$Log : il banner '== qwen36 Phase-2 engine |' non c'e'. Il motore non e' arrivato a dichiarare la sua configurazione, oppure non e' qwen36."
     }
     $banner = $Matches[1].Trim()
@@ -402,6 +452,7 @@ function Read-Run([string]$Text, [string]$Log) {
         Step=$step; Dn=$g["deltanet"]; Attn=$g["attention"]; Moe=$g["moe_total"]; Head=$g["lm_head"]
         Issue=$g["issue"]; CpuMiss=$g["cpu-miss"]; Take=$g["take"]; ShOvl=$g["shared-ovl"]
         Vram=$vram; Swaps=$swaps; Miss=$miss; Resident=$res; Toks=$toks; Place=$place; Banner=$banner
+        DecTok=$dtok
     }
 }
 
@@ -420,7 +471,7 @@ if ($oldLogs.Count) {
 $HeatStamp = ""
 if (-not (Test-Path "heat.caldo.bin")) {
     "heat.caldo.bin non c'e': la costruisco su $PromptCaldo (un run)..."
-    Remove-Item heat.bin -ErrorAction SilentlyContinue
+    Remove-Item heat.bin -Force -ErrorAction SilentlyContinue
     $txt0 = Invoke-Engine $true $PromptCaldo "heatfile-warmup.log"
     $r0 = Read-Run $txt0 "heatfile-warmup.log"
     if (-not (Test-Path "heat.bin")) { throw "la scaldata non ha scritto heat.bin -- vedi heatfile-warmup.log" }
@@ -455,7 +506,7 @@ function Invoke-Arm([string]$Tag, [int]$Rep) {
             throw "CROSS rip ${Rep}: nessun 'HEAT_FILE loaded' in $log. La tabella non e' stata letta: staresti misurando due volte il braccio freddo."
         }
     } else {
-        Remove-Item heat.bin -ErrorAction SilentlyContinue
+        Remove-Item heat.bin -Force -ErrorAction SilentlyContinue
         $txt = Invoke-Engine $false $Prompt $log
         if ($txt -match 'HEAT_FILE loaded') {
             throw "COLD rip ${Rep}: 'HEAT_FILE loaded' in $log. Il braccio freddo e' contaminato."
@@ -510,6 +561,14 @@ if ($residents.Count -ne 1) {
     throw ("residenza diversa fra i run: {0} -- i bracci non hanno lo stesso numero di esperti in VRAM e il delta non e' attribuibile alla tabella heat." -f ($residents -join ", "))
 }
 "residenza identica in tutti i run: {0}" -f $residents[0]
+# Se i bracci non decodificano lo stesso numero di token, l'indice per miss
+# qui sotto confronta due rapporti con denominatori diversi e non significa
+# niente -- il record lo dice a chiare lettere, e il contatore era nel log.
+$dtoks = @($rows | ForEach-Object { $_.DecTok } | Sort-Object -Unique)
+if ($dtoks.Count -ne 1) {
+    throw ("i run non hanno decodificato lo stesso numero di token: {0}. L'indice per miss non e' confrontabile fra i bracci." -f ($dtoks -join ", "))
+}
+"token di decode identici in tutti i run: {0}" -f $dtoks[0]
 
 # ---- statistica sui delta appaiati ---------------------------------------
 $deltas = 1..$Reps | ForEach-Object {
@@ -528,10 +587,18 @@ $se   = $sd / [math]::Sqrt($Reps)
 # quantili t al 95 % a due code, df 1..15
 $tq = @(12.706,4.303,3.182,2.776,2.571,2.447,2.365,2.306,2.262,2.228,2.201,2.179,2.160,2.145,2.131)
 $df = $Reps - 1
-$t  = if ($df -ge 1 -and $df -le 15) { $tq[$df-1] } else { 1.96 }
+# Oltre la tavola si usava 1.96, lo z asintotico, continuando a stampare
+# "intervallo 95 %": a df 17 il t vero e' 2.110, quindi l'intervallo usciva
+# l'8 % piu' stretto di quello che dichiarava. Estesa ai df pari raggiungibili
+# con -Reps pari (17, 19, 21, 23, 25, 29) e, oltre, si dice cosa si sta usando.
+$tq2 = @{ 17 = 2.110; 19 = 2.093; 21 = 2.080; 23 = 2.069; 25 = 2.060; 29 = 2.045 }
+$tApprox = $false
+$t = if ($df -ge 1 -and $df -le 15) { $tq[$df-1] }
+     elseif ($tq2.ContainsKey($df))  { $tq2[$df] }
+     else { $tApprox = $true; 1.96 }
 ""
 "media   {0,6:N2}   sd {1,5:N2}   se {2,5:N2}   df {3}" -f $mean, $sd, $se, $df
-"intervallo 95 %:  [{0:N2} ; {1:N2}]   ampiezza +-{2:N2}" -f ($mean-$t*$se), ($mean+$t*$se), ($t*$se)
+"intervallo 95 %{3}:  [{0:N2} ; {1:N2}]   ampiezza +-{2:N2}" -f ($mean-$t*$se), ($mean+$t*$se), ($t*$se), $(if ($tApprox) { " (APPROSSIMATO: z=1.96, df $df fuori tavola)" } else { "" })
 "negativi {0}/{1}" -f (($deltas | Where-Object { $_ -lt 0 }).Count), $Reps
 
 ""
@@ -570,7 +637,11 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
     $q = $grp.Group | Where-Object { $_.Miss -gt 0 }
     if ($q.Count -eq 0) { "{0,-5}  nessun miss" -f $grp.Name; continue }
     $idx = $q | ForEach-Object { 1000.0 * $_.CpuMiss / $_.Miss }
-    "{0,-5}  indice {1,6:N3} us   (min {2:N3} max {3:N3} su {4} run)" -f $grp.Name,
+    # nessuna unita' di tempo: 1000*(ms per token di decode)/(miss di tutta la
+    # corsa) ha dimensione us per token per miss, non us. Stamparlo come "us"
+    # due righe sotto i costi per miss veri del record (79 e 101 us) metteva
+    # tre ordini di grandezza sotto la stessa etichetta.
+    "{0,-5}  indice {1,6:N3}      (min {2:N3} max {3:N3} su {4} run)" -f $grp.Name,
         (($idx | Measure-Object -Average).Average), (($idx | Measure-Object -Minimum).Minimum),
         (($idx | Measure-Object -Maximum).Maximum), $q.Count
 }
