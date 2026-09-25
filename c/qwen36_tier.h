@@ -103,6 +103,8 @@ int  qt_dense_count(void);
  * the tier copies what it uploads inside the qt_note call and keeps no
  * pointer into the engine's slot. e4m3_lut is quant.h's E4M3_LUT, published
  * to the backend so fmt=8 uploads are accepted. */
+/* Init returns 0 without changing an active tier. Shut down before reinit;
+ * callers must serialize init/shutdown with new work. */
 int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
                  int cap_experts_per_layer, int topk, const float *e4m3_lut);
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
@@ -125,8 +127,10 @@ void qt_note(int layer, int eid,
  * the GPU. Compute the misses on the CPU, then call qt_take(). */
 uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
 
-/* Collect the GPU results and accumulate val[k]*y_k into out[hidden]. */
-void qt_take(uint32_t mask, const float *val, int K, float *out);
+/* Collect all GPU results and accumulate val[k]*y_k into out[hidden].
+ * Returns 0 on collection failure, leaving out unchanged. The caller must
+ * stop inference: experts selected by qt_issue were not computed on CPU. */
+int qt_take(uint32_t mask, const float *val, int K, float *out);
 
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
@@ -167,7 +171,7 @@ static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
-static inline void qt_take(uint32_t a,const float*b,int c,float*d){(void)a;(void)b;(void)c;(void)d;}
+static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}

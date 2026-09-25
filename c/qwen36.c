@@ -2820,7 +2820,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
              * pages on, made in the instrumentation itself. */
             g_qt_time_take = (tm_on() && S==1) ? 1 : 0;
 #endif
-            qt_take(qmask, val, K, out + (int64_t)s*D);
+            if(!qt_take(qmask, val, K, out + (int64_t)s*D)){
+                fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
+                exit(1);
+            }
             if (tm_on() && S==1) {
                 extern double g_qt_iss, g_qt_cpu, g_qt_shr, g_qt_tak;
                 g_qt_iss += _q1-_q0; g_qt_cpu += _qm-_q1;
