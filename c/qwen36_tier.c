@@ -1206,10 +1206,14 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
     /* Drain every device before deciding whether this layer is usable.
      * The two-phase shape this function takes upstream separates exactly the
      * two things the split measures: the whole drain is the wait, the publish
-     * loop below is the accumulation. Il clock si legge solo quando c'e'
-     * qualcosa da attendere: con mask == 0 nessun dispositivo ha esperti in
-     * volo, e avvolgere il drenaggio vuoto addebiterebbe un contributo ~0 per
-     * OGNI layer senza esperti in VRAM. */
+     * loop below is the accumulation. */
+    /* Il clock si legge SOLO quando c'e' qualcosa da attendere. Con mask == 0
+     * nessun dispositivo ha esperti in volo, e avvolgere il drenaggio vuoto
+     * addebiterebbe un contributo ~0 per ogni layer senza esperti in VRAM --
+     * che in aggregato non e' zero, ma una costante per layer aggiunta al
+     * braccio con MENO esperti residenti, cioe' un bias orientato al contrario
+     * proprio nel confronto per cui lo split esiste. Il guard `&& mask` non
+     * viene da monte. Coperto da tests/test_qwen36_tier_take_split.c. */
     const int _tm = g_qt_time_take && mask;
     double _w0 = _tm ? qt_ms() : 0.0;
     if(mask) for(int di=0;di<G.ndev;di++){
