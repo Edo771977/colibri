@@ -236,7 +236,22 @@ static int pretok_end(const char *s,int i,int n){
         if(s[i]==' '&&i+1<n){ int a1; unsigned c1=utf8_decode(s,i+1,n,&a1); if(uclass(c1)!=U_W&&uclass(c1)!=U_L&&uclass(c1)!=U_N&&c1!='\r'&&c1!='\n'){ k=i+1; while(k<n){int a;unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)!=U_W&&uclass(cc)!=U_L&&uclass(cc)!=U_N&&cc!='\r'&&cc!='\n')k+=a; else break;} while(k<n&&(s[k]=='\r'||s[k]=='\n'))k++; return k; } }
         if(uclass(c0)!=U_W&&uclass(c0)!=U_L&&uclass(c0)!=U_N&&c0!='\r'&&c0!='\n'){ int k2=i; while(k2<n){int a;unsigned cc=utf8_decode(s,k2,n,&a); if(uclass(cc)!=U_W&&uclass(cc)!=U_L&&uclass(cc)!=U_N&&cc!='\r'&&cc!='\n')k2+=a; else break;} while(k2<n&&(s[k2]=='\r'||s[k2]=='\n'))k2++; return k2; }
     }
-    if(uclass(c0)==U_W){ int k=i; while(k<n){int a;unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)==U_W)k+=a; else break;} return k; }
+    if(uclass(c0)==U_W){
+        /* The three whitespace rules, in the regex's order. `last` is where the
+         * final whitespace char of the run starts, `nl_end` where the last CR/LF
+         * inside the run ends. */
+        int k=i,last=i,nl_end=-1;
+        while(k<n){int a;unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)!=U_W) break; last=k; k+=a; if(cc=='\r'||cc=='\n') nl_end=k;}
+        /* rule5: \s*[\r\n]+ -- greedy up to the LAST newline; spaces after it
+         * belong to the next piece ("\n  x" is "\n" then " " then " x"). */
+        if(nl_end>0) return nl_end;
+        /* rule6: \s+(?!\S) -- a run followed by a non-space keeps its last char
+         * for the next piece, which then takes it as " x" or " ." (HF: "  <" is
+         * " " then " <", not "  " then "<"). A single char cannot back off and
+         * falls to rule7, \s+, which takes it whole. */
+        if(k<n && last>i) return last;
+        return k;
+    }
     return i+adv;
 }
 static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
@@ -271,22 +286,39 @@ static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
     for(int k=0;k<sc;k++){ int id=smap_get(&g_rev,syms[k]); if(id<0) id=0; push_id(ids,n,cap,id); free(syms[k]); }
     free(syms);
 }
+/* The next added token at or after i, or n when there is none. HF splits the
+ * added tokens out FIRST and pre-tokenizes only the ordinary text between them.
+ * Looking for the special at the start of each piece is not the same thing: the
+ * punctuation rule ` ?[^\s\p{L}\p{M}\p{N}]+` swallows the `<|` of `<|im_end|>`
+ * together with the `.` before it, so the special was never at a piece start and
+ * got encoded as text (#1653: `X.<|im_end|>` was 7 tokens instead of 3, and
+ * every chat turn ending in punctuation paid +4). qwen38.c already splits this
+ * way; this is the same shape. */
+static int next_special(const char *s,int i,int n){
+    for(int k=i;k<n;k++){ int sid; if(try_special(s,k,n,&sid)>0) return k; }
+    return n;
+}
 static void encode_text(const char *text,int **out_ids,int *out_n){
     int cap=1024,n=0; int *ids=malloc(cap*sizeof(int));
     int tlen=(int)strlen(text); int i=0;
     while(i<tlen){
         int sid; int L=try_special(text,i,tlen,&sid);
         if(L>0){ push_id(&ids,&n,&cap,sid); i+=L; continue; }
-        int j=pretok_end(text,i,tlen); if(j<=i) j=i+utf8_adv(text,i,tlen);
-        if(j>tlen) j=tlen;
-        bpe_piece(text+i,j-i,&ids,&n,&cap);
-        i=j;
+        /* Ordinary text runs to the next added token, and the pre-tokenizer
+         * sees that boundary as the end of its input, exactly as HF's does. */
+        int end=next_special(text,i+1,tlen);
+        while(i<end){
+            int j=pretok_end(text,i,end); if(j<=i) j=i+utf8_adv(text,i,end);
+            if(j>end) j=end;
+            bpe_piece(text+i,j-i,&ids,&n,&cap);
+            i=j;
+        }
     }
     *out_ids=ids; *out_n=n;
 }
 
-/* Load Qwen tokenizer.json and build an id->piece table. Only needs the
- * "model.vocab" map (piece string -> id); merges are irrelevant for decoding. */
+/* Load Qwen tokenizer.json and build an id->piece table from model.vocab
+ * and added_tokens. Merges are irrelevant for decoding. */
 static void load_tokenizer(const char *path){
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[tok] cannot open %s\n", path); return; }
@@ -300,17 +332,42 @@ static void load_tokenizer(const char *path){
     jval *vocab = json_get(model, "vocab");
     if (!vocab) vocab = json_get(model, "tokens");
     if (!vocab) { fprintf(stderr, "[tok] no model.vocab/tokens in %s\n", path); free(buf); return; }
+    jval *adds = json_get(root, "added_tokens");
+
     int mx = 0;
     if (vocab->t == J_OBJ){
         for (int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>mx)mx=id; }
     } else {
         mx = vocab->len - 1;
     }
+    if (adds && adds->t==J_ARR){
+        for (int k=0;k<adds->len;k++){
+            jval *t = adds->kids[k];
+            int id = (int)jnum(t,"id");
+            if (id > mx) mx = id;
+        }
+    }
+
     g_tok = calloc((size_t)mx+1, sizeof(char*));
     if (vocab->t == J_OBJ){
         for (int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>=0 && id<=mx) g_tok[id]=strdup(vocab->keys[i]); }
     } else {
         for (int i=0;i<vocab->len;i++){ if(vocab->kids[i] && vocab->kids[i]->t==J_STR) g_tok[i]=strdup(vocab->kids[i]->str); }
+    }
+    if (adds && adds->t==J_ARR){
+        for (int k=0;k<adds->len;k++){
+            jval *t = adds->kids[k];
+            const char *c = jstr(t,"content");
+            int id = (int)jnum(t,"id");
+            /* Only the non-special ones: <think>, </think>, <tool_call>,
+             * <tool_response> are text the gateway parses. Special tokens
+             * (<|im_start|>, <|endoftext|>, ...) keep decoding to nothing,
+             * as reference decoding does with skip_special_tokens. */
+            jval *sp = json_get(t,"special");
+            if (sp && sp->t==J_BOOL && sp->boolean) continue;
+            if (c && id>=0 && id<=mx && !g_tok[id])
+                g_tok[id]=strdup(c);
+        }
     }
     g_tok_n = mx+1;
 
@@ -348,7 +405,6 @@ static void load_tokenizer(const char *path){
             smap_put(&g_merge, key, r);
         }
     }
-    jval *adds = json_get(root, "added_tokens");
     if (adds && adds->t==J_ARR && g_nspecial==0){
         g_nspecial = adds->len;
         g_sp_str = malloc(g_nspecial*sizeof(char*));
@@ -454,7 +510,7 @@ static void sse_chunk(const char *json){
  * <0xXX> byte-fallback tokens emit the raw byte directly. */
 static void decode_id_to_bytes(int id, unsigned char *out, int *outn){
     *outn = 0;
-    if (!g_tok || id<0 || id>=g_tok_n) return;
+    if (!g_tok || id<0 || id>=g_tok_n || !g_tok[id]) return;
     const unsigned char *pc = (const unsigned char*)g_tok[id];
     /* byte-fallback token: <0xXX> -> raw byte */
     if (pc[0]=='<' && pc[1]=='0' && pc[2]=='x' && pc[5]=='>'){
@@ -3144,10 +3200,13 @@ static int    g_pin_use_logit = 0;   /* 1 quando questa richiesta e ripartita da
 typedef struct { float **rec, **conv; int n_layers; } Q36PinState;
 
 /* Stato della lettura del prefill: dichiarato qui perche step() lo consulta e
- * step() viene prima del codice di servizio che lo accende. */
+ * step() viene prima del codice di servizio che lo accende. Solo il servizio
+ * lo accende e solo il servizio definisce serve_echo: senza main non esiste. */
+#ifndef QWEN36_NO_MAIN
 static int   g_echo_k  = 0;      /* 0 = spento */
 static const char *g_echo_id = NULL;
 static void serve_echo(const char *id, int pos, int token, const float *lo, int V, int k);
+#endif
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
@@ -3192,6 +3251,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
      * token, il cui predittore sta nello stato precedente. Per questo il
      * chiamante arretra di uno il riuso del prefisso quando la lettura e
      * accesa: cosi il primo token dell'opzione ricade sempre qui dentro. */
+#ifndef QWEN36_NO_MAIN
     if (g_echo_k > 0 && g_echo_id && S > 0) {
         float *erow = falloc(D), *elog = falloc(c->vocab);
         /* Il primo token fresco e predetto dallo stato PRECEDENTE, che dopo un
@@ -3207,6 +3267,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         free(erow); free(elog);
     }
+#endif
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -3944,13 +4005,35 @@ static void hits_emit(Model *m){
 }
 static double tm_sum(int idx){ return (g_tm_dec[idx]+g_tm_pre[idx])/1e3; }   /* ms -> s */
 
+/* The generation budget a request gets. max_tokens is a CEILING, not a
+ * target (#260/#382, the rule GLM and DeepSeek V4 already apply): the prompt
+ * must fit with room for one token (none for a read-only logprobs request,
+ * docs/brio.md), and the budget is then clamped to what the context can hold.
+ * Returns the budget, or -1 when the PROMPT does not fit. Refusing when
+ * prompt + budget exceeded the context (#1641) turned the gateway's default
+ * output budget -- 8192 here, the whole default context -- into a 400 on
+ * every message of `coli chat` and on every request without max_tokens. */
+static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
+    if (np < 1) return -1;
+    int room = max_ctx - np;
+    if (read_only) return room < 0 ? -1 : (max_tok < room ? max_tok : room);
+    if (room < 1) return -1;
+    return max_tok > room ? room : max_tok;
+}
+
 static void serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
     int max_ctx = qwen36_max_ctx();
-    if(np<1 || np+q->max_tok>max_ctx){
+    int budget = qwen36_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
+    if(budget < 0){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
         fflush(stdout); free(ids); return;
+    }
+    if(budget < q->max_tok){
+        fprintf(stderr,"[serve] max_tokens %d clamped to %d (context %d - prompt %d); raise Q36_MAXT for longer answers\n",
+                q->max_tok, budget, max_ctx, np);
+        q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     m->max_t = np + q->max_tok;
