@@ -23,9 +23,9 @@
 #          congelata heat.caldo.bin, costruita su -PromptCaldo -- un prompt di
 #          argomento diverso da quello misurato -- se non esiste gia'. Se
 #          esiste viene riusata solo se heat.caldo.bin.sha256, scritto accanto
-#          quando la tabella e' stata costruita, dice che viene da un prompt
-#          con lo stesso contenuto di -PromptCaldo e che non e' cambiata dopo.
-#          Misura quanto del guadagno sopravvive a un cambio di argomento.
+#          quando la tabella e' stata costruita, combacia con questa corsa:
+#          vedi "tabella congelata" piu' sotto. Misura quanto del guadagno
+#          sopravvive a un cambio di argomento.
 #   SELF   (-Self) come CROSS, ma la tabella (heat.self.bin) e' costruita sul
 #          prompt misurato stesso, e viene ricostruita a ogni corsa.
 # La tabella congelata viene ricopiata in heat.bin prima di ogni run caldo,
@@ -45,7 +45,7 @@ param(
     [string] $Snap        = "C:\modelli\qwen36_i4_gs64",
     [string] $Exe         = ".\qwen36_clang.exe",
     # L'eseguibile che la build produce: $Exe deve esserne una copia identica
-    # (stesso sha256). -Built '' rinuncia a questo confronto -- non al
+    # (stesso sha256). -Built "" rinuncia a questo confronto -- non al
     # controllo di staleness sui sorgenti -- e lo stamp dei parametri lo dichiara.
     [string] $Built       = "qwen36.exe",
     [string] $Prompt      = "prompt25.txt",
@@ -96,10 +96,9 @@ Set-Location -LiteralPath $WorkDir
 # Rifiuta ogni variabile d'ambiente che combacia con $EnvSuspect, tranne quelle
 # che lo script imposta ($EnvOwn), i percorsi del toolkit CUDA ($EnvBenign) e
 # quelle che l'operatore dichiara innocue con -AllowEnv. I prefissi coprono le
-# famiglie di nomi del motore, di CUDA e del runtime OpenMP. I nomi senza
-# prefisso sono ricavati dai getenv dei sorgenti di qwen36$(EXE), vanno
-# riallineati a mano quando il motore ne aggiunge, e sono rifiutati tutti allo
-# stesso titolo: la guardia non li classifica.
+# famiglie di nomi del motore, di CUDA e del runtime OpenMP. L'elenco dei nomi
+# senza prefisso va tenuto allineato a mano ai getenv del motore, e quei nomi
+# sono rifiutati tutti allo stesso titolo: la guardia non li classifica.
 $EnvOwn = @("SNAP","COLI_CUDA","COLI_GPUS","COLI_TIMERS","COLI_PLACE","HEAT_FILE","N_NEW")
 # Con -File, PowerShell passa "-AllowEnv A,B" come UN SOLO elemento di
 # [string[]]: va rispezzato a mano.
@@ -161,7 +160,7 @@ if ($exeItem.DirectoryName.TrimEnd([IO.Path]::DirectorySeparatorChar) -ne $wdFul
 $exeHash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash
 if ($Built) {
     if (-not (Test-Path -LiteralPath $Built)) {
-        throw "manca ${Built}: non posso verificare che $Exe venga dalla build corrente. Compila, oppure passa -Built '' per rinunciare al confronto -- ma allora la provenienza non e' verificata e il record va scritto dicendolo."
+        throw "manca ${Built}: non posso verificare che $Exe venga dalla build corrente. Compila, oppure passa -Built `"`" per rinunciare al confronto -- ma allora la provenienza non e' verificata e il record va scritto dicendolo."
     }
     $builtItem = Get-Item -LiteralPath $Built
     if ($builtItem.PSIsContainer) { throw "${Built} e' una cartella, non un file." }
@@ -171,7 +170,7 @@ if ($Built) {
     # coperti: in compenso rendono impossibile dimenticare la copia, che e' il
     # caso per cui la guardia esiste.
     if ($builtItem.FullName -eq $exeItem.FullName) {
-        throw "$Exe e ${Built} sono lo stesso file: il confronto di provenienza si autoconfermerebbe. Passa -Built con il vero output della build, o -Built '' dichiarando che non e' verificato."
+        throw "$Exe e ${Built} sono lo stesso file: il confronto di provenienza si autoconfermerebbe. Passa -Built con il vero output della build, o -Built `"`" dichiarando che non e' verificato."
     }
     $builtHash = (Get-FileHash -LiteralPath $Built -Algorithm SHA256).Hash
     if ($builtHash -ne $exeHash) {
@@ -334,7 +333,13 @@ function Invoke-Engine([bool]$WithHeat, [string]$PromptFile, [string]$Log) {
     # solo il primo run -- il resto lo coprono il Remove-Item sopra e il catch.
     if ($null -eq $code) { throw "$Exe non ha registrato alcun exit code. Vedi $Log." }
     if ($code -ne 0) { throw "exit $code -- vedi $Log" }
-    $out = (@($all) | Where-Object { $_ -is [string] }) -join "`n"
+    # Lo stdout, senza le righe [meta] in testa: load_meta (c/qwen36.c) ne
+    # scrive una su stdout, prima della generazione, quando lo snapshot non ha
+    # qwen36_meta.json. Non e' testo generato.
+    $lines = @(@($all) | Where-Object { $_ -is [string] })
+    $k = 0
+    while ($k -lt $lines.Count -and $lines[$k] -match '^\[meta\] ') { $k++ }
+    $out = (@($lines | Select-Object -Skip $k)) -join "`n"
     [pscustomobject]@{ Text = (Get-Content $Log -Raw); Out = $out }
 }
 
@@ -398,7 +403,7 @@ function Read-Run([string]$Text, [string]$Log) {
     # porta un prefisso: Windows PowerShell 5.1 ne antepone uno al primo
     # ErrorRecord del log (non verificato qui).
     if ($Text -notmatch '(?m)(== qwen36 Phase-2 engine \|.*==)\s*$') {
-        throw "$Log : il banner '== qwen36 Phase-2 engine |' non c'e'. Il motore non e' arrivato a dichiarare la sua configurazione, oppure non e' qwen36."
+        throw "$Log : il banner '== qwen36 Phase-2 engine |' non c'e'. Il motore non e' arrivato a stamparlo, oppure non e' qwen36."
     }
     $banner = $Matches[1].Trim()
 
@@ -424,11 +429,28 @@ if ($oldLogs.Count) {
     $oldLogs | Remove-Item -Force
 }
 
-# La tabella congelata e' la variabile indipendente dell'esperimento. Accanto
-# ha un file con due impronte: il prompt su cui e' stata costruita e la tabella
-# stessa. Una tabella si riusa solo se entrambe combaciano; senza quel file, o
-# con impronte diverse, la corsa si ferma, perche' non si saprebbe cosa misura.
+function Get-TextHash([string]$s) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s)) | ForEach-Object { $_.ToString("x2") }) }
+    finally { $sha.Dispose() }
+}
+
+# ---- tabella congelata ---------------------------------------------------
+# E' la variabile indipendente dell'esperimento. Accanto ha un file con le
+# condizioni in cui e' stata costruita: impronta del prompt, impronta
+# dell'eseguibile, N_NEW, cap, bits, impronta del PERCORSO dello snapshot (non
+# del suo contenuto), e impronta della tabella stessa. Si riusa solo se tutte
+# combaciano con questa corsa; altrimenti la corsa si ferma e il messaggio
+# dice quali non combaciano.
 $Side = "$Frozen.sha256"
+$Want = [ordered]@{
+    prompt     = $hCaldo
+    eseguibile = $exeHash
+    n_new      = "$NNew"
+    cap        = "$Cap"
+    bits       = "$Bits"
+    snap       = Get-TextHash ((Get-Item -LiteralPath $Snap).FullName)
+}
 $HeatStamp = ""
 if ($Self -or -not (Test-Path -LiteralPath $Frozen)) {
     "costruisco $Frozen su $PromptCaldo (un run)..."
@@ -439,20 +461,28 @@ if ($Self -or -not (Test-Path -LiteralPath $Frozen)) {
     $r0 = Read-Run $e0.Text "heatfile-warmup.log"
     if (-not (Test-Path "heat.bin")) { throw "la scaldata non ha scritto heat.bin -- vedi heatfile-warmup.log" }
     Copy-Item heat.bin $Frozen -Force
-    Set-Content -LiteralPath $Side -Encoding ascii -Value ("{0} {1}" -f $hCaldo, (Get-FileHash -LiteralPath $Frozen -Algorithm SHA256).Hash)
+    $lines = @($Want.Keys | ForEach-Object { "{0}={1}" -f $_, $Want[$_] })
+    $lines += "tabella={0}" -f (Get-FileHash -LiteralPath $Frozen -Algorithm SHA256).Hash
+    Set-Content -LiteralPath $Side -Encoding ascii -Value $lines
     "scaldata ok ({0:N2} tok/s, hit {1:N1} %), tabella congelata in {2}" -f $r0.Toks, $r0.Vram, $Frozen
     ""
     $HeatStamp = "COSTRUITA in questa corsa su $PromptCaldo"
 } else {
     if (-not (Test-Path -LiteralPath $Side)) {
-        throw "$Frozen esiste ma accanto non c'e' ${Side}: non so su quale prompt sia stata costruita. Cancellala, e lo script la ricostruira' su $PromptCaldo."
+        throw "$Frozen esiste ma accanto non c'e' ${Side}: non so in quali condizioni sia stata costruita. Cancellala, e lo script la ricostruira' su $PromptCaldo."
     }
-    $sd = @(((Get-Content -LiteralPath $Side -Raw) -replace '^\s+|\s+$', '') -split '\s+')
-    $hTab = (Get-FileHash -LiteralPath $Frozen -Algorithm SHA256).Hash
-    if ($sd.Count -ne 2 -or $sd[0] -ne $hCaldo -or $sd[1] -ne $hTab) {
-        throw "$Frozen non viene da un prompt con lo stesso contenuto di $PromptCaldo, oppure e' cambiata dopo la costruzione ($Side non combacia). Cancellala, e lo script la ricostruira'."
+    $got = @{}
+    foreach ($ln in @(Get-Content -LiteralPath $Side)) {
+        if ($ln -match '^\s*([a-z_]+)=(\S+)\s*$') { $got[$Matches[1]] = $Matches[2] }
     }
-    $HeatStamp = "RIUSATA: costruita su un prompt con lo stesso sha256 di $PromptCaldo, e non cambiata dopo"
+    $check = [ordered]@{}
+    foreach ($key in $Want.Keys) { $check[$key] = $Want[$key] }
+    $check["tabella"] = (Get-FileHash -LiteralPath $Frozen -Algorithm SHA256).Hash
+    $bad = @($check.Keys | Where-Object { -not $got.ContainsKey($_) -or $got[$_] -ne $check[$_] })
+    if ($bad.Count) {
+        throw ("{0} non e' stata costruita nelle condizioni di questa corsa: in {1} non combaciano {2}. Cancellala, e lo script la ricostruira'." -f $Frozen, $Side, ($bad -join ", "))
+    }
+    $HeatStamp = "RIUSATA: $Side combacia su prompt, eseguibile, N_NEW, cap, bits, percorso dello snapshot e tabella"
 }
 $hc = Get-Item -LiteralPath $Frozen
 $HeatStamp = "{0}: {1} byte | {2} | sha256 {3} | {4}" -f `
@@ -460,12 +490,6 @@ $HeatStamp = "{0}: {1} byte | {2} | sha256 {3} | {4}" -f `
     (Get-FileHash -LiteralPath $Frozen -Algorithm SHA256).Hash.Substring(0,16), $HeatStamp
 $HeatStamp
 ""
-
-function Get-TextHash([string]$s) {
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s)) | ForEach-Object { $_.ToString("x2") }) }
-    finally { $sha.Dispose() }
-}
 
 # ---- un braccio ----------------------------------------------------------
 function Invoke-Arm([string]$Tag, [int]$Rep) {
@@ -489,7 +513,7 @@ function Invoke-Arm([string]$Tag, [int]$Rep) {
     $row = Read-Run $e.Text $log
     # Uno stdout vuoto farebbe passare a vuoto il confronto sul testo in coda.
     if (-not $e.Out.Trim()) {
-        throw "$Tag rip ${Rep}: il motore non ha scritto niente su stdout, dove esce il testo generato. Il confronto sul testo passerebbe a vuoto."
+        throw "$Tag rip ${Rep}: nessun testo generato su stdout (tolte le righe [meta]). Il confronto sul testo passerebbe a vuoto."
     }
     $row | Add-Member -NotePropertyName Rep -NotePropertyValue $Rep
     $row | Add-Member -NotePropertyName Arm -NotePropertyValue $Tag
@@ -509,7 +533,7 @@ for ($rep = 1; $rep -le $Reps; $rep++) {
         $rep, $(if ($rep % 2 -eq 1) { "COLD prima" } else { "$Warm prima" }), $c, $x, ($x - $c), $Warm | Write-Host
 }
 
-# ---- controlli che devono valere su TUTTI i run --------------------------
+# ---- invarianti su tutti i run, poi il testo fra i bracci -----------------
 ""
 "--- invarianti ---"
 $ExeStamp
@@ -521,7 +545,7 @@ $ParamStamp
 # prodotti in forma incollabile.
 $banners = @($rows | ForEach-Object { $_.Banner } | Sort-Object -Unique)
 if ($banners.Count -ne 1) {
-    throw ("il motore NON ha girato con la stessa configurazione in tutti i run:`n  {0}" -f ($banners -join "`n  "))
+    throw ("il banner del motore NON e' identico in tutti i run:`n  {0}" -f ($banners -join "`n  "))
 }
 "banner del motore identico in tutti i run:"
 "  {0}" -f $banners[0]
@@ -538,9 +562,9 @@ if ($residents.Count -ne 1) {
 # Il testo generato. Dentro ogni braccio deve essere identico: se le
 # ripetizioni dello stesso braccio non decodificano la stessa sequenza, non
 # sono ripetizioni. Fra i due bracci puo' differire, e lo script lo dichiara
-# invece di rifiutare la corsa: da dove diverge, il delta include anche
-# l'effetto di due sequenze diverse. L'impronta e' quella dello stdout come
-# PowerShell lo legge (righe unite con LF), non dei byte scritti dal motore.
+# invece di rifiutare la corsa. L'impronta e' quella dello stdout come
+# PowerShell lo legge (righe unite con LF, senza le righe [meta] in testa), non
+# dei byte scritti dal motore.
 foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
     $h = @($grp.Group | ForEach-Object { $_.OutHash } | Sort-Object -Unique)
     if ($h.Count -ne 1) {
@@ -553,15 +577,27 @@ $tWarm = @($rows | Where-Object { $_.Arm -eq $Warm })[0]
 "testo generato identico fra i run di ogni braccio (sha256 dello stdout letto):"
 "  COLD  {0}" -f $tCold.OutHash.Substring(0,16)
 "  {0,-5} {1}" -f $Warm, $tWarm.OutHash.Substring(0,16)
-if ($tCold.Out -ceq $tWarm.Out) {
+""
+"--- testo fra i due bracci (dichiarato: non ferma la corsa) ---"
+# Confronto ORDINALE: con la cultura invariante -ceq tratta come uguali due
+# testi che differiscono per un carattere ignorabile (per esempio U+200B).
+if ([string]::Equals($tCold.Out, $tWarm.Out, [StringComparison]::Ordinal)) {
     "testo generato IDENTICO fra i due bracci"
 } else {
     $a = $tCold.Out; $b = $tWarm.Out
     $n = [Math]::Min($a.Length, $b.Length); $i = 0
     while ($i -lt $n -and [int]$a[$i] -eq [int]$b[$i]) { $i++ }
-    "testo generato DIVERSO fra i due bracci, dalla posizione {0} dello stdout letto: da li' in poi il delta include anche l'effetto di due sequenze diverse." -f $i
-    "  COLD  ...{0}" -f ($a.Substring($i, [Math]::Min(40, $a.Length - $i)) -replace "`n", " / ")
-    "  {0,-5} ...{1}" -f $Warm, ($b.Substring($i, [Math]::Min(40, $b.Length - $i)) -replace "`n", " / ")
+    # Non partire da meta' di una coppia surrogata: la meta' alta prima e'
+    # comune ai due testi.
+    if ($i -gt 0 -and (($i -lt $a.Length -and [char]::IsLowSurrogate($a[$i])) -or ($i -lt $b.Length -and [char]::IsLowSurrogate($b[$i])))) { $i-- }
+    function Get-Excerpt([string]$s, [int]$from) {
+        $len = [Math]::Min(40, $s.Length - $from)
+        if ($len -gt 0 -and [char]::IsHighSurrogate($s[$from + $len - 1])) { $len-- }
+        $s.Substring($from, $len) -replace "`n", " / "
+    }
+    "testo generato DIVERSO fra i due bracci. Primo carattere diverso alla posizione {0} dello stdout letto, contata da 0 in unita' UTF-16: dal token che la contiene in poi il delta include anche l'effetto di due sequenze diverse." -f $i
+    "  COLD  ...{0}" -f (Get-Excerpt $a $i)
+    "  {0,-5} ...{1}" -f $Warm, (Get-Excerpt $b $i)
 }
 
 # ---- statistica sui delta appaiati ---------------------------------------
@@ -636,7 +672,7 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
     $idx = $q | ForEach-Object { 1000.0 * $_.CpuMiss / $_.Miss }
     # Nessuna unita' di tempo: la dimensione e' us per token per miss. Il
     # record che pubblicava un costo per miss l'ha ritirato per questa ragione
-    # (qwen36-heatfile-2026-09-23-raw.txt:603-604).
+    # (qwen36-heatfile-2026-09-23-raw.txt:598-604).
     "{0,-5}  indice {1,6:N3}      (min {2:N3} max {3:N3} su {4} run)" -f $grp.Name,
         (($idx | Measure-Object -Average).Average), (($idx | Measure-Object -Minimum).Minimum),
         (($idx | Measure-Object -Maximum).Maximum), $q.Count
