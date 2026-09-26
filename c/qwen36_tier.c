@@ -1166,9 +1166,27 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
  * the wait and pay nothing. Split here, gated on g_qt_time_take so the
  * inference build pays nothing: with COLI_TIMERS off not one clock is read.
  *
- * The accumulation is not bookkeeping either -- it is K rows of D floats per
- * layer per token, and at the measured hit rates it is most of what `take`
- * reports. */
+ * The premise that motivated the split was WRONG, and the split is what
+ * proved it. docs/experiments/qwen36-take-split-2026-09-23-raw.txt measures
+ * take 0.94 ms/token as wait 0.84 + accum 0.09: the accumulation is 10 % of
+ * take, and `take` is a WAIT. The physics agrees independently -- K rows of D
+ * floats at an 87 % hit rate is about 7 x 2048 multiply-adds per layer per
+ * token over 40 layers, which lands near 0.1 ms/token. The split stays
+ * because that is the answer it exists to give, not because it was the
+ * expected one: it REMOVES the accumulation as an optimisation target instead
+ * of adding one.
+ *
+ * Earlier wordings of this paragraph asserted the opposite -- "most of the
+ * 1.2 ms/token `take` currently reports", and then the same claim with the
+ * figure dropped. What was wrong is the "most of", not the magnitude: 1.2 is
+ * the rounded COLD arm of qwen36-heatfile-2026-09-23-raw.txt:320 ("take is
+ * 1.59/1.21 cold"), a record that predates that wording, so the figure had a
+ * source. But no SINGLE reading of `take` belongs in a comment: across the
+ * records it runs from 0.27 to 1.86 on arms that differ in placement, in
+ * kernel flags and in host compiler, and docs/ENVIRONMENT.md:242 already
+ * records four withdrawn attempts to make one number out of that spread. The
+ * run dedicated to the split reads 0.94 and settles the RATIO, which is what
+ * this paragraph needs. Do not restore either wording. */
 /* Defined HERE, not in the engine next to g_qt_iss: tests/test_qwen36_tier
  * _int8.c does #include "../qwen36_tier.c" and links without qwen36.c, so
  * this translation unit has to stand on its own. Putting them in the engine
