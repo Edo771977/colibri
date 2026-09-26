@@ -13,13 +13,14 @@
 # -4.80 ms/token fra tier freddo e tier scaldato da un prompt di ALTRO
 # argomento, ma con n=2 per braccio: l'intervallo al 95 % e' [1.74, 7.86].
 # Il segno e' sicuro, la taglia no -- e un numero che si moltiplica per milioni
-# di token non puo' avere un'incertezza di +-3 ms. Con 6 ripetizioni appaiate
-# lo stesso scatter da' circa +-0.8.
+# di token non puo' avere un'incertezza di +-3 ms. La corsa a 6 ripetizioni
+# fatta con questo script sta in
+# docs/experiments/qwen36-heatfile-6rep-2026-09-23-raw.txt.
 #
 # I DUE BRACCI:
 #   COLD   HEAT_FILE NON impostata. Il motore non carica niente e, cosa che
 #          conta per l'alternanza, non SCRIVE niente in uscita: qt_shutdown
-#          (c/qwen36_tier.c:1264) scrive solo se la variabile c'e'. Se il
+#          (c/qwen36_tier.c) scrive solo se la variabile c'e'. Se il
 #          braccio freddo scrivesse, contaminerebbe il caldo successivo.
 #   CROSS  HEAT_FILE=heat.bin, con dentro una copia della tabella congelata
 #          costruita su prompt-caldo.txt -- argomento senza niente in comune
@@ -60,7 +61,8 @@ $ErrorActionPreference = "Stop"
 # contaminazione e' gia' avvenuta una volta, in
 # docs/experiments/qwen36-dense-pinned-2026-09-21-raw.txt:126, scritta da uno
 # script fratello sulla stessa macchina. Fissata qui la cultura invariante per
-# tutto il processo. Non tocca la LETTURA: i cast [double] di PowerShell sono
+# questo thread -- il meccanismo di processo sarebbe DefaultThreadCurrentCulture,
+# e questo script e' a thread singolo. Non tocca la LETTURA: i cast [double] sono
 # invarianti di cultura per costruzione, e questo script non usa mai
 # [double]::Parse, che invece leggerebbe "0.94" come 94 sotto it-IT.
 [System.Threading.Thread]::CurrentThread.CurrentCulture   = [System.Globalization.CultureInfo]::InvariantCulture
@@ -115,15 +117,14 @@ $AllowEnv = @($AllowEnv | ForEach-Object { $_ -split ',' } | ForEach-Object { $_
 # CUDA_PATH e la sua famiglia le scrive l'installer del toolkit: sono percorsi,
 # non interruttori. CUDA_VISIBLE_DEVICES non e' fra queste e viene rifiutata a
 # ragione, perche' rimapperebbe il COLI_GPUS=0 che lo script imposta.
-# Una versione precedente esentava anche MODULE_LOADING_MODE, che NON e' una
-# variabile CUDA: quella vera si chiama CUDA_MODULE_LOADING (LAZY/EAGER) ed e'
-# un interruttore, non un percorso, quindi resta -- correttamente -- rifiutata.
-# Il nome inventato e' stato tolto. La classe e' ancorata in coda con $ perche'
-# senza l'ancora un nome piu' lungo che comincia per CUDA_PATH... passerebbe.
-$EnvBenign = '^CUDA_(PATH|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH)([A-Z0-9_]*)?$'
+# Insieme CHIUSO, non una famiglia con coda libera: ogni nome e' scritto per
+# intero e l'unica variazione ammessa e' il suffisso di versione che l'installer
+# mette su CUDA_PATH. Cosi' un interruttore futuro che cominciasse per CUDA_PATH
+# o CUDA_HOME resta rifiutato invece di essere esentato in silenzio.
+$EnvBenign = '^CUDA_(PATH(_V[0-9_]+)?|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH)$'
 # I prefissi non bastano: QT_ collide con il namespace del framework Qt, che
 # Anaconda e vari installer impostano, quindi si nominano le due sole variabili
-# QT_ che il motore legge davvero; e sedici getenv del motore non hanno alcun
+# QT_ che il motore legge davvero; e diversi getenv del motore non hanno alcun
 # prefisso riconoscibile. Fra quelle la piu' grave e' MODEL (c/qwen36.c), che
 # cambia il modello misurato senza che nulla nel confronto fra i bracci lo
 # riveli; poi Q36_MAXT, che muove il tetto di contesto (e' il solo ingresso di
@@ -226,10 +227,10 @@ if ($Built) {
 # $Exe e' quella della BUILD, non della copia: questo confronto replica cio' che
 # make gia' fa, e serve per il caso in cui nessuno ha invocato make.
 #
-# La lista e' i prerequisiti di qwen36$(EXE) in c/Makefile:1223. Scriverne
-# cinque a mano su ventuno lasciava passare una modifica a decode_batch.h,
-# simd_i8f.h, omp_tune.h, kv_prefix.h o st.h -- cioe' al percorso caldo del
-# decode -- senza un avviso. .build-config e' in quella lista e va controllato
+# La lista sono i prerequisiti di qwen36$(EXE) in c/Makefile, con
+# backend_loader.o sostituito dai suoi due sorgenti: va tenuta allineata a mano,
+# e un prerequisito MANCANTE qui sotto e' un errore, non un salto silenzioso.
+# .build-config ne fa parte e va controllato
 # come gli altri: se e' piu' recente dell'eseguibile, la configurazione
 # registrata NON e' quella del binario, e lo stamp qui sotto mentirebbe.
 $QwenSrc = @(
@@ -287,11 +288,9 @@ $CfgStamp = "build-config: $BuildCfg"
 # GetModuleFileNameA e, in fallback, cerca solo in APPLICATION_DIR e SYSTEM32 --
 # mai nella cwd, mai sul PATH. E la guardia di contenimento qui sopra impone che
 # l'eseguibile stia in $WorkDir. Quindi "non trovata qui" significa che il tier
-# GPU quasi certamente non partira', e la guardia su "CUDA VRAM expert tier
-# active" fermera' la corsa poco dopo. Una versione precedente di questa riga
-# diceva "il loader la prende da altrove": era falso, e il commit che dichiarava
-# di averlo ritirato non aveva toccato la riga.
-$DllStamp = "coli_cuda.dll: NON TROVATA accanto all'eseguibile -- il loader non la cerchera' altrove che in System32, quindi il tier GPU non partira'"
+# GPU parte solo se la DLL e' installata in System32, e la guardia su "CUDA VRAM
+# expert tier active" e' cio' che lo stabilisce davvero.
+$DllStamp = "coli_cuda.dll: NON TROVATA accanto all'eseguibile -- il loader la cerchera' solo in System32, e la sua identita' NON e' registrata"
 foreach ($d in @("coli_cuda.dll","coli_hip.dll")) {
     if (Test-Path -LiteralPath $d) {
         $di = Get-Item -LiteralPath $d
@@ -401,7 +400,7 @@ function Read-Run([string]$Text, [string]$Log) {
     if ($Text -notmatch 'CUDA VRAM expert tier active') {
         throw "$Log : il tier CUDA non e' attivo. Senza COLI_CUDA=1, o con cap diverso da n_experts, qt_init torna 0 in silenzio e staresti misurando la CPU."
     }
-    # [ \t] e non \s in ogni pattern di questa funzione: in .NET \s include \n e
+    # [ \t] e non \s nei pattern che leggono un valore: in .NET \s include \n e
     # \r, quindi con (?m) un '^\s*' puo' scavalcare la riga e un '\s*(.+)' su una
     # riga troncata pesca la riga SUCCESSIVA. Misurato: con "[timers]   qtier:"
     # senza coda, '\s*(.+)$' cattura la riga di qt_stats e i quattro sotto-timer
@@ -426,7 +425,7 @@ function Read-Run([string]$Text, [string]$Log) {
     # log intero e' come cercare "take" in un testo inglese: la prima
     # occorrenza vince e non e' detto sia un numero di questo run.
     $qline = if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+qtier:[ \t]*([^\r\n]+)') { $Matches[1] } else { "" }
-    if (-not $qline) { throw "$Log : riga [timers] qtier non trovata." }
+    if (-not $qline.Trim()) { throw "$Log : riga [timers] qtier non trovata." }
     foreach ($k in @("issue","cpu-miss","take","shared-ovl")) {
         if ($qline -match "$([regex]::Escape($k))[ \t]+([0-9.]+)") { $g[$k] = [double]$Matches[1] } else { $g[$k] = [double]::NaN }
     }
@@ -466,15 +465,12 @@ function Read-Run([string]$Text, [string]$Log) {
     # sull'ASSENZA del dato invece che sulla sua costanza. Un invariante che
     # passa a vuoto e' peggio di un invariante che manca, perche' viene
     # ricopiato nel record come se avesse verificato qualcosa.
-    # Il motore dichiara la propria configurazione in una riga sola
-    # (c/qwen36.c:4236: cap, bits, ctx, pilot, wide, hot, smooth, conf).
-    # Pretenderla identica fra i run copre cap, bits, Q36_MAXT (il campo ctx e'
-    # qwen36_max_ctx(), che legge Q36_MAXT e NON la variabile CTX), PILOT, WIDE,
-    # HOT, SMOOTH e CONF_LIMIT. Delle sedici variabili che sfuggivano alla
-    # denylist precedente il banner ne aggiunge tre: PILOT, WIDE e Q36_MAXT --
-    # le altre erano gia' coperte per nome. Il guadagno non e' il numero: e' che
-    # qui non si indovina cosa l'ambiente abbia fatto, si legge cosa il motore
-    # ha deciso, e nessuna lista di nomi puo' dare la stessa cosa.
+    # Il motore dichiara la propria configurazione in una riga sola (c/qwen36.c:
+    # cap, bits, ctx, pilot, wide, hot, smooth, conf; il campo ctx e'
+    # qwen36_max_ctx(), che legge Q36_MAXT e NON la variabile CTX).
+    # Pretenderla identica fra i run non aggiunge nomi alla lista qui sopra: il
+    # guadagno e' che qui non si indovina cosa l'ambiente abbia fatto, si legge
+    # cosa il motore ha deciso, e nessuna lista di nomi puo' dare la stessa cosa.
     # \s*$ e non $: in .NET, in modalita' multiline, $ aggancia la posizione
     # PRIMA del \n, quindi un letterale come "==" davanti a $ non puo' essere
     # seguito dal \r di un log CRLF -- e Out-File scrive Environment.NewLine,
@@ -629,13 +625,9 @@ $se   = $sd / [math]::Sqrt($Reps)
 $tq = @(12.706,4.303,3.182,2.776,2.571,2.447,2.365,2.306,2.262,2.228,2.201,2.179,2.160,2.145,2.131)
 $df = $Reps - 1
 # Oltre la tavola si usava 1.96, lo z asintotico, continuando a stampare
-# "intervallo 95 %": a df 17 il t vero e' 2.110, quindi l'intervallo usciva
-# il 7,1 % piu' stretto di quello che dichiarava (1 - 1.96/2.110). Estesa ai df
-# DISPARI raggiungibili con -Reps pari -- df = Reps-1, quindi con Reps pari il df
-# e' per costruzione dispari, e una versione precedente di questo commento li
-# chiamava "pari" -- e oltre si dice cosa si sta usando. df 27 (-Reps 28) era
-# l'unico valore dispari fra 17 e 29 assente dalla tavola e finiva in z=1.96,
-# cioe' un intervallo il 4,5 % troppo stretto: aggiunto.
+# "intervallo 95 %": un intervallo piu' stretto di quello dichiarato. Estesa ai
+# df raggiungibili con -Reps pari (df = Reps-1, quindi dispari), e oltre la
+# tavola l'etichetta dice che si sta usando z.
 $tq2 = @{ 17 = 2.110; 19 = 2.093; 21 = 2.080; 23 = 2.069; 25 = 2.060; 27 = 2.052; 29 = 2.045 }
 $tApprox = $false
 $t = if ($df -ge 1 -and $df -le 15) { $tq[$df-1] }
@@ -686,12 +678,10 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
     # corsa) ha dimensione us per token per miss, non us -- denominatori diversi,
     # quindi un indice e non un costo. Stamparlo come "us" metterebbe tre ordini
     # di grandezza sotto la stessa etichetta di un costo vero.
-    # Una versione precedente di questo commento parlava dei "costi per miss veri
-    # del record (79 e 101 us)". Quei due numeri non esistono in nessun record, in
-    # nessuna revisione: i soli us per miss mai pubblicati sono 56 e 71, e sono
-    # stati RITIRATI dalla revisione successiva, che scrive (rec:604) "the two
-    # columns have different denominators and their ratio means nothing" -- cioe'
-    # esattamente la ragione per cui qui si stampa un indice senza unita'.
+    # Il record che pubblicava un costo per miss l'ha ritirato nella revisione
+    # successiva: "the two columns have different denominators and their ratio
+    # means nothing" (qwen36-heatfile-2026-09-23-raw.txt:603-604) -- cioe'
+    # esattamente la ragione per cui qui non si mette un'unita' di tempo.
     "{0,-5}  indice {1,6:N3}      (min {2:N3} max {3:N3} su {4} run)" -f $grp.Name,
         (($idx | Measure-Object -Average).Average), (($idx | Measure-Object -Minimum).Minimum),
         (($idx | Measure-Object -Maximum).Maximum), $q.Count
