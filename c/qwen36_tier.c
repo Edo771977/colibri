@@ -1166,9 +1166,35 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
  * the wait and pay nothing. Split here, gated on g_qt_time_take so the
  * inference build pays nothing: with COLI_TIMERS off not one clock is read.
  *
- * The accumulation is not bookkeeping either -- it is K rows of D floats per
- * layer per token, and at the measured hit rates it is most of what `take`
- * reports. */
+ * The premise that motivated the split was WRONG, and the split is what
+ * proved it. docs/experiments/qwen36-take-split-2026-09-23-raw.txt measures
+ * take 0.94 ms/token as wait 0.84 + accum 0.09: the accumulation is 10 % of
+ * take, and `take` is a WAIT. The physics agrees independently -- K rows of D
+ * floats at an 87 % hit rate is about 7 x 2048 multiply-adds per layer per
+ * token over 40 layers, which lands near 0.1 ms/token. The split stays
+ * because that is the answer it exists to give, not because it was the
+ * expected one: it REMOVES the accumulation as an optimisation target instead
+ * of adding one.
+ *
+ * Two earlier wordings of this paragraph asserted the opposite -- "most of the
+ * 1.2 ms/token `take` currently reports", and then the same claim with the
+ * figure dropped. Both are retracted. The 0.94 above is quoted for ONE purpose,
+ * as the denominator of the ratio, and it is one repetition of one arm -- the
+ * record labels that block "CROSS repetition 1", and the split is measured
+ * exactly once in this tree, never replicated. What makes the retraction hold
+ * beyond that one arm is not the ratio but the LEVEL: `accum` is pinned near
+ * 0.1 ms/token by the arithmetic above, independently of any timer, while
+ * `take` runs from 0.27 to 1.86 across the records on arms differing in
+ * placement, in kernel flags and in host compiler. 0.09 is not "most of" any
+ * value in that range.
+ *
+ * For the readings themselves: docs/ENVIRONMENT.md:242 lists thirteen of them,
+ * 0.27 to 1.14, from arms with the expert graph off, and tracks the corrections
+ * withdrawn from that passage; docs/qwen36-cuda-tier.md:511 is what tabulates
+ * each one with its record, line and arm. Do not restore either retracted
+ * wording, and do not import a reading from another arm to characterise this
+ * one: three attempts to say where the 1.2 came from were made while writing
+ * this paragraph, and all three were wrong. */
 /* Defined HERE, not in the engine next to g_qt_iss: tests/test_qwen36_tier
  * _int8.c does #include "../qwen36_tier.c" and links without qwen36.c, so
  * this translation unit has to stand on its own. Putting them in the engine
