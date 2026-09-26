@@ -1,5 +1,5 @@
-# misure-heatfile.ps1 -- quanto vale una heat table persistente, con abbastanza
-# ripetizioni da poterci moltiplicare sopra.
+# misure-heatfile.ps1 -- il guadagno di una heat table persistente sul tier
+# CUDA di qwen36, con delta appaiati fra un braccio freddo e uno caldo.
 #
 # SI LANCIA DA cmd, con UNA riga:
 #
@@ -10,39 +10,39 @@
 # e heat.bin -- passa -WorkDir se il tuo albero e' diverso.
 #
 # PERCHE' ESISTE. docs/experiments/qwen36-heatfile-2026-09-23-raw.txt misura
-# -4.80 ms/token fra tier freddo e tier scaldato da un prompt di ALTRO
-# argomento, ma con n=2 per braccio: l'intervallo al 95 % e' [1.74, 7.86].
-# Il segno e' sicuro, la taglia no -- e un numero che si moltiplica per milioni
-# di token non puo' avere un'incertezza di +-3 ms. La corsa a 6 ripetizioni
-# fatta con questo script sta in
+# il guadagno con due run per braccio, e il suo intervallo al 95 % e' largo
+# circa +-3 ms/token. La corsa a sei ripetizioni fatta con una versione
+# precedente di questo script sta in
 # docs/experiments/qwen36-heatfile-6rep-2026-09-23-raw.txt.
 #
-# I DUE BRACCI:
-#   COLD   HEAT_FILE NON impostata. Il motore non carica niente e, cosa che
-#          conta per l'alternanza, non SCRIVE niente in uscita: qt_shutdown
-#          (c/qwen36_tier.c) scrive solo se la variabile c'e'. Se il
-#          braccio freddo scrivesse, contaminerebbe il caldo successivo.
-#   CROSS  HEAT_FILE=heat.bin, con dentro una copia della tabella congelata
-#          costruita su prompt-caldo.txt -- argomento senza niente in comune
-#          col prompt misurato. Ricopiata PRIMA DI OGNI RUN, perche' ogni run
-#          la riscrive.
+# I BRACCI:
+#   COLD   HEAT_FILE rimossa dall'ambiente. Lo script verifica che il run non
+#          carichi la tabella e non scriva heat.bin.
+#   CROSS  (default) HEAT_FILE=heat.bin, con dentro una copia della tabella
+#          congelata heat.caldo.bin, costruita su -PromptCaldo -- un prompt di
+#          argomento diverso da quello misurato -- se non esiste gia'; se
+#          esiste viene riusata, e lo stamp lo dichiara. Misura quanto del
+#          guadagno sopravvive a un cambio di argomento.
+#   SELF   (-Self) come CROSS, ma la tabella (heat.self.bin) e' costruita sul
+#          prompt misurato stesso, e viene ricostruita a ogni corsa.
+# La tabella congelata viene ricopiata in heat.bin prima di ogni run caldo,
+# cosi' ogni run caldo parte dalla stessa.
 #
-# ORDINE ABBA: l'ordine dentro la ripetizione si inverte, altrimenti un
-# effetto di posizione nella sessione e' indistinguibile dall'effetto del
-# braccio -- che e' esattamente il dubbio che il record non ha saputo
-# chiudere, avendo solo tre punti freddi.
+# ORDINE ABBA: dentro ogni ripetizione l'ordine dei bracci si inverte. Con un
+# numero PARI di ripetizioni, un effetto di posizione dentro la coppia che
+# resti costante lungo la sessione si annulla esattamente nella media dei
+# delta.
 
 param(
     [string] $Snap        = "C:\modelli\qwen36_i4_gs64",
     [string] $Exe         = ".\qwen36_clang.exe",
-    # L'eseguibile che la build produce. $Exe ne e' una copia fatta a mano, e
-    # niente lo legava alla build: dimenticare il "copy /Y" fa misurare il
-    # binario di due giorni prima con TUTTI gli invarianti verdi -- piu' verdi
-    # del normale, perche' [place] e la residenza sono identiche in tutti i run
-    # proprio in quanto e' lo stesso vecchio binario. Passare -Built "" per
-    # disattivare il confronto, consapevolmente.
+    # L'eseguibile che la build produce: $Exe deve esserne una copia identica
+    # (stesso sha256). -Built '' rinuncia a questo confronto -- non al
+    # controllo di staleness sui sorgenti -- e lo stamp dei parametri lo dichiara.
     [string] $Built       = "qwen36.exe",
     [string] $Prompt      = "prompt25.txt",
+    # Il prompt su cui si costruisce la tabella del braccio CROSS. Con -Self non
+    # si usa: la tabella si costruisce su -Prompt.
     [string] $PromptCaldo = "prompt-caldo.txt",
     [int]    $Cap         = 256,
     [int]    $Bits        = 4,
@@ -51,34 +51,27 @@ param(
     [string] $WorkDir     = "",
     # Variabili d'ambiente che l'operatore dichiara innocue per questa misura.
     # Esplicito, per non dover disarmare il controllo intero.
-    [string[]] $AllowEnv  = @()
+    [string[]] $AllowEnv  = @(),
+    # Braccio caldo SELF invece di CROSS: vedi l'intestazione.
+    [switch] $Self
 )
 
 $ErrorActionPreference = "Stop"
-# Il blocco finale e' "pronto da incollare" in un record, e i record -- come il
-# motore, che stampa con printf -- usano il PUNTO decimale. Ma "{0:N2}" -f segue
-# la CurrentCulture, e su una macchina italiana produce "-4,92": la
-# contaminazione e' gia' avvenuta una volta, in
-# docs/experiments/qwen36-dense-pinned-2026-09-21-raw.txt:126, scritta da uno
-# script fratello sulla stessa macchina. Fissata qui la cultura invariante per
-# questo thread -- il meccanismo di processo sarebbe DefaultThreadCurrentCulture,
-# e questo script e' a thread singolo. Non tocca la LETTURA: i cast [double] sono
-# invarianti di cultura per costruzione, e questo script non usa mai
-# [double]::Parse, che invece leggerebbe "0.94" come 94 sotto it-IT.
+# Il blocco finale va incollato nei record, che usano il PUNTO decimale, ma
+# "{0:N2}" -f segue la CurrentCulture e su una macchina italiana stamperebbe la
+# virgola; in docs/experiments/qwen36-dense-pinned-2026-09-21-raw.txt:126
+# compaiono gia' numeri con la virgola. Si fissa la cultura invariante per
+# questo thread: lo script e' a thread singolo. La lettura dei log usa cast
+# [double], che sono invarianti di cultura.
 [System.Threading.Thread]::CurrentThread.CurrentCulture   = [System.Globalization.CultureInfo]::InvariantCulture
 [System.Threading.Thread]::CurrentThread.CurrentUICulture = [System.Globalization.CultureInfo]::InvariantCulture
 
-# Questo script esiste per produrre un intervallo di confidenza su delta
-# appaiati in ordine ABBA. Con -Reps 1 stampava "media -0.41  sd NaN  se NaN
-# df 0  intervallo [NaN ; NaN]" -- un blocco pronto da incollare con la
-# statistica interamente assente -- e df 0 cadeva nel ramo z=1.96 su una sola
-# osservazione. Con un numero dispari l'alternanza ABBA non si chiude.
+# Servono almeno 2 ripetizioni per avere un intervallo, e un numero PARI
+# perche' l'alternanza ABBA si bilanci.
 if ($Reps -lt 2 -or ($Reps % 2) -ne 0) {
-    throw "-Reps $Reps non e' valido: servono almeno 2 ripetizioni e un numero PARI, altrimenti l'alternanza ABBA non si chiude e l'intervallo non esiste."
+    throw "-Reps $Reps non e' valido: servono almeno 2 ripetizioni (con una sola non c'e' intervallo) e un numero PARI (con un numero dispari l'alternanza ABBA non si bilancia)."
 }
-# Lo script sta in c\tools\, l'eseguibile e i prompt in c\. Una versione
-# precedente faceva Set-Location $PSScriptRoot e poi cercava .\qwen36_clang.exe
-# nella cartella sbagliata.
+# Lo script sta in c\tools\, l'eseguibile e i prompt in c\.
 if (-not $WorkDir) { $WorkDir = Split-Path -Parent $PSScriptRoot }
 if (-not (Test-Path -LiteralPath $WorkDir)) { throw "cartella di lavoro non trovata: $WorkDir" }
 # Normalizzato PRIMA del Set-Location: piu' sotto $WorkDir viene riusato, e un
@@ -89,55 +82,23 @@ Set-Location -LiteralPath $WorkDir
 "cartella di lavoro: {0}" -f (Get-Location).Path
 
 # ---- guardie ambiente ----------------------------------------------------
-# Una DENYLIST scritta a mano non regge: il motore legge 55 variabili
-# d'ambiente e l'elenco sarebbe sempre indietro. La versione committata
-# precedente ne nominava tre, e due erano morte per questo eseguibile:
-# COLI_GRAPH_DIAG non e' letta da nessun file C dell'albero, e PROF solo da
-# c/colibri.c, che non entra in questa riga di link. La terza,
-# COLI_CUDA_PROFILE, e' viva ma la legge coli_cuda.dll (c/backend_cuda.cu), non
-# l'host: sfuggiva quindi a chi cercasse i getenv del solo qwen36.c.
-#
-# Omesse invece le variabili del runtime OpenMP. OMP_WAIT_POLICY e compagne le
-# imposta deliberatamente c/colibri.c sulle piattaforme non-Apple, e qwen36.c
-# non fa alcun setenv (verificato: zero occorrenze), quindi per qwen36.exe
-# arrivano interamente dalla shell: il valore dell'operatore vince e non lascia
-# traccia. NON si cita qui una cifra: il "+122% decode" a c/colibri.c:11024 e'
-# un REGRESSO misurato su macOS/Apple Silicon con libomp LLVM sul motore
-# GLM-5.2 int4, e su Windows/x86/CUDA quel dato non si trasferisce -- il repo
-# li' considera la stessa variabile benefica.
-#
-# Quindi si rovescia: fallisce QUALUNQUE variabile che possa toccare il motore,
-# tranne quelle che lo script imposta lui stesso e quelle che l'operatore
-# dichiara innocue con -AllowEnv.
+# Rifiuta ogni variabile d'ambiente che combacia con $EnvSuspect, tranne quelle
+# che lo script imposta ($EnvOwn), i percorsi del toolkit CUDA ($EnvBenign) e
+# quelle che l'operatore dichiara innocue con -AllowEnv. I prefissi coprono le
+# famiglie di nomi del motore, di CUDA e del runtime OpenMP. I nomi senza
+# prefisso sono ricavati dai getenv dei sorgenti di qwen36$(EXE), vanno
+# riallineati a mano quando il motore ne aggiunge, e sono rifiutati tutti allo
+# stesso titolo: la guardia non li classifica.
 $EnvOwn = @("SNAP","COLI_CUDA","COLI_GPUS","COLI_TIMERS","COLI_PLACE","HEAT_FILE","N_NEW")
 # Con -File, PowerShell passa "-AllowEnv A,B" come UN SOLO elemento di
-# [string[]]: la valvola di sfogo era rotta per il modo d'uso documentato in
-# testa a questo file. Va quindi rispezzata a mano.
+# [string[]]: va rispezzato a mano.
 $AllowEnv = @($AllowEnv | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-# CUDA_PATH e la sua famiglia le scrive l'installer del toolkit: sono percorsi,
-# non interruttori. CUDA_VISIBLE_DEVICES non e' fra queste e viene rifiutata a
-# ragione, perche' rimapperebbe il COLI_GPUS=0 che lo script imposta.
-# Insieme CHIUSO, non una famiglia con coda libera: ogni nome e' scritto per
-# intero e l'unica variazione ammessa e' il suffisso di versione che l'installer
-# mette su CUDA_PATH. Cosi' un interruttore futuro che cominciasse per CUDA_PATH
-# o CUDA_HOME resta rifiutato invece di essere esentato in silenzio.
+# Insieme CHIUSO di percorsi, non una famiglia con coda libera: l'unica
+# variazione ammessa e' il suffisso di versione di CUDA_PATH. Ogni altro nome
+# CUDA_ resta rifiutato, compreso CUDA_VISIBLE_DEVICES.
 $EnvBenign = '^CUDA_(PATH(_V[0-9_]+)?|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH)$'
-# I prefissi non bastano: QT_ collide con il namespace del framework Qt, che
-# Anaconda e vari installer impostano, quindi si nominano le due sole variabili
-# QT_ che il motore legge davvero; e diversi getenv del motore non hanno alcun
-# prefisso riconoscibile. Fra quelle la piu' grave e' MODEL (c/qwen36.c), che
-# cambia il modello misurato senza che nulla nel confronto fra i bracci lo
-# riveli; poi Q36_MAXT, che muove il tetto di contesto (e' il solo ingresso di
-# qwen36_max_ctx(), c/qwen36.c), e SERVE/PPL/CONSIST, che cambiano modalita'.
-# Due nomi che NON sono buoni esempi, contrariamente a quanto diceva una versione
-# precedente di questo commento, e per la stessa ragione: sono inerti con questo
-# script. WIDE, perche' g_wide compare solo dentro pilot_prefetch (c/qwen36.c),
-# che gira solo con PILOT >= 1, e PILOT vale 0 per default ed e' rifiutata qui
-# sopra. E CTX, perche' l'unico getenv("CTX") del motore sta dentro
-# if (ram_gb > 0.0): serve a proiettare kv_gb per auto-dimensionare cap, e
-# richiede RAM_GB, che questo script rifiuta. Restano rifiutate entrambe -- la
-# guardia sbaglia per eccesso di severita', che e' il verso giusto -- ma non sono
-# la ragione per cui la guardia esiste.
+# QT_ collide con il namespace del framework Qt, quindi al posto del prefisso
+# si nominano le due variabili QT_ che compaiono nei getenv del motore.
 $EnvSuspect = '^(COLI_|COLIBRI_|QWEN_|QWEN36_|QWEN38_|CUDA_|GOMP_|KMP_|OMP_|HEAT_|Q36_)' +
               '|^(QT_NO_WARMSTART|QT_UPLOAD_SYNC)$' +
               '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW)$'
@@ -164,21 +125,11 @@ $exeItem = Get-Item -LiteralPath $Exe
 if ($exeItem.PSIsContainer) { throw "$Exe e' una cartella, non un file." }
 $exeLen = $exeItem.Length
 
-# Un .exe che esiste ma e' vuoto o non avviabile da' "non e' un'applicazione
-# valida per questo sistema operativo" con una traccia PowerShell illeggibile.
-# Succede davvero: incollare in cmd un transcript che contiene il prompt
-# "C:\...\c>" fa leggere quel ">" come redirezione e TRONCA il file che segue.
-#
-# La prima versione di questa guardia confrontava la dimensione con 1MB. Era
-# una soglia indovinata, mai misurata contro un binario reale, e ha bocciato un
-# build clang perfettamente sano da 368128 byte. Una soglia in byte non puo'
-# fare questo lavoro: non distingue un eseguibile da un file di testo e non sa
-# quanto debba essere grande un binario legittimo, che dipende dai flag di link
-# (c/Makefile:142: WIN_STATIC aggiunge -static ai build gcc e non a quelli
-# clang, e questo da solo la porta da 368 128 a 1 083 842 byte, 2,94 volte).
-#
-# Il test giusto e' la struttura, non la taglia: i due byte 'MZ' che aprono
-# ogni PE.
+# Un .exe vuoto o troncato -- succede: un '>' incollato in cmd fa da
+# redirezione e tronca il file -- da' al lancio un errore illeggibile. Si
+# controlla la struttura e non la taglia: i due byte 'MZ' che aprono ogni PE.
+# Una soglia in byte non distingue un eseguibile da un file di testo, e la
+# taglia legittima dipende dai flag di link.
 if ($exeLen -eq 0) { throw "$Exe e' di 0 byte: qualcosa lo ha troncato -- ricostruisci: make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe" }
 $fs = [System.IO.File]::OpenRead($exeItem.FullName)
 try { $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte() } finally { $fs.Dispose() }
@@ -186,16 +137,12 @@ if ($b0 -ne 0x4D -or $b1 -ne 0x5A) {
     throw "$Exe ($exeLen byte) non inizia con la firma PE 'MZ': non e' un eseguibile Windows."
 }
 
-# La guardia che serviva davvero, e che nessuna soglia puo' dare: l'eseguibile
-# misurato e' la copia di quello che la build ha appena prodotto? Chiude due
-# casi che la soglia lasciava passare -- il "copy /Y" dimenticato (binario
-# stantio, numeri attribuiti a un commit mai eseguito) e il "copy /Y"
-# interrotto a meta' (PE tronco ma con la firma MZ intatta).
-# I sorgenti e .build-config si leggono relativi a $WorkDir, $Exe no: con un
-# eseguibile fuori dall'albero lo script stampava la sua impronta e, subito
-# sotto, la build-config di un ALTRO albero, come se appartenessero allo stesso
-# binario. La riga sulla toolchain non vale nulla se non e' legata al file
-# misurato.
+# Provenienza: l'eseguibile misurato deve essere la copia di quello che la
+# build ha appena prodotto. Chiude il "copy /Y" dimenticato (binario stantio)
+# e quello interrotto a meta' (PE tronco con la firma MZ intatta).
+# L'eseguibile deve stare in $WorkDir: sorgenti e .build-config si leggono da
+# li', e altrimenti lo stamp legherebbe al binario la configurazione di un
+# altro albero.
 $wdFull = (Get-Item -LiteralPath $WorkDir).FullName.TrimEnd([IO.Path]::DirectorySeparatorChar)
 if ($exeItem.DirectoryName.TrimEnd([IO.Path]::DirectorySeparatorChar) -ne $wdFull) {
     throw "$Exe non sta nella cartella di lavoro ($WorkDir): .build-config e i sorgenti verrebbero letti da un albero diverso da quello dell'eseguibile, e la toolchain stampata non sarebbe la sua."
@@ -203,7 +150,7 @@ if ($exeItem.DirectoryName.TrimEnd([IO.Path]::DirectorySeparatorChar) -ne $wdFul
 $exeHash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash
 if ($Built) {
     if (-not (Test-Path -LiteralPath $Built)) {
-        throw "manca ${Built}: non posso verificare che $Exe venga dalla build corrente. Compila, oppure passa -Built '' per rinunciare al controllo -- ma allora la provenienza non e' verificata e il record va scritto dicendolo."
+        throw "manca ${Built}: non posso verificare che $Exe venga dalla build corrente. Compila, oppure passa -Built '' per rinunciare al confronto -- ma allora la provenienza non e' verificata e il record va scritto dicendolo."
     }
     $builtItem = Get-Item -LiteralPath $Built
     if ($builtItem.PSIsContainer) { throw "${Built} e' una cartella, non un file." }
@@ -223,26 +170,23 @@ if ($Built) {
     }
 }
 
-# Staleness. `copy` preserva il LastWriteTime della sorgente, quindi la data di
-# $Exe e' quella della BUILD, non della copia: questo confronto replica cio' che
-# make gia' fa, e serve per il caso in cui nessuno ha invocato make.
+# Staleness: nessun prerequisito puo' essere piu' recente dell'eseguibile.
+# `copy` preserva il LastWriteTime della sorgente, quindi la data di $Exe e'
+# quella della build. Il controllo replica cio' che make gia' fa, per il caso
+# in cui make non e' stato invocato.
 #
 # La lista sono i prerequisiti di qwen36$(EXE) in c/Makefile, con
-# backend_loader.o sostituito dai suoi due sorgenti: va tenuta allineata a mano,
-# e un prerequisito MANCANTE qui sotto e' un errore, non un salto silenzioso.
-# .build-config ne fa parte e va controllato
-# come gli altri: se e' piu' recente dell'eseguibile, la configurazione
-# registrata NON e' quella del binario, e lo stamp qui sotto mentirebbe.
+# backend_loader.o sostituito dai suoi due sorgenti; va tenuta allineata a
+# mano. .build-config ne fa parte: se e' piu' recente dell'eseguibile, la
+# configurazione registrata non e' quella del binario.
 $QwenSrc = @(
     "qwen36.c","qwen36_tier.c","qwen36_tier.h","expert_ffn.h","simd_i8f.h",
     "decode_batch.h","serve_poll.h","cli_args.h","st.h","json.h","compat.h",
     "omp_tune.h","kv_prefix.h","pin_pool.h",
     "edge_adapter_internal.h","edge_adapters.h","edge_runtime.h",
     "segment_adapter_internal.h","segment_adapters.h","segment_runtime.h",
-    # $(CUDA_OBJ) sotto CUDA_DLL=1 e' backend_loader.o (c/Makefile:596-598), che
-    # dipende da backend_loader.c e backend_cuda.h (c/Makefile:847). Ometterli
-    # lasciava fuori dal controllo proprio il pezzo che carica la DLL dove sta
-    # tutto il calcolo esperti.
+    # $(CUDA_OBJ) sotto CUDA_DLL=1 e' backend_loader.o (c/Makefile:596-598),
+    # che dipende da backend_loader.c e backend_cuda.h (c/Makefile:847).
     "backend_loader.c","backend_cuda.h",
     ".build-config"
 )
@@ -265,11 +209,10 @@ foreach ($src in $QwenSrc) {
 $ExeStamp = "eseguibile: {0} | {1} byte | {2} | sha256 {3}" -f `
     $Exe, $exeLen, $exeItem.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"), $exeHash.Substring(0,16)
 
-# c/Makefile:823 definisce BUILD_CONFIG come CC|CFLAGS|LDFLAGS|CUDA|CUDA_DLL|
-# ARCH|... e :832 lo scrive in .build-config; $(CC) e' il primo campo: e' l'unico posto dell'albero che registra CHI ha
-# compilato. Il nome qwen36_clang.exe e' il nome di una copia fatta a mano e non
-# prova nulla da solo. Senza questa riga un record non puo' dichiarare la
-# toolchain, quindi l'assenza e' un errore e non una nota.
+# c/Makefile:823 compone BUILD_CONFIG -- compilatore, CFLAGS, LDFLAGS, CUDA,
+# CUDA_DLL, ARCH e altro -- e :832 lo scrive in .build-config. Il nome
+# qwen36_clang.exe e' quello di una copia fatta a mano e non prova la
+# toolchain, quindi senza .build-config il record non puo' dichiararla.
 $BuildCfg = (Get-Content -LiteralPath ".build-config" -Raw -Force)
 if ($null -eq $BuildCfg -or -not $BuildCfg.Trim()) {
     throw ".build-config e' vuoto: la toolchain di questo binario non e' registrata da nessuna parte e il record non potrebbe dichiararla. Ricompila."
@@ -277,20 +220,12 @@ if ($null -eq $BuildCfg -or -not $BuildCfg.Trim()) {
 $BuildCfg = $BuildCfg.Trim()
 $CfgStamp = "build-config: $BuildCfg"
 
-# Con CUDA_DLL=1 l'host che stiamo hashando non contiene il calcolo esperti:
-# CUDA_OBJ e' il solo backend_loader.o (c/Makefile:596-598) e tutti i kernel
-# stanno in coli_cuda.dll (COLI_BACKEND_DLL, c/backend_loader.c:57), caricata a
-# runtime. Una DLL stantia cambia ogni tempo misurato con l'host verificato.
-# Non posso legarla alla build -- e' costruita a parte con nvcc -- ma la sua
-# impronta va nel record, che e' la differenza fra un dato e un'omissione.
-# Se non e' qui, NON viene caricata da altrove in modo utile: backend_loader.c
-# (:1318-1340) costruisce il percorso assoluto accanto all'ESEGUIBILE con
-# GetModuleFileNameA e, in fallback, cerca solo in APPLICATION_DIR e SYSTEM32 --
-# mai nella cwd, mai sul PATH. E la guardia di contenimento qui sopra impone che
-# l'eseguibile stia in $WorkDir. Quindi "non trovata qui" significa che il tier
-# GPU parte solo se la DLL e' installata in System32, e la guardia su "CUDA VRAM
-# expert tier active" e' cio' che lo stabilisce davvero.
-$DllStamp = "coli_cuda.dll: NON TROVATA accanto all'eseguibile -- il loader la cerchera' solo in System32, e la sua identita' NON e' registrata"
+# Con CUDA_DLL=1 i kernel stanno in coli_cuda.dll (COLI_BACKEND_DLL,
+# c/backend_loader.c:57), caricata a runtime e costruita a parte con nvcc: non
+# posso legarla alla build, ma la sua impronta va nel record. Se non e' accanto
+# all'eseguibile la sua identita' resta ignota; che il tier GPU sia partito lo
+# stabilisce la guardia su "CUDA VRAM expert tier active".
+$DllStamp = "coli_cuda.dll: NON TROVATA accanto all'eseguibile -- la sua identita' NON e' registrata"
 foreach ($d in @("coli_cuda.dll","coli_hip.dll")) {
     if (Test-Path -LiteralPath $d) {
         $di = Get-Item -LiteralPath $d
@@ -305,25 +240,33 @@ $ExeStamp
 $CfgStamp
 $DllStamp
 
+if ($Self) {
+    if ($PSBoundParameters.ContainsKey('PromptCaldo')) {
+        throw "-Self costruisce la tabella su -Prompt, quindi -PromptCaldo non si usa: togli uno dei due."
+    }
+    $PromptCaldo = $Prompt
+}
+$Warm   = if ($Self) { "SELF" } else { "CROSS" }
+$Frozen = if ($Self) { "heat.self.bin" } else { "heat.caldo.bin" }
+
 if (-not (Test-Path -LiteralPath $Prompt))      { throw "manca $Prompt" }
-if (-not (Test-Path -LiteralPath $PromptCaldo)) { throw "manca $PromptCaldo -- serve un prompt di argomento DIVERSO da $Prompt" }
+if (-not (Test-Path -LiteralPath $PromptCaldo)) { throw "manca $PromptCaldo -- serve un prompt di argomento DIVERSO da $Prompt, oppure -Self" }
 if (-not (Test-Path -LiteralPath $Snap))        { throw "modello non trovato in $Snap -- passalo con -Snap <dir>" }
 
-# La premessa dichiarata del braccio CROSS e' che la tabella sia stata
-# costruita su un argomento ESTRANEO. Se i due prompt hanno lo stesso
-# contenuto, CROSS misura uno scaldamento sullo stesso argomento e la premessa
-# cade, senza che nulla nell'output lo riveli.
-if ((Get-FileHash -LiteralPath $Prompt -Algorithm SHA256).Hash -eq
-    (Get-FileHash -LiteralPath $PromptCaldo -Algorithm SHA256).Hash) {
-    throw "$Prompt e $PromptCaldo hanno lo stesso contenuto: il braccio CROSS misurerebbe uno scaldamento sullo stesso argomento, non su uno estraneo."
+$hPrompt = (Get-FileHash -LiteralPath $Prompt -Algorithm SHA256).Hash
+$hCaldo  = (Get-FileHash -LiteralPath $PromptCaldo -Algorithm SHA256).Hash
+# CROSS presuppone una tabella costruita su un argomento diverso: con due prompt
+# dallo stesso contenuto misurerebbe SELF sotto il nome sbagliato.
+if (-not $Self -and $hPrompt -eq $hCaldo) {
+    throw "$Prompt e $PromptCaldo hanno lo stesso contenuto: il braccio CROSS misurerebbe uno scaldamento sullo stesso argomento. Per quella misura usa -Self."
 }
 
-# I parametri della corsa vanno nel record insieme ai numeri: -Cap 64 o
-# -NNew 16 da riga di comando non lasciavano alcuna traccia nell'output.
-# Le deroghe devono comparire nel record come tutto il resto: -Built "" e
-# -AllowEnv disattivano controlli, e affidare all'operatore il compito di
-# dichiararlo a voce e' esattamente cio' che questo script non fa per nient'altro.
-$ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps | snap=$Snap | prompt=$Prompt caldo=$PromptCaldo" +
+# Parametri, deroghe e impronte dei prompt vanno nel record insieme ai numeri:
+# senza l'impronta, quale prompt sia stato usato resterebbe affidato alla
+# parola dell'operatore. I path sono argomenti di -f, non parte del formato.
+$ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps braccio=$Warm | snap=$Snap" +
+    ("  | prompt={0} sha256 {1}" -f $Prompt, $hPrompt.Substring(0,16)) +
+    $(if ($Self) { "  | tabella costruita sul prompt misurato" } else { "  | caldo={0} sha256 {1}" -f $PromptCaldo, $hCaldo.Substring(0,16) }) +
     ("  | built={0}" -f $(if ($Built) { $Built } else { "'' -- PROVENIENZA NON VERIFICATA" })) +
     ("  | allow-env={0}" -f $(if ($AllowEnv.Count) { ($AllowEnv -join ",") + " -- DEROGA" } else { "nessuna" }))
 $ParamStamp
@@ -339,46 +282,33 @@ function Invoke-Engine([bool]$WithHeat, [string]$PromptFile, [string]$Log) {
     if ($WithHeat) { $env:HEAT_FILE = "heat.bin" }
     else           { Remove-Item Env:\HEAT_FILE -ErrorAction SilentlyContinue }
 
-    # Il log va RIMOSSO prima della chiamata, non soltanto verificato dopo.
-    # Quando il LANCIO del nativo fallisce (PE non valido, DLL mancante),
-    # Out-File non tocca un log preesistente, e questo script non cancella mai
-    # i log -- li annuncia in coda come artefatto da conservare. Quindi
-    # heatfile-COLD-r1.log esiste sempre, dalla corsa precedente. Con
-    # $LASTEXITCODE = 0 ereditato da una chiamata nativa riuscita prima (il
-    # warmup, o l'altro braccio della coppia), una versione che verificava solo
-    # l'ESISTENZA del log passava tutti i controlli e Get-Content restituiva la
-    # misura di DUE GIORNI PRIMA come risultato di questo run. Verificare che il
-    # log esista non basta: bisogna garantire che sia di questa corsa.
+    # Il log va RIMOSSO prima della chiamata: se il lancio fallisse, un log
+    # della corsa precedente con lo stesso nome verrebbe letto come risultato
+    # di questo run.
     Remove-Item -LiteralPath $Log -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $Log) {
         throw "non riesco a rimuovere $Log prima del run: non posso garantire che il log appartenga a questa corsa."
     }
 
     $old = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"      # il motore scrive tutto su stderr
+    $ErrorActionPreference = "Continue"      # le righe su stderr non devono fermare lo script
     $code = $null
     try {
-        # $exeItem.FullName, non $Exe: per un comando nativo PowerShell NON
-        # cerca nella cartella corrente, risolve un nome nudo sul PATH. Con un
-        # omonimo sul PATH tutte le guardie validavano il file nella work dir e
-        # la misura veniva da un altro binario, con lo stamp di provenienza che
-        # dichiarava il primo -- esattamente lo scenario che le guardie esistono
-        # per chiudere.
-        & $exeItem.FullName $Cap $Bits $PromptFile 2>&1 | Out-File -Encoding utf8 $Log
+        # $exeItem.FullName, non $Exe: per un comando nativo PowerShell non
+        # cerca nella cartella corrente ma sul PATH, e un omonimo sul PATH
+        # verrebbe misurato al posto del file che le guardie hanno validato.
+        # Tee-Object tiene gli oggetti: con 2>&1 le righe di stdout arrivano
+        # come stringhe e quelle di stderr come ErrorRecord, quindi lo stdout
+        # -- dove esce il testo generato -- si separa senza dipendere dall'ordine
+        # in cui i due canali si mescolano nel log.
+        & $exeItem.FullName $Cap $Bits $PromptFile 2>&1 | Tee-Object -Variable all | Out-File -Encoding utf8 $Log
         $code = $LASTEXITCODE
     } catch {
-        # Fuori da un try, con ErrorActionPreference = Continue, il fallimento di
-        # lancio del nativo prosegue lasciando $LASTEXITCODE non impostato e la
-        # traccia "ResourceUnavailable ... failed to run ... Exec format error"
-        # sulla console. Dentro un try viene catturato in entrambe le
-        # preferenze, e il messaggio leggibile prende il posto della traccia.
-        # Il testo .NET originale porta ancora in coda la posizione nel file:
-        # la taglio, altrimenti la traccia rientra dalla finestra.
+        # Il fallimento del LANCIO (PE non valido, DLL mancante) diventa qui un
+        # messaggio leggibile, con la posizione nel file tagliata via. -csplit e
+        # non -split: -split non distingue le maiuscole, e 'At ' combacerebbe con
+        # l'"at " di "format error", tagliando la diagnosi invece della posizione.
         $ErrorActionPreference = $old
-        # -csplit, non -split: -split e' case-insensitive per default e la sua
-        # alternativa 'At ' combacia con l'"at " dentro "form-at error",
-        # lasciando "... Exec form" e buttando via la DIAGNOSI invece della
-        # posizione nel file. Verificato eseguendolo.
         $m = ($_.Exception.Message -csplit '\r?\nAt |At ' )[0].Trim()
         throw "$Exe non e' partito: $m"
     }
@@ -392,25 +322,19 @@ function Invoke-Engine([bool]$WithHeat, [string]$PromptFile, [string]$Log) {
     # solo il primo run -- il resto lo coprono il Remove-Item sopra e il catch.
     if ($null -eq $code) { throw "$Exe non ha registrato alcun exit code. Vedi $Log." }
     if ($code -ne 0) { throw "exit $code -- vedi $Log" }
-    Get-Content $Log -Raw
+    $out = (@($all) | Where-Object { $_ -is [string] }) -join "`n"
+    [pscustomobject]@{ Text = (Get-Content $Log -Raw); Out = $out }
 }
 
 # ---- lettura di un log ---------------------------------------------------
 function Read-Run([string]$Text, [string]$Log) {
     if ($Text -notmatch 'CUDA VRAM expert tier active') {
-        throw "$Log : il tier CUDA non e' attivo. Senza COLI_CUDA=1, o con cap diverso da n_experts, qt_init torna 0 in silenzio e staresti misurando la CPU."
+        throw "$Log : il tier CUDA non e' attivo: staresti misurando la CPU. Controlla le righe [qtier] del log."
     }
-    # [ \t] e non \s nei pattern che leggono un valore: in .NET \s include \n e
-    # \r, quindi con (?m) un '^\s*' puo' scavalcare la riga e un '\s*(.+)' su una
-    # riga troncata pesca la riga SUCCESSIVA. Misurato: con "[timers]   qtier:"
-    # senza coda, '\s*(.+)$' cattura la riga di qt_stats e i quattro sotto-timer
-    # diventano NaN in silenzio -- e il guard "if (-not $qline)" non puo' scattare,
-    # perche' $qline non e' mai vuoto. Ancorare alla riga rende quel guard vivo.
-    # NIENTE '$' in coda dopo [^\r\n]+: la classe si ferma davanti al \r di una
-    # riga CRLF e '$' non lo scavalca, quindi il pattern non combacerebbe su
-    # Windows. E' la stessa trappola della regex del banner, e un primo tentativo
-    # di questa correzione l'ha reintrodotta: la classe negata basta da sola,
-    # perche' non puo' superare il fine riga.
+    # Prima del valore i pattern usano [ \t] e non \s: in .NET \s include \r e
+    # \n, e con (?m) un '\s*' puo' scavalcare la fine riga e leggere il valore
+    # dalla riga successiva. E niente '$' dopo [^\r\n]+: su un log CRLF la
+    # classe si ferma davanti al \r e '$' non combacerebbe.
     if ($Text -notmatch '(?m)^[ \t]*\[timers\][ \t]+step\(\) total:[ \t]*([0-9.]+)[ \t]*ms/token') {
         throw "$Log : riga step() non trovata. COLI_TIMERS non ha avuto effetto o il run non e' arrivato in fondo."
     }
@@ -429,54 +353,35 @@ function Read-Run([string]$Text, [string]$Log) {
     foreach ($k in @("issue","cpu-miss","take","shared-ovl")) {
         if ($qline -match "$([regex]::Escape($k))[ \t]+([0-9.]+)") { $g[$k] = [double]$Matches[1] } else { $g[$k] = [double]::NaN }
     }
-    $vram  = if ($Text -match 'VRAM hit rate:[ \t]*([0-9.]+)[ \t]*%')             { [double]$Matches[1] } else { [double]::NaN }
-    # miss(CPU) e LFRU swaps non possono ripiegare in silenzio su -1. Con
-    # Miss = -1 il blocco "costo per miss" in coda -- il motivo dichiarato di
-    # esistere di questo script -- filtra su Miss -gt 0, trova il gruppo vuoto
-    # e stampa "nessun miss" proseguendo: il controllo principale evaporerebbe
-    # senza un errore se il formato di quella riga cambiasse.
-    # I token di decode: il motore li stampa e nessuno li leggeva. L'indice per
-    # miss qui sotto e' 1000*(ms per token di DECODE)/(miss di TUTTA la corsa):
-    # se i due bracci decodificano un numero diverso di token -- e possono, per
-    # esempio fermandosi a un EOS diverso -- l'indice si muove per quel solo
-    # motivo. E' il confondimento che il record rifiuta esplicitamente, con un
-    # contatore che era nel log tutto il tempo.
-    if ($Text -notmatch '(?m)^[ \t]*\[timers\][ \t]+decode:[ \t]*([0-9]+)[ \t]+tokens') {
-        throw "$Log : riga '[timers] decode: N tokens' non trovata. Senza il numero di token di decode l'indice per miss non e' confrontabile fra i bracci."
+    # Un timer illeggibile entrerebbe come NaN nelle medie senza alcun errore.
+    foreach ($k in @("deltanet","attention","moe_total","lm_head","issue","cpu-miss","take","shared-ovl")) {
+        if ([double]::IsNaN($g[$k])) { throw "$Log : il timer '$k' non e' leggibile. Entrerebbe come NaN nelle medie." }
     }
-    $dtok = [int]$Matches[1]
-    if ($Text -notmatch 'miss\(CPU\)[ \t]+([0-9]+)') { throw "$Log : riga 'miss(CPU) N' non trovata. Il controllo sul costo per miss passerebbe a vuoto." }
+    $vram  = if ($Text -match 'VRAM hit rate:[ \t]*([0-9.]+)[ \t]*%')             { [double]$Matches[1] } else { [double]::NaN }
+    # miss(CPU) serve all'indice per miss in coda, LFRU swaps alle medie per
+    # braccio: nessuno dei due ripiega su un valore di comodo.
+    if ($Text -notmatch 'miss\(CPU\)[ \t]+([0-9]+)') { throw "$Log : riga 'miss(CPU) N' non trovata. L'indice per miss passerebbe a vuoto." }
     $miss  = [int]$Matches[1]
     if ($Text -notmatch 'LFRU swaps[ \t]+([0-9]+)')   { throw "$Log : riga 'LFRU swaps N' non trovata." }
     $swaps = [int]$Matches[1]
     $res   = if ($Text -match 'resident[ \t]+([0-9]+)/([0-9]+)[ \t]+experts')     { "$($Matches[1])/$($Matches[2])" } else { "?" }
     $toks  = if ($Text -match 'Speed:[ \t]*([0-9.]+)[ \t]*tok/s')                 { [double]$Matches[1] } else { [double]::NaN }
-    # TUTTE le righe [place] auto:, non solo la prima. Il motore ne stampa una
-    # per layer che resta sulla CPU e una di riepilogo del trunk
-    # (c/qwen36_tier.c): prendendo la prima, l'invariante che il commento chiama
-    # "il piazzamento del trunk" poteva confrontare una riga per-layer e non
-    # vedere affatto il riepilogo.
+    # TUTTE le righe [place] auto:, non solo la prima.
     $place = (([regex]::Matches($Text, '(?m)^\[place\] auto:.*$') |
                ForEach-Object { $_.Value.Trim() }) -join ' ;; ')
 
-    # Questi due alimentano gli invarianti in coda. Se il regex non trova
-    # nulla, Place resta "" e Resident resta "?" per TUTTI i run: l'elenco
-    # unico ha un solo elemento e lo script stampa "identica in tutti i run"
-    # sull'ASSENZA del dato invece che sulla sua costanza. Un invariante che
-    # passa a vuoto e' peggio di un invariante che manca, perche' viene
-    # ricopiato nel record come se avesse verificato qualcosa.
-    # Il motore dichiara la propria configurazione in una riga sola (c/qwen36.c:
-    # cap, bits, ctx, pilot, wide, hot, smooth, conf; il campo ctx e'
-    # qwen36_max_ctx(), che legge Q36_MAXT e NON la variabile CTX).
-    # Pretenderla identica fra i run non aggiunge nomi alla lista qui sopra: il
-    # guadagno e' che qui non si indovina cosa l'ambiente abbia fatto, si legge
-    # cosa il motore ha deciso, e nessuna lista di nomi puo' dare la stessa cosa.
-    # \s*$ e non $: in .NET, in modalita' multiline, $ aggancia la posizione
-    # PRIMA del \n, quindi un letterale come "==" davanti a $ non puo' essere
-    # seguito dal \r di un log CRLF -- e Out-File scrive Environment.NewLine,
-    # che su Windows e' CRLF. Senza \s* questo invariante non combaciava MAI
-    # sulla piattaforma di questo script e la corsa moriva al primo run. Il
-    # pattern di [place] sopravvive perche' finisce in .*, che assorbe il \r.
+    # Banner, [place] e residenza alimentano gli invarianti in coda. Se un regex
+    # non trovasse nulla, il valore sarebbe lo stesso per TUTTI i run e
+    # l'invariante stamperebbe "identica in tutti i run" sull'ASSENZA del dato:
+    # un invariante che passa a vuoto e' peggio di uno che manca, perche' finisce
+    # nel record come se avesse verificato qualcosa. Per questo la loro assenza
+    # e' un errore.
+    # Il banner riporta la configurazione con cui il motore e' partito:
+    # pretenderlo identico fra i run legge cosa il motore ha deciso, invece di
+    # indovinarlo dall'ambiente.
+    # \s*$ e non $: su un log CRLF il \r sta prima della fine riga, e un
+    # letterale seguito da '$' non combacerebbe. Il pattern di [place] finisce
+    # in .*, che assorbe il \r.
     if ($Text -notmatch '(?m)^(== qwen36 Phase-2 engine \|.*==)\s*$') {
         throw "$Log : il banner '== qwen36 Phase-2 engine |' non c'e'. Il motore non e' arrivato a dichiarare la sua configurazione, oppure non e' qwen36."
     }
@@ -489,7 +394,6 @@ function Read-Run([string]$Text, [string]$Log) {
         Step=$step; Dn=$g["deltanet"]; Attn=$g["attention"]; Moe=$g["moe_total"]; Head=$g["lm_head"]
         Issue=$g["issue"]; CpuMiss=$g["cpu-miss"]; Take=$g["take"]; ShOvl=$g["shared-ovl"]
         Vram=$vram; Swaps=$swaps; Miss=$miss; Resident=$res; Toks=$toks; Place=$place; Banner=$banner
-        DecTok=$dtok
     }
 }
 
@@ -506,67 +410,78 @@ if ($oldLogs.Count) {
 }
 
 $HeatStamp = ""
-if (-not (Test-Path "heat.caldo.bin")) {
-    "heat.caldo.bin non c'e': la costruisco su $PromptCaldo (un run)..."
+if ($Self -or -not (Test-Path -LiteralPath $Frozen)) {
+    "costruisco $Frozen su $PromptCaldo (un run)..."
     Remove-Item heat.bin -Force -ErrorAction SilentlyContinue
-    $txt0 = Invoke-Engine $true $PromptCaldo "heatfile-warmup.log"
-    $r0 = Read-Run $txt0 "heatfile-warmup.log"
+    $e0 = Invoke-Engine $true $PromptCaldo "heatfile-warmup.log"
+    $r0 = Read-Run $e0.Text "heatfile-warmup.log"
     if (-not (Test-Path "heat.bin")) { throw "la scaldata non ha scritto heat.bin -- vedi heatfile-warmup.log" }
-    Copy-Item heat.bin heat.caldo.bin -Force
-    "scaldata ok ({0:N2} tok/s, hit {1:N1} %), tabella congelata in heat.caldo.bin" -f $r0.Toks, $r0.Vram
+    Copy-Item heat.bin $Frozen -Force
+    "scaldata ok ({0:N2} tok/s, hit {1:N1} %), tabella congelata in {2}" -f $r0.Toks, $r0.Vram, $Frozen
     ""
     $HeatStamp = "COSTRUITA in questa corsa su $PromptCaldo"
 } else {
-    # Una heat.caldo.bin preesistente veniva riusata senza alcuna verifica e
-    # senza comparire da nessuna parte. E' la variabile INDIPENDENTE
-    # dell'esperimento -- l'unico input che differisce fra i bracci -- e il
-    # motore ne valida solo magic, n_layers e n_experts, quindi qualunque
-    # tabella per questa forma di modello si carica e stampa "HEAT_FILE
-    # loaded", superando anche quel controllo. Non posso provare da dove
-    # venga; posso impedirle di restare invisibile.
+    # Una tabella preesistente viene riusata. E' la variabile indipendente
+    # dell'esperimento e la sua provenienza non si puo' verificare: lo stamp lo
+    # dichiara, con l'impronta.
     $HeatStamp = "RIUSATA da una corsa precedente -- la sua provenienza NON e' verificata"
 }
-$hc = Get-Item -LiteralPath "heat.caldo.bin"
-$HeatStamp = "heat.caldo.bin: {0} byte | {1} | sha256 {2} | {3}" -f `
-    $hc.Length, $hc.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"),
-    (Get-FileHash -LiteralPath "heat.caldo.bin" -Algorithm SHA256).Hash.Substring(0,16), $HeatStamp
+$hc = Get-Item -LiteralPath $Frozen
+$HeatStamp = "{0}: {1} byte | {2} | sha256 {3} | {4}" -f `
+    $Frozen, $hc.Length, $hc.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"),
+    (Get-FileHash -LiteralPath $Frozen -Algorithm SHA256).Hash.Substring(0,16), $HeatStamp
 $HeatStamp
 ""
+
+function Get-TextHash([string]$s) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s)) | ForEach-Object { $_.ToString("x2") }) }
+    finally { $sha.Dispose() }
+}
 
 # ---- un braccio ----------------------------------------------------------
 function Invoke-Arm([string]$Tag, [int]$Rep) {
     $log = "heatfile-$Tag-r$Rep.log"
-    if ($Tag -eq "CROSS") {
-        Copy-Item heat.caldo.bin heat.bin -Force     # identica in ogni run caldo
-        $txt = Invoke-Engine $true $Prompt $log
-        if ($txt -notmatch 'HEAT_FILE loaded') {
-            throw "CROSS rip ${Rep}: nessun 'HEAT_FILE loaded' in $log. La tabella non e' stata letta: staresti misurando due volte il braccio freddo."
+    if ($Tag -eq $Warm) {
+        Copy-Item -LiteralPath $Frozen heat.bin -Force     # identica in ogni run caldo
+        $e = Invoke-Engine $true $Prompt $log
+        if ($e.Text -notmatch 'HEAT_FILE loaded') {
+            throw "$Tag rip ${Rep}: nessun 'HEAT_FILE loaded' in $log. La tabella non e' stata letta: staresti misurando due volte il braccio freddo."
         }
     } else {
         Remove-Item heat.bin -Force -ErrorAction SilentlyContinue
-        $txt = Invoke-Engine $false $Prompt $log
-        if ($txt -match 'HEAT_FILE loaded') {
+        $e = Invoke-Engine $false $Prompt $log
+        if ($e.Text -match 'HEAT_FILE loaded') {
             throw "COLD rip ${Rep}: 'HEAT_FILE loaded' in $log. Il braccio freddo e' contaminato."
         }
         if (Test-Path "heat.bin") {
-            throw "COLD rip ${Rep}: il run ha scritto heat.bin. HEAT_FILE non era davvero fuori dall'ambiente e il prossimo CROSS sarebbe contaminato."
+            throw "COLD rip ${Rep}: il run ha scritto heat.bin, quindi HEAT_FILE non era fuori dall'ambiente del braccio freddo."
         }
     }
-    $row = Read-Run $txt $log
+    $row = Read-Run $e.Text $log
+    # Con lo stesso prompt e lo stesso N_NEW i bracci devono decodificare la
+    # STESSA sequenza. Se un braccio devia, da quel token in poi il routing -- e
+    # con lui i contatori del tier -- puo' cambiare per quel motivo e non per
+    # la tabella. Uno stdout vuoto farebbe passare l'invariante a vuoto.
+    if (-not $e.Out.Trim()) {
+        throw "$Tag rip ${Rep}: il motore non ha scritto niente su stdout, dove esce il testo generato. L'invariante sul testo passerebbe a vuoto."
+    }
     $row | Add-Member -NotePropertyName Rep -NotePropertyValue $Rep
     $row | Add-Member -NotePropertyName Arm -NotePropertyValue $Tag
+    $row | Add-Member -NotePropertyName OutHash -NotePropertyValue (Get-TextHash $e.Out)
+    $row | Add-Member -NotePropertyName OutLen -NotePropertyValue $e.Out.Length
     $row
 }
 
 # ---- il ciclo ------------------------------------------------------------
 $rows = @()
 for ($rep = 1; $rep -le $Reps; $rep++) {
-    if ($rep % 2 -eq 1) { $rows += Invoke-Arm "COLD" $rep; $rows += Invoke-Arm "CROSS" $rep }
-    else                { $rows += Invoke-Arm "CROSS" $rep; $rows += Invoke-Arm "COLD" $rep }
-    $c = ($rows | Where-Object { $_.Rep -eq $rep -and $_.Arm -eq "COLD"  }).Step
-    $x = ($rows | Where-Object { $_.Rep -eq $rep -and $_.Arm -eq "CROSS" }).Step
-    "rip {0} ({1})  COLD {2,6:N2}  CROSS {3,6:N2}  delta {4,6:N2} ms/token" -f `
-        $rep, $(if ($rep % 2 -eq 1) { "COLD prima" } else { "CROSS prima" }), $c, $x, ($x - $c) | Write-Host
+    if ($rep % 2 -eq 1) { $rows += Invoke-Arm "COLD" $rep; $rows += Invoke-Arm $Warm $rep }
+    else                { $rows += Invoke-Arm $Warm $rep; $rows += Invoke-Arm "COLD" $rep }
+    $c = ($rows | Where-Object { $_.Rep -eq $rep -and $_.Arm -eq "COLD" }).Step
+    $x = ($rows | Where-Object { $_.Rep -eq $rep -and $_.Arm -eq $Warm  }).Step
+    "rip {0} ({1})  COLD {2,6:N2}  {5,-5} {3,6:N2}  delta {4,6:N2} ms/token" -f `
+        $rep, $(if ($rep % 2 -eq 1) { "COLD prima" } else { "$Warm prima" }), $c, $x, ($x - $c), $Warm | Write-Host
 }
 
 # ---- controlli che devono valere su TUTTI i run --------------------------
@@ -577,11 +492,8 @@ $CfgStamp
 $DllStamp
 $HeatStamp
 $ParamStamp
-# Un invariante VIOLATO era un avviso, e lo script proseguiva fino a stampare
-# l'intero blocco statistico pronto da incollare: la riga ATTENZIONE si perde
-# in quaranta righe di output, mentre dice essa stessa che in quel caso
-# 'attention' non e' piu' un controllo. Se un invariante non tiene, i numeri
-# non vanno prodotti in forma incollabile.
+# Un invariante violato ferma lo script: se non tiene, i numeri non vanno
+# prodotti in forma incollabile.
 $banners = @($rows | ForEach-Object { $_.Banner } | Sort-Object -Unique)
 if ($banners.Count -ne 1) {
     throw ("il motore NON ha girato con la stessa configurazione in tutti i run:`n  {0}" -f ($banners -join "`n  "))
@@ -590,7 +502,7 @@ if ($banners.Count -ne 1) {
 "  {0}" -f $banners[0]
 $places = @($rows | ForEach-Object { $_.Place } | Sort-Object -Unique)
 if ($places.Count -ne 1) {
-    throw ("la riga [place] auto: NON e' identica in tutti i run -- il piazzamento del trunk e' cambiato fra i bracci, quindi 'attention' non e' piu' un controllo e i bracci non sono confrontabili:`n  {0}" -f ($places -join "`n  "))
+    throw ("la riga [place] auto: NON e' identica in tutti i run: i bracci non sono confrontabili.`n  {0}" -f ($places -join "`n  "))
 }
 "[place] auto: identica in tutti i {0} run" -f @($rows).Count
 $residents = @($rows | ForEach-Object { $_.Resident } | Sort-Object -Unique)
@@ -598,36 +510,32 @@ if ($residents.Count -ne 1) {
     throw ("residenza diversa fra i run: {0} -- i bracci non hanno lo stesso numero di esperti in VRAM e il delta non e' attribuibile alla tabella heat." -f ($residents -join ", "))
 }
 "residenza identica in tutti i run: {0}" -f $residents[0]
-# Se i bracci non decodificano lo stesso numero di token, l'indice per miss
-# qui sotto confronta due rapporti con denominatori diversi e non significa
-# niente -- il record lo dice a chiare lettere, e il contatore era nel log.
-$dtoks = @($rows | ForEach-Object { $_.DecTok } | Sort-Object -Unique)
-if ($dtoks.Count -ne 1) {
-    throw ("i run non hanno decodificato lo stesso numero di token: {0}. L'indice per miss non e' confrontabile fra i bracci." -f ($dtoks -join ", "))
+$outs = @($rows | ForEach-Object { $_.OutHash } | Sort-Object -Unique)
+if ($outs.Count -ne 1) {
+    throw ("il testo generato NON e' identico in tutti i run: i bracci hanno decodificato sequenze diverse e il delta non e' attribuibile solo alla tabella. I testi sono nei log.`n  {0}" -f
+        (($rows | ForEach-Object { "{0,-5} rip {1}: sha256 {2}" -f $_.Arm, $_.Rep, $_.OutHash.Substring(0,16) }) -join "`n  "))
 }
-"token di decode identici in tutti i run: {0}" -f $dtoks[0]
+"testo generato identico in tutti i run: sha256 {0}, {1} caratteri" -f $outs[0].Substring(0,16), $rows[0].OutLen
 
 # ---- statistica sui delta appaiati ---------------------------------------
 $deltas = 1..$Reps | ForEach-Object {
     $rp = $_
-    (($rows | Where-Object { $_.Rep -eq $rp -and $_.Arm -eq "CROSS" }).Step) -
-    (($rows | Where-Object { $_.Rep -eq $rp -and $_.Arm -eq "COLD"  }).Step)
+    (($rows | Where-Object { $_.Rep -eq $rp -and $_.Arm -eq $Warm  }).Step) -
+    (($rows | Where-Object { $_.Rep -eq $rp -and $_.Arm -eq "COLD" }).Step)
 }
 
 ""
-"--- delta appaiati (CROSS - COLD), ms/token ---"
+"--- delta appaiati ($Warm - COLD), ms/token ---"
 ($deltas | ForEach-Object { "{0:N2}" -f $_ }) -join "   "
 
 $mean = ($deltas | Measure-Object -Average).Average
 $sd   = if ($Reps -gt 1) { [math]::Sqrt((($deltas | ForEach-Object { [math]::Pow($_ - $mean, 2) }) | Measure-Object -Sum).Sum / ($Reps - 1)) } else { [double]::NaN }
 $se   = $sd / [math]::Sqrt($Reps)
-# quantili t al 95 % a due code, df 1..15
+# quantili t al 95 % a due code: df 1..15, poi i df dispari fino a 29
+# (-Reps 30). Oltre la tavola si usa z=1.96 e l'etichetta dell'intervallo lo
+# dichiara.
 $tq = @(12.706,4.303,3.182,2.776,2.571,2.447,2.365,2.306,2.262,2.228,2.201,2.179,2.160,2.145,2.131)
 $df = $Reps - 1
-# Oltre la tavola si usava 1.96, lo z asintotico, continuando a stampare
-# "intervallo 95 %": un intervallo piu' stretto di quello dichiarato. Estesa ai
-# df raggiungibili con -Reps pari (df = Reps-1, quindi dispari), e oltre la
-# tavola l'etichetta dice che si sta usando z.
 $tq2 = @{ 17 = 2.110; 19 = 2.093; 21 = 2.080; 23 = 2.069; 25 = 2.060; 27 = 2.052; 29 = 2.045 }
 $tApprox = $false
 $t = if ($df -ge 1 -and $df -le 15) { $tq[$df-1] }
@@ -640,11 +548,17 @@ $t = if ($df -ge 1 -and $df -le 15) { $tq[$df-1] }
 
 ""
 "--- controllo POSIZIONE (ABBA) ---"
-"COLD prima:  {0}" -f ((1..$Reps | Where-Object { $_ % 2 -eq 1 } | ForEach-Object { "{0:N2}" -f $deltas[$_-1] }) -join "  ")
-"CROSS prima: {0}" -f ((1..$Reps | Where-Object { $_ % 2 -eq 0 } | ForEach-Object { "{0:N2}" -f $deltas[$_-1] }) -join "  ")
-"Se i due gruppi hanno segno diverso o grandezza molto diversa, non e' il braccio: e' la posizione."
+$gA = @(1..$Reps | Where-Object { $_ % 2 -eq 1 } | ForEach-Object { $deltas[$_-1] })
+$gB = @(1..$Reps | Where-Object { $_ % 2 -eq 0 } | ForEach-Object { $deltas[$_-1] })
+"COLD prima:  {0}" -f (($gA | ForEach-Object { "{0:N2}" -f $_ }) -join "  ")
+"{0,-5} prima: {1}" -f $Warm, (($gB | ForEach-Object { "{0:N2}" -f $_ }) -join "  ")
+"differenza fra le medie dei due gruppi: {0:N2} ms/token" -f `
+    (($gA | Measure-Object -Average).Average - ($gB | Measure-Object -Average).Average)
+"Stima il doppio dell'effetto di posizione dentro la coppia. Con -Reps pari"
+"quell'effetto si annulla nella media dei delta se resta costante lungo la"
+"sessione; se varia, si annulla solo in parte."
 
-# ---- medie per braccio, e il controllo che nel record NON tornava --------
+# ---- medie per braccio e indice per miss ---------------------------------
 ""
 "--- medie per braccio ---"
 foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
@@ -666,28 +580,20 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
 }
 
 ""
-"--- il controllo che nel record NON tornava: costo per miss ---"
-"Il costo per miss dovrebbe essere costante fra i bracci. Nel record da n=2"
-"differiva del 28 % fra i bracci. Qui, dividendo cpu-miss per i miss"
-"dello STESSO run -- denominatori diversi, quindi e' un indice, non un costo:"
+"--- indice per miss: 1000 * cpu-miss / miss(CPU), per braccio ---"
+"(ms per token di decode diviso i miss dell'intera corsa: denominatori"
+"diversi, quindi e' un indice e non un costo per miss)"
 foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
     $q = $grp.Group | Where-Object { $_.Miss -gt 0 }
     if ($q.Count -eq 0) { "{0,-5}  nessun miss" -f $grp.Name; continue }
     $idx = $q | ForEach-Object { 1000.0 * $_.CpuMiss / $_.Miss }
-    # nessuna unita' di tempo: 1000*(ms per token di decode)/(miss di tutta la
-    # corsa) ha dimensione us per token per miss, non us -- denominatori diversi,
-    # quindi un indice e non un costo. Stamparlo come "us" metterebbe tre ordini
-    # di grandezza sotto la stessa etichetta di un costo vero.
-    # Il record che pubblicava un costo per miss l'ha ritirato nella revisione
-    # successiva: "the two columns have different denominators and their ratio
-    # means nothing" (qwen36-heatfile-2026-09-23-raw.txt:603-604) -- cioe'
-    # esattamente la ragione per cui qui non si mette un'unita' di tempo.
+    # Nessuna unita' di tempo: la dimensione e' us per token per miss. Il
+    # record che pubblicava un costo per miss l'ha ritirato per questa ragione
+    # (qwen36-heatfile-2026-09-23-raw.txt:603-604).
     "{0,-5}  indice {1,6:N3}      (min {2:N3} max {3:N3} su {4} run)" -f $grp.Name,
         (($idx | Measure-Object -Average).Average), (($idx | Measure-Object -Minimum).Minimum),
         (($idx | Measure-Object -Maximum).Maximum), $q.Count
 }
-"Se i due indici restano distanti oltre la loro dispersione, il costo per miss"
-"dipende davvero dal batching e nessun numero per-miss si puo' estrapolare."
 
 ""
-"Log per run: heatfile-COLD-r*.log e heatfile-CROSS-r*.log"
+"Log per run: heatfile-COLD-r*.log e heatfile-$Warm-r*.log"
