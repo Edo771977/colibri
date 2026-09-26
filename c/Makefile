@@ -2278,3 +2278,9 @@ tests/test_qwen36_tier_take_error$(EXE): tests/test_qwen36_tier_take_error.c tes
 # Failed tier startup must release host storage and initialized synchronization.
 tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The wait/accum split in qt_take: the one part of qt_take that is local.
+# Depends on qt_ms being the only clock_gettime in qwen36_tier.c -- the test
+# counts reads through a #define and pins the count, so a new read fails loudly.
+tests/test_qwen36_tier_take_split$(EXE): tests/test_qwen36_tier_take_split.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
