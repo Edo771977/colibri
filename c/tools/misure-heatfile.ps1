@@ -54,6 +54,17 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Il blocco finale e' "pronto da incollare" in un record, e i record -- come il
+# motore, che stampa con printf -- usano il PUNTO decimale. Ma "{0:N2}" -f segue
+# la CurrentCulture, e su una macchina italiana produce "-4,92": la
+# contaminazione e' gia' avvenuta una volta, in
+# docs/experiments/qwen36-dense-pinned-2026-09-21-raw.txt:126, scritta da uno
+# script fratello sulla stessa macchina. Fissata qui la cultura invariante per
+# tutto il processo. Non tocca la LETTURA: i cast [double] di PowerShell sono
+# invarianti di cultura per costruzione, e questo script non usa mai
+# [double]::Parse, che invece leggerebbe "0.94" come 94 sotto it-IT.
+[System.Threading.Thread]::CurrentThread.CurrentCulture   = [System.Globalization.CultureInfo]::InvariantCulture
+[System.Threading.Thread]::CurrentThread.CurrentUICulture = [System.Globalization.CultureInfo]::InvariantCulture
 
 # Questo script esiste per produrre un intervallo di confidenza su delta
 # appaiati in ordine ABBA. Con -Reps 1 stampava "media -0.41  sd NaN  se NaN
@@ -104,18 +115,28 @@ $AllowEnv = @($AllowEnv | ForEach-Object { $_ -split ',' } | ForEach-Object { $_
 # CUDA_PATH e la sua famiglia le scrive l'installer del toolkit: sono percorsi,
 # non interruttori. CUDA_VISIBLE_DEVICES non e' fra queste e viene rifiutata a
 # ragione, perche' rimapperebbe il COLI_GPUS=0 che lo script imposta.
-$EnvBenign = '^CUDA_(PATH|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH|MODULE_LOADING_MODE)'
+# Una versione precedente esentava anche MODULE_LOADING_MODE, che NON e' una
+# variabile CUDA: quella vera si chiama CUDA_MODULE_LOADING (LAZY/EAGER) ed e'
+# un interruttore, non un percorso, quindi resta -- correttamente -- rifiutata.
+# Il nome inventato e' stato tolto. La classe e' ancorata in coda con $ perche'
+# senza l'ancora un nome piu' lungo che comincia per CUDA_PATH... passerebbe.
+$EnvBenign = '^CUDA_(PATH|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH)([A-Z0-9_]*)?$'
 # I prefissi non bastano: QT_ collide con il namespace del framework Qt, che
 # Anaconda e vari installer impostano, quindi si nominano le due sole variabili
 # QT_ che il motore legge davvero; e sedici getenv del motore non hanno alcun
 # prefisso riconoscibile. Fra quelle la piu' grave e' MODEL (c/qwen36.c), che
 # cambia il modello misurato senza che nulla nel confronto fra i bracci lo
-# riveli; poi CTX e Q36_MAXT, che muovono il tetto di contesto e
-# l'allocazione KV, e SERVE/PPL/CONSIST, che cambiano modalita'.
-# WIDE invece NON e' un buon esempio, contrariamente a quanto diceva una
-# versione precedente di questo commento: g_wide compare solo dentro
-# pilot_prefetch (c/qwen36.c), che gira solo con PILOT >= 1, e PILOT vale 0 per
-# default ed e' rifiutata qui sopra -- quindi con questo script WIDE e' inerte.
+# riveli; poi Q36_MAXT, che muove il tetto di contesto (e' il solo ingresso di
+# qwen36_max_ctx(), c/qwen36.c), e SERVE/PPL/CONSIST, che cambiano modalita'.
+# Due nomi che NON sono buoni esempi, contrariamente a quanto diceva una versione
+# precedente di questo commento, e per la stessa ragione: sono inerti con questo
+# script. WIDE, perche' g_wide compare solo dentro pilot_prefetch (c/qwen36.c),
+# che gira solo con PILOT >= 1, e PILOT vale 0 per default ed e' rifiutata qui
+# sopra. E CTX, perche' l'unico getenv("CTX") del motore sta dentro
+# if (ram_gb > 0.0): serve a proiettare kv_gb per auto-dimensionare cap, e
+# richiede RAM_GB, che questo script rifiuta. Restano rifiutate entrambe -- la
+# guardia sbaglia per eccesso di severita', che e' il verso giusto -- ma non sono
+# la ragione per cui la guardia esiste.
 $EnvSuspect = '^(COLI_|COLIBRI_|QWEN_|QWEN36_|QWEN38_|CUDA_|GOMP_|KMP_|OMP_|HEAT_|Q36_)' +
               '|^(QT_NO_WARMSTART|QT_UPLOAD_SYNC)$' +
               '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW)$'
@@ -261,7 +282,16 @@ $CfgStamp = "build-config: $BuildCfg"
 # runtime. Una DLL stantia cambia ogni tempo misurato con l'host verificato.
 # Non posso legarla alla build -- e' costruita a parte con nvcc -- ma la sua
 # impronta va nel record, che e' la differenza fra un dato e un'omissione.
-$DllStamp = "coli_cuda.dll: NON TROVATA nella cartella di lavoro -- il loader la prende da altrove e la sua identita' NON e' registrata"
+# Se non e' qui, NON viene caricata da altrove in modo utile: backend_loader.c
+# (:1318-1340) costruisce il percorso assoluto accanto all'ESEGUIBILE con
+# GetModuleFileNameA e, in fallback, cerca solo in APPLICATION_DIR e SYSTEM32 --
+# mai nella cwd, mai sul PATH. E la guardia di contenimento qui sopra impone che
+# l'eseguibile stia in $WorkDir. Quindi "non trovata qui" significa che il tier
+# GPU quasi certamente non partira', e la guardia su "CUDA VRAM expert tier
+# active" fermera' la corsa poco dopo. Una versione precedente di questa riga
+# diceva "il loader la prende da altrove": era falso, e il commit che dichiarava
+# di averlo ritirato non aveva toccato la riga.
+$DllStamp = "coli_cuda.dll: NON TROVATA accanto all'eseguibile -- il loader non la cerchera' altrove che in System32, quindi il tier GPU non partira'"
 foreach ($d in @("coli_cuda.dll","coli_hip.dll")) {
     if (Test-Path -LiteralPath $d) {
         $di = Get-Item -LiteralPath $d
@@ -371,25 +401,36 @@ function Read-Run([string]$Text, [string]$Log) {
     if ($Text -notmatch 'CUDA VRAM expert tier active') {
         throw "$Log : il tier CUDA non e' attivo. Senza COLI_CUDA=1, o con cap diverso da n_experts, qt_init torna 0 in silenzio e staresti misurando la CPU."
     }
-    if ($Text -notmatch '(?m)^\s*\[timers\]\s+step\(\) total:\s*([0-9.]+)\s*ms/token') {
+    # [ \t] e non \s in ogni pattern di questa funzione: in .NET \s include \n e
+    # \r, quindi con (?m) un '^\s*' puo' scavalcare la riga e un '\s*(.+)' su una
+    # riga troncata pesca la riga SUCCESSIVA. Misurato: con "[timers]   qtier:"
+    # senza coda, '\s*(.+)$' cattura la riga di qt_stats e i quattro sotto-timer
+    # diventano NaN in silenzio -- e il guard "if (-not $qline)" non puo' scattare,
+    # perche' $qline non e' mai vuoto. Ancorare alla riga rende quel guard vivo.
+    # NIENTE '$' in coda dopo [^\r\n]+: la classe si ferma davanti al \r di una
+    # riga CRLF e '$' non lo scavalca, quindi il pattern non combacerebbe su
+    # Windows. E' la stessa trappola della regex del banner, e un primo tentativo
+    # di questa correzione l'ha reintrodotta: la classe negata basta da sola,
+    # perche' non puo' superare il fine riga.
+    if ($Text -notmatch '(?m)^[ \t]*\[timers\][ \t]+step\(\) total:[ \t]*([0-9.]+)[ \t]*ms/token') {
         throw "$Log : riga step() non trovata. COLI_TIMERS non ha avuto effetto o il run non e' arrivato in fondo."
     }
     $step = [double]$Matches[1]
 
     $g = @{}
     foreach ($k in @("deltanet","attention","moe_total","lm_head")) {
-        if ($Text -match "(?m)^\s*\[timers\]\s+$k\s+[0-9.]+\s+ms\s+([0-9.]+)\s+ms/token") { $g[$k] = [double]$Matches[1] }
+        if ($Text -match "(?m)^[ \t]*\[timers\][ \t]+$k[ \t]+[0-9.]+[ \t]+ms[ \t]+([0-9.]+)[ \t]+ms/token") { $g[$k] = [double]$Matches[1] }
         else { $g[$k] = [double]::NaN }
     }
     # I quattro sotto-timer vanno cercati DENTRO la riga qtier. Cercarli nel
     # log intero e' come cercare "take" in un testo inglese: la prima
     # occorrenza vince e non e' detto sia un numero di questo run.
-    $qline = if ($Text -match '(?m)^\s*\[timers\]\s+qtier:\s*(.+)$') { $Matches[1] } else { "" }
+    $qline = if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+qtier:[ \t]*([^\r\n]+)') { $Matches[1] } else { "" }
     if (-not $qline) { throw "$Log : riga [timers] qtier non trovata." }
     foreach ($k in @("issue","cpu-miss","take","shared-ovl")) {
-        if ($qline -match "$([regex]::Escape($k))\s+([0-9.]+)") { $g[$k] = [double]$Matches[1] } else { $g[$k] = [double]::NaN }
+        if ($qline -match "$([regex]::Escape($k))[ \t]+([0-9.]+)") { $g[$k] = [double]$Matches[1] } else { $g[$k] = [double]::NaN }
     }
-    $vram  = if ($Text -match 'VRAM hit rate:\s*([0-9.]+)\s*%')             { [double]$Matches[1] } else { [double]::NaN }
+    $vram  = if ($Text -match 'VRAM hit rate:[ \t]*([0-9.]+)[ \t]*%')             { [double]$Matches[1] } else { [double]::NaN }
     # miss(CPU) e LFRU swaps non possono ripiegare in silenzio su -1. Con
     # Miss = -1 il blocco "costo per miss" in coda -- il motivo dichiarato di
     # esistere di questo script -- filtra su Miss -gt 0, trova il gruppo vuoto
@@ -401,16 +442,16 @@ function Read-Run([string]$Text, [string]$Log) {
     # esempio fermandosi a un EOS diverso -- l'indice si muove per quel solo
     # motivo. E' il confondimento che il record rifiuta esplicitamente, con un
     # contatore che era nel log tutto il tempo.
-    if ($Text -notmatch '(?m)^\s*\[timers\]\s+decode:\s*([0-9]+)\s+tokens') {
+    if ($Text -notmatch '(?m)^[ \t]*\[timers\][ \t]+decode:[ \t]*([0-9]+)[ \t]+tokens') {
         throw "$Log : riga '[timers] decode: N tokens' non trovata. Senza il numero di token di decode l'indice per miss non e' confrontabile fra i bracci."
     }
     $dtok = [int]$Matches[1]
-    if ($Text -notmatch 'miss\(CPU\)\s+([0-9]+)') { throw "$Log : riga 'miss(CPU) N' non trovata. Il controllo sul costo per miss passerebbe a vuoto." }
+    if ($Text -notmatch 'miss\(CPU\)[ \t]+([0-9]+)') { throw "$Log : riga 'miss(CPU) N' non trovata. Il controllo sul costo per miss passerebbe a vuoto." }
     $miss  = [int]$Matches[1]
-    if ($Text -notmatch 'LFRU swaps\s+([0-9]+)')   { throw "$Log : riga 'LFRU swaps N' non trovata." }
+    if ($Text -notmatch 'LFRU swaps[ \t]+([0-9]+)')   { throw "$Log : riga 'LFRU swaps N' non trovata." }
     $swaps = [int]$Matches[1]
-    $res   = if ($Text -match 'resident\s+([0-9]+)/([0-9]+)\s+experts')     { "$($Matches[1])/$($Matches[2])" } else { "?" }
-    $toks  = if ($Text -match 'Speed:\s*([0-9.]+)\s*tok/s')                 { [double]$Matches[1] } else { [double]::NaN }
+    $res   = if ($Text -match 'resident[ \t]+([0-9]+)/([0-9]+)[ \t]+experts')     { "$($Matches[1])/$($Matches[2])" } else { "?" }
+    $toks  = if ($Text -match 'Speed:[ \t]*([0-9.]+)[ \t]*tok/s')                 { [double]$Matches[1] } else { [double]::NaN }
     # TUTTE le righe [place] auto:, non solo la prima. Il motore ne stampa una
     # per layer che resta sulla CPU e una di riepilogo del trunk
     # (c/qwen36_tier.c): prendendo la prima, l'invariante che il commento chiama
@@ -589,9 +630,13 @@ $tq = @(12.706,4.303,3.182,2.776,2.571,2.447,2.365,2.306,2.262,2.228,2.201,2.179
 $df = $Reps - 1
 # Oltre la tavola si usava 1.96, lo z asintotico, continuando a stampare
 # "intervallo 95 %": a df 17 il t vero e' 2.110, quindi l'intervallo usciva
-# l'8 % piu' stretto di quello che dichiarava. Estesa ai df pari raggiungibili
-# con -Reps pari (17, 19, 21, 23, 25, 29) e, oltre, si dice cosa si sta usando.
-$tq2 = @{ 17 = 2.110; 19 = 2.093; 21 = 2.080; 23 = 2.069; 25 = 2.060; 29 = 2.045 }
+# il 7,1 % piu' stretto di quello che dichiarava (1 - 1.96/2.110). Estesa ai df
+# DISPARI raggiungibili con -Reps pari -- df = Reps-1, quindi con Reps pari il df
+# e' per costruzione dispari, e una versione precedente di questo commento li
+# chiamava "pari" -- e oltre si dice cosa si sta usando. df 27 (-Reps 28) era
+# l'unico valore dispari fra 17 e 29 assente dalla tavola e finiva in z=1.96,
+# cioe' un intervallo il 4,5 % troppo stretto: aggiunto.
+$tq2 = @{ 17 = 2.110; 19 = 2.093; 21 = 2.080; 23 = 2.069; 25 = 2.060; 27 = 2.052; 29 = 2.045 }
 $tApprox = $false
 $t = if ($df -ge 1 -and $df -le 15) { $tq[$df-1] }
      elseif ($tq2.ContainsKey($df))  { $tq2[$df] }
@@ -631,16 +676,22 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
 ""
 "--- il controllo che nel record NON tornava: costo per miss ---"
 "Il costo per miss dovrebbe essere costante fra i bracci. Nel record da n=2"
-"differiva del 28 % (79 contro 101 us). Qui, dividendo cpu-miss per i miss"
+"differiva del 28 % fra i bracci. Qui, dividendo cpu-miss per i miss"
 "dello STESSO run -- denominatori diversi, quindi e' un indice, non un costo:"
 foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
     $q = $grp.Group | Where-Object { $_.Miss -gt 0 }
     if ($q.Count -eq 0) { "{0,-5}  nessun miss" -f $grp.Name; continue }
     $idx = $q | ForEach-Object { 1000.0 * $_.CpuMiss / $_.Miss }
     # nessuna unita' di tempo: 1000*(ms per token di decode)/(miss di tutta la
-    # corsa) ha dimensione us per token per miss, non us. Stamparlo come "us"
-    # due righe sotto i costi per miss veri del record (79 e 101 us) metteva
-    # tre ordini di grandezza sotto la stessa etichetta.
+    # corsa) ha dimensione us per token per miss, non us -- denominatori diversi,
+    # quindi un indice e non un costo. Stamparlo come "us" metterebbe tre ordini
+    # di grandezza sotto la stessa etichetta di un costo vero.
+    # Una versione precedente di questo commento parlava dei "costi per miss veri
+    # del record (79 e 101 us)". Quei due numeri non esistono in nessun record, in
+    # nessuna revisione: i soli us per miss mai pubblicati sono 56 e 71, e sono
+    # stati RITIRATI dalla revisione successiva, che scrive (rec:604) "the two
+    # columns have different denominators and their ratio means nothing" -- cioe'
+    # esattamente la ragione per cui qui si stampa un indice senza unita'.
     "{0,-5}  indice {1,6:N3}      (min {2:N3} max {3:N3} su {4} run)" -f $grp.Name,
         (($idx | Measure-Object -Average).Average), (($idx | Measure-Object -Minimum).Minimum),
         (($idx | Measure-Object -Maximum).Maximum), $q.Count
