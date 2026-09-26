@@ -237,12 +237,13 @@ $CfgStamp = "build-config: $BuildCfg"
 # all'eseguibile la sua identita' resta ignota; che il tier GPU sia partito lo
 # stabilisce la guardia su "CUDA VRAM expert tier active".
 $DllStamp = "coli_cuda.dll: NON TROVATA accanto all'eseguibile -- la sua identita' NON e' registrata"
+$DllHash  = "assente"
 foreach ($d in @("coli_cuda.dll","coli_hip.dll")) {
     if (Test-Path -LiteralPath $d) {
         $di = Get-Item -LiteralPath $d
+        $DllHash = (Get-FileHash -LiteralPath $d -Algorithm SHA256).Hash
         $DllStamp = "{0}: {1} byte | {2} | sha256 {3}" -f `
-            $d, $di.Length, $di.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"),
-            (Get-FileHash -LiteralPath $d -Algorithm SHA256).Hash.Substring(0,16)
+            $d, $di.Length, $di.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"), $DllHash.Substring(0,16)
         break
     }
 }
@@ -278,7 +279,7 @@ if (-not $Self -and $hPrompt -eq $hCaldo) {
 $ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps braccio=$Warm | snap=$Snap" +
     ("  | prompt={0} sha256 {1}" -f $Prompt, $hPrompt.Substring(0,16)) +
     $(if ($Self) { "  | tabella costruita sul prompt misurato" } else { "  | caldo={0} sha256 {1}" -f $PromptCaldo, $hCaldo.Substring(0,16) }) +
-    ("  | built={0}" -f $(if ($Built) { $Built } else { "'' -- PROVENIENZA NON VERIFICATA" })) +
+    ("  | built={0}" -f $(if ($Built) { $Built } else { "(vuoto) -- PROVENIENZA NON VERIFICATA" })) +
     ("  | allow-env={0}" -f $(if ($AllowEnv.Count) { ($AllowEnv -join ",") + " -- DEROGA" } else { "nessuna" }))
 $ParamStamp
 
@@ -333,12 +334,12 @@ function Invoke-Engine([bool]$WithHeat, [string]$PromptFile, [string]$Log) {
     # solo il primo run -- il resto lo coprono il Remove-Item sopra e il catch.
     if ($null -eq $code) { throw "$Exe non ha registrato alcun exit code. Vedi $Log." }
     if ($code -ne 0) { throw "exit $code -- vedi $Log" }
-    # Lo stdout, senza le righe [meta] in testa: load_meta (c/qwen36.c) ne
+    # Lo stdout, senza la riga [meta] in testa: load_meta (c/qwen36.c) ne
     # scrive una su stdout, prima della generazione, quando lo snapshot non ha
-    # qwen36_meta.json. Non e' testo generato.
+    # qwen36_meta.json. Si toglie al massimo quella, con le maiuscole esatte.
     $lines = @(@($all) | Where-Object { $_ -is [string] })
     $k = 0
-    while ($k -lt $lines.Count -and $lines[$k] -match '^\[meta\] ') { $k++ }
+    if ($lines.Count -and $lines[0] -cmatch '^\[meta\] ') { $k = 1 }
     $out = (@($lines | Select-Object -Skip $k)) -join "`n"
     [pscustomobject]@{ Text = (Get-Content $Log -Raw); Out = $out }
 }
@@ -436,20 +437,28 @@ function Get-TextHash([string]$s) {
 }
 
 # ---- tabella congelata ---------------------------------------------------
-# E' la variabile indipendente dell'esperimento. Accanto ha un file con le
-# condizioni in cui e' stata costruita: impronta del prompt, impronta
-# dell'eseguibile, N_NEW, cap, bits, impronta del PERCORSO dello snapshot (non
-# del suo contenuto), e impronta della tabella stessa. Si riusa solo se tutte
-# combaciano con questa corsa; altrimenti la corsa si ferma e il messaggio
-# dice quali non combaciano.
+# E' la variabile indipendente dell'esperimento. Accanto ha un file che
+# registra, una riga chiave=valore ciascuna: impronta del prompt, impronta
+# dell'eseguibile, impronta di coli_cuda.dll (o "assente"), N_NEW, cap, bits,
+# le deroghe -AllowEnv, impronta del PERCORSO dello snapshot e impronta della
+# tabella. NON registra il contenuto dello snapshot. Si riusa solo se ogni
+# chiave combacia con questa corsa; altrimenti la corsa si ferma e il messaggio
+# dice quali chiavi non combaciano.
+# Il percorso dello snapshot si registra senza separatori finali e, su
+# Windows, in minuscolo: "C:\modelli\x", "C:\modelli\x\" e "C:\Modelli\x"
+# danno la stessa impronta.
+$SnapPath = (Get-Item -LiteralPath $Snap).FullName.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+if ([IO.Path]::DirectorySeparatorChar -eq [char]'\') { $SnapPath = $SnapPath.ToLowerInvariant() }
 $Side = "$Frozen.sha256"
 $Want = [ordered]@{
     prompt     = $hCaldo
     eseguibile = $exeHash
+    dll        = $DllHash
     n_new      = "$NNew"
     cap        = "$Cap"
     bits       = "$Bits"
-    snap       = Get-TextHash ((Get-Item -LiteralPath $Snap).FullName)
+    allow_env  = $(if ($AllowEnv.Count) { (@($AllowEnv | Sort-Object) -join ",") } else { "nessuna" })
+    snap       = Get-TextHash $SnapPath
 }
 $HeatStamp = ""
 if ($Self -or -not (Test-Path -LiteralPath $Frozen)) {
@@ -471,18 +480,26 @@ if ($Self -or -not (Test-Path -LiteralPath $Frozen)) {
     if (-not (Test-Path -LiteralPath $Side)) {
         throw "$Frozen esiste ma accanto non c'e' ${Side}: non so in quali condizioni sia stata costruita. Cancellala, e lo script la ricostruira' su $PromptCaldo."
     }
+    # Lo scrive lo script: una riga che non ha la forma chiave=valore, o una
+    # chiave ripetuta, vuol dire che e' stato toccato a mano.
     $got = @{}
     foreach ($ln in @(Get-Content -LiteralPath $Side)) {
-        if ($ln -match '^\s*([a-z_]+)=(\S+)\s*$') { $got[$Matches[1]] = $Matches[2] }
+        if (-not $ln.Trim()) { continue }
+        if ($ln -notmatch '^\s*([a-z_]+)=(\S+)\s*$') { throw "${Side}: riga non riconosciuta '$ln'. Cancella $Frozen e $Side, e lo script ricostruira' la tabella." }
+        if ($got.ContainsKey($Matches[1])) { throw "${Side}: la chiave '$($Matches[1])' compare due volte. Cancella $Frozen e $Side, e lo script ricostruira' la tabella." }
+        $got[$Matches[1]] = $Matches[2]
     }
     $check = [ordered]@{}
     foreach ($key in $Want.Keys) { $check[$key] = $Want[$key] }
     $check["tabella"] = (Get-FileHash -LiteralPath $Frozen -Algorithm SHA256).Hash
-    $bad = @($check.Keys | Where-Object { -not $got.ContainsKey($_) -or $got[$_] -ne $check[$_] })
-    if ($bad.Count) {
-        throw ("{0} non e' stata costruita nelle condizioni di questa corsa: in {1} non combaciano {2}. Cancellala, e lo script la ricostruira'." -f $Frozen, $Side, ($bad -join ", "))
+    $miss = @($check.Keys | Where-Object { -not $got.ContainsKey($_) })
+    $diff = @($check.Keys | Where-Object { $got.ContainsKey($_) -and $got[$_] -ne $check[$_] })
+    if ($miss.Count -or $diff.Count) {
+        throw ("{0} non si puo' riusare: in {1} {2}{3}. Cancellala, e lo script la ricostruira'." -f $Frozen, $Side,
+            $(if ($diff.Count) { "non combaciano con questa corsa: " + ($diff -join ", ") } else { "" }),
+            $(if ($miss.Count) { $(if ($diff.Count) { "; " } else { "" }) + "mancano: " + ($miss -join ", ") } else { "" }))
     }
-    $HeatStamp = "RIUSATA: $Side combacia su prompt, eseguibile, N_NEW, cap, bits, percorso dello snapshot e tabella"
+    $HeatStamp = "RIUSATA: $Side combacia su prompt, eseguibile, coli_cuda.dll, N_NEW, cap, bits, deroghe, percorso dello snapshot e tabella (non registra il contenuto dello snapshot)"
 }
 $hc = Get-Item -LiteralPath $Frozen
 $HeatStamp = "{0}: {1} byte | {2} | sha256 {3} | {4}" -f `
@@ -513,7 +530,7 @@ function Invoke-Arm([string]$Tag, [int]$Rep) {
     $row = Read-Run $e.Text $log
     # Uno stdout vuoto farebbe passare a vuoto il confronto sul testo in coda.
     if (-not $e.Out.Trim()) {
-        throw "$Tag rip ${Rep}: nessun testo generato su stdout (tolte le righe [meta]). Il confronto sul testo passerebbe a vuoto."
+        throw "$Tag rip ${Rep}: nessun testo generato su stdout (tolta la riga [meta]). Il confronto sul testo passerebbe a vuoto."
     }
     $row | Add-Member -NotePropertyName Rep -NotePropertyValue $Rep
     $row | Add-Member -NotePropertyName Arm -NotePropertyValue $Tag
@@ -542,19 +559,25 @@ $DllStamp
 $HeatStamp
 $ParamStamp
 # Un invariante violato ferma lo script: se non tiene, i numeri non vanno
-# prodotti in forma incollabile.
-$banners = @($rows | ForEach-Object { $_.Banner } | Sort-Object -Unique)
+# prodotti in forma incollabile. I confronti sono ORDINALI: Sort-Object
+# -Unique, con la cultura invariante, tratta come uguali due righe che
+# differiscono per maiuscole o per un carattere ignorabile.
+function Get-Distinct($items) {
+    $set = New-Object "System.Collections.Generic.HashSet[string]" -ArgumentList ([StringComparer]::Ordinal)
+    foreach ($x in $items) { if ($set.Add([string]$x)) { [string]$x } }
+}
+$banners = @(Get-Distinct @($rows | ForEach-Object { $_.Banner }))
 if ($banners.Count -ne 1) {
     throw ("il banner del motore NON e' identico in tutti i run:`n  {0}" -f ($banners -join "`n  "))
 }
 "banner del motore identico in tutti i run:"
 "  {0}" -f $banners[0]
-$places = @($rows | ForEach-Object { $_.Place } | Sort-Object -Unique)
+$places = @(Get-Distinct @($rows | ForEach-Object { $_.Place }))
 if ($places.Count -ne 1) {
     throw ("la riga [place] auto: NON e' identica in tutti i run: i bracci non sono confrontabili.`n  {0}" -f ($places -join "`n  "))
 }
 "[place] auto: identica in tutti i {0} run" -f @($rows).Count
-$residents = @($rows | ForEach-Object { $_.Resident } | Sort-Object -Unique)
+$residents = @(Get-Distinct @($rows | ForEach-Object { $_.Resident }))
 if ($residents.Count -ne 1) {
     throw ("residenza diversa fra i run: {0} -- i bracci non hanno lo stesso numero di esperti in VRAM e il delta non e' attribuibile alla tabella heat." -f ($residents -join ", "))
 }
@@ -562,19 +585,20 @@ if ($residents.Count -ne 1) {
 # Il testo generato. Dentro ogni braccio deve essere identico: se le
 # ripetizioni dello stesso braccio non decodificano la stessa sequenza, non
 # sono ripetizioni. Fra i due bracci puo' differire, e lo script lo dichiara
-# invece di rifiutare la corsa. L'impronta e' quella dello stdout come
-# PowerShell lo legge (righe unite con LF, senza le righe [meta] in testa), non
-# dei byte scritti dal motore.
+# invece di rifiutare la corsa. Impronta e confronto sono sullo stdout come
+# PowerShell lo legge (righe unite con LF, senza la riga [meta] in testa), non
+# sui byte scritti dal motore: due stdout che differiscono solo nei fine riga,
+# o in byte UTF-8 non validi, risultano uguali.
 foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
-    $h = @($grp.Group | ForEach-Object { $_.OutHash } | Sort-Object -Unique)
+    $h = @(Get-Distinct @($grp.Group | ForEach-Object { $_.OutHash }))
     if ($h.Count -ne 1) {
-        throw ("il testo generato NON e' identico fra i run del braccio {0}: le sue ripetizioni hanno decodificato sequenze diverse. I testi sono nei log.`n  {1}" -f $grp.Name,
+        throw ("il testo generato NON e' identico fra i run del braccio {0}: le sue ripetizioni hanno scritto testi diversi. I testi sono nei log; qui l'impronta di ogni run.`n  {1}" -f $grp.Name,
             (($grp.Group | ForEach-Object { "{0,-5} rip {1}: sha256 {2}" -f $_.Arm, $_.Rep, $_.OutHash.Substring(0,16) }) -join "`n  "))
     }
 }
 $tCold = @($rows | Where-Object { $_.Arm -eq "COLD" })[0]
 $tWarm = @($rows | Where-Object { $_.Arm -eq $Warm })[0]
-"testo generato identico fra i run di ogni braccio (sha256 dello stdout letto):"
+"testo generato identico fra i run di ogni braccio (sha256 dello stdout letto, senza la riga [meta]):"
 "  COLD  {0}" -f $tCold.OutHash.Substring(0,16)
 "  {0,-5} {1}" -f $Warm, $tWarm.OutHash.Substring(0,16)
 ""
@@ -582,20 +606,28 @@ $tWarm = @($rows | Where-Object { $_.Arm -eq $Warm })[0]
 # Confronto ORDINALE: con la cultura invariante -ceq tratta come uguali due
 # testi che differiscono per un carattere ignorabile (per esempio U+200B).
 if ([string]::Equals($tCold.Out, $tWarm.Out, [StringComparison]::Ordinal)) {
-    "testo generato IDENTICO fra i due bracci"
+    "testo generato IDENTICO fra i due bracci (sullo stdout letto)"
 } else {
     $a = $tCold.Out; $b = $tWarm.Out
     $n = [Math]::Min($a.Length, $b.Length); $i = 0
     while ($i -lt $n -and [int]$a[$i] -eq [int]$b[$i]) { $i++ }
+    $prefix = ($i -eq $n)
     # Non partire da meta' di una coppia surrogata: la meta' alta prima e'
     # comune ai due testi.
     if ($i -gt 0 -and (($i -lt $a.Length -and [char]::IsLowSurrogate($a[$i])) -or ($i -lt $b.Length -and [char]::IsLowSurrogate($b[$i])))) { $i-- }
+    # Gli estratti non cominciano ne' finiscono a meta' di una coppia
+    # surrogata; un'emoji fatta di piu' caratteri (tono della pelle, ZWJ) puo'
+    # comunque restare spezzata. I caratteri di controllo diventano '?'.
     function Get-Excerpt([string]$s, [int]$from) {
         $len = [Math]::Min(40, $s.Length - $from)
         if ($len -gt 0 -and [char]::IsHighSurrogate($s[$from + $len - 1])) { $len-- }
-        $s.Substring($from, $len) -replace "`n", " / "
+        ($s.Substring($from, $len) -replace "`n", " / ") -replace '\p{Cc}', '?'
     }
-    "testo generato DIVERSO fra i due bracci. Primo carattere diverso alla posizione {0} dello stdout letto, contata da 0 in unita' UTF-16: dal token che la contiene in poi il delta include anche l'effetto di due sequenze diverse." -f $i
+    if ($prefix) {
+        "testo generato DIVERSO fra i due bracci: il testo di {0} e' l'inizio dell'altro e finisce alla posizione {1} (contata da 0, in unita' UTF-16, sullo stdout letto)." -f $(if ($a.Length -lt $b.Length) { "COLD" } else { $Warm }), $n
+    } else {
+        "testo generato DIVERSO fra i due bracci: primo carattere diverso alla posizione {0} (contata da 0, in unita' UTF-16, sullo stdout letto)." -f $i
+    }
     "  COLD  ...{0}" -f (Get-Excerpt $a $i)
     "  {0,-5} ...{1}" -f $Warm, (Get-Excerpt $b $i)
 }
