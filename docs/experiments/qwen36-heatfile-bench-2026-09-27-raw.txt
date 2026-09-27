@@ -1,15 +1,17 @@
-Qwen3.6-35B-A3B: the heat-table gain, first run of the tool as merged in #51.
+Qwen3.6-35B-A3B: heat-table gain, first run of the #51 tool on the real engine.
 27 September 2026.
 
 c/tools/misure-heatfile.ps1 was reworked over ten review rounds in #51 and
 merged as 8a074f21. In review it was run only against simulated engines on
-Linux. This is the first run of the merged version on the operator's
-machine, with the real engine, the GPU and the documented launcher. It had
-two questions to answer before the merge:
+Linux. This is its first run on the operator's machine, with the real
+engine, the GPU and the documented launcher. The run took place minutes
+before the merge, on the branch tip, whose script is the same file that was
+merged (see "Script" below). It had two questions to answer before the
+merge:
 
   1. Do the six runs of the SAME arm generate the same text? The tool
-     refuses the run if they do not, so if they did not it would refuse
-     every run of this configuration.
+     refuses the run if they do not; if they diverged systematically it
+     would refuse every run of this configuration.
   2. Do COLD and CROSS generate the same text? Nothing in the earlier
      records says. The tool declares the answer without refusing.
 
@@ -18,21 +20,32 @@ Both answers are yes, for this prompt pair, N_NEW=128 and this build.
 --- what was run -----------------------------------------------------------
 
 Script : c/tools/misure-heatfile.ps1 at 24c35a63, the #51 branch tip at the
-         time, fetched with
-           git show FETCH_HEAD:c/tools/misure-heatfile.ps1
-         into tools\misure-heatfile-pr51.ps1. At 24c35a63 that file is the
-         same git blob as on main after the merge 8a074f21 (5b533e60).
-Launch : from cmd, in C:\colibri-fork\c, in one chain with the rebuild:
+         time. The operator was given the command
+           git show FETCH_HEAD:c/tools/misure-heatfile.ps1 > tools\misure-heatfile-pr51.ps1
+         and its execution was not pasted. The output corroborates it: its
+         strings "senza la riga [meta]" and "(sullo stdout letto)" exist,
+         among the script's versions on the #51 branch, only from 24c35a63
+         on. At 24c35a63 the file is the same git blob as on main after the
+         merge 8a074f21 (5b533e60).
+Launch : from cmd, in C:\colibri-fork\c. The operator was given the chain
            make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe && powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-heatfile-pr51.ps1 > misure-pr51.txt 2>&1
+         and its execution was not pasted. The output shows what it
+         produced: the build output changed (qwen36.exe was E0345C33... at
+         attempt 3, and the provenance guard passed on A2D344B9...), and
+         .build-config carries the flags. It does not show -B itself.
          powershell.exe is Windows PowerShell, the launcher the script
          documents.
-Engine : qwen36_clang.exe, rebuilt and copied by the chain above.
+Engine : qwen36_clang.exe, rebuilt and copied as above.
          THE SOURCE COMMIT OF THIS BUILD IS NOT RECORDED. The script checks
          that no prerequisite of qwen36$(EXE) is newer than the executable
          and that the executable is a copy of the build output; it does not
          record which commit the tree was at.
 DLL    : coli_cuda.dll dated 2026-09-21 20:46:01, not rebuilt for this
-         session. Its sha256 prefix is in the stamp below.
+         session. Its sha256 prefix is in the stamp below. ITS SOURCE COMMIT
+         IS NOT RECORDED either. It is NOT a build of the diagnostic branch
+         claude/graph-diag (6652f6b7, "TEMPORANEO ... NON MERGIARE"), whose
+         date is close to the DLL's: see "the DLL is not the diagnostic
+         build" below.
 Host   : NOT identified by the script's output.
 Table  : built in this run on prompt-caldo.txt. A table left by the
          earlier version of the script has no condition file next to it, so
@@ -40,9 +53,12 @@ Table  : built in this run on prompt-caldo.txt. A table left by the
          command renaming any heat.caldo.bin to heat.caldo.2026-09-23.bin.
          The name is a label, not the table's date. The output shows the
          tool building a new table.
-Logs   : the tool deletes heatfile-*.log at start-up, so the previous ones
-         were moved to logs-heatfile-prima\ first. The output has no
-         "rimuovo N log della corsa precedente" line: none were left.
+Logs   : the tool deletes heatfile-*.log at start-up, after its guards.
+         The operator was given commands moving the previous ones to
+         logs-heatfile-prima\ first, and their execution was not pasted.
+         The output has no "rimuovo N log della corsa precedente" line, so
+         no heatfile-*.log was present when this run started: either they
+         were moved, or there were none.
 
 --- three refused attempts -------------------------------------------------
 
@@ -50,18 +66,52 @@ The tool stopped three times before the run below. Each was a real
 condition of the machine, and each message named it:
 
   1. COLI_GRAPH_DIAG=1 in the environment (the environment guard). No C
-     source on main reads this variable; it was absent at the next
-     attempt.
+     source on main reads this variable. The diagnostic commit 6652f6b7,
+     on the branch claude/graph-diag and never merged, reads it in
+     c/backend_cuda.cu, that is in coli_cuda.dll; the DLL of this run is
+     not that build (below). The variable was absent at the next attempt.
   2. CUDA_EXPERT_GB=12 in the environment (the environment guard). The
-     engine reads this one: it is the expert VRAM budget. Removed with
-     `set CUDA_EXPERT_GB=`, so that the budget is the engine's default,
-     free VRAM minus 1 GB (c/qwen36_tier.c:612-618).
+     engine reads this one: it is the per-device allowance for tier and
+     trunk (c/qwen36_tier.c:607). Removed with `set CUDA_EXPERT_GB=`, so
+     the allowance is the engine's default, free VRAM minus 1 GB
+     (:612-618). That value is printed in the per-run logs, not in the
+     output below.
   3. ".\qwen36_clang.exe NON e' la copia di qwen36.exe (sha256
      E2AB428B44E9CAD5 contro E0345C330BE51603)" (the provenance guard).
      Fixed by the rebuild above.
 
+The guard lists every suspect variable at once, and attempt 1 did not list
+CUDA_EXPERT_GB. So the environment of attempt 2 differed from that of
+attempt 1 by more than the removal of COLI_GRAPH_DIAG; how is not known.
+
 The successful run's stamp reads allow-env=nessuna: the environment guard
 found no suspect variable and no exemption was used.
+
+--- the DLL is not the diagnostic build ------------------------------------
+
+The DLL's date, 2026-09-21 20:46:01 local time, falls about half an hour
+after 6652f6b7 (18:12:13 UTC), if local time is UTC+2. The operator ran,
+in C:\colibri-fork\c:
+
+  powershell -NoProfile -Command "$t = [IO.File]::ReadAllText((Resolve-Path 'coli_cuda.dll').Path, [Text.Encoding]::GetEncoding(28591)); 'controllo: ' + $t.Contains('[CUDA] invalid device'); 'diagnostica: ' + $t.Contains('BeginCapture FALLITA')"
+
+and pasted:
+
+  controllo: True
+  diagnostica: False
+
+"BeginCapture FALLITA" is a string literal of 6652f6b7, in an fprintf under
+#if COLI_GPU_HAS_GRAPH, which is 1 in every CUDA build
+(c/backend_gpu_compat.h:120); among the repository's branches it exists
+only on claude/graph-diag. "[CUDA] invalid device" is a string literal of
+c/backend_cuda.cu present in its first version (aa87ff5f), on main and on
+claude/graph-diag, outside every #if on both of the latter: it is the
+control that the reading works on this file. A build of 6652f6b7 would
+contain both.
+
+An earlier check with findstr is not quoted as evidence: its control
+string turned out to sit inside #ifdef COLI_ANS, so its absence said
+nothing about findstr.
 
 --- the script's output, verbatim ------------------------------------------
 
@@ -135,7 +185,9 @@ negative. Recomputed from the six printed deltas: mean -5.383, sd 0.794,
 se 0.324, t(5) = 2.571.
 
 The ABBA groups: COLD first -5.633, CROSS first -5.133, difference -0.50.
-Its size is below the 0.79 scatter of the deltas themselves.
+The standard error of a difference between two means of three, from the
+delta sd of 0.794, is 0.65: the difference is not distinguishable from
+zero.
 
 --- the generated text -----------------------------------------------------
 
@@ -150,12 +202,21 @@ have made the six hashes of an arm differ.
 
 The CROSS miss count reads 6240 in some runs and 6241 in others, while the
 text is the same in all six: identical text does not imply identical
-counters.
+counters. Nor does it imply identical arithmetic: the arms compute
+different experts on the CPU and on the GPU, and the text only says that
+the decoded strings came out the same. Not even the token sequences are
+shown to be the same: two different sequences can decode to the same
+text.
 
 --- the accounting ---------------------------------------------------------
 
 Computed here from the per-arm means printed above, which are rounded to
-0.01, so the sums carry a rounding error of a few hundredths:
+0.01. The four phases do not exhaust step(): they sum to 28.01 against
+29.02 in COLD and 22.64 against 23.63 in CROSS, so about 1.0 ms/token lies
+outside them in each arm, and the four sub-timers leave about 1.07 ms/token
+of moe_total outside them. The gap between the sums of the deltas below and
+the delta they are set against is therefore rounding plus the change in
+that residual; the rounded means cannot separate the two.
 
                  COLD     CROSS    delta
     deltanet      8.96     8.33    -0.63
@@ -176,20 +237,22 @@ Inside moe_total:
 
 --- not compared with the earlier records ----------------------------------
 
-qwen36-heatfile-6rep-2026-09-23-raw.txt measures the same comparison as
--4.92 +-0.69. The two are not compared here: a different day, and a
-different binary. This run's attention reads 2.25 and 2.06 where that
-record reads 5.40 and 5.36, and residency is 6859 where it was 6959.
-
-That record says that placing attnproj takes residency from 6959 to 6859.
-This run's 6859 is consistent with that, and is not evidence of it: the
-[place] lines that would say are in the logs, not in this output, which
-reports only that they were identical in all twelve runs.
+Two records of 23 September measure the same comparison:
+qwen36-heatfile-6rep-2026-09-23-raw.txt and
+qwen36-take-split-2026-09-23-raw.txt. No number of this run is compared with
+theirs: a different day, a different build, and an expert allowance that is
+not recorded for those runs. Neither record mentions CUDA_EXPERT_GB or the
+allowance; the heat-table script of that day did not refuse the variable;
+and on this day it was set in the operator's shell.
 
 --- what this run did NOT measure ------------------------------------------
 
-  - The source commit of the binary, and the host (see above).
+  - The source commit of the binary and of the DLL, and the host (see
+    above).
   - Anything about current main as such: the tree's commit is unknown.
+  - Reproducibility across sessions. The interval describes the scatter of
+    six pairs inside one session, not how the result moves from one day
+    to the next.
   - The SELF arm, the other direction (the table built on prompt25 and
     measured on prompt-caldo), other prompt pairs, other N_NEW, a second
     device.
@@ -206,6 +269,6 @@ evidence.sha256 exists for this record.
 
 --- no manifest ------------------------------------------------------------
 
-c/experiment_manifest.py requires a full 40-character commit SHA and the
-hardware fields (:58-66 and the lines after). Neither was recorded for
-this binary, so this record cannot carry a manifest.
+c/experiment_manifest.py requires a full 40-character commit SHA (:58-66)
+and the host's hardware fields (the lines after). Neither was recorded for
+this run, so this record cannot carry a manifest.
