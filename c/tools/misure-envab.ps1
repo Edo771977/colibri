@@ -28,8 +28,12 @@
 # heat.bin all'uscita, quindi senza la copia ogni run partirebbe dalla
 # tabella lasciata dal run prima. Ogni log deve contenere "HEAT_FILE loaded";
 # la tabella congelata non deve cambiare durante la corsa. Se accanto c'e'
-# <tabella>.sha256 (lo scrive misure-heatfile.ps1), lo stamp dice su quale
-# prompt e' stata costruita e se e' il prompt misurato.
+# <tabella>.sha256 (lo scrive misure-heatfile.ps1) deve essere completo e
+# combaciare con la tabella; lo stamp dice su quale prompt e' stata costruita,
+# se e' il prompt misurato e quali condizioni della costruzione differiscono.
+# Il heat.bin che c'era nella cartella viene sovrascritto al primo run; alla
+# fine (anche dopo un errore) contiene la tabella riscritta dall'ultimo run.
+# HEAT_FILE torna com'era prima dello script.
 # -Var e -Marker non hanno default: lo script e' nato per una variabile del
 # motore che non e' entrata in main (docs/experiments/
 # qwen36-gpu-clocks-2026-09-27-raw.txt, sezione 1).
@@ -130,6 +134,7 @@ $EnvOwn = $ScriptOwned + @($Var)
 # variabili che lo script imposta restano cambiate: lanciato con -File (come
 # indica l'intestazione) gira in un processo suo e non tocca la finestra.
 $VarBefore = [Environment]::GetEnvironmentVariable($Var)
+$HeatEnvBefore = [Environment]::GetEnvironmentVariable("HEAT_FILE")
 # Con -File, PowerShell passa "-AllowEnv A,B" come UN SOLO elemento di
 # [string[]]: va rispezzato a mano.
 $AllowEnv = @($AllowEnv | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -327,49 +332,78 @@ if (-not (Test-Path -LiteralPath $Snap))   { throw "modello non trovato in $Snap
 $hPrompt = (Get-FileHash -LiteralPath $Prompt -Algorithm SHA256).Hash
 
 # ---- tabella heat (opzionale) --------------------------------------------
-# Relativa alla cartella di lavoro e DIRETTAMENTE li'. Non puo' essere
-# heat.bin: e' il file che il motore riscrive a ogni uscita.
+# Non puo' essere heat.bin: e' il file che il motore riscrive a ogni uscita.
 $HeatDesc  = "nessuna"
 $HeatStamp = ""
 $HeatHash  = ""
+$HeatFix   = "ricostruiscila con misure-heatfile.ps1 su questo modello (la lascia in heat.caldo.bin, con heat.caldo.bin.sha256 accanto)"
 if ($HeatFile) {
     $hfResolved = if ([System.IO.Path]::IsPathRooted($HeatFile)) { $HeatFile } else { Join-Path $WorkDir $HeatFile }
-    if (-not (Test-Path -LiteralPath $hfResolved -PathType Leaf)) { throw "-HeatFile $HeatFile ($hfResolved) non esiste o non e' un file." }
-    $hfItem = Get-Item -LiteralPath $hfResolved
-    if (-not [string]::Equals($hfItem.DirectoryName.TrimEnd('\','/'), $WorkDir.TrimEnd('\','/'), [StringComparison]::OrdinalIgnoreCase)) {
-        throw "-HeatFile $($hfItem.FullName) non sta direttamente nella cartella di lavoro $WorkDir."
+    if (-not (Test-Path -LiteralPath $hfResolved -PathType Leaf)) {
+        throw "-HeatFile $HeatFile ($hfResolved) non esiste o non e' un file. Passa il nome della tabella congelata, per esempio heat.caldo.bin, oppure $HeatFix."
     }
+    $hfItem = Get-Item -LiteralPath $hfResolved
     if ([string]::Equals($hfItem.Name, "heat.bin", [StringComparison]::OrdinalIgnoreCase)) {
         throw "-HeatFile non puo' essere heat.bin: il motore lo riscrive all'uscita di ogni run. Passa la tabella congelata (per esempio heat.caldo.bin)."
     }
-    # Formato del motore (c/qwen36_tier.c, qt_init/qt_shutdown): tre uint32
+    # Forma del file (c/qwen36_tier.c, qt_init/qt_shutdown): tre uint32
     # little-endian -- magic 0x51544831, layer, esperti -- poi un uint32 per
-    # esperto. Un file di altra forma il motore lo ignora in silenzio.
+    # esperto. Qui si controlla solo che il file sia coerente con la sua
+    # intestazione. Che layer x esperti siano quelli del modello lo verifica il
+    # motore: se non lo sono ignora la tabella in silenzio, e allora manca la
+    # riga "HEAT_FILE loaded" e il run si ferma.
     $hb = [System.IO.File]::ReadAllBytes($hfItem.FullName)
-    if ($hb.Length -lt 12) { throw "-HeatFile ${HeatFile}: $($hb.Length) byte, meno dell'intestazione di una tabella heat." }
+    if ($hb.Length -lt 12) { throw "-HeatFile ${HeatFile}: $($hb.Length) byte, meno dell'intestazione di una tabella heat: non e' una tabella. $HeatFix." }
     $hMagic = [BitConverter]::ToUInt32($hb, 0); $hNl = [BitConverter]::ToUInt32($hb, 4); $hNe = [BitConverter]::ToUInt32($hb, 8)
-    if ($hMagic -ne 0x51544831) { throw ("-HeatFile {0}: non e' una tabella heat (magic 0x{1:X8})." -f $HeatFile, $hMagic) }
+    if ($hMagic -ne 0x51544831) { throw ("-HeatFile {0}: non e' una tabella heat (magic 0x{1:X8}). {2}." -f $HeatFile, $hMagic, $HeatFix) }
     if ($hb.Length -ne 12 + 4 * [long]$hNl * [long]$hNe) {
-        throw "-HeatFile ${HeatFile}: $($hb.Length) byte, ma l'intestazione dice $hNl layer x $hNe esperti ($(12 + 4 * [long]$hNl * [long]$hNe) byte)."
+        throw "-HeatFile ${HeatFile}: $($hb.Length) byte, ma l'intestazione dice $hNl layer x $hNe esperti ($(12 + 4 * [long]$hNl * [long]$hNe) byte): file troncato o corrotto. $HeatFix."
     }
     Remove-Variable hb
     $HeatHash = (Get-FileHash -LiteralPath $hfItem.FullName -Algorithm SHA256).Hash
-    $origin = "provenienza non registrata (nessun $($hfItem.Name).sha256 accanto)"
+
+    # <tabella>.sha256, scritto da misure-heatfile.ps1 quando costruisce la
+    # tabella: una riga chiave=valore ciascuna. Se c'e', si legge con le sue
+    # stesse regole (misure-heatfile.ps1, "tabella congelata"): una riga non
+    # riconosciuta, una chiave ripetuta, prompt= o tabella= mancanti fermano
+    # la corsa, perche' lo stamp direbbe una provenienza non verificata.
     $side = "$($hfItem.FullName).sha256"
+    $sideName = "$($hfItem.Name).sha256"
+    $sideFix = "ricostruisci la tabella con misure-heatfile.ps1, oppure togli $sideName per usarla con provenienza non registrata"
+    $origin = "provenienza non registrata (nessun $sideName accanto)"
     if (Test-Path -LiteralPath $side) {
+        if (-not (Test-Path -LiteralPath $side -PathType Leaf)) { throw "$sideName esiste ma non e' un file. Rimedio: $sideFix." }
         $sg = @{}
-        foreach ($ln in @(Get-Content -LiteralPath $side)) { if ($ln -match '^\s*([a-z_]+)=(\S+)\s*$') { $sg[$Matches[1]] = $Matches[2] } }
-        if ($sg.ContainsKey("tabella") -and $sg["tabella"] -ne $HeatHash) {
-            throw "-HeatFile ${HeatFile}: la sua impronta non combacia con tabella= in $($hfItem.Name).sha256. La tabella e' stata cambiata dopo essere stata costruita."
+        foreach ($ln in @(Get-Content -LiteralPath $side)) {
+            if (-not $ln.Trim()) { continue }
+            if ($ln -notmatch '^\s*([a-z_]+)=(\S+)\s*$') { throw "${sideName}: riga non riconosciuta '$ln' (formato di una versione vecchia, o toccato a mano). Rimedio: $sideFix." }
+            if ($sg.ContainsKey($Matches[1])) { throw "${sideName}: la chiave '$($Matches[1])' compare due volte. Rimedio: $sideFix." }
+            $sg[$Matches[1]] = $Matches[2]
         }
-        if ($sg.ContainsKey("prompt")) {
-            $origin = "costruita su un prompt sha256 {0}, {1}" -f $sg["prompt"].Substring(0, [Math]::Min(16, $sg["prompt"].Length)),
-                $(if ($sg["prompt"] -eq $hPrompt) { "LO STESSO prompt misurato (come SELF)" } else { "diverso dal prompt misurato (come CROSS)" })
+        $sideMiss = @(@("prompt","tabella") | Where-Object { -not $sg.ContainsKey($_) })
+        if ($sideMiss.Count) { throw "${sideName}: mancano $($sideMiss -join ', '). Rimedio: $sideFix." }
+        if ($sg["tabella"] -ne $HeatHash) {
+            throw "${sideName}: tabella= non combacia con l'impronta di ${HeatFile}. O la tabella e' cambiata dopo la costruzione, o il file .sha256 appartiene a un'altra tabella. Rimedio: $sideFix."
         }
+        # Le condizioni della costruzione che differiscono da questa corsa:
+        # non fermano la misura (la tabella e' la stessa nei due bracci), ma
+        # vanno nel record.
+        $snapNorm = (Get-Item -LiteralPath $Snap).FullName.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        if ([IO.Path]::DirectorySeparatorChar -eq [char]'\') { $snapNorm = $snapNorm.ToLowerInvariant() }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $snapHash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($snapNorm)) | ForEach-Object { $_.ToString("x2") }) }
+        finally { $sha.Dispose() }
+        $now = @{ eseguibile = $exeHash; dll = $DllHash; n_new = "$NNew"; cap = "$Cap"; bits = "$Bits"; snap = $snapHash
+                 allow_env = $(if ($AllowEnv.Count) { (@($AllowEnv | Sort-Object) -join ",") } else { "nessuna" }) }
+        $differ = @(@("n_new","cap","bits","snap","allow_env","eseguibile","dll") | Where-Object { -not $sg.ContainsKey($_) -or $sg[$_] -ne $now[$_] })
+        $origin = "costruita su un prompt sha256 {0}, {1} | {2}: tabella= verificata | condizioni della costruzione diverse da questa corsa: {3}" -f `
+            $sg["prompt"].Substring(0, [Math]::Min(16, $sg["prompt"].Length)),
+            $(if ($sg["prompt"] -eq $hPrompt) { "LO STESSO prompt misurato (come SELF)" } else { "diverso dal prompt misurato (come CROSS)" }),
+            $sideName, $(if ($differ.Count) { $differ -join ", " } else { "nessuna" })
     }
     $HeatDesc  = "{0}, la stessa in entrambi i bracci" -f $hfItem.Name
     $HeatStamp = "heat: {0} | {1} byte | {2} layer x {3} esperti | {4} | sha256 {5} | {6}" -f `
-        $hfItem.Name, $hfItem.Length, $hNl, $hNe, $hfItem.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"), $HeatHash.Substring(0,16), $origin
+        $hfItem.FullName, $hfItem.Length, $hNl, $hNe, $hfItem.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"), $HeatHash.Substring(0,16), $origin
 }
 
 # Parametri, deroghe e impronta del prompt vanno nel record insieme ai numeri.
@@ -395,7 +429,7 @@ function Invoke-Engine([bool]$On, [string]$PromptFile, [string]$Log) {
         # Ogni run parte dalla stessa tabella: il run prima ha riscritto heat.bin.
         Copy-Item -LiteralPath $hfItem.FullName -Destination (Join-Path $WorkDir "heat.bin") -Force
         if ((Get-FileHash -LiteralPath (Join-Path $WorkDir "heat.bin") -Algorithm SHA256).Hash -ne $HeatHash) {
-            throw "heat.bin non e' una copia identica di ${HeatFile} dopo la copia: il run partirebbe da un'altra tabella."
+            throw "heat.bin non e' una copia identica di ${HeatFile} dopo la copia: il run partirebbe da un'altra tabella. Controlla che heat.bin non sia aperto o in sola lettura, poi rilancia."
         }
         $env:HEAT_FILE = "heat.bin"
     } else {
@@ -560,8 +594,9 @@ function Invoke-Arm([string]$Tag, [int]$Rep) {
     $log = "envab-$Tag-r$Rep.log"
     $e = Invoke-Engine ($Tag -eq "ON") $Prompt $log
     if ($HeatFile) {
-        if ($e.Text -notmatch 'HEAT_FILE loaded') {
-            throw "$Tag rip ${Rep}: nessun 'HEAT_FILE loaded' in $log. La tabella non e' stata letta: questo run e' senza tabella, l'altro braccio forse no."
+        if ($e.Text -notmatch '\[qtier\] HEAT_FILE loaded: heat\.bin') {
+            throw ("$Tag rip ${Rep}: nessun 'HEAT_FILE loaded: heat.bin' in $log, quindi il motore non ha letto la tabella e questo run non e' del braccio che si voleva. " +
+                "La causa piu' probabile: $HeatFile non e' di questo modello (il motore ignora in silenzio layer x esperti diversi dai suoi; vedi la riga heat: dello stamp). Rimedio: $HeatFix.")
         }
     } elseif ($e.Text -match 'HEAT_FILE loaded') {
         throw "$Tag rip ${Rep}: 'HEAT_FILE loaded' in $log. Senza -HeatFile nessun braccio deve caricare una tabella heat."
@@ -600,6 +635,8 @@ try {
     # La variabile la imposta lo script: nella sessione torna com'era prima.
     if ($null -ne $VarBefore) { Set-Item -LiteralPath "Env:\$Var" -Value $VarBefore }
     else { Remove-Item -LiteralPath "Env:\$Var" -ErrorAction SilentlyContinue }
+    if ($null -ne $HeatEnvBefore) { $env:HEAT_FILE = $HeatEnvBefore }
+    else { Remove-Item Env:\HEAT_FILE -ErrorAction SilentlyContinue }
 }
 
 # ---- invarianti su tutti i run, poi il testo fra i bracci -----------------
@@ -612,7 +649,7 @@ $ParamStamp
 if ($HeatFile) {
     # La tabella congelata e' la stessa per tutti i run solo se non e' cambiata.
     if ((Get-FileHash -LiteralPath $hfItem.FullName -Algorithm SHA256).Hash -ne $HeatHash) {
-        throw "${HeatFile} e' cambiata durante la corsa: i run non sono partiti tutti dalla stessa tabella."
+        throw "${HeatFile} e' cambiata durante la corsa: i run non sono partiti tutti dalla stessa tabella. Nessun altro processo deve scriverla durante la misura; rilancia la corsa."
     }
     $HeatStamp
     "tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i $(2 * $Reps) run"
