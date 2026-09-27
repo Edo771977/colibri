@@ -30,8 +30,10 @@ else. In order:
      inside coli_cuda.dll, no administrator rights: step() 30.87 -> 27.62
      ms/token, 95 % [-4.41, -2.09], 6 of 6 pairs, text identical, the
      card at P2 through every ON run; re-run with a later start, -2.97,
-     [-4.32, -1.61], 6/6. Both versions made each run ~18 s longer end to
-     end, most likely at exit (expert tensors freed while the spin runs).
+     [-4.32, -1.61], 6/6. Both made each run ~18 s longer end to end.
+     With the spin paused on tensor frees (the ~20000 at exit), the third
+     run: -3.45 ms/token, 95 % [-3.69, -3.21], 6/6, 29.07 -> 25.62, and
+     no end-to-end cost.
 
 Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
@@ -421,8 +423,31 @@ instead: qt_shutdown (c/qwen36_tier.c) frees every expert tensor, ~20000
 coli_cuda_tensor_free calls, before it calls coli_cuda_shutdown, where
 the spin stops; each cudaFree waits for the running spin. That fits the
 ~18 s, and is again an inference from code and timings. The commit after
-db24c2a7 pauses the spin for 50 ms on every coli_cuda_tensor_free; not
-measured here.
+db24c2a7 (b2ab40f6) pauses the spin for 50 ms on every
+coli_cuda_tensor_free.
+
+Third run, 17:38-17:43, at ee8ba807, which carries that pause:
+coli_cuda.dll 759296 bytes, 17:38:17, sha256 prefix A3F7B9D3B6FEEB39;
+qwen36_clang.exe 17:38:26, sha256 prefix B3D0B91348FB4638. The test
+passed on the card, including "2000 frees took 10.7 ms, 2000 pauses
+requested" and "it launches again once the frees stop". misure-envab,
+same arguments:
+
+  delta appaiati (ON - OFF), ms/token
+  -3.20   -3.70   -3.40   -3.20   -3.50   -3.70
+  media    -3.45   sd  0.23   se  0.09   df 5
+  intervallo 95 %:  [-3.69 ; -3.21]   ampiezza +-0.24
+  negativi 6/6
+  differenza fra le medie dei due gruppi (ABBA): 0.17 ms/token
+
+  OFF step 29.07, moe 15.21, head 1.64, dn 8.91, attn 2.27, take 1.33
+  ON  step 25.62, moe 14.47, head 0.99, dn 7.33, attn 1.82, take 0.57
+
+Text identical within and between the arms (4a000cc01f310b64); banner,
+[place] and residency identical in all 12 runs; miss(CPU) 15611 in both.
+The log end times now space every run 23-26 s from the one before, ON
+and OFF alike: the ~18 s is gone with the pause on frees, which supports
+the exit-path explanation without tracing it.
 
 --- what this means ----------------------------------------------------------
 
@@ -440,7 +465,8 @@ read. Earlier records of this path in docs/experiments logged no clocks,
 so how much of their decode ran in P3 is unknown.
 
 The keep-alive of section 7 gets the same clocks without administrator
-rights and, in its own six pairs, a resolved step() gain of 3.25 ms/token.
+rights: in its final version, step() 29.07 -> 25.62 ms/token, 95 %
+[-3.69, -3.21], six pairs of six, no end-to-end cost.
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
@@ -485,7 +511,6 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
-  - The keep-alive with the pause on frees (the version after db24c2a7):
-    its end-to-end time and its step().
+  - The keep-alive on another card, another driver, or Linux.
   - The keep-alive's power draw, and its effect with a heat table or on
     long generations.

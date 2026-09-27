@@ -1801,9 +1801,9 @@ extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
  * free during decode (an LFRU swap) costs a 50 ms pause, too short for the
  * driver to change state.
  *
- * Measured there (misure-envab.ps1, six ABBA pairs, started at init):
- * step() 30.87 -> 27.62 ms/token, 95 % [-4.41, -2.09], 6/6, text identical,
- * the card at P2 2805 / 10251 MHz through every ON run. Off by default all
+ * Measured there (misure-envab.ps1, six ABBA pairs, this version): step()
+ * 29.07 -> 25.62 ms/token, 95 % [-3.69, -3.21], 6/6, text identical, the
+ * card at P2 2805 / 10251 MHz through every ON run, no end-to-end cost. Off by default all
  * the same: it keeps the card at full clocks, and so at higher power, for
  * as long as the process runs.
  * It cannot change a result -- the kernel reads and writes nothing -- but it
