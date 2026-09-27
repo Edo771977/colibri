@@ -71,7 +71,9 @@ int main(int argc, char **argv) {
         for (int i = 0; i < I; i++) x[i] = 1.f;
         if (!coli_cuda_init(devs, 1)) { printf("FATAL cuda init\n"); return 1; }
         gemv(y, w, sc, x, I, O);
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        /* 50 ms of pause from the free inside gemv(), then the setup and
+         * the first module load: 300 ms leaves room for a slow first launch. */
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         if (g_ka_run.load() != 1 || g_ka_launches.load() == 0) {
             printf("FAIL keep-alive not running before the exit\n"); return 1;
         }

@@ -1798,13 +1798,14 @@ extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
  * each waited for the running spin, ~0.45 ms on average. So
  * coli_cuda_tensor_free pauses the spin for 50 ms, renewed by every further
  * free: a burst of frees waits for one spin at most. A free during decode
- * (an LFRU swap, 8 in each run measured) costs a 50 ms pause; that this is
+ * (an LFRU swap, 8 per run in the third run) costs a 50 ms pause; that this is
  * too short for the driver to change state is inferred, not measured.
  *
- * Measured there with this version (misure-envab.ps1, six ABBA pairs, no
- * heat table): step() 29.07 -> 25.62 ms/token, 95 % [-3.69, -3.21], 6/6,
- * text identical, no end-to-end cost visible at the 1 s resolution of the
- * logs' end times. Clocks were logged only for the init-time version: P2,
+ * Measured there with the pause on frees (ee8ba807; the exit and error
+ * handling added after it were not re-measured; misure-envab.ps1, six ABBA
+ * pairs, no heat table): step() 29.07 -> 25.62 ms/token, 95 % [-3.69,
+ * -3.21], 6/6, text identical, no end-to-end cost visible in the logs' end
+ * times (both arms 23-26 s apart, so 2-3 s would not show). Clocks were logged only for the init-time version: P2,
  * 2790-2805 / 10251 MHz, through every ON run. Off by default all the same:
  * it keeps the card at full clocks, and so at higher power, for as long as
  * the process runs.
@@ -1865,8 +1866,9 @@ static void keepalive_start(void) {
     std::lock_guard<std::mutex> lk(g_ka_mu);
     if (!keepalive_mode() || g_nctx < 1 || g_ka_thr) return;
     /* Registered after cudart's own teardown (the runtime is up by now), so
-     * it runs first: the thread is joined while the runtime still works. On
-     * Windows the process has killed the thread by then; the join returns. */
+     * it runs first: the thread is joined while the runtime still works. In
+     * coli_cuda.dll on Windows it runs at DLL_PROCESS_DETACH, after
+     * ExitProcess has killed the thread: the join returns at once. */
     static bool atexit_done = false;
     if (!atexit_done) atexit_done = std::atexit(keepalive_atexit) == 0;
     int n = g_nctx, devs[COLI_CUDA_MAX_DEVICES] = {};

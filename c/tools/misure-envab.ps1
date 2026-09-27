@@ -277,7 +277,8 @@ $DllStamp
 # Lettura Latin-1: un byte, un carattere, quindi un letterale ASCII si
 # ritrova tale e quale.
 # -MarkerFile e' relativo alla cartella di lavoro (la cwd e' gia' quella) e
-# deve starci dentro: un file preso altrove non e' quello che il motore carica.
+# deve stare DIRETTAMENTE li', accanto all'eseguibile: la DLL che il motore
+# carica e' quella. Un file in una sottocartella o altrove non lo e'.
 $MarkerStamp = ""
 if ($MarkerFile) {
     $mfResolved = Join-Path $WorkDir $MarkerFile
@@ -285,9 +286,8 @@ if ($MarkerFile) {
     if (-not (Test-Path -LiteralPath $mfResolved -PathType Leaf)) { throw "-MarkerFile $MarkerFile ($mfResolved) non esiste o non e' un file." }
     $mfItem = Get-Item -LiteralPath $mfResolved
     $mfPath = $mfItem.FullName
-    $wdFull = $WorkDir.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorChar
-    if (-not $mfPath.StartsWith($wdFull, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "-MarkerFile $mfPath non sta nella cartella di lavoro $WorkDir."
+    if (-not [string]::Equals($mfItem.DirectoryName.TrimEnd('\','/'), $WorkDir.TrimEnd('\','/'), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "-MarkerFile $mfPath non sta direttamente nella cartella di lavoro $WorkDir, dove il motore carica la DLL."
     }
     $mfFix  = "ricompila $MarkerFile (per coli_cuda.dll: make cuda-dll, dal prompt x64 Native Tools)"
     # Stessa guardia di staleness dell'eseguibile, per i sorgenti della DLL.

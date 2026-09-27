@@ -30,12 +30,12 @@ else. In order:
      inside coli_cuda.dll, no administrator rights: step() 30.87 -> 27.62
      ms/token, 95 % [-4.41, -2.09], 6 of 6 pairs, text identical, the
      card at P2 through every ON run (clocks logged in this run only);
-     re-run with a later start, -2.97, [-4.32, -1.61], 6/6. Both made
-     each ON run 18-20 s longer end to end. With the spin paused on
-     tensor frees (the ~41000 cudaFree at exit, two per tensor), the
-     third run: -3.45 ms/token, 95 % [-3.69, -3.21], 6/6, 29.07 ->
-     25.62, and no end-to-end cost visible at the 1 s resolution of the
-     log end times.
+     re-run with a later start, -2.97, [-4.32, -1.61], 6/6. They made
+     each ON run 18-20 s and 17-21 s longer end to end. With the spin
+     paused on tensor frees (the ~41000 cudaFree at exit, two per
+     tensor), the third run: -3.45 ms/token, 95 % [-3.69, -3.21], 6/6,
+     29.07 -> 25.62, and no end-to-end cost visible in the log end times
+     (both arms 23-26 s apart, so a cost of 2-3 s would not show).
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -414,7 +414,8 @@ starts the spin instead of coli_cuda_init (35ee232e): coli_cuda.dll
 758784 bytes, 17:21:06, sha256 prefix E6F056825DEDFE2B; qwen36_clang.exe
 17:21:15, sha256 prefix 6BCD3A14FDD54FFA. The test passed on the card,
 including "init ... arms it and does not start it" and "the first
-coli_cuda_matmul starts it". misure-envab, same arguments:
+coli_cuda_matmul starts it". misure-envab, same arguments (excerpt, the
+timer lines condensed):
 
   delta appaiati (ON - OFF), ms/token
   -1.50   -2.80   -2.40   -2.30   -3.60   -5.20
@@ -448,7 +449,7 @@ coli_cuda.dll 759296 bytes, 17:38:17, sha256 prefix A3F7B9D3B6FEEB39;
 qwen36_clang.exe 17:38:26, sha256 prefix B3D0B91348FB4638. The test
 passed on the card, including "2000 frees took 10.7 ms, 2000 pauses
 requested" and "it launches again once the frees stop". misure-envab,
-same arguments:
+same arguments (excerpt, the timer lines condensed):
 
   delta appaiati (ON - OFF), ms/token
   -3.20   -3.70   -3.40   -3.20   -3.50   -3.70
@@ -466,7 +467,8 @@ Text identical within and between the arms (4a000cc01f310b64); banner,
 run 23-26 s from the one before, ON and OFF alike: the 18-20 s is gone
 with the pause on frees (inferred; the pause removed it), which supports
 the exit-path explanation without tracing it. No end-to-end cost is
-visible at the 1 s resolution of those end times. Each of the 8 swaps
+visible in those end times, though with both arms spread over 23-26 s a
+cost of 2-3 s would not show. Each of the 8 swaps
 frees tensors during decode and so pauses the spin for 50 ms; that this
 is too short for the driver to change state is inferred, not measured:
 clocks were not logged in the second and third runs.
@@ -489,7 +491,7 @@ so how much of their decode ran in P3 is unknown.
 The keep-alive of section 7 held P2 without administrator rights in its
 first run, the only one with a clock log. In its final version, step()
 29.07 -> 25.62 ms/token, 95 % [-3.69, -3.21], six pairs of six, no
-end-to-end cost visible at 1 s resolution.
+end-to-end cost visible in the log end times (to within 2-3 s).
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
