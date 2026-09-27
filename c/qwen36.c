@@ -871,6 +871,13 @@ static int tm_on(void){ if(g_timers<0){ const char *e=getenv("COLI_TIMERS"); g_t
  * and was mostly the shared expert. */
 double g_qt_iss=0, g_qt_cpu=0, g_qt_shr=0, g_qt_tak=0;
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
+/* The two GPU-facing parts of g_dn_sub split further (decode): [0] the qkvz
+ * projection (one placed GEMV, or the two CPU matmuls), [1] the a/b matmuls
+ * (CPU), [2] the gated RMSNorm (CPU), [3] out_proj (placed GEMV or CPU).
+ * g_dn_calls counts decode deltanet calls, g_dn_gpu[0|1] those whose dnproj /
+ * dnout ran on the GPU. Timing only: nothing here changes a result. */
+double g_dn_split[4];
+long g_dn_calls, g_dn_gpu[2];
 double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
 static double g_tm_win_moe=0; static int g_tm_win_n=0;
@@ -902,6 +909,12 @@ static void tm_report(void){
     if(g_dn_sub[0]+g_dn_sub[1]+g_dn_sub[2]+g_dn_sub[3]>0)
         fprintf(stderr,"[timers]   dn-sub: proj %.1f | conv %.1f | l2n+rec %.1f | norm+out %.1f ms/token\n",
             g_dn_sub[0]/g_tm_dec_tokens,g_dn_sub[1]/g_tm_dec_tokens,g_dn_sub[2]/g_tm_dec_tokens,g_dn_sub[3]/g_tm_dec_tokens);
+    if(g_dn_calls>0)
+        fprintf(stderr,"[timers]   dn-split: qkvz %.2f | a+b %.2f | norm %.2f | out %.2f ms/token"
+                " | on GPU: dnproj %ld/%ld, dnout %ld/%ld\n",
+            g_dn_split[0]/g_tm_dec_tokens,g_dn_split[1]/g_tm_dec_tokens,
+            g_dn_split[2]/g_tm_dec_tokens,g_dn_split[3]/g_tm_dec_tokens,
+            g_dn_gpu[0],g_dn_calls,g_dn_gpu[1],g_dn_calls);
     if(g_xf_load+g_xf_run>0)
         fprintf(stderr,"[timers]   expert kernel: fetch %.2f | compute %.2f ms/token\n",
                 g_xf_load/g_tm_dec_tokens, g_xf_run/g_tm_dec_tokens);
@@ -2974,17 +2987,20 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
 
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s * H;
-        extern double g_dn_sub[4];
-        double _d0 = tm_now();
+        extern double g_dn_sub[4], g_dn_split[4];
+        extern long g_dn_calls, g_dn_gpu[2];
+        double _d0 = tm_now(), _s0 = _d0;
         /* projections (single-token matmuls). One fused GEMV when this layer's
          * dnproj is placed on a GPU, the two CPU matmuls otherwise. */
-        if (!qt_dnproj_matmul(layer, qkvz, xs, H, conv_dim + value_dim)) {
+        int dn_gpu_proj = qt_dnproj_matmul(layer, qkvz, xs, H, conv_dim + value_dim);
+        if (!dn_gpu_proj) {
             matmul_d(qkv, xs, l->dn_qkv, 1, H, conv_dim);
             matmul_d(z,   xs, l->dn_z,   1, H, value_dim);
         }
+        if (tm_on() && S==1){ double t=tm_now(); g_dn_split[0]+=t-_s0; _s0=t; g_dn_calls++; g_dn_gpu[0]+=dn_gpu_proj!=0; }
         matmul(b,   xs, l->dn_b,   1, H, vh);
         matmul(a,   xs, l->dn_a,   1, H, vh);
-        if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
+        if (tm_on() && S==1){ double t=tm_now(); g_dn_split[1]+=t-_s0; g_dn_sub[0]+=t-_d0; _d0=t; }
         for (int h = 0; h < vh; h++) {
             beta[h] = 1.f / (1.f + expf(-b[h]));
             gg[h] = -expf(l->dn_alog[h]) * softplus_f(a[h] + l->dn_dtbias[h]);
@@ -3110,9 +3126,11 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
          * per-row -- the loop around it hands one row at a time -- so a
          * placed handle would turn a prompt into S driver round-trips per
          * layer, which is a cost with nothing on the other side of it. */
-        if (!(S == 1 && trunk_out_matmul(l->h_dnout, out + (int64_t)s * H, outr, value_dim, H)))
+        if (tm_on() && S==1){ _s0=tm_now(); g_dn_split[2]+=_s0-_d0; }
+        int dn_gpu_out = S == 1 && trunk_out_matmul(l->h_dnout, out + (int64_t)s * H, outr, value_dim, H);
+        if (!dn_gpu_out)
             matmul_d(out + (int64_t)s * H, outr, l->dn_out, 1, value_dim, H);
-        if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
+        if (tm_on() && S==1){ double t=tm_now(); g_dn_split[3]+=t-_s0; g_dn_sub[3]+=t-_d0; g_dn_gpu[1]+=dn_gpu_out!=0; }
         if (layer == 0 && s == 0 && getenv("DN_DBG")) {
             FILE *dbg = fopen(getenv("DN_DBG"), "wb");
             if (dbg) {

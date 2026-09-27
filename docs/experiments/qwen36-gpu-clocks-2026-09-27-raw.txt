@@ -36,6 +36,12 @@ else. In order:
      tensor), the third run: -3.45 ms/token, 95 % [-3.69, -3.21], 6/6,
      29.07 -> 25.62, and no end-to-end cost visible in the log end times
      (both arms 23-26 s apart, so a cost of 2-3 s would not show).
+  8. The keep-alive with the heat table loaded in both arms (evening,
+     main 8ac49bb9): -2.37 ms/token, 95 % [-3.76, -0.98], 6/6, 25.67 ->
+     23.30, text identical. deltanet is then the largest phase (8.03
+     ms/token); its GPU-facing parts, the qkvz/a/b projections and the
+     norm + out_proj, take 5.67 of it, of which ~1.7-2.5 ms is dense
+     kernel by section 5's durations.
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -44,9 +50,9 @@ Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
 evidence.sha256 exists for them.
 
-The next section describes sections 1 to 6. Section 7 rebuilt the DLL
-and the engine three times and ran each time under misure-envab.ps1; its
-builds and hashes are given there.
+The next section describes sections 1 to 6. Sections 7 and 8 rebuilt the
+DLL and the engine and ran under misure-envab.ps1; their builds and
+hashes are given there.
 
 --- the machine and the binaries -------------------------------------------
 
@@ -473,6 +479,75 @@ frees tensors during decode and so pauses the spin for 50 ms; that this
 is too short for the driver to change state is inferred, not measured:
 clocks were not logged in the second and third runs.
 
+--- 8. the keep-alive with the heat table ------------------------------------
+
+Same day, evening, after #56 and #57 were merged. The operator pulled
+main at 8ac49bb9 (the keep-alive as merged in #56, misure-envab.ps1 with
+-HeatFile from #57) and rebuilt both, DLL first: coli_cuda.dll 759808
+bytes, 21:36:54, sha256 prefix 413CBA2FF43ABFCB; qwen36_clang.exe 374784
+bytes, 21:36:58, sha256 prefix 522F9540244DCA46. Before that, the keep-
+alive test built from 180a793b passed on the card, including the new
+"--exit-without-shutdown" run, which exited with status 0.
+
+  misure-envab.ps1 -Var COLI_CUDA_KEEPALIVE -Marker "[cuda] keep-alive
+  active:" -MarkerFile coli_cuda.dll -HeatFile heat.caldo.bin
+
+six ABBA pairs, both arms with the same table: heat.caldo.bin, 40972
+bytes, 40 layers x 256 experts, sha256 prefix 2682CA6E4CD9744F, the
+table built at 07:49 on prompt-caldo.txt for the heat-table record of
+this morning (qwen36-heatfile-bench-2026-09-27-raw.txt); its sidecar
+matched ("tabella= verificata"), and differs from this run only in the
+executable and the DLL. The table was loaded in all 12 runs and did not
+change. Excerpt (the per-arm timer lines condensed):
+
+  delta appaiati (ON - OFF), ms/token
+  -3.00   -1.20   -0.30   -3.80   -2.90   -3.00
+  media    -2.37   sd  1.32   se  0.54   df 5
+  intervallo 95 %:  [-3.76 ; -0.98]   ampiezza +-1.39
+  negativi 6/6
+  differenza fra le medie dei due gruppi: 0.60 ms/token
+
+  OFF step 25.67, moe 11.71, attn 2.38, dn 9.10, head 1.43, wait 0.63,
+      cpu-miss 4.26, (shared) 3.69, take 0.74, hit 87.2 %, miss 6240
+  ON  step 23.30, moe 11.11, attn 2.08, dn 8.03, head 1.03, wait 0.36,
+      cpu-miss 4.17, (shared) 3.63, take 0.47, hit 87.2 %, miss 6240
+
+Recomputed from the six deltas: mean -2.367, sd 1.325, se 0.541,
+interval -2.367 +- 1.391. Banner, [place] and residency (6859/10240)
+identical in all 12 runs; 8.0 LFRU swaps per run in both arms; the text
+identical within and between the arms (4a000cc01f310b64).
+
+The gain is smaller and noisier than without the table (section 7,
+third run: -3.45, [-3.69, -3.21]). The two runs are separate sessions of
+one evening with different binaries, so the difference between them is
+not a measured effect. One reading is that with ~60 % fewer CPU misses
+the card is busier and drops to P3 less in the OFF arm (its head, 1.43,
+is below the 1.64 of section 7's OFF arm); clocks were not logged during
+this run (the nvidia-smi log was started after it ended), so that is not
+shown.
+
+The dn-sub line of the same 12 logs (the engine prints it under
+COLI_TIMERS; the script did not read it), mean of six runs per arm,
+ms/token:
+
+                proj   conv   l2n+rec   norm+out   sum    dn
+  OFF           4.43   0.43   1.95      2.23       9.05   9.10
+  ON            3.70   0.45   1.97      1.97       8.08   8.03
+
+  proj      = the qkvz projection (one placed GEMV, dnproj) plus the a
+              and b matmuls on the CPU (c/qwen36.c, deltanet()).
+  norm+out  = the gated RMSNorm on the CPU plus out_proj (placed GEMV,
+              dnout).
+
+The keep-alive moves only the two parts with a GPU call in them. With
+it, those two take 5.67 ms/token over 30 layers. The dense kernels
+inside them, at section 5's durations (dnproj 42 us minimum, 44-55 in
+the benchmark; dnout 15 minimum, 17-27 in the benchmark), come to
+30 x (57..82) us = 1.7-2.5 ms. The other ~3.2-4.0 ms is the two
+synchronous round trips per layer (copies, launch, wait), the a/b
+matmuls and the norm; the timers do not split it. That the card was at
+P2 during these calls is assumed from the keep-alive, not logged.
+
 --- what this means ----------------------------------------------------------
 
 On this machine, in every decode that was logged, the card holds P2 for a
@@ -536,6 +611,10 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
+  - Clocks in section 8's run, and how the ~3.2-4.0 ms of deltanet's
+    GPU-facing parts that is not kernel splits between round trips, the
+    a/b matmuls and the norm. The dn-split timers added with this
+    section separate the last three from the round trips' share.
   - Clocks in the keep-alive's second and third runs: that the final
     version, with its 50 ms pauses on frees, holds P2 is inferred from
     its step() times, not logged.
