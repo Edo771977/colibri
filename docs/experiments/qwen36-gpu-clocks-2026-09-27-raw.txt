@@ -29,8 +29,9 @@ else. In order:
   7. COLI_CUDA_KEEPALIVE=1, a one-warp spin kept running on the card from
      inside coli_cuda.dll, no administrator rights: step() 30.87 -> 27.62
      ms/token, 95 % [-4.41, -2.09], 6 of 6 pairs, text identical, the
-     card at P2 through every ON run. Started at init, it made each run
-     ~18 s longer end to end.
+     card at P2 through every ON run; re-run with a later start, -2.97,
+     [-4.32, -1.61], 6/6. Both versions made each run ~18 s longer end to
+     end, most likely at exit (expert tensors freed while the spin runs).
 
 Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
@@ -386,14 +387,42 @@ for a few samples at exit; the OFF runs show the P2 burst and P3 of
 section 5. The spin counts as load for the driver.
 
 The cost: the log end times put each ON run at 44-45 s after the run
-before it and each OFF run at 25-26 s. With the spin started at init,
-the warm start's ~41000 cudaFree calls (the API summary of section 5's
-Nsight run: 41277 cudaFree, 1.09 s in total without the spin) each wait
-for the running kernel. That is the likely cause, inferred from the
-timings, not traced. The commit after 4582d0e5 starts the spin at the first
-coli_cuda_matmul instead, after the warm start; that version is not
-measured here. The spin also keeps the card at full clocks, and so at
-higher power, for as long as the process runs; power was not logged.
+before it and each OFF run at 25-26 s. With the spin started at init, the
+warm start's ~41000 cudaFree calls (the API summary of section 5's Nsight
+run: 41277 cudaFree, 1.09 s in total without the spin) each wait for the
+running kernel. That was the first guess, inferred from the timings, not
+traced, and it was wrong: see the re-run below. The spin also keeps the
+card at full clocks, and so at higher power, for as long as the process
+runs; power was not logged.
+
+Re-run, 17:20-17:28, at db24c2a7, where the first coli_cuda_matmul
+starts the spin instead of coli_cuda_init (35ee232e): coli_cuda.dll
+758784 bytes, 17:21:06, sha256 prefix E6F056825DEDFE2B; qwen36_clang.exe
+17:21:15, sha256 prefix 6BCD3A14FDD54FFA. The test passed on the card,
+including "init ... arms it and does not start it" and "the first
+coli_cuda_matmul starts it". misure-envab, same arguments:
+
+  delta appaiati (ON - OFF), ms/token
+  -1.50   -2.80   -2.40   -2.30   -3.60   -5.20
+  media    -2.97   sd  1.29   se  0.53   df 5
+  intervallo 95 %:  [-4.32 ; -1.61]   ampiezza +-1.36
+  negativi 6/6
+
+  OFF step 30.27, head 1.64, dn 9.37, attn 2.48, take 1.03
+  ON  step 27.30, head 1.01, dn 7.97, attn 2.10, take 0.35
+
+Text identical within and between the arms (4a000cc01f310b64), banner,
+[place] and residency identical in all 12 runs. The end times still put
+the ON runs at 44-46 s and the OFF runs at 25-27 s: moving the start
+past the warm start changed nothing there, so the warm start was not the
+cost. (The warm-start durations were meant to be read from the logs; the
+lines came out cut after "6859", and were not.) Reading the exit path
+instead: qt_shutdown (c/qwen36_tier.c) frees every expert tensor, ~20000
+coli_cuda_tensor_free calls, before it calls coli_cuda_shutdown, where
+the spin stops; each cudaFree waits for the running spin. That fits the
+~18 s, and is again an inference from code and timings. The commit after
+db24c2a7 pauses the spin for 50 ms on every coli_cuda_tensor_free; not
+measured here.
 
 --- what this means ----------------------------------------------------------
 
@@ -456,7 +485,7 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
-  - The keep-alive started at the first GEMV (the version after 4582d0e5):
-    its load time and its step().
+  - The keep-alive with the pause on frees (the version after db24c2a7):
+    its end-to-end time and its step().
   - The keep-alive's power draw, and its effect with a heat table or on
     long generations.
