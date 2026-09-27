@@ -336,18 +336,18 @@ drift across a session by as much as the effects (6a N 27.9 -> 30.0, 6c A
 
 --- what this means ----------------------------------------------------------
 
-On this machine, in every decode that was logged, the card holds P2 for
-a burst of 1.5-2 s and then drops to P3, at 15-40 % utilization; when
-that burst starts relative to the first decoded token is not marked. In
-P3 the placed dense kernels take about twice their P2 time. Locking both clocks brings lm_head back
-to its benchmark time. That accounts for much of the kernel half of the
-benchmark-engine gap of section 3, how much is not measured (no locked
-run was profiled); the copy and host half (~35 us a call, measured
-profiled) is not addressed by it. The double lock recovered 2.07
-ms/token, if that number holds, against ~5.6 missing (81 x 133 us
-against 5.20 ms). The expert kernels probably slow down too; that was
-not read. Earlier records of this path in docs/experiments logged no
-clocks, so how much of their decode ran in P3 is unknown.
+On this machine, in every decode that was logged, the card holds P2 for a
+burst of 1.5-2 s and then drops to P3, at 15-40 % utilization; when that
+burst starts relative to the first decoded token is not marked. In P3 the
+placed dense kernels take about twice their P2 time. Locking both clocks
+brings lm_head back to its benchmark time. That accounts for much of the
+kernel half of the benchmark-engine gap of section 3, how much is not
+measured (no locked run was profiled); the copy and host half (~35 us a
+call, measured profiled) is not addressed by it. The double lock recovered
+2.07 ms/token, if that number holds, against ~5.6 missing (81 x 133 us
+against 5.20 ms). The expert kernels probably slow down too; that was not
+read. Earlier records of this path in docs/experiments logged no clocks,
+so how much of their decode ran in P3 is unknown.
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
