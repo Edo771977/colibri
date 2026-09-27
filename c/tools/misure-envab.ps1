@@ -573,9 +573,18 @@ function Read-Run([string]$Text, [string]$Log) {
     if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+dn-sub:[ \t]*proj[ \t]+([0-9.]+)[ \t]*\|[ \t]*conv[ \t]+([0-9.]+)[ \t]*\|[ \t]*l2n\+rec[ \t]+([0-9.]+)[ \t]*\|[ \t]*norm\+out[ \t]+([0-9.]+)') {
         $dnSub = @([double]$Matches[1], [double]$Matches[2], [double]$Matches[3], [double]$Matches[4])
     }
-    if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+dn-split:[ \t]*qkvz[ \t]+([0-9.]+)[ \t]*\|[ \t]*a\+b[ \t]+([0-9.]+)[ \t]*\|[ \t]*norm[ \t]+([0-9.]+)[ \t]*\|[ \t]*out[ \t]+([0-9.]+)[ \t]*ms/token[ \t]*\|[ \t]*on GPU:[ \t]*dnproj[ \t]+([0-9]+/[0-9]+),[ \t]*dnout[ \t]+([0-9]+/[0-9]+)') {
+    if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+dn-split:[ \t]*qkvz[ \t]+([0-9.]+)[ \t]*\|[ \t]*a\+b[ \t]+([0-9.]+)[ \t]*\|[ \t]*norm[ \t]+([0-9.]+)[ \t]*\|[ \t]*out[ \t]+([0-9.]+)[ \t]*ms/token') {
         $dnSplit = @([double]$Matches[1], [double]$Matches[2], [double]$Matches[3], [double]$Matches[4])
-        $dnGpu = "dnproj {0}, dnout {1}" -f $Matches[5], $Matches[6]
+    }
+    if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+dn-gpu:[ \t]*dnproj[ \t]+([0-9]+/[0-9]+)[ \t]*\|[ \t]*dnout[ \t]+([0-9]+/[0-9]+)') {
+        $dnGpu = "dnproj {0}, dnout {1}" -f $Matches[1], $Matches[2]
+    }
+    # Una riga presente ma illeggibile (spezzata nel log, un valore inf/nan)
+    # toglierebbe in silenzio la riga dalle medie: lo si dice.
+    foreach ($k in @(@("dn-sub", [double]::IsNaN($dnSub[0])), @("dn-split", [double]::IsNaN($dnSplit[0])), @("dn-gpu", -not $dnGpu))) {
+        if ($k[1] -and $Text -match "\[timers\][ \t]+$($k[0]):") {
+            Write-Host ("attenzione: {0} contiene una riga '{1}:' che non si legge (spezzata o con un valore non numerico): esce dalle medie per braccio." -f $Log, $k[0])
+        }
     }
     [pscustomobject]@{
         DnSub=$dnSub; DnSplit=$dnSplit; DnGpu=$dnGpu
@@ -813,7 +822,7 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
     $spl = @(0..3 | ForEach-Object { $i = $_; ($q | ForEach-Object { $_.DnSplit[$i] } | Measure-Object -Average).Average })
     if (-not @($q | Where-Object { [double]::IsNaN($_.DnSplit[0]) }).Count) {
         "       dn-split: qkvz {0,5:N2}  a+b {1,5:N2}  norm {2,5:N2}  out {3,5:N2}  | GPU: {4}" -f $spl[0], $spl[1], $spl[2], $spl[3],
-            (($q | ForEach-Object { $_.DnGpu } | Sort-Object -Unique) -join " / ")
+            $(if (@($q | Where-Object { -not $_.DnGpu }).Count) { "non letta in tutti i run" } else { (($q | ForEach-Object { $_.DnGpu } | Sort-Object -Unique) -join " / ") })
     }
 }
 

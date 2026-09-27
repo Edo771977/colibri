@@ -909,12 +909,16 @@ static void tm_report(void){
     if(g_dn_sub[0]+g_dn_sub[1]+g_dn_sub[2]+g_dn_sub[3]>0)
         fprintf(stderr,"[timers]   dn-sub: proj %.1f | conv %.1f | l2n+rec %.1f | norm+out %.1f ms/token\n",
             g_dn_sub[0]/g_tm_dec_tokens,g_dn_sub[1]/g_tm_dec_tokens,g_dn_sub[2]/g_tm_dec_tokens,g_dn_sub[3]/g_tm_dec_tokens);
-    if(g_dn_calls>0)
-        fprintf(stderr,"[timers]   dn-split: qkvz %.2f | a+b %.2f | norm %.2f | out %.2f ms/token"
-                " | on GPU: dnproj %ld/%ld, dnout %ld/%ld\n",
+    if(g_dn_calls>0){
+        /* Two short lines, not one: Windows PowerShell 5.1 wraps stderr lines
+         * near 120 columns when it logs them, and a wrapped line no longer
+         * matches the measurement scripts' patterns. */
+        fprintf(stderr,"[timers]   dn-split: qkvz %.2f | a+b %.2f | norm %.2f | out %.2f ms/token\n",
             g_dn_split[0]/g_tm_dec_tokens,g_dn_split[1]/g_tm_dec_tokens,
-            g_dn_split[2]/g_tm_dec_tokens,g_dn_split[3]/g_tm_dec_tokens,
+            g_dn_split[2]/g_tm_dec_tokens,g_dn_split[3]/g_tm_dec_tokens);
+        fprintf(stderr,"[timers]   dn-gpu: dnproj %ld/%ld | dnout %ld/%ld calls\n",
             g_dn_gpu[0],g_dn_calls,g_dn_gpu[1],g_dn_calls);
+    }
     if(g_xf_load+g_xf_run>0)
         fprintf(stderr,"[timers]   expert kernel: fetch %.2f | compute %.2f ms/token\n",
                 g_xf_load/g_tm_dec_tokens, g_xf_run/g_tm_dec_tokens);
