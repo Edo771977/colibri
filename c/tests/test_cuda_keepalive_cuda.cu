@@ -12,10 +12,12 @@
  *      GEMV with it stopped;
  *   3b. coli_cuda_tensor_free pauses it: 2000 frees in a row while it runs
  *      take well under the ~1 s they would if each cudaFree waited for a
- *      1 ms spin (qt_shutdown frees ~20000 tensors this way), and it
+ *      1 ms spin (qt_shutdown makes ~41000 cudaFree calls this way), and it
  *      launches again once the frees stop;
  *   4. coli_cuda_shutdown stops and joins it, and a later init with the
- *      variable off does not restart it.
+ *      variable off does not restart it;
+ *   5. with --exit-without-shutdown (a second run from make): returning
+ *      from main while it runs, without coli_cuda_shutdown, exits cleanly.
  * Whether the driver keeps its clocks up is not testable here: that is the
  * measurement in docs/experiments/qwen36-gpu-clocks-2026-09-27-raw.txt.
  *
@@ -51,11 +53,31 @@ static void gemv(float *y, const int8_t *w, const float *sc, const float *x, int
     coli_cuda_tensor_free(t);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
 #if !COLI_HAS_KEEPALIVE
+    (void)argc; (void)argv; (void)check; (void)gemv; (void)set_env; (void)devs;
     printf("SKIP test_cuda_keepalive: CUDA only (the spin reads %%globaltimer)\n");
     return 0;
 #else
+    /* Run by make as a second command: start it and return from main without
+     * coli_cuda_shutdown, as the GLM engine does. The exit must be clean (a
+     * joinable static std::thread used to abort here). */
+    if (argc > 1 && !strcmp(argv[1], "--exit-without-shutdown")) {
+        set_env("COLI_CUDA_KEEPALIVE", "1");
+        const int I = 256, O = 256;
+        static int8_t w[I * O]; static float sc[O], x[I], y[O];
+        for (int i = 0; i < I * O; i++) w[i] = (int8_t)(i % 101 - 50);
+        for (int o = 0; o < O; o++) sc[o] = 0.01f;
+        for (int i = 0; i < I; i++) x[i] = 1.f;
+        if (!coli_cuda_init(devs, 1)) { printf("FATAL cuda init\n"); return 1; }
+        gemv(y, w, sc, x, I, O);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        if (g_ka_run.load() != 1 || g_ka_launches.load() == 0) {
+            printf("FAIL keep-alive not running before the exit\n"); return 1;
+        }
+        printf("OK test_cuda_keepalive --exit-without-shutdown: running, returning from main\n");
+        return 0;
+    }
     printf("parse\n");
     set_env("COLI_CUDA_KEEPALIVE", "");     check(!keepalive_mode(), "unset: off");
     set_env("COLI_CUDA_KEEPALIVE", "0");    check(!keepalive_mode(), "\"0\": off");
@@ -77,6 +99,8 @@ int main(void) {
     check(g_ka_run.load() == 0 && g_ka_armed.load() == 1, "init with COLI_CUDA_KEEPALIVE=1 arms it and does not start it");
     gemv(y_first, w, sc, x, I, O);
     check(g_ka_run.load() == 1 && g_ka_armed.load() == 0, "the first coli_cuda_matmul starts it");
+    /* The free inside gemv() paused it for 50 ms: sample after that. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
     unsigned long long l0 = g_ka_launches.load();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     unsigned long long l1 = g_ka_launches.load();
@@ -109,7 +133,7 @@ int main(void) {
     printf("results\n");
     gemv(y_on, w, sc, x, I, O);
     keepalive_stop();
-    check(g_ka_run.load() == 0 && !g_ka_thr.joinable(), "keepalive_stop stops and joins it");
+    check(g_ka_run.load() == 0 && g_ka_thr == nullptr, "keepalive_stop stops and joins it");
     gemv(y_off, w, sc, x, I, O);
     check(!memcmp(y_on, y_off, O * sizeof(float)), "a GEMV while it runs equals the GEMV without it, byte for byte");
     check(!memcmp(y_first, y_off, O * sizeof(float)), "the GEMV that starts it gives the same bytes too");
@@ -121,7 +145,7 @@ int main(void) {
     gemv(y_first, w, sc, x, I, O);
     check(g_ka_run.load() == 1, "re-init with it on, then a GEMV, restarts it");
     coli_cuda_shutdown();
-    check(g_ka_run.load() == 0 && !g_ka_thr.joinable(), "coli_cuda_shutdown stops and joins it");
+    check(g_ka_run.load() == 0 && g_ka_thr == nullptr, "coli_cuda_shutdown stops and joins it");
     set_env("COLI_CUDA_KEEPALIVE", "0");
     if (!coli_cuda_init(devs, 1)) { printf("FATAL cuda re-init\n"); return 1; }
     gemv(y_first, w, sc, x, I, O);

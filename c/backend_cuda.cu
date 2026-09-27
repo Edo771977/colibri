@@ -1777,45 +1777,56 @@ extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
  *
  * Measured on an RTX 4070 Ti SUPER under Windows (docs/experiments/
  * qwen36-gpu-clocks-2026-09-27-raw.txt): qwen36's decode keeps the card
- * 15-40 % busy, and about two seconds in the driver drops it from P2 to P3,
- * memory 10251 -> 5001 MHz and graphics ~2600 -> ~1900 MHz. The placed
- * dense GEMVs then take twice their P2 time. Locking both clocks with
- * nvidia-smi gave -2.07 ms/token over three pairs (95 % interval including
- * zero), but needs administrator
- * rights; the driver's "Prefer maximum performance" did not reach the
- * process. This is the unprivileged attempt, after COLI_METAL_SPIN
- * (backend_metal.mm): a host thread relaunches a one-warp spin kernel of
- * ~1 ms on its own non-blocking, lowest-priority stream, waiting on an event
- * with blocking sync so the thread sleeps between launches.
+ * 15-40 % busy, and after a P2 burst of 1.5-2 s the driver drops it to P3,
+ * memory 10251 -> 5001 MHz and graphics to ~1700-2050 MHz. The placed
+ * dense GEMVs' median duration is then about twice their minimum. Locking
+ * both clocks with nvidia-smi gave -2.07 ms/token over three pairs (95 %
+ * interval including zero) but needs administrator rights; the driver's
+ * "Prefer maximum performance" had no measurable effect. This is the
+ * unprivileged attempt, after COLI_METAL_SPIN (backend_metal.mm): a host
+ * thread relaunches a one-warp spin kernel of ~1 ms on its own non-blocking
+ * stream (at the device's least priority, which is also the default streams'
+ * priority: it gets no precedence over them, nor they over it), waiting on
+ * an event with blocking sync so the thread sleeps between launches.
  *
- * Armed by coli_cuda_init, started by the first coli_cuda_matmul. Started
- * at init, the ON runs took ~18 s longer end to end on that machine, most
- * likely because the warm start's ~41000 cudaFree each wait for every
- * running kernel, the spin included (inferred from log times, not traced).
- * qwen36's first placed GEMV comes after the warm start. That did not remove
- * the ~18 s: re-measured, the ON runs were still that much longer. The
- * cost was at exit, where qt_shutdown frees ~20000 expert tensors before it
- * calls coli_cuda_shutdown, and each cudaFree waits for the running spin.
- * So coli_cuda_tensor_free pauses the spin for 50 ms, renewed by every
- * further free: a burst of frees waits for one spin at most, and the rare
- * free during decode (an LFRU swap) costs a 50 ms pause, too short for the
- * driver to change state.
+ * Armed by coli_cuda_init, started by the first coli_cuda_matmul, paused on
+ * tensor frees. Started at init, the ON runs took 18-20 s longer end to end.
+ * Moving the start after the warm start did not change that. The cost is at
+ * exit, inferred from the code and removed by the pause: qt_shutdown frees
+ * every expert tensor before it calls coli_cuda_shutdown, ~41000 cudaFree
+ * (two per tensor; Nsight counted 41277 in a run with 6851 residents), and
+ * each waited for the running spin, ~0.45 ms on average. So
+ * coli_cuda_tensor_free pauses the spin for 50 ms, renewed by every further
+ * free: a burst of frees waits for one spin at most. A free during decode
+ * (an LFRU swap, 8 in each run measured) costs a 50 ms pause; that this is
+ * too short for the driver to change state is inferred, not measured.
  *
- * Measured there (misure-envab.ps1, six ABBA pairs, this version): step()
- * 29.07 -> 25.62 ms/token, 95 % [-3.69, -3.21], 6/6, text identical, the
- * card at P2 2805 / 10251 MHz through every ON run, no end-to-end cost. Off by default all
- * the same: it keeps the card at full clocks, and so at higher power, for
- * as long as the process runs.
+ * Measured there with this version (misure-envab.ps1, six ABBA pairs, no
+ * heat table): step() 29.07 -> 25.62 ms/token, 95 % [-3.69, -3.21], 6/6,
+ * text identical, no end-to-end cost visible at the 1 s resolution of the
+ * logs' end times. Clocks were logged only for the init-time version: P2,
+ * 2790-2805 / 10251 MHz, through every ON run. Off by default all the same:
+ * it keeps the card at full clocks, and so at higher power, for as long as
+ * the process runs.
  * It cannot change a result -- the kernel reads and writes nothing -- but it
  * holds a warp on one SM and a CPU thread. Non-blocking stream: the dense
  * path's legacy stream 0 does not wait for it. Stopped and joined first
  * thing in coli_cuda_shutdown (qwen36 reaches it through atexit), before any
- * context state goes. CUDA only: the spin reads %globaltimer. */
+ * context state goes, and by an atexit of its own for the callers that never
+ * call coli_cuda_shutdown (the GLM engine). Only the free in
+ * coli_cuda_tensor_free pauses it; other synchronising calls (cudaFree in
+ * reserve(), cudaDeviceSynchronize, cudaFreeHost) can still wait up to ~1 ms
+ * for the running spin. CUDA only: the spin reads %globaltimer. */
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__)
+/* The iteration cap bounds the kernel should %globaltimer not advance (some
+ * virtualised setups): a spin that never ends would hang every cudaFree. */
 __global__ static void keepalive_spin(unsigned long long ns) {
     unsigned long long t0, t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
-    do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < ns);
+    for (unsigned it = 0; it < (1u << 24); it++) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 >= ns) break;
+    }
 }
 #define COLI_HAS_KEEPALIVE 1
 #else
@@ -1837,22 +1848,31 @@ static inline void keepalive_yield(void) {
     g_ka_yields++;
 }
 static std::atomic<unsigned long long> g_ka_launches{0};
-static std::thread g_ka_thr;
-/* Exactly "1" turns it on, as COLI_DENSE_IDOT does on the engine side. */
+/* On the heap, not a static std::thread: one still joinable when static
+ * destructors run would call std::terminate. keepalive_stop joins and
+ * deletes it; nothing else ever destroys it. */
+static std::thread *g_ka_thr = nullptr;
+static std::mutex g_ka_mu;                 /* serialises start and stop */
+/* Exactly "1" turns it on. */
 static int keepalive_mode(void) {
     const char *e = std::getenv("COLI_CUDA_KEEPALIVE");
     return e && e[0] == '1' && e[1] == 0;
 }
+static void keepalive_stop(void);
+static void keepalive_atexit(void) { keepalive_stop(); }
 static void keepalive_start(void) {
 #if COLI_HAS_KEEPALIVE
-    if (!keepalive_mode() || g_nctx < 1 || g_ka_run.exchange(1)) return;
-    int n = g_nctx, devs[COLI_CUDA_MAX_DEVICES];
+    std::lock_guard<std::mutex> lk(g_ka_mu);
+    if (!keepalive_mode() || g_nctx < 1 || g_ka_thr) return;
+    /* Registered after cudart's own teardown (the runtime is up by now), so
+     * it runs first: the thread is joined while the runtime still works. On
+     * Windows the process has killed the thread by then; the join returns. */
+    static bool atexit_done = false;
+    if (!atexit_done) atexit_done = std::atexit(keepalive_atexit) == 0;
+    int n = g_nctx, devs[COLI_CUDA_MAX_DEVICES] = {};
     for (int i = 0; i < n; i++) devs[i] = g_ctx[i].device;
-    /* Announced from here, before the thread runs: the line is the proof a
-     * measurement script checks that the ON arm really took this branch. */
-    std::fprintf(stderr, "[cuda] keep-alive active: COLI_CUDA_KEEPALIVE=1, "
-                 "a 1 ms one-warp spin per device on a low-priority stream\n");
-    g_ka_thr = std::thread([n, devs]() {
+    g_ka_run.store(1);
+    try { g_ka_thr = new std::thread([n, devs]() {
         cudaStream_t st[COLI_CUDA_MAX_DEVICES] = {};
         cudaEvent_t ev[COLI_CUDA_MAX_DEVICES] = {};
         int ok = 1;
@@ -1863,19 +1883,32 @@ static void keepalive_start(void) {
               && cudaStreamCreateWithPriority(&st[i], cudaStreamNonBlocking, lo) == cudaSuccess
               && cudaEventCreateWithFlags(&ev[i], cudaEventBlockingSync | cudaEventDisableTiming) == cudaSuccess;
         }
-        if (!ok) std::fprintf(stderr, "[cuda] keep-alive: setup failed (%s), not running\n",
-                              cudaGetErrorString(cudaGetLastError()));
+        /* Announced only once the streams and events exist: the line is the
+         * proof a measurement script checks that the ON arm really runs the
+         * spin, so a failed setup must not print it. */
+        if (ok) std::fprintf(stderr, "[cuda] keep-alive active: COLI_CUDA_KEEPALIVE=1, "
+                             "a 1 ms one-warp spin per device on its own stream\n");
+        else std::fprintf(stderr, "[cuda] keep-alive: setup failed (%s), not running\n",
+                          cudaGetErrorString(cudaGetLastError()));
         while (ok && g_ka_run.load()) {
             if (ka_now_ns() < g_ka_pause_until.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
-            for (int i = 0; i < n; i++) {
+            for (int i = 0; i < n && ok; i++) {
                 cudaSetDevice(devs[i]);
                 keepalive_spin<<<1, 32, 0, st[i]>>>(1000000ULL);
-                cudaEventRecord(ev[i], st[i]);
+                /* A launch that fails (no kernel image for this card, say)
+                 * would leave the event records and syncs returning at once:
+                 * a loop burning a CPU core. Stop instead. */
+                cudaError_t le = cudaGetLastError();
+                if (le != cudaSuccess || cudaEventRecord(ev[i], st[i]) != cudaSuccess) {
+                    std::fprintf(stderr, "[cuda] keep-alive: launch failed (%s), stopped\n",
+                                 cudaGetErrorString(le != cudaSuccess ? le : cudaGetLastError()));
+                    ok = 0;
+                }
             }
-            for (int i = 0; i < n; i++)
+            for (int i = 0; i < n && ok; i++)
                 if (cudaEventSynchronize(ev[i]) != cudaSuccess) ok = 0;
             if (ok) g_ka_launches++;
         }
@@ -1884,16 +1917,32 @@ static void keepalive_start(void) {
             if (ev[i]) cudaEventDestroy(ev[i]);
             if (st[i]) cudaStreamDestroy(st[i]);
         }
-    });
+        g_ka_run.store(0);
+    }); } catch (...) {
+        g_ka_thr = nullptr;
+        g_ka_run.store(0);
+        std::fprintf(stderr, "[cuda] keep-alive: could not create its thread, not running\n");
+    }
 #endif
 }
 static void keepalive_stop(void) {
+    std::lock_guard<std::mutex> lk(g_ka_mu);
     g_ka_armed.store(0);
-    if (g_ka_run.exchange(0) && g_ka_thr.joinable()) g_ka_thr.join();
+    g_ka_run.store(0);
+    if (g_ka_thr) {
+        if (g_ka_thr->joinable()) g_ka_thr->join();
+        delete g_ka_thr;
+        g_ka_thr = nullptr;
+    }
 }
 /* Called by coli_cuda_init: remember, do not start (see above). */
 static void keepalive_arm(void) {
+#if COLI_HAS_KEEPALIVE
     g_ka_armed.store(keepalive_mode() && g_nctx > 0 ? 1 : 0);
+#else
+    if (keepalive_mode())
+        std::fprintf(stderr, "[cuda] COLI_CUDA_KEEPALIVE=1 ignored: CUDA builds only\n");
+#endif
 }
 /* Called at the top of coli_cuda_matmul: one relaxed load once running. */
 static inline void keepalive_on_first_use(void) {
@@ -1902,6 +1951,7 @@ static inline void keepalive_on_first_use(void) {
 }
 
 extern "C" int coli_cuda_init(const int *devices, int count) {
+    keepalive_stop();   /* a second init must not leave the old spin running */
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
     /* #509: the ROCm runtime (comgr, MIOpen, roctracer) reads $TEMP as a temp-dir
      * path. A stray numeric TEMP (the engine's legacy sampling alias) makes comgr's

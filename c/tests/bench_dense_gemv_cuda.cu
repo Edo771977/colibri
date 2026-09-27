@@ -90,7 +90,7 @@ static const int ROUNDS = 3;
 static int fails;
 
 static void die(const char *what) {
-    printf("FATAL %s: %s\n", what, cudaGetErrorString(cudaGetLastError()));
+    printf("FATAL %s refused (last CUDA error: %s)\n", what, cudaGetErrorString(cudaGetLastError()));
     exit(1);
 }
 static void cuda_check(cudaError_t e, const char *what) {
@@ -137,6 +137,8 @@ int main(void) {
      * backend; the profile flag is cached on first use, so clear it first. */
     bench_setenv("COLI_CUDA_PROFILE", "0");
     bench_setenv("COLI_CUDA_DENSE_PINNED", "0");
+    /* Kernels alone: no keep-alive spin sharing the card with them. */
+    bench_setenv("COLI_CUDA_KEEPALIVE", "0");
     if (!coli_cuda_init(devs, 1)) { printf("FATAL cuda init\n"); return 1; }
     cudaDeviceProp prop;
     cuda_check(cudaGetDeviceProperties(&prop, 0), "device properties");
@@ -349,6 +351,7 @@ int main(void) {
     printf("  weight bytes per token: %.2f GB\n", total_bytes / 1e9);
 
     bench_setenv("COLI_CUDA_I8_ROWS", "");
+    coli_cuda_shutdown();
     if (fails) { printf("\n%d check(s) FAILED: the timings above are not of a correct kernel\n", fails); return 1; }
     printf("\nOK: every width equals R=0 byte for byte, R=0 equals the CPU reference\n");
     return 0;

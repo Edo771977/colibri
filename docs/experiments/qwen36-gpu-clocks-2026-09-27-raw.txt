@@ -29,15 +29,24 @@ else. In order:
   7. COLI_CUDA_KEEPALIVE=1, a one-warp spin kept running on the card from
      inside coli_cuda.dll, no administrator rights: step() 30.87 -> 27.62
      ms/token, 95 % [-4.41, -2.09], 6 of 6 pairs, text identical, the
-     card at P2 through every ON run; re-run with a later start, -2.97,
-     [-4.32, -1.61], 6/6. Both made each run ~18 s longer end to end.
-     With the spin paused on tensor frees (the ~20000 at exit), the third
-     run: -3.45 ms/token, 95 % [-3.69, -3.21], 6/6, 29.07 -> 25.62, and
-     no end-to-end cost.
+     card at P2 through every ON run (clocks logged in this run only);
+     re-run with a later start, -2.97, [-4.32, -1.61], 6/6. Both made
+     each ON run 18-20 s longer end to end. With the spin paused on
+     tensor frees (the ~41000 cudaFree at exit, two per tensor), the
+     third run: -3.45 ms/token, 95 % [-3.69, -3.21], 6/6, 29.07 ->
+     25.62, and no end-to-end cost visible at the 1 s resolution of the
+     log end times.
+
+The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
+main does not have the variable.
 
 Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
 evidence.sha256 exists for them.
+
+The next section describes sections 1 to 6. Section 7 rebuilt the DLL
+and the engine three times and ran each time under misure-envab.ps1; its
+builds and hashes are given there.
 
 --- the machine and the binaries -------------------------------------------
 
@@ -53,8 +62,8 @@ Engine : .\qwen36_clang.exe, 374272 bytes, 2026-09-27 14:50:39, sha256
          plus the opt-in COLI_DENSE_IDOT). With that variable unset the
          engine's arithmetic is main's; the misure-envab stamp printed the
          build-config (clang, -O3 -march=native -fopenmp, -DCOLI_CUDA,
-         CUDA_DLL=1). The operator did not rebuild the engine during the
-         session: every engine run below is this binary, 6c's P arm a
+         CUDA_DLL=1). The operator did not rebuild the engine during
+         sections 1-6: every engine run below is this binary, 6c's P arm a
          byte copy of it under another name.
 DLL    : coli_cuda.dll, 752640 bytes, 2026-09-21 20:46:01, sha256
          prefix 0D57602B4917A92C. Its source commit is unknown. Read as
@@ -77,7 +86,8 @@ Env    : COLI_CUDA=1, COLI_GPUS=0, COLI_TIMERS=1, N_NEW=128, SNAP set as
          above. COLI_GRAPH_DIAG, CUDA_EXPERT_GB, HEAT_FILE, COLI_PLACE,
          COLI_DENSE_IDOT, COLI_CUDA_PROFILE and KMP_BLOCKTIME cleared with
          `set X=` before each block, except where a block sets one of them.
-         Only experiment 1 ran under a guard script (misure-envab.ps1);
+         Of sections 1-6, only experiment 1 ran under a guard script
+         (misure-envab.ps1);
          the other blocks were plain cmd lines, so the environment beyond
          those names was not checked by anything.
 Bench  : c/tests/bench_dense_gemv_cuda.cu, `make dense-gemv-bench CC=clang
@@ -94,7 +104,8 @@ those lines were not in what was pasted.
 
 c/tools/misure-envab.ps1 (1f049055): same executable, OFF = variable
 absent, ON = COLI_DENSE_IDOT=1, six ABBA pairs, marker line checked in
-every ON log and absent from every OFF log. Excerpt of the output:
+every ON log and absent from every OFF log. Excerpt of the output (the
+per-arm timer lines condensed):
 
   delta appaiati (ON - OFF), ms/token
   0.00   0.40   -0.20   -0.10   -0.30   0.10
@@ -359,7 +370,8 @@ checked.
 
 In this build coli_cuda_init starts the spin. c/tools/misure-envab.ps1
 -Var COLI_CUDA_KEEPALIVE -Marker "[cuda] keep-alive active:" -MarkerFile
-coli_cuda.dll, six ABBA pairs, no heat table. Excerpt:
+coli_cuda.dll, six ABBA pairs, no heat table. Excerpt (the per-arm
+timer lines condensed):
 
   delta appaiati (ON - OFF), ms/token
   -1.80   -2.50   -3.30   -5.10   -3.30   -3.50
@@ -389,11 +401,11 @@ for a few samples at exit; the OFF runs show the P2 burst and P3 of
 section 5. The spin counts as load for the driver.
 
 The cost: the log end times put each ON run at 44-45 s after the run
-before it and each OFF run at 25-26 s. With the spin started at init, the
-warm start's ~41000 cudaFree calls (the API summary of section 5's Nsight
-run: 41277 cudaFree, 1.09 s in total without the spin) each wait for the
-running kernel. That was the first guess, inferred from the timings, not
-traced, and it was wrong: see the re-run below. The spin also keeps the
+before it and each OFF run at 25-26 s. The first guess was the warm
+start: with the spin started at init, each cudaFree waits for the running
+kernel, and section 5's Nsight API summary counts 41277 cudaFree (1.09 s
+in total without the spin). That guess came from the timings, not a
+trace, and it put the calls in the wrong place: see the re-run below. The spin also keeps the
 card at full clocks, and so at higher power, for as long as the process
 runs; power was not logged.
 
@@ -409,6 +421,8 @@ coli_cuda_matmul starts it". misure-envab, same arguments:
   media    -2.97   sd  1.29   se  0.53   df 5
   intervallo 95 %:  [-4.32 ; -1.61]   ampiezza +-1.36
   negativi 6/6
+  (order split, recomputed here from the deltas: OFF first -2.50, ON
+  first -3.43, difference 0.93 ms/token)
 
   OFF step 30.27, head 1.64, dn 9.37, attn 2.48, take 1.03
   ON  step 27.30, head 1.01, dn 7.97, attn 2.10, take 0.35
@@ -419,10 +433,13 @@ the ON runs at 44-46 s and the OFF runs at 25-27 s: moving the start
 past the warm start changed nothing there, so the warm start was not the
 cost. (The warm-start durations were meant to be read from the logs; the
 lines came out cut after "6859", and were not.) Reading the exit path
-instead: qt_shutdown (c/qwen36_tier.c) frees every expert tensor, ~20000
-coli_cuda_tensor_free calls, before it calls coli_cuda_shutdown, where
-the spin stops; each cudaFree waits for the running spin. That fits the
-~18 s, and is again an inference from code and timings. The commit after
+instead: qt_shutdown (c/qwen36_tier.c) frees every expert tensor before
+it calls coli_cuda_shutdown, where the spin stops, and each
+coli_cuda_tensor_free makes two cudaFree calls: 6851 residents x 3
+tensors x 2, plus ~160 for the dense tensors, is ~41270, against the
+41277 Nsight counted; the warm start frees almost nothing. Each cudaFree
+waits for the running spin, and ~41000 x ~0.45 ms fits the 18-20 s. That
+is again an inference from code and timings, not a trace. The commit after
 db24c2a7 (b2ab40f6) pauses the spin for 50 ms on every
 coli_cuda_tensor_free.
 
@@ -438,16 +455,21 @@ same arguments:
   media    -3.45   sd  0.23   se  0.09   df 5
   intervallo 95 %:  [-3.69 ; -3.21]   ampiezza +-0.24
   negativi 6/6
-  differenza fra le medie dei due gruppi (ABBA): 0.17 ms/token
+  differenza fra le medie dei due gruppi: 0.17 ms/token
 
   OFF step 29.07, moe 15.21, head 1.64, dn 8.91, attn 2.27, take 1.33
   ON  step 25.62, moe 14.47, head 0.99, dn 7.33, attn 1.82, take 0.57
 
 Text identical within and between the arms (4a000cc01f310b64); banner,
-[place] and residency identical in all 12 runs; miss(CPU) 15611 in both.
-The log end times now space every run 23-26 s from the one before, ON
-and OFF alike: the ~18 s is gone with the pause on frees, which supports
-the exit-path explanation without tracing it.
+[place] and residency identical in all 12 runs; miss(CPU) 15611 in both;
+8.0 LFRU swaps per run in both arms. The log end times now space every
+run 23-26 s from the one before, ON and OFF alike: the 18-20 s is gone
+with the pause on frees (inferred; the pause removed it), which supports
+the exit-path explanation without tracing it. No end-to-end cost is
+visible at the 1 s resolution of those end times. Each of the 8 swaps
+frees tensors during decode and so pauses the spin for 50 ms; that this
+is too short for the driver to change state is inferred, not measured:
+clocks were not logged in the second and third runs.
 
 --- what this means ----------------------------------------------------------
 
@@ -464,9 +486,10 @@ against 5.20 ms). The expert kernels probably slow down too; that was not
 read. Earlier records of this path in docs/experiments logged no clocks,
 so how much of their decode ran in P3 is unknown.
 
-The keep-alive of section 7 gets the same clocks without administrator
-rights: in its final version, step() 29.07 -> 25.62 ms/token, 95 %
-[-3.69, -3.21], six pairs of six, no end-to-end cost.
+The keep-alive of section 7 held P2 without administrator rights in its
+first run, the only one with a clock log. In its final version, step()
+29.07 -> 25.62 ms/token, 95 % [-3.69, -3.21], six pairs of six, no
+end-to-end cost visible at 1 s resolution.
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
@@ -511,6 +534,9 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
+  - Clocks in the keep-alive's second and third runs: that the final
+    version, with its 50 ms pauses on frees, holds P2 is inferred from
+    its step() times, not logged.
   - The keep-alive on another card, another driver, or Linux.
   - The keep-alive's power draw, and its effect with a heat table or on
     long generations.

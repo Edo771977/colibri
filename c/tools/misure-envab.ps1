@@ -20,8 +20,8 @@
 # I BRACCI, entrambi senza tabella heat (HEAT_FILE fuori dall'ambiente):
 #   OFF   la variabile -Var rimossa dall'ambiente.
 #   ON    -Var impostata a -Value (default "1").
-# -Var e -Marker non hanno default: lo script e' nato per COLI_DENSE_IDOT,
-# che non e' entrato in main (docs/experiments/
+# -Var e -Marker non hanno default: lo script e' nato per una variabile del
+# motore che non e' entrata in main (docs/experiments/
 # qwen36-gpu-clocks-2026-09-27-raw.txt, sezione 1).
 #
 # PROVA DEL BRACCIO: -Marker e' una riga che il motore scrive su stderr
@@ -85,6 +85,12 @@ if (-not $Var) {
 if ($Var -cnotmatch '^[A-Z][A-Z0-9_]*$') {
     throw "-Var '$Var' non e' un nome di variabile valido (maiuscole, cifre, _)."
 }
+# Queste le imposta o le rimuove lo script in ogni run: come -Var il braccio
+# ON e OFF sarebbero decisi da Invoke-Engine, non dalla variabile.
+$ScriptOwned = @("SNAP","COLI_CUDA","COLI_GPUS","COLI_TIMERS","COLI_PLACE","HEAT_FILE","N_NEW")
+if ($ScriptOwned -contains $Var) {
+    throw "-Var $Var e' una delle variabili che lo script imposta da se' ($($ScriptOwned -join ', ')): non si puo' misurare con questo script."
+}
 if (-not $Value) { throw "-Value e' vuoto: il braccio ON sarebbe una variabile vuota, che il motore puo' leggere come assente." }
 if (-not $Marker.Trim()) { throw "-Marker e' vuoto: senza la riga di prova non si puo' verificare che il braccio ON sia diverso da OFF." }
 if ($NNew -lt 2) {
@@ -107,7 +113,11 @@ Set-Location -LiteralPath $WorkDir
 # famiglie di nomi del motore, di CUDA e del runtime OpenMP. L'elenco dei nomi
 # senza prefisso va tenuto allineato a mano ai getenv del motore, e quei nomi
 # sono rifiutati tutti allo stesso titolo: la guardia non li classifica.
-$EnvOwn = @("SNAP","COLI_CUDA","COLI_GPUS","COLI_TIMERS","COLI_PLACE","HEAT_FILE","N_NEW",$Var)
+$EnvOwn = $ScriptOwned + @($Var)
+# Il valore che -Var aveva prima dello script, rimesso alla fine. Le altre
+# variabili che lo script imposta restano cambiate: lanciato con -File (come
+# indica l'intestazione) gira in un processo suo e non tocca la finestra.
+$VarBefore = [Environment]::GetEnvironmentVariable($Var)
 # Con -File, PowerShell passa "-AllowEnv A,B" come UN SOLO elemento di
 # [string[]]: va rispezzato a mano.
 $AllowEnv = @($AllowEnv | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -266,10 +276,30 @@ $DllStamp
 # modifica non lo contiene e i due bracci sarebbero lo stesso programma.
 # Lettura Latin-1: un byte, un carattere, quindi un letterale ASCII si
 # ritrova tale e quale.
+# -MarkerFile e' relativo alla cartella di lavoro (la cwd e' gia' quella) e
+# deve starci dentro: un file preso altrove non e' quello che il motore carica.
+$MarkerStamp = ""
 if ($MarkerFile) {
-    if (-not (Test-Path -LiteralPath $MarkerFile -PathType Leaf)) { throw "-MarkerFile $MarkerFile non esiste o non e' un file." }
-    $mfPath = (Get-Item -LiteralPath $MarkerFile).FullName
+    $mfResolved = Join-Path $WorkDir $MarkerFile
+    if ([System.IO.Path]::IsPathRooted($MarkerFile)) { $mfResolved = $MarkerFile }
+    if (-not (Test-Path -LiteralPath $mfResolved -PathType Leaf)) { throw "-MarkerFile $MarkerFile ($mfResolved) non esiste o non e' un file." }
+    $mfItem = Get-Item -LiteralPath $mfResolved
+    $mfPath = $mfItem.FullName
+    $wdFull = $WorkDir.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $mfPath.StartsWith($wdFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "-MarkerFile $mfPath non sta nella cartella di lavoro $WorkDir."
+    }
     $mfFix  = "ricompila $MarkerFile (per coli_cuda.dll: make cuda-dll, dal prompt x64 Native Tools)"
+    # Stessa guardia di staleness dell'eseguibile, per i sorgenti della DLL.
+    foreach ($src in @("backend_cuda.cu","backend_cuda.h","backend_gpu_compat.h")) {
+        if (-not (Test-Path -LiteralPath $src)) { throw "manca $src nella cartella di lavoro ($WorkDir): il controllo di staleness di $MarkerFile passerebbe a vuoto." }
+        if ((Get-Item -LiteralPath $src).LastWriteTime -gt $mfItem.LastWriteTime) {
+            throw "$src e' piu' recente di ${mfPath}: $mfFix, altrimenti misuri una DLL che non e' quella dell'albero."
+        }
+    }
+    $MarkerStamp = "marker-file: {0} | {1} byte | {2} | sha256 {3}" -f `
+        $MarkerFile, $mfItem.Length, $mfItem.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"),
+        (Get-FileHash -LiteralPath $mfPath -Algorithm SHA256).Hash.Substring(0,16)
 } else {
     $mfPath = $exeItem.FullName
     $mfFix  = "ricompila e ricopia: make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe"
@@ -292,6 +322,7 @@ $ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps | OFF: $Var 
     ("  | allow-env={0}" -f $(if ($AllowEnv.Count) { ($AllowEnv -join ",") + " -- DEROGA" } else { "nessuna" }))
 $ParamStamp
 "marker: $Marker  (testo trovato in $mfPath)"
+if ($MarkerStamp) { $MarkerStamp }
 
 # ---- motore --------------------------------------------------------------
 function Invoke-Engine([bool]$On, [string]$PromptFile, [string]$Log) {
@@ -494,8 +525,9 @@ try {
             $rep, $(if ($rep % 2 -eq 1) { "OFF prima" } else { "ON prima " }), $c, $x, ($x - $c) | Write-Host
     }
 } finally {
-    # La variabile la imposta lo script: non deve restare nella sessione.
-    Remove-Item -LiteralPath "Env:\$Var" -ErrorAction SilentlyContinue
+    # La variabile la imposta lo script: nella sessione torna com'era prima.
+    if ($null -ne $VarBefore) { Set-Item -LiteralPath "Env:\$Var" -Value $VarBefore }
+    else { Remove-Item -LiteralPath "Env:\$Var" -ErrorAction SilentlyContinue }
 }
 
 # ---- invarianti su tutti i run, poi il testo fra i bracci -----------------
