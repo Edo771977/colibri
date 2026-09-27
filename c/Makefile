@@ -1290,6 +1290,10 @@ tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c expert_ffn.h qwen3
 tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# COLI_DENSE_IDOT: off keeps the old bytes, on is qrow_i8 + an exact int32 dot.
+tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 

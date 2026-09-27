@@ -1317,6 +1317,117 @@ static int dense_i8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("CO
  * the time. */
 static int kv_prefix_off(void){ const char *e=getenv("COLI_KV_PREFIX"); return e && *e=='0'; }
 static int dense_batch_on(void){ const char *e=getenv("QWEN_DENSE_BATCH"); return !(e&&*e=='0'); }
+/* COLI_DENSE_IDOT=1: matmul_d quantizes the activation rows to int8 (one
+ * scale per row, amax/127, the qrow_i8 contract) and multiplies them by the
+ * int8 weights with integer dots (matmul_q_idot_d), in place of int8 weights
+ * times f32 activations. Every matmul_d that runs on the CPU takes it, the
+ * prompt's batched rows included. Which ones those are depends on the
+ * placement: with every trunk matrix on the GPU, at decode they are the
+ * shared expert and the router; without a tier, the whole trunk. Not
+ * bit-identical to the f32-activation path: the activation is rounded, and
+ * through the router that can change which experts a token picks. Upstream
+ * measured on the 35B, CPU only, +1.0% perplexity and lm_head 12.6 -> 10.2
+ * ms/token (commit dfec3a4b in JustVugg/colibri, where it is on by default).
+ * OFF by default here until it is measured on this fork's configuration.
+ * File-scope so the test can reset what the first call read. */
+static int g_dense_idot = -1;
+static int dense_idot_on(void){
+    if (g_dense_idot < 0) {
+        const char *e = getenv("COLI_DENSE_IDOT");
+        g_dense_idot = (e && *e == '1');
+        /* one line per process: the proof, in the log, that this run took the
+         * integer path (c/tools/misure-envab.ps1 checks for it) */
+        if (g_dense_idot) fprintf(stderr, "[dense] COLI_DENSE_IDOT=1: int8 activations for the CPU dense GEMVs (matmul_d)\n");
+    }
+    return g_dense_idot;
+}
+/* qrow_i8 vectorized: the scalar lrintf loop costs ~7 us per 4096 values
+ * (upstream's measurement), and a token calls it once per CPU GEMV. Same
+ * scale and the same round-to-nearest-even as qrow_i8, so the bytes are the
+ * same (tests/test_qwen36_dense_idot.c holds that). Ported from dfec3a4b
+ * without the int4 block sums. */
+static float dense_act_i8(const float *x, int I, int8_t *xq){
+    float amax = 0.f;
+    int i = 0;
+#ifdef __AVX2__
+    {
+        __m256 am = _mm256_setzero_ps();
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        for (; i + 8 <= I; i += 8) am = _mm256_max_ps(am, _mm256_andnot_ps(sign, _mm256_loadu_ps(x + i)));
+        float tmp[8]; _mm256_storeu_ps(tmp, am);
+        for (int k = 0; k < 8; k++) if (tmp[k] > amax) amax = tmp[k];
+    }
+#endif
+    for (; i < I; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    float s = amax / 127.f; if (s < 1e-12f) s = 1e-12f;
+    float inv = 1.f / s;
+    i = 0;
+#ifdef __AVX2__
+    {
+        const __m256 vinv = _mm256_set1_ps(inv);
+        for (; i + 32 <= I; i += 32) {
+            __m256i a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i),      vinv));
+            __m256i b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 8),  vinv));
+            __m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
+            __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
+            /* packs interleave 128-bit lanes: fix the order with one permute */
+            __m256i ab = _mm256_packs_epi32(a, b), cd = _mm256_packs_epi32(c, d);
+            __m256i abcd = _mm256_packs_epi16(ab, cd);
+            abcd = _mm256_permutevar8x32_epi32(abcd, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            _mm256_storeu_si256((__m256i *)(xq + i), abcd);
+        }
+    }
+#endif
+    for (; i < I; i++) xq[i] = (int8_t)lrintf(x[i] * inv);
+    return s;
+}
+/* int8 x int8 dot, exact int32: quant.h's dot_i8i8 (AVX-512 VNNI, AVX2 and
+ * scalar branches), which this file cannot include because quant.h also
+ * defines matmul and matmul_q. Integer sums are exact, so every branch
+ * returns the same value. Both operands must lie in [-127, 127]: the AVX-512
+ * branch negates x where w is negative, and the AVX2 branch's maddubs pairs
+ * stay below the int16 limit only there. qdw_register clamps the weights to
+ * that range and dense_act_i8's codes are in it. Without AVX2 only the
+ * scalar loop runs: correct and slow, one more reason the flag is opt-in. */
+static inline int32_t qwen_dot_i8i8(const int8_t *w, const int8_t *x, int I){
+    int32_t sum = 0; int i = 0;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    __m512i acc = _mm512_setzero_si512();
+    for (; i + 64 <= I; i += 64) {
+        __m512i wv = _mm512_loadu_si512((const void *)(w + i));
+        __m512i xv = _mm512_loadu_si512((const void *)(x + i));
+        __mmask64 neg = _mm512_movepi8_mask(wv);
+        __m512i xs = _mm512_mask_sub_epi8(xv, neg, _mm512_setzero_si512(), xv);
+        acc = _mm512_dpbusd_epi32(acc, _mm512_abs_epi8(wv), xs);
+    }
+    sum = _mm512_reduce_add_epi32(acc);
+#elif defined(__AVX2__)
+    __m256i acc = _mm256_setzero_si256(); const __m256i ones = _mm256_set1_epi16(1);
+    for (; i + 32 <= I; i += 32) {
+        __m256i wv = _mm256_loadu_si256((const __m256i *)(w + i));
+        __m256i xv = _mm256_loadu_si256((const __m256i *)(x + i));
+        __m256i p = _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(xv, wv));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, ones));
+    }
+    __m128i h = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0x4E));
+    h = _mm_add_epi32(h, _mm_shuffle_epi32(h, 0xB1));
+    sum = _mm_cvtsi128_si32(h);
+#endif
+    for (; i < I; i++) sum += (int32_t)w[i] * x[i];
+    return sum;
+}
+/* quant.h's matmul_q_idot on x86: one exact integer dot per (row, output),
+ * scaled by the weight row's scale and then the activation row's. Same
+ * if(O >= 256) as matmul_q. */
+static void matmul_q_idot_d(float *y, const int8_t *xq, const float *sx, const int8_t *q,
+                            const float *scale, int S, int I, int O){
+    #pragma omp parallel for schedule(static) if(O >= 256)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I; float sc = scale[o];
+        for (int s = 0; s < S; s++) y[(int64_t)s * O + o] = (float)qwen_dot_i8i8(w, xq + (int64_t)s * I, I) * sc * sx[s];
+    }
+}
 static void qdw_register(const float *W, int I, int O){
     if (!W || !dense_i8_on() || g_qdw_n >= QDW_MAX) return;
     for (int i = 0; i < g_qdw_n; i++) if (g_qdw[i].w == W) return;   /* already quantized at load */
@@ -1385,6 +1496,17 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
     g_qwen_matmul_d_calls++;
 #endif
     for (int i = 0; i < g_qdw_n; i++) if (g_qdw[i].w == W && g_qdw[i].I == I) {
+        if (dense_idot_on()) {
+            int8_t *xq = malloc((size_t)S * I);
+            float *sx = malloc((size_t)S * sizeof(float));
+            if (xq && sx) {
+                for (int s = 0; s < S; s++) sx[s] = dense_act_i8(x + (int64_t)s * I, I, xq + (int64_t)s * I);
+                matmul_q_idot_d(y, xq, sx, g_qdw[i].q, g_qdw[i].sc, S, I, O);
+                free(xq); free(sx);
+                return;
+            }
+            free(xq); free(sx);      /* out of memory: the f32-activation path below */
+        }
         if (S > 1 && dense_batch_on())
             matmul_q_batch(y, x, g_qdw[i].q, g_qdw[i].sc, S, I, O);
         else
