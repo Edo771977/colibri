@@ -34,6 +34,15 @@
  * the per-call cost grows with the gap toward the engine's ~133 us, the
  * cost lives in the card going idle between calls, not in the engine.
  *
+ * FRESH OUTPUT. qwen36's step() mallocs the logit buffer (vocab floats,
+ * ~1 MB) for every token and its caller frees it, so lm_head's D2H lands in
+ * memory the process has never touched; a block that size typically comes
+ * straight from the OS, one page fault per 4 KB page on first write. The
+ * bench reuses one buffer. The fresh section times call at R=2 three ways:
+ * into the reused buffer (control), into a buffer malloc'd for this call (the
+ * engine's pattern; malloc and free outside the timed window, as in step()),
+ * and into the reused buffer plus a memcpy into a fresh one.
+ *
  * Before timing, it checks that every width gives the same bytes as R=0 and
  * that R=0 matches a double-precision CPU reference, so the numbers belong to
  * kernels that compute the right thing.
@@ -113,6 +122,8 @@ static double t_wall1[8][NWIDTHS][ROUNDS], t_call[8][NWIDTHS][ROUNDS];
 static const int GAPS[] = { 0, 50, 200, 500 };
 static const int NGAPS = 4;
 static double g_kern[8][NGAPS][ROUNDS], g_call[8][NGAPS][ROUNDS];
+/* Fresh section, R=2: reused / fresh / reused + memcpy to fresh. */
+static double f_time[8][3][ROUNDS];
 
 static void spin_us(double us) {
     if (us <= 0) return;
@@ -255,6 +266,26 @@ int main(void) {
                 g_call[si][gi][round] = csum / calls;
             }
 
+        /* fresh output buffer: the engine's malloc-per-token pattern */
+        for (int round = 0; round < ROUNDS; round++)
+            for (int fm = 0; fm < 3; fm++) {
+                double tsum = 0;
+                for (int p = 0; p < passes; p++)
+                    for (int m = 0; m < n; m++) {
+                        float *yf = fm ? (float *)malloc((size_t)O * sizeof(float)) : nullptr;
+                        if (fm && !yf) { printf("FATAL malloc\n"); return 1; }
+                        float *dst = fm == 1 ? yf : y.data();
+                        double c0 = now_us();
+                        if (!coli_cuda_matmul(&t[m], dst, x.data(), w.data(), sc.data(), 1, 1, I, O, 0, 0)) die("matmul");
+                        if (fm == 2) memcpy(yf, y.data(), (size_t)O * sizeof(float));
+                        tsum += now_us() - c0;
+                        if (fm == 1 && memcmp(yf, y0.data(), (size_t)O * sizeof(float))) {
+                            printf("FAIL %s: fresh-buffer result differs\n", sh.name); fails++; }
+                        free(yf);
+                    }
+                f_time[si][fm][round] = tsum / calls;
+            }
+
         printf("\n%-8s  I=%d O=%d  x%d matrices, %.1f MB each, %d calls per measurement, ref rel rms %.1e\n",
                sh.name, I, O, n, bytes / 1e6, calls, rel);
         printf("  R  round | batch us  GB/s | single kernel us  GB/s  host us | call us\n");
@@ -269,6 +300,10 @@ int main(void) {
             for (int round = 0; round < ROUNDS; round++)
                 printf("  gap %3d us  round %d          | %16.1f %5.0f | %7.1f\n", GAPS[gi], round + 1,
                        g_kern[si][gi][round], bytes / (g_kern[si][gi][round] * 1e3), g_call[si][gi][round]);
+        printf("  output buffer at R=2          | reused us | fresh us | reused+memcpy us\n");
+        for (int round = 0; round < ROUNDS; round++)
+            printf("  round %d                       | %9.1f | %8.1f | %16.1f\n", round + 1,
+                   f_time[si][0][round], f_time[si][1][round], f_time[si][2][round]);
 
         cudaFree(dx); cudaFree(dy);
         for (int m = 0; m < n; m++) coli_cuda_tensor_free(t[m]);
@@ -298,6 +333,15 @@ int main(void) {
             c += k * median3(g_call[si][gi][0], g_call[si][gi][1], g_call[si][gi][2]);
         }
         printf("  %6d | %13.2f | %4.2f\n", GAPS[gi], s, c);
+    }
+    printf("\n--- per qwen36 token at R=2, output buffer, median of %d rounds, ms ---\n", ROUNDS);
+    printf("  reused | fresh | reused+memcpy\n");
+    {
+        double f[3] = { 0, 0, 0 };
+        for (int fm = 0; fm < 3; fm++)
+            for (int si = 0; si < NSHAPES; si++)
+                f[fm] += SHAPES[si].count / 1000.0 * median3(f_time[si][fm][0], f_time[si][fm][1], f_time[si][fm][2]);
+        printf("  %6.2f | %5.2f | %13.2f\n", f[0], f[1], f[2]);
     }
     double total_bytes = 0;
     for (int si = 0; si < NSHAPES; si++)
