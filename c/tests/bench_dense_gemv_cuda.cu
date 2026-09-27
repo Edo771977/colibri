@@ -24,12 +24,22 @@
  * for each width of COLI_CUDA_I8_ROWS (0, 2, 4, 8), three rounds each, and
  * sums the per-call medians into ms per token over the 81 calls of a token.
  *
+ * GAPS. Run that way, the card is never idle, and inside the engine it is:
+ * between two dense calls the CPU runs the convolution, the recurrence, the
+ * norms and the MoE, so a token is ~81 short GPU bursts with gaps of tens to
+ * hundreds of microseconds (and nvidia-smi saw the memory clock drop from
+ * 10251 to 5001 MHz after ~1.5 s of that). The gap section repeats single and
+ * call at R=2 with the host spinning GAP microseconds before every call, the
+ * GPU idle meanwhile; the gap itself is not counted in the time per call. If
+ * the per-call cost grows with the gap toward the engine's ~133 us, the
+ * cost lives in the card going idle between calls, not in the engine.
+ *
  * Before timing, it checks that every width gives the same bytes as R=0 and
  * that R=0 matches a double-precision CPU reference, so the numbers belong to
  * kernels that compute the right thing.
  *
  * Build and run: make dense-gemv-bench   (from a shell with nvcc; on Windows
- * the x64 Native Tools prompt, as for make cuda-dll). Takes about a minute
+ * the x64 Native Tools prompt, as for make cuda-dll). Takes about two minutes
  * and at most ~0.8 GB of VRAM (one shape at a time): close the engine first.
  */
 #include <cstdio>
@@ -99,6 +109,16 @@ static double median3(double a, double b, double c) {
 /* Per shape, per width, per round: microseconds per call, three ways. */
 static double t_batch[8][NWIDTHS][ROUNDS], t_single[8][NWIDTHS][ROUNDS];
 static double t_wall1[8][NWIDTHS][ROUNDS], t_call[8][NWIDTHS][ROUNDS];
+/* Gap section, R=2: per shape, per gap, per round. */
+static const int GAPS[] = { 0, 50, 200, 500 };
+static const int NGAPS = 4;
+static double g_kern[8][NGAPS][ROUNDS], g_call[8][NGAPS][ROUNDS];
+
+static void spin_us(double us) {
+    if (us <= 0) return;
+    double t0 = now_us();
+    while (now_us() - t0 < us) { }
+}
 
 int main(void) {
     int devs[1] = { 0 };
@@ -209,6 +229,32 @@ int main(void) {
                 t_call[si][wi][round] = (now_us() - c0) / calls;
             }
 
+        /* gaps: R=2, the host idles the card for GAPS[gi] us before each call */
+        set_width(2);
+        for (int round = 0; round < ROUNDS; round++)
+            for (int gi = 0; gi < NGAPS; gi++) {
+                double ksum = 0, csum = 0;
+                for (int p = 0; p < passes; p++)
+                    for (int m = 0; m < n; m++) {
+                        spin_us(GAPS[gi]);
+                        cudaEventRecord(e0, 0);
+                        quant_matmul_launch(dy, dx, t[m]->weights, t[m]->scales, 1, 1, I, O, rb, t[m]->gs, t[m]->ng);
+                        cudaEventRecord(e1, 0);
+                        cuda_check(cudaEventSynchronize(e1), "gap single sync");
+                        float k = 0; cudaEventElapsedTime(&k, e0, e1); ksum += 1000.0 * k;
+                    }
+                cuda_check(cudaGetLastError(), "gap single launch");
+                for (int p = 0; p < passes; p++)
+                    for (int m = 0; m < n; m++) {
+                        spin_us(GAPS[gi]);
+                        double c0 = now_us();
+                        if (!coli_cuda_matmul(&t[m], y.data(), x.data(), w.data(), sc.data(), 1, 1, I, O, 0, 0)) die("matmul");
+                        csum += now_us() - c0;
+                    }
+                g_kern[si][gi][round] = ksum / calls;
+                g_call[si][gi][round] = csum / calls;
+            }
+
         printf("\n%-8s  I=%d O=%d  x%d matrices, %.1f MB each, %d calls per measurement, ref rel rms %.1e\n",
                sh.name, I, O, n, bytes / 1e6, calls, rel);
         printf("  R  round | batch us  GB/s | single kernel us  GB/s  host us | call us\n");
@@ -218,6 +264,11 @@ int main(void) {
                        t_batch[si][wi][round], bytes / (t_batch[si][wi][round] * 1e3),
                        t_single[si][wi][round], bytes / (t_single[si][wi][round] * 1e3),
                        t_wall1[si][wi][round], t_call[si][wi][round]);
+        printf("  gaps at R=2 (gap not counted) | single kernel us  GB/s | call us\n");
+        for (int gi = 0; gi < NGAPS; gi++)
+            for (int round = 0; round < ROUNDS; round++)
+                printf("  gap %3d us  round %d          | %16.1f %5.0f | %7.1f\n", GAPS[gi], round + 1,
+                       g_kern[si][gi][round], bytes / (g_kern[si][gi][round] * 1e3), g_call[si][gi][round]);
 
         cudaFree(dx); cudaFree(dy);
         for (int m = 0; m < n; m++) coli_cuda_tensor_free(t[m]);
@@ -236,6 +287,17 @@ int main(void) {
             c += k * median3(t_call[si][wi][0], t_call[si][wi][1], t_call[si][wi][2]);
         }
         printf("  %d | %5.2f | %13.2f | %11.2f | %4.2f\n", WIDTHS[wi], b, s, h, c);
+    }
+    printf("\n--- per qwen36 token at R=2, host gap before every call (gap not counted), median of %d rounds, ms ---\n", ROUNDS);
+    printf("  gap us | single kernel | call\n");
+    for (int gi = 0; gi < NGAPS; gi++) {
+        double s = 0, c = 0;
+        for (int si = 0; si < NSHAPES; si++) {
+            double k = SHAPES[si].count / 1000.0;
+            s += k * median3(g_kern[si][gi][0], g_kern[si][gi][1], g_kern[si][gi][2]);
+            c += k * median3(g_call[si][gi][0], g_call[si][gi][1], g_call[si][gi][2]);
+        }
+        printf("  %6d | %13.2f | %4.2f\n", GAPS[gi], s, c);
     }
     double total_bytes = 0;
     for (int si = 0; si < NSHAPES; si++)
