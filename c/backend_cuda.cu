@@ -1792,7 +1792,14 @@ extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
  * at init, the ON runs took ~18 s longer end to end on that machine, most
  * likely because the warm start's ~41000 cudaFree each wait for every
  * running kernel, the spin included (inferred from log times, not traced).
- * qwen36's first placed GEMV comes after the warm start.
+ * qwen36's first placed GEMV comes after the warm start. That did not remove
+ * the ~18 s: re-measured, the ON runs were still that much longer. The
+ * cost was at exit, where qt_shutdown frees ~20000 expert tensors before it
+ * calls coli_cuda_shutdown, and each cudaFree waits for the running spin.
+ * So coli_cuda_tensor_free pauses the spin for 50 ms, renewed by every
+ * further free: a burst of frees waits for one spin at most, and the rare
+ * free during decode (an LFRU swap) costs a 50 ms pause, too short for the
+ * driver to change state.
  *
  * Measured there (misure-envab.ps1, six ABBA pairs, started at init):
  * step() 30.87 -> 27.62 ms/token, 95 % [-4.41, -2.09], 6/6, text identical,
@@ -1816,6 +1823,19 @@ __global__ static void keepalive_spin(unsigned long long ns) {
 #endif
 static std::atomic<int> g_ka_run{0};
 static std::atomic<int> g_ka_armed{0};
+static std::atomic<long long> g_ka_pause_until{0};   /* steady_clock ns */
+static std::atomic<unsigned long long> g_ka_yields{0};
+static long long ka_now_ns(void) {
+    return (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+/* Called by coli_cuda_tensor_free before its cudaFree: no new spin for the
+ * next 50 ms. The spin already running (at most ~1 ms) is still waited for. */
+static inline void keepalive_yield(void) {
+    if (!g_ka_run.load(std::memory_order_relaxed)) return;
+    g_ka_pause_until.store(ka_now_ns() + 50000000LL);
+    g_ka_yields++;
+}
 static std::atomic<unsigned long long> g_ka_launches{0};
 static std::thread g_ka_thr;
 /* Exactly "1" turns it on, as COLI_DENSE_IDOT does on the engine side. */
@@ -1846,6 +1866,10 @@ static void keepalive_start(void) {
         if (!ok) std::fprintf(stderr, "[cuda] keep-alive: setup failed (%s), not running\n",
                               cudaGetErrorString(cudaGetLastError()));
         while (ok && g_ka_run.load()) {
+            if (ka_now_ns() < g_ka_pause_until.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             for (int i = 0; i < n; i++) {
                 cudaSetDevice(devs[i]);
                 keepalive_spin<<<1, 32, 0, st[i]>>>(1000000ULL);
@@ -3539,6 +3563,7 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
 
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (!tensor) return;
+    keepalive_yield();
     DeviceContext *ctx = find_ctx(tensor->device);
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {

@@ -10,6 +10,10 @@
  *      keep-alive that never runs would pass every other check);
  *   3. a dense GEMV computed while it runs equals, byte for byte, the same
  *      GEMV with it stopped;
+ *   3b. coli_cuda_tensor_free pauses it: 2000 frees in a row while it runs
+ *      take well under the ~1 s they would if each cudaFree waited for a
+ *      1 ms spin (qt_shutdown frees ~20000 tensors this way), and it
+ *      launches again once the frees stop;
  *   4. coli_cuda_shutdown stops and joins it, and a later init with the
  *      variable off does not restart it.
  * Whether the driver keeps its clocks up is not testable here: that is the
@@ -79,6 +83,29 @@ int main(void) {
     printf("  %llu spin kernels completed in 100 ms\n", l1 - l0);
     check(l1 - l0 >= 20, "it launches (>= 20 one-millisecond spins in 100 ms)");
 
+    printf("frees\n");
+    {
+        enum { NT = 2000, TI = 64, TO = 64 };
+        static ColiCudaTensor *tt[NT];
+        int8_t tw[TI * TO]; float ts[TO];
+        for (int i = 0; i < TI * TO; i++) tw[i] = (int8_t)(i % 127);
+        for (int o = 0; o < TO; o++) ts[o] = 0.01f;
+        int up = 1;
+        for (int k = 0; k < NT && up; k++) { tt[k] = NULL; up = coli_cuda_tensor_upload(&tt[k], tw, ts, 1, TI, TO, 0); }
+        check(up, "2000 small tensors uploaded while it runs");
+        unsigned long long y0 = g_ka_yields.load();
+        auto f0 = std::chrono::steady_clock::now();
+        for (int k = 0; k < NT; k++) coli_cuda_tensor_free(tt[k]);
+        double fms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
+        printf("  2000 frees took %.1f ms, %llu pauses requested\n", fms, g_ka_yields.load() - y0);
+        check(g_ka_yields.load() - y0 == NT, "every free asks for a pause");
+        check(fms < 300.0, "2000 frees in under 300 ms (each waiting for a spin would take ~1 s)");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        unsigned long long a0 = g_ka_launches.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        check(g_ka_launches.load() - a0 >= 20, "it launches again once the frees stop");
+    }
+
     printf("results\n");
     gemv(y_on, w, sc, x, I, O);
     keepalive_stop();
@@ -104,7 +131,7 @@ int main(void) {
     free(w); free(sc); free(x); free(y_on); free(y_off); free(y_first);
     set_env("COLI_CUDA_KEEPALIVE", "");
     if (fails) { printf("test_cuda_keepalive: %d failure(s)\n", fails); return 1; }
-    printf("OK test_cuda_keepalive: off unless \"1\", starts at the first GEMV, launches, changes no byte, stops at shutdown\n");
+    printf("OK test_cuda_keepalive: off unless \"1\", starts at the first GEMV, launches, yields to frees, changes no byte, stops at shutdown\n");
     return 0;
 #endif
 }
