@@ -15,10 +15,10 @@ else. In order:
      grids show R=2), the spinning OpenMP team (not supported, with a
      confound), sub-millisecond idle gaps between calls (small), a fresh
      output buffer per token (no).
-  5. nvidia-smi and Nsight Systems: 1.5-2 s after the P2 burst that
-     precedes decode the card drops to P3 (memory 5001 MHz, graphics
-     ~1700-2050 MHz), and the dense kernels' median duration is twice
-     their minimum.
+  5. nvidia-smi and Nsight Systems: during each logged decode the card
+     holds P2 for a burst of 1.5-2 s, then drops to P3 (memory 5001 MHz,
+     graphics ~1700-2050 MHz); the dense kernels' median duration is
+     twice their minimum.
   6. Locking both clocks with nvidia-smi: lm_head and deltanet lower in
      every locked run than in every unlocked one (lm_head 1.05-1.11 ms
      against 1.28-1.69); step() -2.07 ms/token, 3 of 3 pairs but 95 %
@@ -54,7 +54,7 @@ DLL    : coli_cuda.dll, 752640 bytes, 2026-09-21 20:46:01, sha256
          COLI_CUDA_DENSE_PINNED and COLI_CUDA_I8_ROWS (all three present).
          The width it runs is read from the Nsight grids in section 5:
          quant_matmul_launch launches O/R blocks for R>0
-         (c/backend_cuda.cu:2300-2303 at 46402074), and 124160, 6144, 4608
+         (c/backend_cuda.cu:2298-2304 at 46402074), and 124160, 6144, 4608
          and 1024 are 248320, 12288, 9216 and 2048 over 2. So R=2, the
          kernel whose source the benchmark compiles:
          quant_matmul_i8r is unchanged from aac94c39 (the R=2 default) to
@@ -265,8 +265,9 @@ on the same 25 MB matrix, which a 48 MB L2 may partly serve) with the
 3810 of decode; the other rows are decode only (1270 = 127 x 10, 5080 =
 127 x 40) but for one prefill lm_head. Section 6a shows the slowdown is
 not the memory clock alone: with memory held at 10251 MHz and graphics
-at ~1.1 GHz, lm_head stays at 1.62-1.69 ms. P3 lowers both clocks, and
-the kernel responds to both. The top rows of the same table (20553 H2D
+at ~1.1 GHz, lm_head stays at 1.62-1.69 ms, so the graphics clock
+matters; whether the memory clock matters on its own was not isolated (no
+graphics-only lock). P3 lowers both. The top rows of the same table (20553 H2D
 copies of 0.524 MB and 0.066 MB, 20553 offset_to_signed_s4 launches) are
 the warm start uploading 6851 experts x 3 matrices, before decode (6851
 in that run's rows; the 6859 resident of section 1 is another run's
@@ -295,7 +296,8 @@ drift across a session by as much as the effects (6a N 27.9 -> 30.0, 6c A
 
   The lock held: the L runs sit at 10251 MHz throughout. The graphics
   clock fell instead, to ~1000-1170 MHz during decode (P2 1170 MHz down to
-  1020 MHz across L1's decode). Slower.
+  1020 MHz across L1's decode). step() slower in all three pairs, with a
+  lower bound of +0.01 and N runs drifting by as much as the effect.
 
 6b. Both, --lock-gpu-clocks=2625,2625 and --lock-memory-clocks=10251,10251:
 
@@ -334,9 +336,10 @@ drift across a session by as much as the effects (6a N 27.9 -> 30.0, 6c A
 
 --- what this means ----------------------------------------------------------
 
-On this machine the card leaves P2 for P3 1.5-2 s into every decode that
-was logged, at 15-40 % utilization, and in P3 the placed dense kernels
-take about twice their P2 time. Locking both clocks brings lm_head back
+On this machine, in every decode that was logged, the card holds P2 for
+a burst of 1.5-2 s and then drops to P3, at 15-40 % utilization; when
+that burst starts relative to the first decoded token is not marked. In
+P3 the placed dense kernels take about twice their P2 time. Locking both clocks brings lm_head back
 to its benchmark time. That accounts for much of the kernel half of the
 benchmark-engine gap of section 3, how much is not measured (no locked
 run was profiled); the copy and host half (~35 us a call, measured
