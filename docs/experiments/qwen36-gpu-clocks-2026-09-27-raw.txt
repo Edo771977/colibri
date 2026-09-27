@@ -1,7 +1,7 @@
 Qwen3.6-35B-A3B on the CUDA tier: where the dense GEMV time goes, and the
 GPU power states behind it.
 27 September 2026, on the operator's machine: one session (sections
-1-7) and one evening run (section 8).
+1-7) and three evening runs (sections 8 and 9).
 
 The session started as an A/B of one CPU-side change and ended somewhere
 else. In order:
@@ -45,11 +45,12 @@ else. In order:
      dense kernel by section 5's durations (an estimate).
   9. Two more runs that evening at main 19203743, with the dn-split
      timers: the keep-alive repeated (-0.57, [-4.46, +3.33], 5/6; one ON
-     run at 31.80 widens it), and COLI_CUDA_DENSE_PINNED=2 with the
-     keep-alive on in both arms (+0.45, [-1.44, +2.34], 1/6): the pinned
-     staging still does not help at full clocks. dn-split puts ~0.8-1.0
-     ms/token in the two tiny a/b matmuls and non-kernel time on
-     each of deltanet's 60 GPU calls per token (~30-60 us, an estimate).
+     run at 31.80 widens it), and COLI_CUDA_DENSE_PINNED=2 with
+     COLI_CUDA_KEEPALIVE=1 in both arms (+0.45, [-1.44, +2.34], 1/6; no
+     gain, and the 21 September slowdown not reproduced at this
+     resolution; clocks not logged). dn-split puts 0.80-1.03 ms/token in
+     the two tiny a/b matmuls, and an estimated ~30-60 us of non-kernel
+     time on each of deltanet's 60 GPU calls per token.
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -58,8 +59,8 @@ Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
 evidence.sha256 exists for them.
 
-The next section describes sections 1 to 6. Sections 7 and 8 rebuilt the
-DLL and the engine and ran under misure-envab.ps1; their builds and
+The next section describes sections 1 to 6. Sections 7 to 9 rebuilt the
+DLL and/or the engine and ran under misure-envab.ps1; their builds and
 hashes are given there.
 
 --- the machine and the binaries -------------------------------------------
@@ -585,7 +586,7 @@ section 8 (413CBA2FF43ABFCB). Both runs: misure-envab.ps1, cap 256, bits
 (sidecar verified, loaded in all 12 runs, unchanged); banner, [place]
 and residency (6859/10240) identical in all 12 runs of each; the text
 identical within and between the arms (4a000cc01f310b64); 8.0 LFRU
-swaps per run.
+swaps per run in every arm. No clocks were logged in either run.
 
 9a. The keep-alive, repeated (same arguments as section 8):
 
@@ -597,13 +598,19 @@ swaps per run.
 
   OFF step 25.12, dn 8.92, head 1.42      ON step 24.55, dn 8.54, head 1.10
 
-Recomputed: mean -0.567, sd 3.711, se 1.515, half-width 3.895. Pair 2 is
+Order split (the script's): -3.47 ms/token, OFF first -2.30, ON first
++1.17, driven by pair 2. Recomputed: mean -0.567, sd 3.711, se 1.515,
+half-width 3.894. Pair 2 is
 ON 31.80 against OFF 24.90; every other run of the ON arm is 22.2-24.0.
 Its cause is not in what was pasted. The run is inconclusive on its own
 and is reported as it is: the interval includes zero. The ON arm's
 per-phase means carry that run.
 
-9b. COLI_CUDA_DENSE_PINNED=2 with the keep-alive on in both arms:
+9b. COLI_CUDA_DENSE_PINNED=2 with COLI_CUDA_KEEPALIVE=1 in both arms (set
+in the shell before the script, which stamped it "allow-env=
+COLI_CUDA_KEEPALIVE -- DEROGA"; the marker the script checked was the
+pinned-staging line, so that the keep-alive ran in every log was not
+checked):
 
   set COLI_CUDA_KEEPALIVE=1, then misure-envab.ps1 -Var
   COLI_CUDA_DENSE_PINNED -Value 2 -Marker "[cuda] dense pinned staging
@@ -618,12 +625,21 @@ per-phase means carry that run.
 
   OFF step 24.58, dn 8.30, attn 2.09      ON step 25.03, dn 8.89, attn 2.27
 
-Recomputed: mean 0.450, sd 1.800, se 0.735, half-width 1.889. One OFF
-run read miss(CPU) 6241 instead of 6240, with the same text. The 21
-September record (qwen36-dense-pinned-2026-09-21-raw.txt) measured mode
-2 at +2.00 ms/token without the keep-alive, when the card dropped to
-P3. At full clocks it still does not help; the two GPU calls of
-deltanet read slower with it (below).
+Order split (the script's): -1.23 ms/token, OFF first -0.17, ON first
++1.07, larger than the effect itself. Recomputed: mean 0.450, sd 1.800,
+se 0.735, half-width 1.889; the paired median is +0.85. The OFF arm's
+miss(CPU) read 6240/6241 (the script prints the distinct values), so at
+least one OFF run had one more miss, with the same text.
+
+The 21 September record (qwen36-dense-pinned-2026-09-21-raw.txt)
+measured mode 2 at +2.00 ms/token (paired median; mean +2.38) without
+the keep-alive, in a different setup: an explicit COLI_PLACE
+(experts=0,lmhead=0,dnproj=0,dnout=0,attnout=0), hit 100 % and
+miss(CPU) 0, another DLL and heat table, no clocks logged, so
+whether that run was in P3 is not known. Here, with the keep-alive on
+in both arms: no gain, and that slowdown not reproduced at this
+resolution. Clocks were not logged, so that the card held P2 is
+assumed from the keep-alive, not shown.
 
 dn-split, mean of six runs per arm, ms/token (dn-gpu: dnproj 3810/3810
 and dnout 3810/3810 in every arm, so both projections ran on the GPU
@@ -635,14 +651,21 @@ in every decode call):
   9b OFF       2.78   1.03   0.15   1.75
   9b ON        3.06   0.98   0.14   2.13
 
-Per call, with the keep-alive (9a ON, 9b OFF): qkvz 93-104 us, out
-58-69 us. Against section 5's kernel durations (dnproj 42-55 us, the
-1024-row grid 15-27 us) that leaves ~30-60 us per call that is not
-kernel (9a ON includes the 31.80 run). The a/b matmuls, two 32 x 2048 f32 products per layer, cost
-0.80-1.03 ms/token: ~13-17 us each, mostly the start and join of an
-OpenMP region for 32 rows. The gated RMSNorm is ~0.13-0.15. The four
-arms' per-phase means come from runs of different binaries and
-settings; the split is a profile, not an A/B.
+9a ON and 9b OFF are the same configuration (same binaries, keep-alive
+on, pinned off) and differ by 0.33 on qkvz and 0.33 on out: that is the
+drift of these means between two runs, as large as 9b's ON-OFF
+differences (+0.28, +0.38), so the split does not show pinned staging
+slowing either call. It is a profile, not an A/B.
+
+Per call, keep-alive on and pinned off (9a ON, 9b OFF): qkvz 93-104 us,
+out 58-69 us. Against section 5's kernel durations (dnproj 42-55 us,
+the 1024-row grid 15-27 us; minima and benchmark times, not typical
+calls) that leaves an estimated ~30-60 us per call that is not kernel
+(9a ON includes the 31.80 run). The a/b matmuls, two 32 x 2048 f32
+products per layer, cost 0.80-1.03 ms/token, ~13-17 us each. How much
+of that is the start and join of the OpenMP region and how much the
+arithmetic (a serial 2048-term reduction per row, no -ffast-math) is
+not separated by the timer. The gated RMSNorm is 0.13-0.15 ms/token.
 
 --- what this means ----------------------------------------------------------
 
@@ -663,7 +686,9 @@ The keep-alive of section 7 held P2 without administrator rights in its
 first run, the only one with a clock log. In its final version, step()
 29.07 -> 25.62 ms/token, 95 % [-3.69, -3.21], six pairs of six, no
 end-to-end cost visible in the log end times (to within 2-3 s). With
-the heat table in both arms (section 8): -2.37, [-3.76, -0.98], 6/6.
+the heat table in both arms (section 8): -2.37, [-3.76, -0.98], 6/6;
+repeated that evening (section 9a): -0.57, [-4.46, +3.33], 5/6, one
+outlier run widening it.
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
@@ -708,15 +733,13 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
-  - Clocks in section 8's run, and how the ~3.2-4.0 ms of deltanet's
-    two GPU-calling parts that is not kernel splits between the GPU
-    calls' overhead, the a/b matmuls and the norm. The dn-split timers
-    added with this section time the a/b matmuls and the norm apart
-    from the two GPU calls; how each call splits between round trip and
-    kernel still rests on section 5's durations.
+  - Clocks in sections 8 and 9, and how each deltanet GPU call splits
+    between round trip and kernel (section 9's dn-split separates the
+    a/b matmuls and the norm from the two calls; the rest still rests
+    on section 5's durations).
   - Clocks in the keep-alive's second and third runs: that the final
     version, with its 50 ms pauses on frees, holds P2 is inferred from
     its step() times, not logged.
   - The keep-alive on another card, another driver, or Linux.
   - The keep-alive's power draw, its effect with a heat table beyond
-    section 8's six pairs, and on long generations.
+    sections 8 and 9a (two runs of six pairs), and on long generations.
