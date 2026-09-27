@@ -652,10 +652,10 @@ in every decode call):
   9b ON        3.06   0.98   0.14   2.13
 
 9a ON and 9b OFF are the same configuration (same binaries, keep-alive
-on, pinned off) and differ by 0.33 on qkvz and 0.33 on out: that is the
-drift of these means between two runs, as large as 9b's ON-OFF
-differences (+0.28, +0.38), so the split does not show pinned staging
-slowing either call. It is a profile, not an A/B.
+set, pinned off) and differ by 0.33 on qkvz and 0.33 on out (9a ON
+includes the 31.80 run): drift between two runs comparable to 9b's
+ON-OFF differences (+0.28, +0.38), so the split does not show pinned
+staging slowing either call. It is a profile, not an A/B.
 
 Per call, keep-alive on and pinned off (9a ON, 9b OFF): qkvz 93-104 us,
 out 58-69 us. Against section 5's kernel durations (dnproj 42-55 us,
