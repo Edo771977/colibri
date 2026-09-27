@@ -4,10 +4,11 @@ Qwen3.6-35B-A3B: heat-table gain, first run of the #51 tool on the real engine.
 c/tools/misure-heatfile.ps1 was reworked over ten review rounds in #51 and
 merged as 8a074f21. In review it was run only against simulated engines on
 Linux. This is its first run on the operator's machine, with the real
-engine, the GPU and the documented launcher. The run took place minutes
-before the merge, on the branch tip, whose script is the same file that was
-merged (see "Script" below). It had two questions to answer before the
-merge:
+engine, the GPU and the documented launcher. The run started about six
+minutes before the merge (executable 07:48:45 local, merge 07:55:06 +02:00;
+its end time is not in the output), on the branch tip, whose script is the
+same file that was merged (see "Script" below). It had two questions to
+answer before the merge:
 
   1. Do the six runs of the SAME arm generate the same text? The tool
      refuses the run if they do not; if they diverged systematically it
@@ -33,8 +34,10 @@ Launch : from cmd, in C:\colibri-fork\c. The operator was given the chain
          produced: the build output changed (qwen36.exe was E0345C33... at
          attempt 3, and the provenance guard passed on A2D344B9...), and
          .build-config carries the flags. It does not show -B itself.
-         powershell.exe is Windows PowerShell, the launcher the script
-         documents.
+         Attempts 2 and 3 below were launched with powershell from cmd
+         and fail in Windows PowerShell's error format; that the
+         successful run used the same launcher follows from the chain
+         given, not from its output.
 Engine : qwen36_clang.exe, rebuilt and copied as above.
          THE SOURCE COMMIT OF THIS BUILD IS NOT RECORDED. The script checks
          that no prerequisite of qwen36$(EXE) is newer than the executable
@@ -72,9 +75,9 @@ condition of the machine, and each message named it:
      not that build (below). The variable was absent at the next attempt.
   2. CUDA_EXPERT_GB=12 in the environment (the environment guard). The
      engine reads this one: it is the per-device allowance for tier and
-     trunk (c/qwen36_tier.c:607). Removed with `set CUDA_EXPERT_GB=`, so
-     the allowance is the engine's default, free VRAM minus 1 GB
-     (:612-618). That value is printed in the per-run logs, not in the
+     trunk (c/qwen36_tier.c:607). Removed with `set CUDA_EXPERT_GB=`, so the
+     allowance is the engine's default, per main's source free VRAM minus 1
+     GB (:612-618). That value is printed in the per-run logs, not in the
      output below.
   3. ".\qwen36_clang.exe NON e' la copia di qwen36.exe (sha256
      E2AB428B44E9CAD5 contro E0345C330BE51603)" (the provenance guard).
@@ -100,14 +103,19 @@ and pasted:
   controllo: True
   diagnostica: False
 
-"BeginCapture FALLITA" is a string literal of 6652f6b7, in an fprintf under
-#if COLI_GPU_HAS_GRAPH, which is 1 in every CUDA build
-(c/backend_gpu_compat.h:120); among the repository's branches it exists
-only on claude/graph-diag. "[CUDA] invalid device" is a string literal of
-c/backend_cuda.cu present in its first version (aa87ff5f), on main and on
-claude/graph-diag, outside every #if on both of the latter: it is the
-control that the reading works on this file. A build of 6652f6b7 would
-contain both.
+The check was run after the measurement and prints no hash: that the file
+read is the DLL of the run (sha256 0D57602B...) is assumed, not shown. No
+command given rebuilt it, and the Makefile does not make it a prerequisite
+of qwen36.exe.
+
+"BeginCapture FALLITA" is part of a string literal of 6652f6b7, in an
+fprintf under #if COLI_GPU_HAS_GRAPH, which is 1 in every CUDA build
+(c/backend_gpu_compat.h:120); no source file on any other branch of the
+repository contains it. "[CUDA] invalid device" is a string literal of
+c/backend_cuda.cu present in the oldest version in this clone (aa87ff5f), on
+main and on claude/graph-diag, outside every #if on both of the latter: it
+is the control that the reading works on this file. A build of 6652f6b7
+would contain both.
 
 An earlier check with findstr is not quoted as evidence: its control
 string turned out to sit inside #ifdef COLI_ANS, so its absence said
@@ -182,12 +190,12 @@ Log per run: heatfile-COLD-r*.log e heatfile-CROSS-r*.log
 
 CROSS - COLD = -5.38 ms/token, 95 % interval [-6.22, -4.55], 6 of 6
 negative. Recomputed from the six printed deltas: mean -5.383, sd 0.794,
-se 0.324, t(5) = 2.571.
+se 0.324, critical t(5) = 2.571.
 
 The ABBA groups: COLD first -5.633, CROSS first -5.133, difference -0.50.
-The standard error of a difference between two means of three, from the
-delta sd of 0.794, is 0.65: the difference is not distinguishable from
-zero.
+From the sd inside the two groups (0.702 and 0.945, pooled 0.833 at df 4),
+the standard error of a difference between two means of three is 0.68:
+t = 0.74, not distinguishable from zero.
 
 --- the generated text -----------------------------------------------------
 
@@ -211,12 +219,12 @@ text.
 --- the accounting ---------------------------------------------------------
 
 Computed here from the per-arm means printed above, which are rounded to
-0.01. The four phases do not exhaust step(): they sum to 28.01 against
-29.02 in COLD and 22.64 against 23.63 in CROSS, so about 1.0 ms/token lies
-outside them in each arm, and the four sub-timers leave about 1.07 ms/token
-of moe_total outside them. The gap between the sums of the deltas below and
-the delta they are set against is therefore rounding plus the change in
-that residual; the rounded means cannot separate the two.
+0.01. The four phases do not exhaust step(): they sum to 28.01 against 29.02
+in COLD and 22.64 against 23.63 in CROSS, so about 1.0 ms/token lies outside
+them in each arm, and the four sub-timers leave about 1.07 (COLD) and 1.08
+(CROSS) ms/token of moe_total outside them. The gap between the sums of the
+deltas below and the delta they are set against is therefore rounding plus
+the change in that residual; the rounded means cannot separate the two.
 
                  COLD     CROSS    delta
     deltanet      8.96     8.33    -0.63
@@ -237,13 +245,15 @@ Inside moe_total:
 
 --- not compared with the earlier records ----------------------------------
 
-Two records of 23 September measure the same comparison:
-qwen36-heatfile-6rep-2026-09-23-raw.txt and
-qwen36-take-split-2026-09-23-raw.txt. No number of this run is compared with
-theirs: a different day, a different build, and an expert allowance that is
-not recorded for those runs. Neither record mentions CUDA_EXPERT_GB or the
-allowance; the heat-table script of that day did not refuse the variable;
-and on this day it was set in the operator's shell.
+Three records of 23 September measure the same comparison:
+qwen36-heatfile-2026-09-23-raw.txt, qwen36-heatfile-6rep-2026-09-23-raw.txt
+and qwen36-take-split-2026-09-23-raw.txt. No number of this run is compared
+with theirs: a different day and a different build. On the expert
+allowance: the first of the three deduces from its printed allowance that
+CUDA_EXPERT_GB took the default path or held a value that happens to
+coincide (its lines 86-94); the other two record no value for it. The
+heat-table script of that day did not refuse the variable, and on this day
+it was set in the operator's shell.
 
 --- what this run did NOT measure ------------------------------------------
 
