@@ -26,6 +26,11 @@ else. In order:
      Locking the memory clock alone: step() +1.80, 95 % [+0.01, +3.59],
      graphics clock down to ~1.0-1.2 GHz. The driver's "Prefer maximum
      performance" for the program: no measurable effect.
+  7. COLI_CUDA_KEEPALIVE=1, a one-warp spin kept running on the card from
+     inside coli_cuda.dll, no administrator rights: step() 30.87 -> 27.62
+     ms/token, 95 % [-4.41, -2.09], 6 of 6 pairs, text identical, the
+     card at P2 through every ON run. Started at init, it made each run
+     ~18 s longer end to end.
 
 Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
@@ -334,6 +339,62 @@ drift across a session by as much as the effects (6a N 27.9 -> 30.0, 6c A
   measurable effect; whether the setting does not reach a CUDA-only
   process or reaches it without governing its P-state is not told apart.
 
+--- 7. COLI_CUDA_KEEPALIVE ---------------------------------------------------
+
+Same session, 17:06-17:14. The DLL rebuilt from 4582d0e5, which carries
+the keep-alive of 11180e32 unchanged: `make cuda-dll CC=clang
+CUDA_ARCH=sm_89` after vcvars64.bat, coli_cuda.dll 758784 bytes,
+2026-09-27 17:06:40, sha256 prefix 7F6CFEC5AAE0D099 (the 21 September DLL
+kept as coli_cuda_0921.dll). tests/test_cuda_keepalive_cuda.cu, built
+with nvcc -O2 -arch=sm_89 and run on the card, passed every check (90
+one-millisecond spins completed in 100 ms). The engine rebuilt from the
+same checkout, because make cuda-dll rewrites .build-config:
+qwen36_clang.exe 374272 bytes, 17:07:19, sha256 prefix AFCBC2BF76D5DA2B.
+qwen36.c is the same source as in 1f049055; the hash differs from
+5DD01BF1CA3C424A, and why (a link timestamp is the usual reason) was not
+checked.
+
+In this build coli_cuda_init starts the spin. c/tools/misure-envab.ps1
+-Var COLI_CUDA_KEEPALIVE -Marker "[cuda] keep-alive active:" -MarkerFile
+coli_cuda.dll, six ABBA pairs, no heat table. Excerpt:
+
+  delta appaiati (ON - OFF), ms/token
+  -1.80   -2.50   -3.30   -5.10   -3.30   -3.50
+  media    -3.25   sd  1.11   se  0.45   df 5
+  intervallo 95 %:  [-4.41 ; -2.09]   ampiezza +-1.16
+  negativi 6/6
+  OFF prima:  -1.80  -3.30  -3.30
+  ON prima:   -2.50  -5.10  -3.50
+  differenza fra le medie dei due gruppi: 0.90 ms/token
+
+  OFF    step  30.87  moe  15.89  attn  2.56  dn  9.69  head  1.70
+         (shared)  3.66  (router)  0.85  wait  0.89
+         issue  1.41  cpu-miss  8.64  take  0.98  sh-ovl  3.67
+  ON     step  27.62  moe  15.34  attn  2.13  dn  8.09  head  1.03
+         (shared)  3.76  (router)  0.83  wait  0.29
+         issue  1.36  cpu-miss  8.66  take  0.38  sh-ovl  3.76
+
+Banner, [place] and residency (6859/10240) identical in all 12 runs;
+the generated text identical within each arm and between the arms
+(4a000cc01f310b64), miss(CPU) 15611 in both. lm_head falls to the
+benchmark's call time (1.03 ms), deltanet by 1.6, the GPU wait inside
+take by 0.6; the CPU-side timers (cpu-miss, shared) do not move.
+
+The clock log (same nvidia-smi query) shows each ON run at P2 2790-2805 /
+10251 MHz and 83-91 % utilization for 67-71 consecutive samples, then P0
+for a few samples at exit; the OFF runs show the P2 burst and P3 of
+section 5. The spin counts as load for the driver.
+
+The cost: the log end times put each ON run at 44-45 s after the run
+before it and each OFF run at 25-26 s. With the spin started at init,
+the warm start's ~41000 cudaFree calls (the API summary of section 5's
+Nsight run: 41277 cudaFree, 1.09 s in total without the spin) each wait
+for the running kernel. That is the likely cause, inferred from the
+timings, not traced. The commit after 4582d0e5 starts the spin at the first
+coli_cuda_matmul instead, after the warm start; that version is not
+measured here. The spin also keeps the card at full clocks, and so at
+higher power, for as long as the process runs; power was not logged.
+
 --- what this means ----------------------------------------------------------
 
 On this machine, in every decode that was logged, the card holds P2 for a
@@ -348,6 +409,9 @@ call, measured profiled) is not addressed by it. The double lock recovered
 against 5.20 ms). The expert kernels probably slow down too; that was not
 read. Earlier records of this path in docs/experiments logged no clocks,
 so how much of their decode ran in P3 is unknown.
+
+The keep-alive of section 7 gets the same clocks without administrator
+rights and, in its own six pairs, a resolved step() gain of 3.25 ms/token.
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
@@ -392,4 +456,7 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
-  - A way to keep the clocks up without administrator rights.
+  - The keep-alive started at the first GEMV (the version after 4582d0e5):
+    its load time and its step().
+  - The keep-alive's power draw, and its effect with a heat table or on
+    long generations.
