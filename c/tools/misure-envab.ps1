@@ -130,9 +130,9 @@ Set-Location -LiteralPath $WorkDir
 # senza prefisso va tenuto allineato a mano ai getenv del motore, e quei nomi
 # sono rifiutati tutti allo stesso titolo: la guardia non li classifica.
 $EnvOwn = $ScriptOwned + @($Var)
-# Il valore che -Var aveva prima dello script, rimesso alla fine. Le altre
-# variabili che lo script imposta restano cambiate: lanciato con -File (come
-# indica l'intestazione) gira in un processo suo e non tocca la finestra.
+# I valori che -Var e HEAT_FILE avevano prima dello script, rimessi alla fine.
+# Le altre variabili che lo script imposta restano cambiate: lanciato con -File
+# (come indica l'intestazione) gira in un processo suo e non tocca la finestra.
 $VarBefore = [Environment]::GetEnvironmentVariable($Var)
 $HeatEnvBefore = [Environment]::GetEnvironmentVariable("HEAT_FILE")
 # Con -File, PowerShell passa "-AllowEnv A,B" come UN SOLO elemento di
@@ -395,7 +395,8 @@ if ($HeatFile) {
         finally { $sha.Dispose() }
         $now = @{ eseguibile = $exeHash; dll = $DllHash; n_new = "$NNew"; cap = "$Cap"; bits = "$Bits"; snap = $snapHash
                  allow_env = $(if ($AllowEnv.Count) { (@($AllowEnv | Sort-Object) -join ",") } else { "nessuna" }) }
-        $differ = @(@("n_new","cap","bits","snap","allow_env","eseguibile","dll") | Where-Object { -not $sg.ContainsKey($_) -or $sg[$_] -ne $now[$_] })
+        $differ = @(@("n_new","cap","bits","snap","allow_env","eseguibile","dll") | ForEach-Object {
+            if (-not $sg.ContainsKey($_)) { "$_ (non registrata)" } elseif ($sg[$_] -ne $now[$_]) { $_ } })
         $origin = "costruita su un prompt sha256 {0}, {1} | {2}: tabella= verificata | condizioni della costruzione diverse da questa corsa: {3}" -f `
             $sg["prompt"].Substring(0, [Math]::Min(16, $sg["prompt"].Length)),
             $(if ($sg["prompt"] -eq $hPrompt) { "LO STESSO prompt misurato (come SELF)" } else { "diverso dal prompt misurato (come CROSS)" }),
