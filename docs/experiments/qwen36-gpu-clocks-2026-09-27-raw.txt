@@ -1,6 +1,7 @@
 Qwen3.6-35B-A3B on the CUDA tier: where the dense GEMV time goes, and the
 GPU power states behind it.
-27 September 2026, one session on the operator's machine.
+27 September 2026, on the operator's machine: one session (sections
+1-7) and one evening run (section 8).
 
 The session started as an A/B of one CPU-side change and ended somewhere
 else. In order:
@@ -38,10 +39,10 @@ else. In order:
      (both arms 23-26 s apart, so a cost of 2-3 s would not show).
   8. The keep-alive with the heat table loaded in both arms (evening,
      main 8ac49bb9): -2.37 ms/token, 95 % [-3.76, -0.98], 6/6, 25.67 ->
-     23.30, text identical. deltanet is then the largest phase (8.03
-     ms/token); its GPU-facing parts, the qkvz/a/b projections and the
-     norm + out_proj, take 5.67 of it, of which ~1.7-2.5 ms is dense
-     kernel by section 5's durations.
+     23.30, text identical. deltanet is then the largest phase after the
+     MoE block (8.03 against 11.11 ms/token); the two of its parts that
+     contain a GPU call take ~5.7 of it, of which ~1.7-2.5 ms would be
+     dense kernel by section 5's durations (an estimate).
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -481,30 +482,40 @@ clocks were not logged in the second and third runs.
 
 --- 8. the keep-alive with the heat table ------------------------------------
 
-Same day, evening, after #56 and #57 were merged. The operator pulled
+Same day, evening (after 21:36; section 7's last run was 17:38), after
+#56 and #57 were merged. This is the first measurement of the keep-alive
+as merged: e0635b51 changed its thread lifetime (heap thread, atexit),
+added an iteration cap to the kernel and announces it only after setup,
+after ee8ba807, which section 7's third run measured. The operator pulled
 main at 8ac49bb9 (the keep-alive as merged in #56, misure-envab.ps1 with
 -HeatFile from #57) and rebuilt both, DLL first: coli_cuda.dll 759808
 bytes, 21:36:54, sha256 prefix 413CBA2FF43ABFCB; qwen36_clang.exe 374784
-bytes, 21:36:58, sha256 prefix 522F9540244DCA46. Before that, the keep-
-alive test built from 180a793b passed on the card, including the new
-"--exit-without-shutdown" run, which exited with status 0.
+bytes, 21:36:58, sha256 prefix 522F9540244DCA46. Earlier that evening
+the keep-alive test built from 180a793b passed on the card, including
+the new "--exit-without-shutdown" run, which exited with status 0.
 
   misure-envab.ps1 -Var COLI_CUDA_KEEPALIVE -Marker "[cuda] keep-alive
   active:" -MarkerFile coli_cuda.dll -HeatFile heat.caldo.bin
 
-six ABBA pairs, both arms with the same table: heat.caldo.bin, 40972
-bytes, 40 layers x 256 experts, sha256 prefix 2682CA6E4CD9744F, the
-table built at 07:49 on prompt-caldo.txt for the heat-table record of
-this morning (qwen36-heatfile-bench-2026-09-27-raw.txt); its sidecar
-matched ("tabella= verificata"), and differs from this run only in the
-executable and the DLL. The table was loaded in all 12 runs and did not
-change. Excerpt (the per-arm timer lines condensed):
+cap 256, bits 4, N_NEW=128, prompt25.txt (sha256 prefix
+35ECA2E6EFD8B6E4), six ABBA pairs, both arms with the same table:
+heat.caldo.bin, 40972 bytes, 40 layers x 256 experts, sha256 prefix
+2682CA6E4CD9744F. It is the table built at 07:49 on prompt-caldo.txt
+(prompt sha256 prefix 6A4F0BCF64192EA3) for this morning's heat-table
+record (qwen36-heatfile-bench-2026-09-27-raw.txt): built on a different
+prompt from the one measured, as in that record's CROSS arm. Its sidecar
+matched the table ("tabella= verificata"); of the build conditions the
+sidecar records, only the executable and the DLL differ from this run.
+The table was loaded in all 12 runs and did not change. Excerpt (the
+per-arm timer lines condensed):
 
   delta appaiati (ON - OFF), ms/token
   -3.00   -1.20   -0.30   -3.80   -2.90   -3.00
   media    -2.37   sd  1.32   se  0.54   df 5
   intervallo 95 %:  [-3.76 ; -0.98]   ampiezza +-1.39
   negativi 6/6
+  OFF prima:  -3.00  -0.30  -2.90
+  ON prima:   -1.20  -3.80  -3.00
   differenza fra le medie dei due gruppi: 0.60 ms/token
 
   OFF step 25.67, moe 11.71, attn 2.38, dn 9.10, head 1.43, wait 0.63,
@@ -518,35 +529,44 @@ identical in all 12 runs; 8.0 LFRU swaps per run in both arms; the text
 identical within and between the arms (4a000cc01f310b64).
 
 The gain is smaller and noisier than without the table (section 7,
-third run: -3.45, [-3.69, -3.21]). The two runs are separate sessions of
-one evening with different binaries, so the difference between them is
-not a measured effect. One reading is that with ~60 % fewer CPU misses
-the card is busier and drops to P3 less in the OFF arm (its head, 1.43,
-is below the 1.64 of section 7's OFF arm); clocks were not logged during
-this run (the nvidia-smi log was started after it ended), so that is not
-shown.
+third run: -3.45, [-3.69, -3.21]). The two are separate runs of the same
+day, with different binaries and a changed keep-alive, so the difference
+between them is not a measured effect. Two readings fit, neither shown:
+with ~60 % fewer CPU misses (6240 against 15611) the card is busier and
+drops to P3 less in the OFF arm; or the shorter decode (~3.3 s against
+~3.7 s at 128 tokens) puts a larger share of it inside the 1.5-2 s P2
+burst. The OFF arm's head, 1.43, is below section 7's 1.64-1.70 either
+way. Clocks were not logged during this run (the nvidia-smi log was
+started after it ended).
 
 The dn-sub line of the same 12 logs (the engine prints it under
-COLI_TIMERS; the script did not read it), mean of six runs per arm,
-ms/token:
+COLI_TIMERS, to one decimal; the script did not read it), mean of six
+runs per arm, ms/token, so about +-0.05 of rounding in each mean:
 
                 proj   conv   l2n+rec   norm+out   sum    dn
   OFF           4.43   0.43   1.95      2.23       9.05   9.10
   ON            3.70   0.45   1.97      1.97       8.08   8.03
 
-  proj      = the qkvz projection (one placed GEMV, dnproj) plus the a
-              and b matmuls on the CPU (c/qwen36.c, deltanet()).
-  norm+out  = the gated RMSNorm on the CPU plus out_proj (placed GEMV,
-              dnout).
+  proj      = the qkvz projection (the placed dnproj GEMV, or the two
+              CPU matmuls) plus the a and b matmuls on the CPU
+              (c/qwen36.c, deltanet()).
+  norm+out  = the gated RMSNorm on the CPU plus out_proj (the placed
+              dnout GEMV, or the CPU matmul).
 
-The keep-alive moves only the two parts with a GPU call in them. With
-it, those two take 5.67 ms/token over 30 layers. The dense kernels
-inside them, at section 5's durations (dnproj 42 us minimum, 44-55 in
-the benchmark; dnout 15 minimum, 17-27 in the benchmark), come to
-30 x (57..82) us = 1.7-2.5 ms. The other ~3.2-4.0 ms is the two
-synchronous round trips per layer (copies, launch, wait), the a/b
-matmuls and the norm; the timers do not split it. That the card was at
-P2 during these calls is assumed from the keep-alive, not logged.
+That dnproj and dnout ran on the GPU in every layer of these runs is
+inferred ([place] identical in all runs, and section 2's count of 30
+dnproj and 30 dnout per token in another build); the logs could not
+show it. The keep-alive moves only the two parts with a GPU call in them
+(conv and l2n+rec change by +0.02, within rounding). With it, those two
+take ~5.7 ms/token over 30 layers. The dense kernels inside them, at
+section 5's durations (dnproj 42 us minimum, 44-55 in the benchmark; the
+1024-row grid, dnout mixed with attnout, 15 minimum, 17-27 in the
+benchmark), would come to 30 x (57..82) us = 1.7-2.5 ms. That is an
+estimate: section 5's minima are extremes of the 21 September DLL under
+Nsight. The other ~3.2-4.0 ms is the two synchronous GPU calls' copies,
+launch and wait, the a/b matmuls and the norm; the timers do not split
+it. That the card was at P2 during these calls is assumed from the
+keep-alive, not logged.
 
 --- what this means ----------------------------------------------------------
 
@@ -566,7 +586,8 @@ so how much of their decode ran in P3 is unknown.
 The keep-alive of section 7 held P2 without administrator rights in its
 first run, the only one with a clock log. In its final version, step()
 29.07 -> 25.62 ms/token, 95 % [-3.69, -3.21], six pairs of six, no
-end-to-end cost visible in the log end times (to within 2-3 s).
+end-to-end cost visible in the log end times (to within 2-3 s). With
+the heat table in both arms (section 8): -2.37, [-3.76, -0.98], 6/6.
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
@@ -603,7 +624,7 @@ Control Panel settings not helping.
     P3 also slows the small h2d/d2h copies.
   - The power and thermal cost of running locked.
   - Any replication in another session or after a reboot.
-  - The heat table. Every run here is without one.
+  - The heat table in sections 1-7: every run there is without one.
   - The generated text in sections 2 to 6 (no guard script compared it).
   - The expert kernels' own slowdown in P3: the graph path records no
     timing without COLI_CUDA_PROFILE, and Nsight's rows for it were not
@@ -612,12 +633,14 @@ Control Panel settings not helping.
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
   - Clocks in section 8's run, and how the ~3.2-4.0 ms of deltanet's
-    GPU-facing parts that is not kernel splits between round trips, the
-    a/b matmuls and the norm. The dn-split timers added with this
-    section separate the last three from the round trips' share.
+    two GPU-calling parts that is not kernel splits between the GPU
+    calls' overhead, the a/b matmuls and the norm. The dn-split timers
+    added with this section time the a/b matmuls and the norm apart
+    from the two GPU calls; how each call splits between round trip and
+    kernel still rests on section 5's durations.
   - Clocks in the keep-alive's second and third runs: that the final
     version, with its 50 ms pauses on frees, holds P2 is inferred from
     its step() times, not logged.
   - The keep-alive on another card, another driver, or Linux.
-  - The keep-alive's power draw, and its effect with a heat table or on
-    long generations.
+  - The keep-alive's power draw, its effect with a heat table beyond
+    section 8's six pairs, and on long generations.
