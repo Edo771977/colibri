@@ -1024,7 +1024,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_group_bcast_arms_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_group_bcast_arms_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_keepalive_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
@@ -1044,6 +1044,10 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# failure on some hosts and would otherwise abort the recipe first.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./fp8_warp_test$(EXE)
+	# COLI_CUDA_KEEPALIVE: off unless "1", launches when on, changes no byte
+	# of a dense GEMV, and coli_cuda_shutdown stops and joins it.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_keepalive_cuda.cu -o cuda_keepalive_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_keepalive_test$(EXE)
 	# fmt=1 per-row int8 with R rows per block (COLI_CUDA_I8_ROWS): the
 	# contract is BITWISE identity with the original kernel, not a tolerance,
 	# on shapes covering a short last block, O < R, and a strided I tail.

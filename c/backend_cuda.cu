@@ -19,6 +19,8 @@
 #include <chrono>
 #include <mutex>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -1770,6 +1772,89 @@ extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
     return 1;
 }
 
+/* COLI_CUDA_KEEPALIVE=1: keep one tiny kernel always running on every
+ * configured device, so the driver does not see an idle card.
+ *
+ * Measured on an RTX 4070 Ti SUPER under Windows (docs/experiments/
+ * qwen36-gpu-clocks-2026-09-27-raw.txt): qwen36's decode keeps the card
+ * 15-40 % busy, and about two seconds in the driver drops it from P2 to P3,
+ * memory 10251 -> 5001 MHz and graphics ~2600 -> ~1900 MHz. The placed
+ * dense GEMVs then take twice their P2 time. Locking both clocks with
+ * nvidia-smi gave -2.07 ms/token over three pairs, but needs administrator
+ * rights; the driver's "Prefer maximum performance" did not reach the
+ * process. This is the unprivileged attempt, after COLI_METAL_SPIN
+ * (backend_metal.mm): a host thread relaunches a one-warp spin kernel of
+ * ~1 ms on its own non-blocking, lowest-priority stream, waiting on an event
+ * with blocking sync so the thread sleeps between launches.
+ *
+ * Whether the driver counts that as load is the experiment; off by default.
+ * It cannot change a result -- the kernel reads and writes nothing -- but it
+ * holds a warp on one SM and a CPU thread. Non-blocking stream: the dense
+ * path's legacy stream 0 does not wait for it. Stopped and joined first
+ * thing in coli_cuda_shutdown (qwen36 reaches it through atexit), before any
+ * context state goes. CUDA only: the spin reads %globaltimer. */
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__)
+__global__ static void keepalive_spin(unsigned long long ns) {
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < ns);
+}
+#define COLI_HAS_KEEPALIVE 1
+#else
+#define COLI_HAS_KEEPALIVE 0
+#endif
+static std::atomic<int> g_ka_run{0};
+static std::atomic<unsigned long long> g_ka_launches{0};
+static std::thread g_ka_thr;
+/* Exactly "1" turns it on, as COLI_DENSE_IDOT does on the engine side. */
+static int keepalive_mode(void) {
+    const char *e = std::getenv("COLI_CUDA_KEEPALIVE");
+    return e && e[0] == '1' && e[1] == 0;
+}
+static void keepalive_start(void) {
+#if COLI_HAS_KEEPALIVE
+    if (!keepalive_mode() || g_nctx < 1 || g_ka_run.exchange(1)) return;
+    int n = g_nctx, devs[COLI_CUDA_MAX_DEVICES];
+    for (int i = 0; i < n; i++) devs[i] = g_ctx[i].device;
+    /* Announced from here, before the thread runs: the line is the proof a
+     * measurement script checks that the ON arm really took this branch. */
+    std::fprintf(stderr, "[cuda] keep-alive active: COLI_CUDA_KEEPALIVE=1, "
+                 "a 1 ms one-warp spin per device on a low-priority stream\n");
+    g_ka_thr = std::thread([n, devs]() {
+        cudaStream_t st[COLI_CUDA_MAX_DEVICES] = {};
+        cudaEvent_t ev[COLI_CUDA_MAX_DEVICES] = {};
+        int ok = 1;
+        for (int i = 0; i < n && ok; i++) {
+            int lo = 0, hi = 0;
+            ok = cudaSetDevice(devs[i]) == cudaSuccess
+              && cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess
+              && cudaStreamCreateWithPriority(&st[i], cudaStreamNonBlocking, lo) == cudaSuccess
+              && cudaEventCreateWithFlags(&ev[i], cudaEventBlockingSync | cudaEventDisableTiming) == cudaSuccess;
+        }
+        if (!ok) std::fprintf(stderr, "[cuda] keep-alive: setup failed (%s), not running\n",
+                              cudaGetErrorString(cudaGetLastError()));
+        while (ok && g_ka_run.load()) {
+            for (int i = 0; i < n; i++) {
+                cudaSetDevice(devs[i]);
+                keepalive_spin<<<1, 32, 0, st[i]>>>(1000000ULL);
+                cudaEventRecord(ev[i], st[i]);
+            }
+            for (int i = 0; i < n; i++)
+                if (cudaEventSynchronize(ev[i]) != cudaSuccess) ok = 0;
+            if (ok) g_ka_launches++;
+        }
+        for (int i = 0; i < n; i++) {
+            cudaSetDevice(devs[i]);
+            if (ev[i]) cudaEventDestroy(ev[i]);
+            if (st[i]) cudaStreamDestroy(st[i]);
+        }
+    });
+#endif
+}
+static void keepalive_stop(void) {
+    if (g_ka_run.exchange(0) && g_ka_thr.joinable()) g_ka_thr.join();
+}
+
 extern "C" int coli_cuda_init(const int *devices, int count) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
     /* #509: the ROCm runtime (comgr, MIOpen, roctracer) reads $TEMP as a temp-dir
@@ -1830,6 +1915,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
                      device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
     }
+    keepalive_start();
     return 1;
 }
 
@@ -1840,6 +1926,7 @@ extern "C" int coli_cuda_available_device_count(void) {
 }
 
 extern "C" void coli_cuda_shutdown(void) {
+    keepalive_stop();
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;

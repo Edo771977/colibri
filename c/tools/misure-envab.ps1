@@ -24,7 +24,8 @@
 # quando la variabile ha effetto. Deve comparire in ogni log ON e in nessun
 # log OFF, e il suo testo deve stare dentro l'eseguibile: se manca, il
 # binario e' stato compilato prima della modifica e i due bracci sarebbero lo
-# stesso programma.
+# stesso programma. Una variabile letta dalla DLL (COLI_CUDA_*) stampa la sua
+# riga da coli_cuda.dll: allora -MarkerFile coli_cuda.dll dice dove cercarla.
 #
 # ORDINE ABBA: l'ordine dei due bracci si alterna da una ripetizione
 # all'altra (OFF prima nelle dispari, ON prima nelle pari). Con un numero
@@ -47,6 +48,8 @@ param(
     [string] $Var         = "COLI_DENSE_IDOT",
     [string] $Value       = "1",
     [string] $Marker      = "[dense] COLI_DENSE_IDOT=1:",
+    # Il file che deve contenere il testo di -Marker. Vuoto: l'eseguibile.
+    [string] $MarkerFile  = "",
     [int]    $Cap         = 256,
     [int]    $Bits        = 4,
     [int]    $Reps        = 6,
@@ -251,15 +254,24 @@ $CfgStamp
 $DllStamp
 
 
-# Il testo di -Marker deve stare nell'eseguibile: e' il letterale che il
-# motore stampa, quindi un binario compilato prima della modifica non lo
-# contiene e i due bracci sarebbero lo stesso programma. Lettura Latin-1: un
-# byte, un carattere, quindi un letterale ASCII si ritrova tale e quale.
-$exeText = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($exeItem.FullName))
-if ($exeText.IndexOf($Marker, [StringComparison]::Ordinal) -lt 0) {
-    throw ("{0} non contiene il testo '{1}': e' stato compilato senza la modifica che {2} accende. Ricompila e ricopia: make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe" -f $Exe, $Marker, $Var)
+# Il testo di -Marker deve stare nel binario che lo stampa (l'eseguibile, o
+# -MarkerFile): e' il letterale, quindi un binario compilato prima della
+# modifica non lo contiene e i due bracci sarebbero lo stesso programma.
+# Lettura Latin-1: un byte, un carattere, quindi un letterale ASCII si
+# ritrova tale e quale.
+if ($MarkerFile) {
+    if (-not (Test-Path -LiteralPath $MarkerFile -PathType Leaf)) { throw "-MarkerFile $MarkerFile non esiste o non e' un file." }
+    $mfPath = (Get-Item -LiteralPath $MarkerFile).FullName
+    $mfFix  = "ricompila $MarkerFile (per coli_cuda.dll: make cuda-dll, dal prompt x64 Native Tools)"
+} else {
+    $mfPath = $exeItem.FullName
+    $mfFix  = "ricompila e ricopia: make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe"
 }
-Remove-Variable exeText
+$mfText = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($mfPath))
+if ($mfText.IndexOf($Marker, [StringComparison]::Ordinal) -lt 0) {
+    throw ("{0} non contiene il testo '{1}': e' stato compilato senza la modifica che {2} accende. Rimedio: {3}" -f $mfPath, $Marker, $Var, $mfFix)
+}
+Remove-Variable mfText
 
 if (-not (Test-Path -LiteralPath $Prompt)) { throw "manca $Prompt" }
 if (-not (Test-Path -LiteralPath $Snap))   { throw "modello non trovato in $Snap -- passalo con -Snap <dir>" }
@@ -272,7 +284,7 @@ $ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps | OFF: $Var 
     ("  | built={0}" -f $(if ($Built) { $Built } else { "(vuoto) -- PROVENIENZA NON VERIFICATA" })) +
     ("  | allow-env={0}" -f $(if ($AllowEnv.Count) { ($AllowEnv -join ",") + " -- DEROGA" } else { "nessuna" }))
 $ParamStamp
-"marker: $Marker"
+"marker: $Marker  (testo trovato in $mfPath)"
 
 # ---- motore --------------------------------------------------------------
 function Invoke-Engine([bool]$On, [string]$PromptFile, [string]$Log) {
