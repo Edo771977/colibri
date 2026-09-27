@@ -191,8 +191,11 @@ static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
  * That question came from dividing the engine's existing timers by their byte
  * counts, and one of those two timers is not the clean divisor it looks like:
  * g_dn_sub[0] (qwen36.c) closes after dn_b and dn_a as well as the fused
- * projection, two CPU-only matmuls whose bytes are in nobody's numerator. They
- * are a low single-digit share of the work at these shapes, so the ~67 GB/s
+ * projection, CPU-only matmuls (one fused call since 2026-09-27) whose bytes
+ * are in nobody's numerator. They are a low single-digit share of the bytes at
+ * these shapes (not of the time: section 9 of docs/experiments/
+ * qwen36-gpu-clocks-2026-09-27-raw.txt times them at ~20-25 % of that
+ * timer), so the ~67 GB/s
  * that motivated this patch is a FLOOR on the dnproj kernel, not a reading of
  * it. Which is the whole point of measuring here instead: these counters time
  * the GEMV and nothing else.
