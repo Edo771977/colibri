@@ -1914,6 +1914,16 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
     st_read_f32(&m->S, name, p, 0);
     return p;
 }
+/* load_t_n into a buffer the caller owns: same checks, no allocation. */
+static void load_t_into(Model *m, const char *name, int64_t want, float *dst) {
+    int64_t n = st_numel(&m->S, name);
+    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (n != want) {
+        fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n",
+                name, (long long)n, (long long)want); exit(1);
+    }
+    st_read_f32(&m->S, name, dst, 0);
+}
 
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
@@ -1999,8 +2009,19 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             int64_t vdim_tot = (int64_t)c->dn_vheads * c->dn_vdim;
             LD4(dn_qkv, "in_proj_qkv.weight", (int64_t)c->dn_conv_dim * c->hidden);
             LD4(dn_z,   "in_proj_z.weight",   vdim_tot * c->hidden);
-            LD4(dn_b,   "in_proj_b.weight",   (int64_t)c->dn_vheads * c->hidden);
-            LD4(dn_a,   "in_proj_a.weight",   (int64_t)c->dn_vheads * c->hidden);
+            /* in_proj_b and in_proj_a in ONE [2*vh, hidden] buffer, b's rows
+             * first, so deltanet() computes both with one matmul (one OpenMP
+             * region per layer instead of two). dn_a points into it and is
+             * never freed on its own; each row's dot product is unchanged. */
+            {
+                int64_t nba = (int64_t)c->dn_vheads * c->hidden;
+                l->dn_b = falloc(2 * nba);
+                l->dn_a = l->dn_b + nba;
+                snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn.in_proj_b.weight",ai);
+                load_t_into(m, nm, nba, l->dn_b);
+                snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn.in_proj_a.weight",ai);
+                load_t_into(m, nm, nba, l->dn_a);
+            }
             LD4(dn_conv,"conv1d.weight",      (int64_t)c->dn_conv_dim * c->dn_convk);
             LD4(dn_dtbias, "dt_bias",         c->dn_vheads);
             LD4(dn_alog,"A_log",              c->dn_vheads);
@@ -2963,7 +2984,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
      * the only thread this engine starts is the pilot prefetcher, which never
      * enters here. Sub-buffers are 64-byte aligned so nothing straddles a cache
      * line; every kernel that reads them uses unaligned loads anyway. */
-    int64_t need = DN_PAD((int64_t)conv_dim + value_dim) + 4*DN_PAD(vh)
+    int64_t need = DN_PAD((int64_t)conv_dim + value_dim) + DN_PAD(2*vh) + 2*DN_PAD(vh)
                  + DN_PAD(conv_dim) + 2*DN_PAD((int64_t)vh * kdim)
                  + 2*DN_PAD(value_dim);
     float *sc = scratch_get(&m->dn_scratch, need);
@@ -2973,8 +2994,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float *qkvz = sc;                       sc += DN_PAD((int64_t)conv_dim + value_dim);
     float *qkv = qkvz;
     float *z   = qkvz + conv_dim;
-    float *b   = sc;                        sc += DN_PAD(vh);
-    float *a   = sc;                        sc += DN_PAD(vh);
+    float *b   = sc;                        sc += DN_PAD(2*vh);
+    float *a   = b + vh;                    /* b ++ a: one matmul fills both */
     float *beta= sc;                        sc += DN_PAD(vh);
     float *gg  = sc;                        sc += DN_PAD(vh);
     float *conv_out = sc;                   sc += DN_PAD(conv_dim);
@@ -3002,8 +3023,9 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             matmul_d(z,   xs, l->dn_z,   1, H, value_dim);
         }
         if (tm_on() && S==1){ double t=tm_now(); g_dn_split[0]+=t-_s0; _s0=t; g_dn_calls++; g_dn_gpu[0]+=dn_gpu_proj!=0; }
-        matmul(b,   xs, l->dn_b,   1, H, vh);
-        matmul(a,   xs, l->dn_a,   1, H, vh);
+        /* b and a together: l->dn_b is [b rows ++ a rows] (see the loader),
+         * the output [b ++ a]. Row by row the same dot products as two calls. */
+        matmul(b,   xs, l->dn_b,   1, H, 2*vh);
         if (tm_on() && S==1){ double t=tm_now(); g_dn_split[1]+=t-_s0; g_dn_sub[0]+=t-_d0; _d0=t; }
         for (int h = 0; h < vh; h++) {
             beta[h] = 1.f / (1.f + expf(-b[h]));
@@ -4660,7 +4682,7 @@ static void qwen36_segment_layer_free(Layer *layer) {
     free(layer->q); free(layer->k); free(layer->v); free(layer->o);
     free(layer->qn); free(layer->kn); free(layer->gate); free(layer->gate_bias);
     free(layer->sh_g); free(layer->sh_u); free(layer->sh_d); free(layer->sh_gate);
-    free(layer->dn_qkv); free(layer->dn_z); free(layer->dn_b); free(layer->dn_a);
+    free(layer->dn_qkv); free(layer->dn_z); free(layer->dn_b);   /* dn_a lives inside dn_b */
     free(layer->dn_conv); free(layer->dn_dtbias); free(layer->dn_alog);
     free(layer->dn_norm); free(layer->dn_out);
 }

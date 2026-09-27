@@ -43,6 +43,13 @@ else. In order:
      MoE block (8.03 against 11.11 ms/token); the two of its parts that
      contain a GPU call take ~5.7 of it, of which ~1.7-2.5 ms would be
      dense kernel by section 5's durations (an estimate).
+  9. Two more runs that evening at main 19203743, with the dn-split
+     timers: the keep-alive repeated (-0.57, [-4.46, +3.33], 5/6; one ON
+     run at 31.80 widens it), and COLI_CUDA_DENSE_PINNED=2 with the
+     keep-alive on in both arms (+0.45, [-1.44, +2.34], 1/6): the pinned
+     staging still does not help at full clocks. dn-split puts ~0.8-1.0
+     ms/token in the two tiny a/b matmuls and non-kernel time on
+     each of deltanet's 60 GPU calls per token (~30-60 us, an estimate).
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -567,6 +574,75 @@ Nsight. The other ~3.2-4.0 ms is the two synchronous GPU calls' copies,
 launch and wait, the a/b matmuls and the norm; the timers do not split
 it. That the card was at P2 during these calls is assumed from the
 keep-alive, not logged.
+
+--- 9. two more runs: the keep-alive again, and pinned staging -------------
+
+Same evening, main 19203743 (#58: the dn-split and dn-gpu timers). The
+operator rebuilt the engine only: qwen36_clang.exe 375808 bytes,
+22:21:44, sha256 prefix 9F10A95F5ECDBC15; coli_cuda.dll unchanged from
+section 8 (413CBA2FF43ABFCB). Both runs: misure-envab.ps1, cap 256, bits
+4, N_NEW=128, prompt25.txt, six ABBA pairs, heat.caldo.bin in both arms
+(sidecar verified, loaded in all 12 runs, unchanged); banner, [place]
+and residency (6859/10240) identical in all 12 runs of each; the text
+identical within and between the arms (4a000cc01f310b64); 8.0 LFRU
+swaps per run.
+
+9a. The keep-alive, repeated (same arguments as section 8):
+
+  delta appaiati (ON - OFF), ms/token
+  -1.80   6.90   -3.30   -1.60   -1.80   -1.80
+  media    -0.57   sd  3.71   se  1.51   df 5
+  intervallo 95 %:  [-4.46 ; 3.33]   ampiezza +-3.89
+  negativi 5/6
+
+  OFF step 25.12, dn 8.92, head 1.42      ON step 24.55, dn 8.54, head 1.10
+
+Recomputed: mean -0.567, sd 3.711, se 1.515, half-width 3.895. Pair 2 is
+ON 31.80 against OFF 24.90; every other run of the ON arm is 22.2-24.0.
+Its cause is not in what was pasted. The run is inconclusive on its own
+and is reported as it is: the interval includes zero. The ON arm's
+per-phase means carry that run.
+
+9b. COLI_CUDA_DENSE_PINNED=2 with the keep-alive on in both arms:
+
+  set COLI_CUDA_KEEPALIVE=1, then misure-envab.ps1 -Var
+  COLI_CUDA_DENSE_PINNED -Value 2 -Marker "[cuda] dense pinned staging
+  active:" -MarkerFile coli_cuda.dll -HeatFile heat.caldo.bin
+  -AllowEnv COLI_CUDA_KEEPALIVE
+
+  delta appaiati (ON - OFF), ms/token
+  -3.00   1.60   2.00   1.20   0.50   0.40
+  media     0.45   sd  1.80   se  0.73   df 5
+  intervallo 95 %:  [-1.44 ; 2.34]   ampiezza +-1.89
+  negativi 1/6
+
+  OFF step 24.58, dn 8.30, attn 2.09      ON step 25.03, dn 8.89, attn 2.27
+
+Recomputed: mean 0.450, sd 1.800, se 0.735, half-width 1.889. One OFF
+run read miss(CPU) 6241 instead of 6240, with the same text. The 21
+September record (qwen36-dense-pinned-2026-09-21-raw.txt) measured mode
+2 at +2.00 ms/token without the keep-alive, when the card dropped to
+P3. At full clocks it still does not help; the two GPU calls of
+deltanet read slower with it (below).
+
+dn-split, mean of six runs per arm, ms/token (dn-gpu: dnproj 3810/3810
+and dnout 3810/3810 in every arm, so both projections ran on the GPU
+in every decode call):
+
+               qkvz   a+b    norm   out
+  9a OFF       3.48   0.84   0.13   2.05
+  9a ON        3.11   0.80   0.13   2.08
+  9b OFF       2.78   1.03   0.15   1.75
+  9b ON        3.06   0.98   0.14   2.13
+
+Per call, with the keep-alive (9a ON, 9b OFF): qkvz 93-104 us, out
+58-69 us. Against section 5's kernel durations (dnproj 42-55 us, the
+1024-row grid 15-27 us) that leaves ~30-60 us per call that is not
+kernel (9a ON includes the 31.80 run). The a/b matmuls, two 32 x 2048 f32 products per layer, cost
+0.80-1.03 ms/token: ~13-17 us each, mostly the start and join of an
+OpenMP region for 32 rows. The gated RMSNorm is ~0.13-0.15. The four
+arms' per-phase means come from runs of different binaries and
+settings; the split is a profile, not an A/B.
 
 --- what this means ----------------------------------------------------------
 
