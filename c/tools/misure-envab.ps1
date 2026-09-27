@@ -3,11 +3,14 @@
 #
 # SI LANCIA DA cmd, con UNA riga:
 #
-#     powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1
+#     powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Var <NOME> -Marker "<riga di prova>" [-MarkerFile coli_cuda.dll]
 #
 # dalla cartella che contiene qwen36_clang.exe (cioe' c\). Lo script vive in
 # c\tools\ ma lavora nella cartella PADRE, dove stanno l'eseguibile e i
-# prompt -- passa -WorkDir se il tuo albero e' diverso.
+# prompt -- passa -WorkDir se il tuo albero e' diverso. Per esempio, il
+# keep-alive CUDA (c/backend_cuda.cu):
+#
+#     ... -Var COLI_CUDA_KEEPALIVE -Marker "[cuda] keep-alive active:" -MarkerFile coli_cuda.dll
 #
 # PERCHE' ESISTE. misure-heatfile.ps1 confronta due tabelle heat, non due
 # impostazioni del motore. Questo script ne riprende le guardie (ambiente,
@@ -16,9 +19,10 @@
 #
 # I BRACCI, entrambi senza tabella heat (HEAT_FILE fuori dall'ambiente):
 #   OFF   la variabile -Var rimossa dall'ambiente.
-#   ON    -Var impostata a -Value.
-# Il default misura COLI_DENSE_IDOT=1 (c/qwen36.c, dense_idot_on): le GEMV
-# dense che girano sulla CPU con attivazioni int8.
+#   ON    -Var impostata a -Value (default "1").
+# -Var e -Marker non hanno default: lo script e' nato per COLI_DENSE_IDOT,
+# che non e' entrato in main (docs/experiments/
+# qwen36-gpu-clocks-2026-09-27-raw.txt, sezione 1).
 #
 # PROVA DEL BRACCIO: -Marker e' una riga che il motore scrive su stderr
 # quando la variabile ha effetto. Deve comparire in ogni log ON e in nessun
@@ -45,9 +49,9 @@ param(
     # controllo di staleness sui sorgenti -- e lo stamp dei parametri lo dichiara.
     [string] $Built       = "qwen36.exe",
     [string] $Prompt      = "prompt25.txt",
-    [string] $Var         = "COLI_DENSE_IDOT",
+    [string] $Var         = "",
     [string] $Value       = "1",
-    [string] $Marker      = "[dense] COLI_DENSE_IDOT=1:",
+    [string] $Marker      = "",
     # Il file che deve contenere il testo di -Marker. Vuoto: l'eseguibile.
     [string] $MarkerFile  = "",
     [int]    $Cap         = 256,
@@ -74,6 +78,9 @@ $ErrorActionPreference = "Stop"
 # perche' l'alternanza ABBA si bilanci.
 if ($Reps -lt 2 -or ($Reps % 2) -ne 0) {
     throw "-Reps $Reps non e' valido: servono almeno 2 ripetizioni (con una sola non c'e' intervallo) e un numero PARI (con un numero dispari l'alternanza ABBA non si bilancia)."
+}
+if (-not $Var) {
+    throw "manca -Var: quale variabile misurare. Esempio: -Var COLI_CUDA_KEEPALIVE -Marker `"[cuda] keep-alive active:`" -MarkerFile coli_cuda.dll"
 }
 if ($Var -cnotmatch '^[A-Z][A-Z0-9_]*$') {
     throw "-Var '$Var' non e' un nome di variabile valido (maiuscole, cifre, _)."
