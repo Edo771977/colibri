@@ -5,19 +5,27 @@ GPU power states behind it.
 The session started as an A/B of one CPU-side change and ended somewhere
 else. In order:
 
-  1. COLI_DENSE_IDOT=1 (integer dots for the CPU dense GEMVs): no effect.
+  1. COLI_DENSE_IDOT=1 (integer dots for the CPU dense GEMVs): no
+     measurable effect on ms/token.
   2. One profiled run: the placed dense GEMVs cost ~133 us a call, the
-     kernel ~255 GB/s.
-  3. A benchmark of the same kernels with no engine around them: 480-620
-     GB/s, about half the time per call.
-  4. Four hypotheses for the gap, each tested and each rejected: an old
-     kernel in the DLL, the spinning OpenMP team, the card idling between
-     calls, a fresh output buffer per token.
-  5. nvidia-smi and Nsight Systems: during decode the card drops to P3/P5
-     after ~2 s, and the dense kernels themselves run at half speed.
-  6. Locking both clocks with nvidia-smi: -2.07 ms/token, 3 of 3 pairs.
-     Locking the memory clock alone: +1.80, 3 of 3. The driver's "Prefer
-     maximum performance" for the program: no effect.
+     kernel ~255 GiB/s as the engine prints it.
+  3. A benchmark of the same kernels with no engine around them: 482-621
+     GB/s back to back at R=2, about half the time per call.
+  4. Hypotheses for the gap: the DLL running the old kernel (no: Nsight's
+     grids show R=2), the spinning OpenMP team (not supported, with a
+     confound), sub-millisecond idle gaps between calls (small), a fresh
+     output buffer per token (no).
+  5. nvidia-smi and Nsight Systems: 1.5-2 s after the P2 burst that
+     precedes decode the card drops to P3 (memory 5001 MHz, graphics
+     ~1700-2050 MHz), and the dense kernels' median duration is twice
+     their minimum.
+  6. Locking both clocks with nvidia-smi: lm_head and deltanet lower in
+     every locked run than in every unlocked one (lm_head 1.05-1.11 ms
+     against 1.28-1.69); step() -2.07 ms/token, 3 of 3 pairs but 95 %
+     [-4.45, +0.32], which includes zero: not resolved at n=3.
+     Locking the memory clock alone: step() +1.80, 95 % [+0.01, +3.59],
+     graphics clock down to ~1.0-1.2 GHz. The driver's "Prefer maximum
+     performance" for the program: no measurable effect.
 
 Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
@@ -31,24 +39,32 @@ GPU    : NVIDIA GeForce RTX 4070 Ti SUPER, sm_89, "17.2 GB VRAM", L2 48 MB
 CPU    : not printed in this session. The 16-core 7950X appears in earlier
          records (qwen36-dense-pinned-2026-09-21-raw.txt:15).
 Engine : .\qwen36_clang.exe, 374272 bytes, 2026-09-27 14:50:39, sha256
-         5DD01BF1CA3C424A, built with
+         prefix 5DD01BF1CA3C424A, built with
            make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native
          from 1f049055 (branch claude/sleepy-johnson-agg34c: main af07f4c8
          plus the opt-in COLI_DENSE_IDOT). With that variable unset the
          engine's arithmetic is main's; the misure-envab stamp printed the
          build-config (clang, -O3 -march=native -fopenmp, -DCOLI_CUDA,
          CUDA_DLL=1). The operator did not rebuild the engine during the
-         session: every engine run below is this binary.
+         session: every engine run below is this binary, 6c's P arm a
+         byte copy of it under another name.
 DLL    : coli_cuda.dll, 752640 bytes, 2026-09-21 20:46:01, sha256
-         0D57602B4917A92C. Its source commit is unknown. Read as Latin-1
-         bytes it contains the strings COLI_CUDA_PROFILE,
-         COLI_CUDA_DENSE_PINNED and COLI_CUDA_I8_ROWS (all three True).
-         COLI_CUDA_DENSE_PINNED arrived in 43ebaef3 (21 Sep 06:20 UTC), after
-         aac94c39 made COLI_CUDA_I8_ROWS default to 2 (20 Sep 12:35 UTC), both
-         on main. That makes R=2 the likely default of this DLL; it is an
-         inference from the strings, not a reading.
-Model  : SNAP=C:\modelli\qwen36_i4_gs64, cap 256, bits 4, prompt25.txt
-         (sha256 35ECA2E6EFD8B6E4), N_NEW=128, no heat table.
+         prefix 0D57602B4917A92C. Its source commit is unknown. Read as
+         Latin-1 bytes it contains the strings COLI_CUDA_PROFILE,
+         COLI_CUDA_DENSE_PINNED and COLI_CUDA_I8_ROWS (all three present).
+         The width it runs is read from the Nsight grids in section 5:
+         quant_matmul_launch launches O/R blocks for R>0
+         (c/backend_cuda.cu:2300-2303 at 46402074), and 124160, 6144, 4608
+         and 1024 are 248320, 12288, 9216 and 2048 over 2. So R=2, the
+         kernel whose source the benchmark compiles:
+         quant_matmul_i8r is unchanged from aac94c39 (the R=2 default) to
+         46402074. COLI_CUDA_I8_ROWS and COLI_CUDA_DENSE_PINNED were not in
+         the cleared list below; the grids, and no "dense pinned staging
+         active" line in what was pasted, are what place the arm.
+Model  : SNAP=C:\modelli\qwen36_i4_gs64 (routed experts int4 gs64; the
+         placed dense matrices are per-row int8, fmt=1), cap 256, bits 4,
+         prompt25.txt (sha256 prefix 35ECA2E6EFD8B6E4), N_NEW=128, no heat
+         table.
 Env    : COLI_CUDA=1, COLI_GPUS=0, COLI_TIMERS=1, N_NEW=128, SNAP set as
          above. COLI_GRAPH_DIAG, CUDA_EXPERT_GB, HEAT_FILE, COLI_PLACE,
          COLI_DENSE_IDOT, COLI_CUDA_PROFILE and KMP_BLOCKTIME cleared with
@@ -56,12 +72,15 @@ Env    : COLI_CUDA=1, COLI_GPUS=0, COLI_TIMERS=1, N_NEW=128, SNAP set as
          Only experiment 1 ran under a guard script (misure-envab.ps1);
          the other blocks were plain cmd lines, so the environment beyond
          those names was not checked by anything.
-Bench  : c/tests/bench_dense_gemv_cuda.cu, built with nvcc -arch=sm_89 at
-         46402074, then bae8b0c8 (host gaps) and 30c63e86 (fresh buffer).
+Bench  : c/tests/bench_dense_gemv_cuda.cu, `make dense-gemv-bench CC=clang
+         CUDA_ARCH=sm_89` from the x64 Native Tools prompt, which printed
+           "nvcc" -O3 -std=c++17 -ftz=false -arch=sm_89 -Xcompiler=-W3
+         at 46402074, then bae8b0c8 (host gaps) and 30c63e86 (fresh buffer).
 
 Experiment 1 checked banner, placement and residency across its twelve
-runs (the banner is the heat-table run's of the same morning). For the
-other engine runs those lines were not in what was pasted.
+runs; its banner is the one printed by the heat-table run recorded in
+qwen36-heatfile-bench-2026-09-27-raw.txt. For the other engine runs
+those lines were not in what was pasted.
 
 --- 1. COLI_DENSE_IDOT, OFF vs ON -------------------------------------------
 
@@ -87,8 +106,11 @@ generated text is identical within each arm and differs between them from
 UTF-16 position 308; miss(CPU) reads 15611 OFF and 15628 ON. Both are
 expected: the rounded activation also feeds the router.
 
-Reading: no effect on the token. The shared expert, the one CPU GEMV this
-placement leaves at decode besides the router, falls by 0.12 ms/token.
+Reading: no measurable effect on ms/token. The shared expert (three
+GEMVs, the one matmul_d site this placement leaves on the CPU at decode
+besides the router; dn_a and dn_b also stay on the CPU, through matmul,
+which the flag does not touch) reads 0.12 ms/token lower, a difference of
+two means with no interval.
 
 --- 2. one profiled run -----------------------------------------------------
 
@@ -102,22 +124,31 @@ COLI_CUDA_PROFILE=1, one run. From the [qtier] and [timers] lines:
   step() total: 32.8 ms/token
   dn-sub: proj 5.6 | conv 0.5 | l2n+rec 1.9 | norm+out 3.1 ms/token
 
+The engine's "GB" here is GiB (c/qwen36_tier.c:1264 divides by 2^30), so
+255 "GB/s" is 274 GB/s decimal; the benchmark below prints decimal GB/s.
+
 11038 = 127 x 81 + 25 x 30 + 1: 81 placed dense GEMVs per decode token
 (30 dnproj, 30 dnout, 10 attnproj, 10 attnout, lm_head), plus the 25
-prompt positions' dnproj and one prefill lm_head. That decomposition fits
-the count; it is not printed by the engine. Per call: 133 us of wall, 82
-of kernel.
+prompt positions' dnproj and one prefill lm_head. The bytes fit it too:
+those calls read 246.876e9 bytes of weights and scales, 229.92 GiB. The
+engine does not print the split. Per call: 133 us of wall, 82 of kernel,
+both under the profiler's four events and one event sync per call, with
+step() at 32.8 ms against 28-30 unprofiled.
 
 --- 3. the kernel alone -----------------------------------------------------
 
-tests/bench_dense_gemv_cuda.cu runs the same kernel (quant_matmul_launch)
+c/tests/bench_dense_gemv_cuda.cu runs the same kernel (quant_matmul_launch)
 on the shapes and matrix counts of one token, distinct matrices so L2 (48
 MB) cannot serve them, for each COLI_CUDA_I8_ROWS width, three rounds.
+Each shape is n device copies of one random int8 matrix, run one shape
+at a time, not in the engine's interleaved order.
 Every width matched R=0 byte for byte and R=0 matched a double CPU
 reference (rel rms 1.0e-07 to 1.1e-07) in all three builds. "batch" is
-back-to-back launches, "single" one launch per synchronize, "call" the
-engine's coli_cuda_matmul with both pageable copies. Per token, 81 calls,
-median of three rounds, ms (first run, 46402074):
+back-to-back launches between two events; "single kernel" is one launch
+between two events, synchronized per call; "single host" is the host wall
+around that event, launch and synchronize; "call" is the engine's
+coli_cuda_matmul with both pageable copies. Per token, 81 calls, median
+of three rounds, ms (first run, 46402074):
 
   R | batch | single kernel | single host | call
   0 |  7.69 |          8.38 |        9.11 | 9.74
@@ -125,20 +156,25 @@ median of three rounds, ms (first run, 46402074):
   4 |  3.21 |          3.91 |        4.63 | 5.27
   8 |  3.26 |          3.95 |        4.68 | 5.28
 
-At R=2 the kernel reads 480-620 GB/s (lm_head 603-621 in batch). The two
-later builds reran this table: R=2 call 5.43 and 5.46.
+At R=2, all shapes, the first run reads 482-621 GB/s in batch and 323-603
+in single kernel (lm_head 603-621 and 595-603). The two later builds
+reran this table: R=2 call 5.43 and 5.46.
 
-So a call that costs ~64 us alone (5.20 / 81) costs ~133 in the engine,
-and the engine's 255 GB/s is close to the benchmark's R=0 (219-243 GB/s
-batch). That raised the question of the DLL's default (section on the
-DLL above: it very likely runs R=2).
+So a call that costs ~64 us alone (5.20 / 81) costs ~133 in the profiled
+engine. Of the ~69 us difference, ~34 is kernel (82 against 47.7 =
+3.86 / 81 in "single") and ~35 is the copies and host residue. The
+engine's 274 GB/s kernel reading was close enough to the benchmark's R=0
+"single" (181-235 GB/s) to raise the question of the DLL's width; the
+Nsight grids settle it as R=2 (section on the DLL above).
 
---- 4. hypotheses tested and rejected ---------------------------------------
+--- 4. hypotheses for the gap ------------------------------------------------
 
-4a. The spinning OpenMP team (the "(c)" left open in
-    qwen36-attnproj-place-2026-09-22-raw.txt:189, "KMP_BLOCKTIME=0
-    discriminates (c)"). Profiled runs, alternated A B A B, A = default
-    (libomp spins 200 ms), B = KMP_BLOCKTIME=0:
+4a. The spinning OpenMP team. qwen36-attnproj-place-2026-09-22-raw.txt
+    left open a "(c) launch latency and OpenMP" for another delta and
+    proposed "Rerunning arm A alone with KMP_BLOCKTIME=0" (its line 189);
+    this addresses the OpenMP half of that in a different setup.
+    Profiled runs, alternated A B A B, A = default (libomp spins 200 ms),
+    B = KMP_BLOCKTIME=0:
 
       run  step()  dense kernel  dense wall  kernel GB/s
       A1   33.1    903 ms        1473 ms     255
@@ -146,16 +182,24 @@ DLL above: it very likely runs R=2).
       A2   32.5    887           1449        259
       B2   50.4    1131          1764        203
 
-    Letting the team sleep makes the token ~17 ms slower and the dense
-    kernel slower too. The team is not what slows the dense path.
+    Stopping the spin does not speed the dense path; it slows it, and the
+    token by ~17 ms. That does not support the spinning team as the
+    cause, but it cannot reject it on its own: the B runs decode at ~50
+    ms/token, so they spend longer at low utilization and, by section 5,
+    longer in P3, which slows the kernel by itself. Two runs per arm,
+    unpaired. The stronger argument against host issue delay is section
+    5's Nsight table, measured on the GPU timeline.
 
-4b. The card idling between calls. The benchmark (bae8b0c8) spins the host
+4b. Short idle gaps between calls. The benchmark (bae8b0c8) spins the host
     0, 50, 200 or 500 us before each call, the gap not counted. Per token
     at R=2, call column: 5.48, 5.57, 5.79, 6.86 ms. A third build
     (30c63e86) read 6.15, 6.03, 6.12, 7.45 in a noisier session: in both
     builds single rounds of dnproj, dnout, attnproj and attnout ran up to
-    twice as slow as their neighbours. Idle gaps cost something, far
-    from the ~5 ms missing.
+    twice as slow as their neighbours, possibly short P3 episodes (clocks
+    were not logged during those runs). Gaps of at most 500 us inside
+    stretches of under a second, between saturating sections, cost little.
+    That is not the regime of section 5, where the card is under-used for
+    seconds on end; no benchmark arm reproduced that.
 
 4c. A fresh output buffer. step() mallocs the vocab-sized logits (~1 MB)
     per token and the caller frees them. The benchmark (30c63e86) timed
@@ -169,22 +213,34 @@ DLL above: it very likely runs R=2).
 
 nvidia-smi --query-gpu=timestamp,pstate,clocks.gr,clocks.mem,
 utilization.gpu every 500 ms, during the four runs of 4a, then during one
-benchmark run. States by count of samples (engine runs include model load
-and exit):
+whole benchmark run (the 46402074 build, 38 samples, ~19 s). States by
+count of samples (engine runs include model load and exit):
 
   engine     P2 10251 MHz 62 | P3 5001 MHz 55 | P8 405 MHz 48 |
              P5 810 MHz 44 | P2 810 MHz 1
   benchmark  P2 10251 MHz 37 | P8 405 MHz 1
 
-The sequence in time, one run (A1, log written 15:28:49), memory clock:
+The sequence in time, one run (A1, log last written 15:28:49), memory
+clock, consecutive samples collapsed:
 
+  15:28:45  P2   810 MHz   x 1   gpu 73 %
   15:28:46  P2 10251 MHz   x 3   gpu 25 %
   15:28:47  P3  5001 MHz   x11   gpu 17 %
+  15:28:53  P5   810 MHz   x 5
 
-Every run of the session shows the same shape: decode starts in P2 and
-after about two seconds the card drops to P3 (memory 5001 MHz, graphics
-~1700-2050 MHz, utilization 15-40 %), then P5 and P8 after exit. A
-128-token run spends roughly half of its decode there.
+The P3 stretch runs past the end of the run, into the model load of the
+next. A1's decode is 127 x 33.1 ms = 4.2 s, so if the log's last write
+marks its end it started near 15:28:45: about 1.5 s at 10251 MHz, then
+about 2 s at 5001 MHz. Decode start is not marked in the logs, so the ~1.5
+s is measured from the P2 burst that precedes it, not from its first
+token; it could be a hysteresis timer running from the warm start (the
+benchmark header, bae8b0c8, says "~1.5 s"). Every run with a clock log
+shows the same shape: the other three of 4a, the N runs of 6a and 6b,
+both arms of 6c. Section 1, section 2 and the Nsight run had no clock
+log. The shape: a
+P2 burst of 1.5-2 s, then P3 (memory 5001 MHz, graphics ~1700-2050 MHz,
+utilization 15-40 %) until after exit, then P5 and P8. "About half of a
+128-token decode in P3" is this arithmetic, not a per-run measurement.
 
 Nsight Systems 2026.3.2 (nsys profile -t cuda --sample=none
 --cpuctxsw=none, one unprofiled run, then nsys stats cuda_gpu_trace
@@ -198,16 +254,33 @@ timeline, where host issue delay cannot enter:
   dnout+attnout (1024)          5080    30     15     ~17-27
 
 In every row the median is about twice the minimum, and the minimum is
-the benchmark's time. A memory-bound kernel at half the memory clock
-takes about twice as long. The top rows of the same table (20553 H2D
+at or just below the benchmark's time. A median at twice the minimum
+means more than half of these calls ran slow, more than the "about half
+of decode" above, which prefill and profiling differences leave
+unreconciled. A minimum over thousands of calls is an extreme,
+not the typical P2 call: the durations were not split by time, so the
+bimodal shape section 5 predicts is not shown, and the clocks were not
+logged during this run. dnproj also mixes 750 prompt calls (25 in a row
+on the same 25 MB matrix, which a 48 MB L2 may partly serve) with the
+3810 of decode; the other rows are decode only (1270 = 127 x 10, 5080 =
+127 x 40) but for one prefill lm_head. Section 6a shows the slowdown is
+not the memory clock alone: with memory held at 10251 MHz and graphics
+at ~1.1 GHz, lm_head stays at 1.62-1.69 ms. P3 lowers both clocks, and
+the kernel responds to both. The top rows of the same table (20553 H2D
 copies of 0.524 MB and 0.066 MB, 20553 offset_to_signed_s4 launches) are
-the warm start uploading 6851 experts x 3 matrices, before decode.
+the warm start uploading 6851 experts x 3 matrices, before decode (6851
+in that run's rows; the 6859 resident of section 1 is another run's
+count, and the difference was not worked out).
 
 --- 6. locking the clocks ----------------------------------------------------
 
-All locks through nvidia-smi from an administrator prompt; every lock was
-followed by the matching reset, and every reset answered "All done."
-Runs unprofiled, pairs alternated N L, L N, N L. step() total, ms/token:
+All locks through nvidia-smi from an administrator prompt. Order of runs:
+reset, N1, lock, L1, L2, reset, N2, N3, lock, L3, reset; the lock stayed
+on across L1 and L2. Every lock and reset answered "All done." Runs
+unprofiled. The pairs are N L, L N, N L: two of one order and one of the
+other, so a within-pair position effect is not balanced out. The N runs
+drift across a session by as much as the effects (6a N 27.9 -> 30.0, 6c A
+28.7 -> 30.4). step() total, ms/token:
 
 6a. Memory only, --lock-memory-clocks=10251,10251:
 
@@ -239,8 +312,10 @@ Runs unprofiled, pairs alternated N L, L N, N L. step() total, ms/token:
   The clock log shows P2 2625 / 10251 MHz for 96 consecutive samples
   across L1 and L2 and for the whole of L3; the N runs drop to P3 as in
   section 5. lm_head under the lock is the benchmark's call time (~1.0
-  ms). The interval includes zero at three pairs; all three pairs agree
-  in sign.
+  ms), and lm_head and deltanet are lower in every L run than in every N
+  run. step() is not resolved: the interval includes zero, and a sign
+  test on three pairs cannot go below p = 0.25 two-sided. More pairs,
+  in a balanced order, are needed before -2.07 is a number.
 
 6c. The driver setting. NVIDIA Control Panel, Manage 3D settings, Program
     settings, "Prefer maximum performance" for qwen36_perf.exe, a byte
@@ -252,42 +327,62 @@ Runs unprofiled, pairs alternated N L, L N, N L. step() total, ms/token:
   2     29.7   29.7    0.0
   3     30.4   30.2   -0.2
 
-  lm_head P 1.83 / 1.72 / 1.65, A 1.65 / 1.64 / 1.82. The clock log shows
-  the P runs dropping to P3 like the A runs. The setting does not reach
-  this CUDA-only process.
+  mean +0.27, sd 0.64. lm_head P 1.83 / 1.72 / 1.65, A 1.65 / 1.64 /
+  1.82. The clock log shows the P runs dropping to P3 like the A runs. No
+  measurable effect; whether the setting does not reach a CUDA-only
+  process or reaches it without governing its P-state is not told apart.
 
 --- what this means ----------------------------------------------------------
 
-On this machine the placed dense GEMVs run at about half speed for most of
-a decode: about two seconds in, at 15-40 % utilization, the card drops to
-P3, and the kernels take twice their P2 time. The expert kernels probably
-slow down too; that was not read. The benchmark keeps the card busy and
-stays in P2, which is why it and the engine disagreed by two. Earlier
-records of this path in docs/experiments logged no clocks, so how much of
-their decode ran in P3 is unknown.
+On this machine the card leaves P2 for P3 1.5-2 s into every decode that
+was logged, at 15-40 % utilization, and in P3 the placed dense kernels
+take about twice their P2 time. Locking both clocks brings lm_head back
+to its benchmark time. That accounts for much of the kernel half of the
+benchmark-engine gap of section 3, how much is not measured (no locked
+run was profiled); the copy and host half (~35 us a call, measured
+profiled) is not addressed by it. The double lock recovered 2.07
+ms/token, if that number holds, against ~5.6 missing (81 x 133 us
+against 5.20 ms). The expert kernels probably slow down too; that was
+not read. Earlier records of this path in docs/experiments logged no
+clocks, so how much of their decode ran in P3 is unknown.
 
-That is also a candidate for the factor 2.1 between the kernel readings
-of 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the
-dense round-trip table): a run spends a longer or shorter part of its
-decode in P3 depending on its length and its phases. A candidate, not a
-finding: no record of those days logged clocks.
+It is a weak candidate for the factor 2.1 between the kernel readings of
+20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
+round-trip table). Both readings are of the same 5224 calls over 64
+tokens, a decode of ~2 s, which by this record would be mostly P2; and
+2.1 is more than the 2 that P3 gives here. It would need one of those
+runs to start already in P3, for instance right after another run. No
+record of those days logged clocks.
 
 Precedents in the repository for the same mechanism on other backends:
-docs/vulkan.md:104 ("decode dispatches are microsecond bursts that never
-ramp DPM on their own; the memory clock can sit parked through an entire
-run", with power_dpm_force_performance_level=high as the pin), and
-COLI_METAL_SPIN in c/backend_metal.mm:1020, a keep-alive that keeps
-trivial GPU work in flight. Outside it, llama.cpp issue #17880 reports a
-GeForce on Windows 11 stuck in P3 during inference, 25 against 37
-tokens/s, with the Control Panel settings not helping.
+docs/vulkan.md:104-106 ("decode dispatches are microsecond bursts that
+never ramp DPM on their own; the memory clock can sit parked through an
+entire run", with power_dpm_force_performance_level=high as the pin), and
+COLI_METAL_SPIN in c/backend_metal.mm:1020-1022, a keep-alive that keeps
+trivial GPU work in flight, described there as an experiment to quantify
+clock ramp-down, not as a measured fix. Outside it, llama.cpp issue #17880
+(github.com/ggml-org/llama.cpp/issues/17880, read through a web summary
+in this session, not checked line by line) reports a GeForce on Windows
+11 stuck in P3 during inference, 25 against 37 tokens/s, with the
+Control Panel settings not helping.
 
 --- what this run did NOT measure --------------------------------------------
 
-  - Longer generations. At 128 tokens about half the decode was already
-    at full clocks in the N arms; a long answer would spend almost all of
-    it in P3, so the gain of 6b is probably larger in use. Not measured.
+  - Longer generations. At 128 tokens about half the decode was at full
+    clocks in the N arms; a long answer would spend a larger share in P3.
+    That any gain of 6b grows with length is an extrapolation.
+  - step() under the double lock with enough pairs, in a balanced order.
+  - A graphics-clock-only lock.
+  - Throttle reasons (clocks_event_reasons), power and temperature: idle
+    DVFS against power or thermal capping, in particular for 6a's graphics
+    clock at ~1.1 GHz under a memory lock.
+  - Clocks during the Nsight run, and kernel durations split by phase.
+  - The per-call breakdown of section 2 without the profiler, and whether
+    P3 also slows the small h2d/d2h copies.
+  - The power and thermal cost of running locked.
+  - Any replication in another session or after a reboot.
   - The heat table. Every run here is without one.
-  - The generated text in sections 4 to 6 (no guard script compared it).
+  - The generated text in sections 2 to 6 (no guard script compared it).
   - The expert kernels' own slowdown in P3: the graph path records no
     timing without COLI_CUDA_PROFILE, and Nsight's rows for it were not
     read.
