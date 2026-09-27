@@ -1024,7 +1024,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_group_bcast_arms_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_group_bcast_arms_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_keepalive_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
@@ -1044,6 +1044,12 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# failure on some hosts and would otherwise abort the recipe first.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./fp8_warp_test$(EXE)
+	# COLI_CUDA_KEEPALIVE: off unless "1"; init arms it, the first dense GEMV
+	# starts it; it launches, yields to a burst of tensor frees, changes no
+	# byte of a GEMV, and coli_cuda_shutdown stops and joins it.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_keepalive_cuda.cu -o cuda_keepalive_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_keepalive_test$(EXE)
+	./cuda_keepalive_test$(EXE) --exit-without-shutdown
 	# fmt=1 per-row int8 with R rows per block (COLI_CUDA_I8_ROWS): the
 	# contract is BITWISE identity with the original kernel, not a tolerance,
 	# on shapes covering a short last block, O < R, and a strided I tail.
@@ -1165,6 +1171,8 @@ gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_dense_pinned_cuda.cu -o dense_pinned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_keepalive_cuda.cu -o cuda_keepalive_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_dense_gemv_cuda.cu -o dense_gemv_bench$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1179,6 +1187,17 @@ fp8_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench
 	"$(GPUCC)" $(GPUFLAGS) tests/bench_fp8_cuda.cu -o fp8_bench$(EXE) $(ANS_NVCC_LIBS)
 fp8-bench: fp8_bench$(EXE)
 	./fp8_bench$(EXE)
+
+# The placed dense GEMV (qwen36 dnproj/dnout/attnproj/attnout/lm_head) with no
+# engine around it: kernel throughput back to back, per call with a sync, and
+# the whole coli_cuda_matmul round trip, for each COLI_CUDA_I8_ROWS width.
+# Checks every width against R=0 and R=0 against a CPU reference first.
+# Needs ~0.8 GB of VRAM; on Windows run it from the x64 Native Tools prompt.
+dense_gemv_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_dense_gemv_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_dense_gemv_cuda.cu -o dense_gemv_bench$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+dense-gemv-bench: dense_gemv_bench$(EXE)
+	./dense_gemv_bench$(EXE)
 
 # NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
 # hand it a define matching nothing and link a runtime it never calls -- a
@@ -2249,7 +2268,7 @@ bench: iobench$(EXE)
 .PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
-	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench dense-gemv-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
