@@ -1180,6 +1180,17 @@ fp8_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench
 fp8-bench: fp8_bench$(EXE)
 	./fp8_bench$(EXE)
 
+# The placed dense GEMV (qwen36 dnproj/dnout/attnproj/attnout/lm_head) with no
+# engine around it: kernel throughput back to back, per call with a sync, and
+# the whole coli_cuda_matmul round trip, for each COLI_CUDA_I8_ROWS width.
+# Checks every width against R=0 and R=0 against a CPU reference first.
+# Needs ~0.8 GB of VRAM; on Windows run it from the x64 Native Tools prompt.
+dense_gemv_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_dense_gemv_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_dense_gemv_cuda.cu -o dense_gemv_bench$(EXE) $(ANS_NVCC_LIBS)
+dense-gemv-bench: dense_gemv_bench$(EXE)
+	./dense_gemv_bench$(EXE)
+
 # NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
 # hand it a define matching nothing and link a runtime it never calls -- a
 # build whose compile line, libraries and exit status all claim "CUDA" while
@@ -2253,7 +2264,7 @@ bench: iobench$(EXE)
 .PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
-	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench dense-gemv-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
