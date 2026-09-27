@@ -566,7 +566,28 @@ function Read-Run([string]$Text, [string]$Log) {
     if (-not $place) { throw "$Log : riga '[place] auto:' non trovata. L'invariante sul piazzamento del trunk passerebbe a vuoto." }
     if ($res -eq "?") { throw "$Log : riga 'resident N/M experts' non trovata. L'invariante sulla residenza passerebbe a vuoto." }
 
+    # Le sotto-parti di deltanet sono facoltative: le stampa solo un motore
+    # che le ha (dn-split da 2026-09-27). Assenti restano NaN, e nelle medie
+    # per braccio la riga relativa non compare.
+    $dnSub = @([double]::NaN) * 4; $dnSplit = @([double]::NaN) * 4; $dnGpu = ""
+    if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+dn-sub:[ \t]*proj[ \t]+([0-9.]+)[ \t]*\|[ \t]*conv[ \t]+([0-9.]+)[ \t]*\|[ \t]*l2n\+rec[ \t]+([0-9.]+)[ \t]*\|[ \t]*norm\+out[ \t]+([0-9.]+)') {
+        $dnSub = @([double]$Matches[1], [double]$Matches[2], [double]$Matches[3], [double]$Matches[4])
+    }
+    if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+dn-split:[ \t]*qkvz[ \t]+([0-9.]+)[ \t]*\|[ \t]*a\+b[ \t]+([0-9.]+)[ \t]*\|[ \t]*norm[ \t]+([0-9.]+)[ \t]*\|[ \t]*out[ \t]+([0-9.]+)[ \t]*ms/token') {
+        $dnSplit = @([double]$Matches[1], [double]$Matches[2], [double]$Matches[3], [double]$Matches[4])
+    }
+    if ($Text -match '(?m)^[ \t]*\[timers\][ \t]+dn-gpu:[ \t]*dnproj[ \t]+([0-9]+/[0-9]+)[ \t]*\|[ \t]*dnout[ \t]+([0-9]+/[0-9]+)') {
+        $dnGpu = "dnproj {0}, dnout {1}" -f $Matches[1], $Matches[2]
+    }
+    # Una riga presente ma illeggibile (spezzata nel log, un valore inf/nan)
+    # toglierebbe in silenzio la riga dalle medie: lo si dice.
+    foreach ($k in @(@("dn-sub", [double]::IsNaN($dnSub[0])), @("dn-split", [double]::IsNaN($dnSplit[0])), @("dn-gpu", -not $dnGpu))) {
+        if ($k[1] -and $Text -match "\[timers\][ \t]+$($k[0]):") {
+            Write-Host ("attenzione: {0} contiene una riga '{1}:' che non si legge (spezzata o con un valore non numerico): esce dalle medie per braccio." -f $Log, $k[0])
+        }
+    }
     [pscustomobject]@{
+        DnSub=$dnSub; DnSplit=$dnSplit; DnGpu=$dnGpu
         Step=$step; Dn=$g["deltanet"]; Attn=$g["attention"]; Moe=$g["moe_total"]; Head=$g["lm_head"]
         Shared=$g["shared"]; Router=$g["router"]; Wait=$g["wait"]
         Issue=$g["issue"]; CpuMiss=$g["cpu-miss"]; Take=$g["take"]; ShOvl=$g["shared-ovl"]
@@ -793,6 +814,16 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
         (($q | ForEach-Object { $_.Vram }    | Measure-Object -Average).Average),
         (($q | ForEach-Object { $_.Swaps }   | Measure-Object -Average).Average),
         (($q | ForEach-Object { $_.Miss }    | Sort-Object -Unique) -join "/")
+    # Sotto-parti di deltanet: solo se TUTTI i run del braccio le hanno.
+    $sub = @(0..3 | ForEach-Object { $i = $_; ($q | ForEach-Object { $_.DnSub[$i] } | Measure-Object -Average).Average })
+    if (-not @($q | Where-Object { [double]::IsNaN($_.DnSub[0]) }).Count) {
+        "       dn-sub:   proj {0,5:N2}  conv {1,5:N2}  l2n+rec {2,5:N2}  norm+out {3,5:N2}" -f $sub[0], $sub[1], $sub[2], $sub[3]
+    }
+    $spl = @(0..3 | ForEach-Object { $i = $_; ($q | ForEach-Object { $_.DnSplit[$i] } | Measure-Object -Average).Average })
+    if (-not @($q | Where-Object { [double]::IsNaN($_.DnSplit[0]) }).Count) {
+        "       dn-split: qkvz {0,5:N2}  a+b {1,5:N2}  norm {2,5:N2}  out {3,5:N2}  | GPU: {4}" -f $spl[0], $spl[1], $spl[2], $spl[3],
+            $(if (@($q | Where-Object { -not $_.DnGpu }).Count) { "non letta in tutti i run" } else { (($q | ForEach-Object { $_.DnGpu } | Sort-Object -Unique) -join " / ") })
+    }
 }
 
 ""
