@@ -1,0 +1,211 @@
+Qwen3.6-35B-A3B: the heat-table gain, first run of the tool as merged in #51.
+27 September 2026.
+
+c/tools/misure-heatfile.ps1 was reworked over ten review rounds in #51 and
+merged as 8a074f21. In review it was run only against simulated engines on
+Linux. This is the first run of the merged version on the operator's
+machine, with the real engine, the GPU and the documented launcher. It had
+two questions to answer before the merge:
+
+  1. Do the six runs of the SAME arm generate the same text? The tool
+     refuses the run if they do not, so if they did not it would refuse
+     every run of this configuration.
+  2. Do COLD and CROSS generate the same text? Nothing in the earlier
+     records says. The tool declares the answer without refusing.
+
+Both answers are yes, for this prompt pair, N_NEW=128 and this build.
+
+--- what was run -----------------------------------------------------------
+
+Script : c/tools/misure-heatfile.ps1 at 24c35a63, the #51 branch tip at the
+         time, fetched with
+           git show FETCH_HEAD:c/tools/misure-heatfile.ps1
+         into tools\misure-heatfile-pr51.ps1. At 24c35a63 that file is the
+         same git blob as on main after the merge 8a074f21 (5b533e60).
+Launch : from cmd, in C:\colibri-fork\c, in one chain with the rebuild:
+           make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe && powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-heatfile-pr51.ps1 > misure-pr51.txt 2>&1
+         powershell.exe is Windows PowerShell, the launcher the script
+         documents.
+Engine : qwen36_clang.exe, rebuilt and copied by the chain above.
+         THE SOURCE COMMIT OF THIS BUILD IS NOT RECORDED. The script checks
+         that no prerequisite of qwen36$(EXE) is newer than the executable
+         and that the executable is a copy of the build output; it does not
+         record which commit the tree was at.
+DLL    : coli_cuda.dll dated 2026-09-21 20:46:01, not rebuilt for this
+         session. Its sha256 prefix is in the stamp below.
+Host   : NOT identified by the script's output.
+Table  : built in this run on prompt-caldo.txt. A table left by the
+         earlier version of the script has no condition file next to it, so
+         the tool would refuse it: before the run the operator was given a
+         command renaming any heat.caldo.bin to heat.caldo.2026-09-23.bin.
+         The name is a label, not the table's date. The output shows the
+         tool building a new table.
+Logs   : the tool deletes heatfile-*.log at start-up, so the previous ones
+         were moved to logs-heatfile-prima\ first. The output has no
+         "rimuovo N log della corsa precedente" line: none were left.
+
+--- three refused attempts -------------------------------------------------
+
+The tool stopped three times before the run below. Each was a real
+condition of the machine, and each message named it:
+
+  1. COLI_GRAPH_DIAG=1 in the environment (the environment guard). No C
+     source on main reads this variable; it was absent at the next
+     attempt.
+  2. CUDA_EXPERT_GB=12 in the environment (the environment guard). The
+     engine reads this one: it is the expert VRAM budget. Removed with
+     `set CUDA_EXPERT_GB=`, so that the budget is the engine's default,
+     free VRAM minus 1 GB (c/qwen36_tier.c:612-618).
+  3. ".\qwen36_clang.exe NON e' la copia di qwen36.exe (sha256
+     E2AB428B44E9CAD5 contro E0345C330BE51603)" (the provenance guard).
+     Fixed by the rebuild above.
+
+The successful run's stamp reads allow-env=nessuna: the environment guard
+found no suspect variable and no exemption was used.
+
+--- the script's output, verbatim ------------------------------------------
+
+cartella di lavoro: C:\colibri-fork\c
+eseguibile: .\qwen36_clang.exe | 368128 byte | 2026-09-27 07:48:45 | sha256 A2D344B9898EECF7
+build-config: clang|-D_FILE_OFFSET_BITS=64 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -DCOLI_CUDA|-lm -fopenmp  -lpsapi -lpthread -Wl,--stack,8388608 |CUDA=0|CUDA_DLL=1|ARCH=native|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=0
+coli_cuda.dll: 752640 byte | 2026-09-21 20:46:01 | sha256 0D57602B4917A92C
+parametri: cap=256 bits=4 N_NEW=128 rip=6 braccio=CROSS | snap=C:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | caldo=prompt-caldo.txt sha256 6A4F0BCF64192EA3  | built=qwen36.exe  | allow-env=nessuna
+costruisco heat.caldo.bin su prompt-caldo.txt (un run)...
+scaldata ok (25.75 tok/s, hit 67.8 %), tabella congelata in heat.caldo.bin
+
+heat.caldo.bin: 40972 byte | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | COSTRUITA in questa corsa su prompt-caldo.txt
+
+rip 1 (COLD prima)  COLD  29.70  CROSS  23.40  delta  -6.30 ms/token
+rip 2 (CROSS prima)  COLD  28.50  CROSS  24.10  delta  -4.40 ms/token
+rip 3 (COLD prima)  COLD  28.60  CROSS  23.70  delta  -4.90 ms/token
+rip 4 (CROSS prima)  COLD  28.80  CROSS  24.00  delta  -4.80 ms/token
+rip 5 (COLD prima)  COLD  29.00  CROSS  23.30  delta  -5.70 ms/token
+rip 6 (CROSS prima)  COLD  29.50  CROSS  23.30  delta  -6.20 ms/token
+
+--- invarianti ---
+eseguibile: .\qwen36_clang.exe | 368128 byte | 2026-09-27 07:48:45 | sha256 A2D344B9898EECF7
+build-config: clang|-D_FILE_OFFSET_BITS=64 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -DCOLI_CUDA|-lm -fopenmp  -lpsapi -lpthread -Wl,--stack,8388608 |CUDA=0|CUDA_DLL=1|ARCH=native|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=0
+coli_cuda.dll: 752640 byte | 2026-09-21 20:46:01 | sha256 0D57602B4917A92C
+heat.caldo.bin: 40972 byte | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | COSTRUITA in questa corsa su prompt-caldo.txt
+parametri: cap=256 bits=4 N_NEW=128 rip=6 braccio=CROSS | snap=C:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | caldo=prompt-caldo.txt sha256 6A4F0BCF64192EA3  | built=qwen36.exe  | allow-env=nessuna
+banner del motore identico in tutti i run:
+  == qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[place] auto: identica in tutti i 12 run
+residenza identica in tutti i run: 6859/10240
+testo generato identico fra i run di ogni braccio (sha256 dello stdout letto, senza la riga [meta]):
+  COLD  513eed141820d28b
+  CROSS 513eed141820d28b
+
+--- testo fra i due bracci (dichiarato: non ferma la corsa) ---
+testo generato IDENTICO fra i due bracci (sullo stdout letto)
+
+--- delta appaiati (CROSS - COLD), ms/token ---
+-6.30   -4.40   -4.90   -4.80   -5.70   -6.20
+
+media    -5.38   sd  0.79   se  0.32   df 5
+intervallo 95 %:  [-6.22 ; -4.55]   ampiezza +-0.83
+negativi 6/6
+
+--- controllo POSIZIONE (ABBA) ---
+COLD prima:  -6.30  -4.90  -5.70
+CROSS prima: -4.40  -4.80  -6.20
+differenza fra le medie dei due gruppi: -0.50 ms/token
+Stima il doppio dell'effetto di posizione dentro la coppia. Con -Reps pari
+quell'effetto si annulla nella media dei delta se resta costante lungo la
+sessione; se varia, si annulla solo in parte.
+
+--- medie per braccio ---
+COLD   step  29.02  moe  15.08  attn  2.25  dn  8.96  head  1.72
+       issue  1.05  cpu-miss  8.08  take  1.42  sh-ovl  3.46  hit  67.9 %  swaps  8.0  miss 15611
+CROSS  step  23.63  moe  10.78  attn  2.06  dn  8.33  head  1.47
+       issue  1.32  cpu-miss  3.95  take  0.96  sh-ovl  3.47  hit  87.2 %  swaps  8.0  miss 6240/6241
+
+--- indice per miss: 1000 * cpu-miss / miss(CPU), per braccio ---
+(ms per token di decode diviso i miss dell'intera corsa: denominatori
+diversi, quindi e' un indice e non un costo per miss)
+COLD   indice  0.517      (min 0.512 max 0.523 su 6 run)
+CROSS  indice  0.633      (min 0.620 max 0.643 su 6 run)
+
+Log per run: heatfile-COLD-r*.log e heatfile-CROSS-r*.log
+
+--- the result -------------------------------------------------------------
+
+CROSS - COLD = -5.38 ms/token, 95 % interval [-6.22, -4.55], 6 of 6
+negative. Recomputed from the six printed deltas: mean -5.383, sd 0.794,
+se 0.324, t(5) = 2.571.
+
+The ABBA groups: COLD first -5.633, CROSS first -5.133, difference -0.50.
+Its size is below the 0.79 scatter of the deltas themselves.
+
+--- the generated text -----------------------------------------------------
+
+Question 1: the six COLD runs share one hash, and so do the six CROSS runs.
+Question 2: the two hashes are the same, 513eed141820d28b, and the tool
+printed IDENTICO. The comparison is on stdout as PowerShell reads it,
+without a leading [meta] line, with the lines rejoined by LF.
+
+This also shows that the tool separated stdout from stderr on this
+launcher. Had stderr lines entered the text, their per-run timings would
+have made the six hashes of an arm differ.
+
+The CROSS miss count reads 6240 in some runs and 6241 in others, while the
+text is the same in all six: identical text does not imply identical
+counters.
+
+--- the accounting ---------------------------------------------------------
+
+Computed here from the per-arm means printed above, which are rounded to
+0.01, so the sums carry a rounding error of a few hundredths:
+
+                 COLD     CROSS    delta
+    deltanet      8.96     8.33    -0.63
+    attention     2.25     2.06    -0.19
+    moe_total    15.08    10.78    -4.30
+    lm_head       1.72     1.47    -0.25
+                                   -----
+                                   -5.37   against step()'s -5.39
+
+Inside moe_total:
+
+    issue         1.05     1.32    +0.27
+    cpu-miss      8.08     3.95    -4.13
+    take          1.42     0.96    -0.46
+    shared-ovl    3.46     3.47    +0.01
+                                   -----
+                                   -4.31   against moe_total's -4.30
+
+--- not compared with the earlier records ----------------------------------
+
+qwen36-heatfile-6rep-2026-09-23-raw.txt measures the same comparison as
+-4.92 +-0.69. The two are not compared here: a different day, and a
+different binary. This run's attention reads 2.25 and 2.06 where that
+record reads 5.40 and 5.36, and residency is 6859 where it was 6959.
+
+That record says that placing attnproj takes residency from 6959 to 6859.
+This run's 6859 is consistent with that, and is not evidence of it: the
+[place] lines that would say are in the logs, not in this output, which
+reports only that they were identical in all twelve runs.
+
+--- what this run did NOT measure ------------------------------------------
+
+  - The source commit of the binary, and the host (see above).
+  - Anything about current main as such: the tree's commit is unknown.
+  - The SELF arm, the other direction (the table built on prompt25 and
+    measured on prompt-caldo), other prompt pairs, other N_NEW, a second
+    device.
+  - Whether the text stays identical between the arms at other prompts or
+    lengths. This run answers question 2 for one pair at one length.
+
+--- evidence ---------------------------------------------------------------
+
+The output above was pasted by the operator. The per-run logs
+(heatfile-warmup.log, heatfile-COLD-r1..6.log, heatfile-CROSS-r1..6.log),
+misure-pr51.txt, heat.caldo.bin and heat.caldo.bin.sha256 are on the
+operator's machine in C:\colibri-fork\c and are not committed. No
+evidence.sha256 exists for this record.
+
+--- no manifest ------------------------------------------------------------
+
+c/experiment_manifest.py requires a full 40-character commit SHA and the
+hardware fields (:58-66 and the lines after). Neither was recorded for
+this binary, so this record cannot carry a manifest.
