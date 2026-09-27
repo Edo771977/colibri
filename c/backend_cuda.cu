@@ -1780,14 +1780,25 @@ extern "C" int coli_cuda_fp8_set_lut(const float *lut) {
  * 15-40 % busy, and about two seconds in the driver drops it from P2 to P3,
  * memory 10251 -> 5001 MHz and graphics ~2600 -> ~1900 MHz. The placed
  * dense GEMVs then take twice their P2 time. Locking both clocks with
- * nvidia-smi gave -2.07 ms/token over three pairs, but needs administrator
+ * nvidia-smi gave -2.07 ms/token over three pairs (95 % interval including
+ * zero), but needs administrator
  * rights; the driver's "Prefer maximum performance" did not reach the
  * process. This is the unprivileged attempt, after COLI_METAL_SPIN
  * (backend_metal.mm): a host thread relaunches a one-warp spin kernel of
  * ~1 ms on its own non-blocking, lowest-priority stream, waiting on an event
  * with blocking sync so the thread sleeps between launches.
  *
- * Whether the driver counts that as load is the experiment; off by default.
+ * Armed by coli_cuda_init, started by the first coli_cuda_matmul. Started
+ * at init, the ON runs took ~18 s longer end to end on that machine, most
+ * likely because the warm start's ~41000 cudaFree each wait for every
+ * running kernel, the spin included (inferred from log times, not traced).
+ * qwen36's first placed GEMV comes after the warm start.
+ *
+ * Measured there (misure-envab.ps1, six ABBA pairs, started at init):
+ * step() 30.87 -> 27.62 ms/token, 95 % [-4.41, -2.09], 6/6, text identical,
+ * the card at P2 2805 / 10251 MHz through every ON run. Off by default all
+ * the same: it keeps the card at full clocks, and so at higher power, for
+ * as long as the process runs.
  * It cannot change a result -- the kernel reads and writes nothing -- but it
  * holds a warp on one SM and a CPU thread. Non-blocking stream: the dense
  * path's legacy stream 0 does not wait for it. Stopped and joined first
@@ -1804,6 +1815,7 @@ __global__ static void keepalive_spin(unsigned long long ns) {
 #define COLI_HAS_KEEPALIVE 0
 #endif
 static std::atomic<int> g_ka_run{0};
+static std::atomic<int> g_ka_armed{0};
 static std::atomic<unsigned long long> g_ka_launches{0};
 static std::thread g_ka_thr;
 /* Exactly "1" turns it on, as COLI_DENSE_IDOT does on the engine side. */
@@ -1852,7 +1864,17 @@ static void keepalive_start(void) {
 #endif
 }
 static void keepalive_stop(void) {
+    g_ka_armed.store(0);
     if (g_ka_run.exchange(0) && g_ka_thr.joinable()) g_ka_thr.join();
+}
+/* Called by coli_cuda_init: remember, do not start (see above). */
+static void keepalive_arm(void) {
+    g_ka_armed.store(keepalive_mode() && g_nctx > 0 ? 1 : 0);
+}
+/* Called at the top of coli_cuda_matmul: one relaxed load once running. */
+static inline void keepalive_on_first_use(void) {
+    if (g_ka_armed.load(std::memory_order_relaxed) && g_ka_armed.exchange(0))
+        keepalive_start();
 }
 
 extern "C" int coli_cuda_init(const int *devices, int count) {
@@ -1915,7 +1937,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
                      device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
     }
-    keepalive_start();
+    keepalive_arm();
     return 1;
 }
 
@@ -2439,6 +2461,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int device, int gs) {
+    keepalive_on_first_use();
     if (fault_injected()) return 0;
     /* fmt=4 carries [O, ceil(I/gs)] scales: without the group size the plain
      * upload truncates the buffer to O floats and quant_matmul divides by

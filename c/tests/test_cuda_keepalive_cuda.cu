@@ -4,8 +4,10 @@
  * What it must never do is change an answer or outlive the backend, so this
  * pins, on real silicon:
  *   1. the parse: only "1" turns it on; unset, "0" and "true" leave it off;
- *   2. on, the thread actually launches (a counter, since a keep-alive that
- *      never runs would pass every other check);
+ *   2. on, init only arms it and the first coli_cuda_matmul starts it (not
+ *      init: the warm start's cudaFree calls would each wait for the
+ *      spin); then the thread actually launches (a counter, since a
+ *      keep-alive that never runs would pass every other check);
  *   3. a dense GEMV computed while it runs equals, byte for byte, the same
  *      GEMV with it stopped;
  *   4. coli_cuda_shutdown stops and joins it, and a later init with the
@@ -56,9 +58,21 @@ int main(void) {
     set_env("COLI_CUDA_KEEPALIVE", "true"); check(!keepalive_mode(), "\"true\": off (only \"1\")");
     set_env("COLI_CUDA_KEEPALIVE", "1");    check(keepalive_mode(), "\"1\": on");
 
+    const int I = 2048, O = 4096;
+    int8_t *w = (int8_t *)malloc((size_t)I * O);
+    float *sc = (float *)malloc(O * sizeof(float)), *x = (float *)malloc(I * sizeof(float));
+    float *y_on = (float *)malloc(O * sizeof(float)), *y_off = (float *)malloc(O * sizeof(float));
+    float *y_first = (float *)malloc(O * sizeof(float));
+    uint32_t r = 12345u;
+    for (size_t i = 0; i < (size_t)I * O; i++) { r = r * 1103515245u + 12345u; w[i] = (int8_t)((int)(r >> 24) % 255 - 127); }
+    for (int o = 0; o < O; o++) sc[o] = 0.001f + (float)(o % 7) * 1e-4f;
+    for (int i = 0; i < I; i++) x[i] = (float)((i * 37) % 201 - 100) / 100.f;
+
     printf("running\n");
     if (!coli_cuda_init(devs, 1)) { printf("FATAL cuda init\n"); return 1; }
-    check(g_ka_run.load() == 1, "init with COLI_CUDA_KEEPALIVE=1 starts it");
+    check(g_ka_run.load() == 0 && g_ka_armed.load() == 1, "init with COLI_CUDA_KEEPALIVE=1 arms it and does not start it");
+    gemv(y_first, w, sc, x, I, O);
+    check(g_ka_run.load() == 1 && g_ka_armed.load() == 0, "the first coli_cuda_matmul starts it");
     unsigned long long l0 = g_ka_launches.load();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     unsigned long long l1 = g_ka_launches.load();
@@ -66,36 +80,31 @@ int main(void) {
     check(l1 - l0 >= 20, "it launches (>= 20 one-millisecond spins in 100 ms)");
 
     printf("results\n");
-    const int I = 2048, O = 4096;
-    int8_t *w = (int8_t *)malloc((size_t)I * O);
-    float *sc = (float *)malloc(O * sizeof(float)), *x = (float *)malloc(I * sizeof(float));
-    float *y_on = (float *)malloc(O * sizeof(float)), *y_off = (float *)malloc(O * sizeof(float));
-    uint32_t r = 12345u;
-    for (size_t i = 0; i < (size_t)I * O; i++) { r = r * 1103515245u + 12345u; w[i] = (int8_t)((int)(r >> 24) % 255 - 127); }
-    for (int o = 0; o < O; o++) sc[o] = 0.001f + (float)(o % 7) * 1e-4f;
-    for (int i = 0; i < I; i++) x[i] = (float)((i * 37) % 201 - 100) / 100.f;
     gemv(y_on, w, sc, x, I, O);
     keepalive_stop();
     check(g_ka_run.load() == 0 && !g_ka_thr.joinable(), "keepalive_stop stops and joins it");
     gemv(y_off, w, sc, x, I, O);
     check(!memcmp(y_on, y_off, O * sizeof(float)), "a GEMV while it runs equals the GEMV without it, byte for byte");
+    check(!memcmp(y_first, y_off, O * sizeof(float)), "the GEMV that starts it gives the same bytes too");
 
     printf("shutdown\n");
     coli_cuda_shutdown();
     set_env("COLI_CUDA_KEEPALIVE", "1");
     if (!coli_cuda_init(devs, 1)) { printf("FATAL cuda re-init\n"); return 1; }
-    check(g_ka_run.load() == 1, "re-init with it on restarts it");
+    gemv(y_first, w, sc, x, I, O);
+    check(g_ka_run.load() == 1, "re-init with it on, then a GEMV, restarts it");
     coli_cuda_shutdown();
     check(g_ka_run.load() == 0 && !g_ka_thr.joinable(), "coli_cuda_shutdown stops and joins it");
     set_env("COLI_CUDA_KEEPALIVE", "0");
     if (!coli_cuda_init(devs, 1)) { printf("FATAL cuda re-init\n"); return 1; }
-    check(g_ka_run.load() == 0, "init with it off does not start it");
+    gemv(y_first, w, sc, x, I, O);
+    check(g_ka_run.load() == 0 && g_ka_armed.load() == 0, "init with it off, then a GEMV, does not start it");
     coli_cuda_shutdown();
 
-    free(w); free(sc); free(x); free(y_on); free(y_off);
+    free(w); free(sc); free(x); free(y_on); free(y_off); free(y_first);
     set_env("COLI_CUDA_KEEPALIVE", "");
     if (fails) { printf("test_cuda_keepalive: %d failure(s)\n", fails); return 1; }
-    printf("OK test_cuda_keepalive: off unless \"1\", launches when on, changes no byte, stops at shutdown\n");
+    printf("OK test_cuda_keepalive: off unless \"1\", starts at the first GEMV, launches, changes no byte, stops at shutdown\n");
     return 0;
 #endif
 }
