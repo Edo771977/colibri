@@ -2969,8 +2969,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float scale = 1.f / sqrtf((float)kdim);
     int H = c->hidden;
 
-    /* One block for all twelve scratch buffers, carved up below and reused for
-     * every layer and every token.
+    /* One block for all the scratch buffers (twelve, once; a now shares b's
+     * region), carved up below and reused for every layer and every token.
      *
      * These were twelve falloc/free per CALL, which on the 35B's 30 DeltaNet
      * layers is 360 malloc and 360 free per decode token. That work sits
@@ -2982,8 +2982,9 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
      *
      * Safe to share: deltanet() has one call site, in step()'s layer loop, and
      * the only thread this engine starts is the pilot prefetcher, which never
-     * enters here. Sub-buffers are 64-byte aligned so nothing straddles a cache
-     * line; every kernel that reads them uses unaligned loads anyway. */
+     * enters here. Sub-buffers start at 16-float offsets from the block,
+     * except a, which follows b directly; every kernel that reads them uses
+     * unaligned loads anyway. */
     int64_t need = DN_PAD((int64_t)conv_dim + value_dim) + DN_PAD(2*vh) + 2*DN_PAD(vh)
                  + DN_PAD(conv_dim) + 2*DN_PAD((int64_t)vh * kdim)
                  + 2*DN_PAD(value_dim);
