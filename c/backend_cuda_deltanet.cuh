@@ -7,31 +7,36 @@
  *   qkvz  [conv_dim + value_dim]   the dnproj GEMV's output (qkv ++ z)
  *   x     [hidden]                 the layer's normed input (for a and b)
  *
- *   dn_ab_gates    b, a = rows of dn_b . x (b rows first, then a rows);
- *                  beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias)
  *   dn_conv_silu   depthwise causal conv against the ring, SiLU, ring advance
- *   dn_rec_norm    per value head: repeat-interleave q/k (value head h takes
- *                  key head h / rep), l2norm, q scaled by 1/sqrt(kdim), decay,
- *                  kv = k S, delta = (v - kv) beta, S += k delta^T, o = q S,
- *                  then that head's gated RMSNorm times silu(z)
+ *   dn_head        one block per value head:
+ *                  b, a = the head's two rows of dn_b . x (b rows first, then
+ *                  a rows); beta = sigmoid(b), g = -exp(A_log) *
+ *                  softplus(a + dt_bias);
+ *                  repeat-interleave q/k (value head h takes key head
+ *                  h / rep), l2norm, q scaled by 1/sqrt(kdim);
+ *                  decay, kv = k S, delta = (v - kv) beta, S += k delta^T,
+ *                  o = q S;
+ *                  the head's gated RMSNorm times silu(z)
  *
  *   outr  [value_dim]              the dnout GEMV's input
  *
- * The CPU reference is deltanet() in qwen36.c; the operations and their
- * order follow it where that is cheap:
- *   - the conv is the same loop per channel;
- *   - the recurrence gives each value column to one thread, which walks the
- *     key rows in the CPU's order, so kv and o are the same sequential sums;
- *   - the l2norm sums, its sqrt and division, and the RMSNorm sum are double;
- *   - the reductions that the CPU does sequentially (the a/b dot products,
- *     the three double sums) are fixed-order trees here: deterministic, not
- *     bit-identical; nvcc also contracts multiply-adds into FMAs. The tests
- *     (tests/test_qwen36_deltanet_cuda.cu) bound the difference.
- * No atomics: the same inputs give the same bytes, run after run.
+ * Two launches per layer. The first version had three (a separate kernel
+ * for a, b and the gates) and gave each value column of the state to one
+ * thread: 32 blocks of 128 threads on the 35B, 29 us per layer for the
+ * recurrence alone, and ~6-7 us for each small kernel, which on the
+ * reference Windows machine is about what a launch costs (record: stage 1
+ * bench). Now the gates live in dn_head, whose blocks are already one per
+ * head, and each column's key rows are split across DN_SPLIT threads.
  *
- * The plan listed four kernels; the l2norm and the repeat-interleave are
- * folded into dn_rec_norm, which is the only reader of q and k: one launch
- * less per layer, no q/k buffers.
+ * The CPU reference is deltanet() in qwen36.c. Where the order is the CPU's:
+ *   - the conv is the same loop per channel;
+ *   - the l2norm sums, its sqrt and division, and the RMSNorm sum are double.
+ * Where it is not: the a/b dot products, kv and o are sums in a fixed order
+ * of partial sums (slices of the key rows, then the slices in order), and
+ * the double sums are fixed-order trees; nvcc also contracts multiply-adds
+ * into FMAs. Deterministic, not bit-identical. The tests
+ * (tests/test_qwen36_deltanet_cuda.cu) bound the difference.
+ * No atomics: the same inputs give the same bytes, run after run.
  *
  * Stage 1 has no engine or backend entry point: this header is included by
  * the test alone, so coli_cuda.dll does not change. Stage 2 includes it in
@@ -55,12 +60,22 @@ static inline int dn_value_dim(const DnShape *s) { return s->vh * s->vdim; }
 /* Smallest power of two >= n (n <= 1024 here). */
 static inline __host__ __device__ int dn_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
 
-/* Dynamic shared memory of dn_rec_norm: q and k of one head, then the double
- * reduction scratch (8-byte aligned). */
-static inline size_t dn_rec_smem(const DnShape *s) {
-    size_t f = (size_t)2 * s->kdim * sizeof(float);
+/* Key-row slices per value column: up to 4, as many as fit 1024 threads,
+ * never more than kdim. dn_head's block is vdim * dn_split threads. */
+static inline int dn_split(const DnShape *s) {
+    int p = s->vdim > 0 ? 1024 / s->vdim : 1;
+    if (p > 4) p = 4;
+    if (p > s->kdim) p = s->kdim;
+    return p < 1 ? 1 : p;
+}
+static inline int dn_head_threads(const DnShape *s) { return s->vdim * dn_split(s); }
+
+/* Dynamic shared memory of dn_head: q and k of one head, the partial sums
+ * of the slices, then the double reduction scratch (8-byte aligned). */
+static inline size_t dn_head_smem(const DnShape *s) {
+    size_t f = ((size_t)2 * s->kdim + (size_t)dn_head_threads(s)) * sizeof(float);
     f = (f + 7) & ~(size_t)7;
-    return f + (size_t)dn_pow2(s->vdim) * sizeof(double);
+    return f + (size_t)dn_pow2(dn_head_threads(s)) * sizeof(double);
 }
 
 /* NULL when the shape is supported, else why not. */
@@ -71,7 +86,7 @@ static inline const char *dn_shape_check(const DnShape *s) {
     if (s->vh % s->vk) return "value heads are not a multiple of key heads";
     if (s->convk < 2) return "conv kernel narrower than 2";
     if (s->vdim > 1024) return "value head dim above 1024 (one thread per value column)";
-    if (dn_rec_smem(s) > 48 * 1024) return "q, k and the reduction scratch exceed 48 KiB of shared memory";
+    if (dn_head_smem(s) > 48 * 1024) return "q, k, the partial sums and the reduction scratch exceed 48 KiB of shared memory";
     return NULL;
 }
 
@@ -92,25 +107,6 @@ __device__ static inline T dn_block_sum(T v, T *red) {
     return total;
 }
 
-/* grid vh, block 256 (a power of two <= 1024). wab: [2*vh][H], b rows first. */
-__global__ static void dn_ab_gates(const float *__restrict__ x, const float *__restrict__ wab,
-                                   const float *__restrict__ alog, const float *__restrict__ dtbias,
-                                   int H, int vh, float *__restrict__ beta, float *__restrict__ g) {
-    __shared__ float red[1024];
-    const int h = blockIdx.x;
-    const float *wb = wab + (size_t)h * H, *wa = wab + (size_t)(vh + h) * H;
-    float sb = 0.f, sa = 0.f;
-    for (int i = threadIdx.x; i < H; i += blockDim.x) { float xi = x[i]; sb += xi * wb[i]; sa += xi * wa[i]; }
-    sb = dn_block_sum(sb, red);
-    sa = dn_block_sum(sa, red);
-    if (threadIdx.x == 0) {
-        beta[h] = 1.f / (1.f + expf(-sb));
-        float z = sa + dtbias[h];
-        float sp = z > 20.f ? z : log1pf(expf(z));    /* softplus_f */
-        g[h] = -expf(alog[h]) * sp;
-    }
-}
-
 /* grid ceil(conv_dim / 256), block 256. ring: [conv_dim][convk-1], oldest
  * first, the host's layout; qkv: the raw projected channels. */
 __global__ static void dn_conv_silu(const float *__restrict__ qkv, const float *__restrict__ wconv,
@@ -129,55 +125,85 @@ __global__ static void dn_conv_silu(const float *__restrict__ qkv, const float *
     rg[convk - 2] = cur;
 }
 
-/* grid vh, block vdim, dynamic shared dn_rec_smem(). rec: [vh][kdim][vdim];
- * z: the z half of qkvz; outr: [vh][vdim]. */
-__global__ static void dn_rec_norm(const float *__restrict__ conv_out, const float *__restrict__ z,
-                                   const float *__restrict__ beta, const float *__restrict__ g,
-                                   const float *__restrict__ normw, float *__restrict__ rec,
-                                   int rep, int kdim, int vdim, int key_dim_tot,
-                                   float scale, float eps, float *__restrict__ outr) {
+/* grid vh, block dn_head_threads() = vdim * split, dynamic shared
+ * dn_head_smem(). Thread t is value column t % vdim, key-row slice
+ * t / vdim, so a warp reads consecutive columns of one state row.
+ * wab: [2*vh][H], b rows first; rec: [vh][kdim][vdim]; z: the z half of
+ * qkvz; beta, g: [vh], written for the tests; outr: [vh][vdim]. */
+__global__ static void dn_head(const float *__restrict__ x, const float *__restrict__ wab,
+                               const float *__restrict__ alog, const float *__restrict__ dtbias,
+                               const float *__restrict__ conv_out, const float *__restrict__ z,
+                               const float *__restrict__ normw, float *__restrict__ rec,
+                               int H, int vh, int rep, int kdim, int vdim, int split, int key_dim_tot,
+                               float scale, float eps,
+                               float *__restrict__ beta_out, float *__restrict__ g_out,
+                               float *__restrict__ outr) {
     extern __shared__ unsigned char dn_smem[];
-    float *qs = (float *)dn_smem, *ks = qs + kdim;
-    double *red = (double *)(dn_smem + (((size_t)2 * kdim * sizeof(float) + 7) & ~(size_t)7));
-    const int h = blockIdx.x, vv = threadIdx.x;
+    const int nt = blockDim.x;
+    float *qs = (float *)dn_smem, *ks = qs + kdim, *part = ks + kdim;
+    double *red = (double *)(dn_smem + ((((size_t)2 * kdim + nt) * sizeof(float) + 7) & ~(size_t)7));
+    float *redf = (float *)red;
+    const int h = blockIdx.x, t = threadIdx.x, vv = t % vdim, sl = t / vdim;
+
+    /* the gates: this head's b and a rows against x */
+    const float *wb = wab + (size_t)h * H, *wa = wab + (size_t)(vh + h) * H;
+    float sb = 0.f, sa = 0.f;
+    for (int i = t; i < H; i += nt) { float xi = x[i]; sb += xi * wb[i]; sa += xi * wa[i]; }
+    sb = dn_block_sum(sb, redf);
+    sa = dn_block_sum(sa, redf);
+    const float bh = 1.f / (1.f + expf(-sb));
+    const float za = sa + dtbias[h];
+    const float gh = -expf(alog[h]) * (za > 20.f ? za : log1pf(expf(za)));   /* softplus_f */
+    if (t == 0) { beta_out[h] = bh; g_out[h] = gh; }
+
+    /* per-head l2norm, eps 1e-6 inside the sqrt, in double */
     const int kh = h / rep;                       /* repeat_interleave: NOT h % vk */
     const float *q_in = conv_out + (size_t)kh * kdim;
     const float *k_in = conv_out + key_dim_tot + (size_t)kh * kdim;
-
-    /* per-head l2norm, eps 1e-6 inside the sqrt, in double */
     double pq = 0.0, pk = 0.0;
-    for (int d = vv; d < kdim; d += blockDim.x) {
-        double a = q_in[d], b = k_in[d]; pq += a * a; pk += b * b;
-    }
+    for (int d = t; d < kdim; d += nt) { double a = q_in[d], b = k_in[d]; pq += a * a; pk += b * b; }
     pq = dn_block_sum(pq, red);
     pk = dn_block_sum(pk, red);
     const double nq = sqrt(1e-6 + pq), nk = sqrt(1e-6 + pk);
-    for (int d = vv; d < kdim; d += blockDim.x) {
+    for (int d = t; d < kdim; d += nt) {
         qs[d] = (float)((double)q_in[d] / nq * (double)scale);
         ks[d] = (float)((double)k_in[d] / nk);
     }
     __syncthreads();
 
-    /* gated delta rule, column vv of this head's state */
+    /* gated delta rule: column vv, key rows [k0, k1) of this head's state */
+    const int chunk = (kdim + split - 1) / split;
+    const int k0 = sl * chunk, k1 = k0 + chunk < kdim ? k0 + chunk : kdim;
     float *Sh = rec + (size_t)h * kdim * vdim;
-    const float egh = expf(g[h]);
-    const float v = conv_out[2 * key_dim_tot + (size_t)h * vdim + vv];
+    const float egh = expf(gh);
+    float kvp = 0.f;
+    for (int kk = k0; kk < k1; kk++) kvp += ks[kk] * (Sh[(size_t)kk * vdim + vv] * egh);
+    part[t] = kvp;
+    __syncthreads();
     float kv = 0.f;
-    for (int kk = 0; kk < kdim; kk++) kv += ks[kk] * (Sh[(size_t)kk * vdim + vv] * egh);
-    const float dl = (v - kv) * beta[h];
-    float o = 0.f;
-    for (int kk = 0; kk < kdim; kk++) {
+    for (int j = 0; j < split; j++) kv += part[j * vdim + vv];
+    const float v = conv_out[2 * key_dim_tot + (size_t)h * vdim + vv];
+    const float dl = (v - kv) * bh;
+    float op = 0.f;
+    for (int kk = k0; kk < k1; kk++) {
         float s = Sh[(size_t)kk * vdim + vv] * egh;
         s += ks[kk] * dl;
         Sh[(size_t)kk * vdim + vv] = s;
-        o += qs[kk] * s;
+        op += qs[kk] * s;
     }
+    __syncthreads();                 /* every slice has read its kv from part */
+    part[t] = op;
+    __syncthreads();
+    float o = 0.f;
+    for (int j = 0; j < split; j++) o += part[j * vdim + vv];
 
-    /* gated RMSNorm over the head, then silu(z) */
-    const double ms = dn_block_sum((double)o * o, red);
-    const float r = 1.f / sqrtf((float)(ms / vdim) + eps);
-    const float zz = z[(size_t)h * vdim + vv];
-    outr[(size_t)h * vdim + vv] = (o * r * normw[vv]) * zz / (1.f + expf(-zz));
+    /* gated RMSNorm over the head (slice 0 holds the column), then silu(z) */
+    const double ms = dn_block_sum(sl == 0 ? (double)o * o : 0.0, red);
+    if (sl == 0) {
+        const float r = 1.f / sqrtf((float)(ms / vdim) + eps);
+        const float zz = z[(size_t)h * vdim + vv];
+        outr[(size_t)h * vdim + vv] = (o * r * normw[vv]) * zz / (1.f + expf(-zz));
+    }
 }
 
 /* Device pointers of one layer, for dn_decode_middle. */
@@ -190,19 +216,19 @@ typedef struct {
     const float *normw;   /* [vdim] */
     float *ring;          /* [conv_dim][convk-1], updated */
     float *rec;           /* [vh][kdim][vdim], updated */
-    float *beta, *g;      /* [vh] scratch */
+    float *beta, *g;      /* [vh], written for the tests */
     float *conv_out;      /* [conv_dim] scratch */
     float *outr;          /* [value_dim] output */
 } DnLayerDev;
 
-/* The three kernels in order on one stream. Returns the launch error (the
+/* The two kernels in order on one stream. Returns the launch error (the
  * kernels run asynchronously; a fault shows at the next synchronisation). */
 static inline cudaError_t dn_decode_middle(cudaStream_t st, const DnShape *s, const DnLayerDev *d) {
     const int conv_dim = dn_conv_dim(s), key_dim_tot = s->vk * s->kdim;
-    dn_ab_gates<<<s->vh, 256, 0, st>>>(d->x, d->wab, d->alog, d->dtbias, s->hidden, s->vh, d->beta, d->g);
     dn_conv_silu<<<(conv_dim + 255) / 256, 256, 0, st>>>(d->qkvz, d->wconv, d->ring, conv_dim, s->convk, d->conv_out);
-    dn_rec_norm<<<s->vh, s->vdim, dn_rec_smem(s), st>>>(d->conv_out, d->qkvz + conv_dim, d->beta, d->g,
-        d->normw, d->rec, s->vh / s->vk, s->kdim, s->vdim, key_dim_tot,
-        1.f / sqrtf((float)s->kdim), s->eps, d->outr);
+    dn_head<<<s->vh, dn_head_threads(s), dn_head_smem(s), st>>>(d->x, d->wab, d->alog, d->dtbias,
+        d->conv_out, d->qkvz + conv_dim, d->normw, d->rec,
+        s->hidden, s->vh, s->vh / s->vk, s->kdim, s->vdim, dn_split(s), key_dim_tot,
+        1.f / sqrtf((float)s->kdim), s->eps, d->beta, d->g, d->outr);
     return cudaGetLastError();
 }

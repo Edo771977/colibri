@@ -27,15 +27,18 @@
  *      steps 128-255, on the mean error per window (the decay makes the
  *      recurrence contractive; an error that grows means it is not carried
  *      the same way). An emulation of the kernels' arithmetic on the host
- *      (not the device expf) gave errors of 1e-7 to 2e-6: the bounds, 1e-5
- *      to 1e-4, leave a margin of about 50.
+ *      (not the device expf) gave errors of 1e-7 to 2e-6, and so did the
+ *      first run on an RTX 4070 Ti SUPER (1e-7 to 2.5e-6, three kernels,
+ *      one thread per state column): the bounds, 2e-6 to 2e-5, leave a
+ *      margin of 4 to 20 over those.
  * The errors are printed, so the tolerances can be tightened with data.
  *
  * --bench: the 35B shape, 30 layers of state (60 MiB, more than the 48 MB
  * L2 of the reference RTX 4070 Ti SUPER; a card with a larger L2 holds it),
- * per-layer time of the three kernels back to back and with a synchronize
- * after every layer, and each kernel alone back to back (for the two small
- * kernels that is launch throughput as much as kernel time).
+ * per-layer time of the two kernels back to back and with a synchronize
+ * after every layer, each kernel alone back to back (for dn_conv_silu that
+ * is launch throughput as much as kernel time), and an empty kernel, the
+ * launch rate by itself.
  *
  * Build: nvcc -O3 -std=c++17 -arch=native tests/test_qwen36_deltanet_cuda.cu
  */
@@ -248,9 +251,9 @@ static void run_shape(const char *name, DnShape s) {
     down(gring, d.ring, nring); down(grec, d.rec, nrec);
     check(rel_err_elem(gb, beta, 1e-30) < 1e-5, "one step: beta, per element", rel_err_elem(gb, beta, 1e-30), 1e-5);
     check(rel_err_elem(gg, g, 1e-30) < 1e-5, "one step: g, per element", rel_err_elem(gg, g, 1e-30), 1e-5);
-    check(rel_err(gc, conv_out) < 1e-5, "one step: conv_out", rel_err(gc, conv_out), 1e-5);
-    check(rel_err(go, outr) < 1e-4, "one step: outr", rel_err(go, outr), 1e-4);
-    check(rel_err(grec, rec) < 1e-4, "one step: state", rel_err(grec, rec), 1e-4);
+    check(rel_err(gc, conv_out) < 2e-6, "one step: conv_out", rel_err(gc, conv_out), 2e-6);
+    check(rel_err(go, outr) < 1e-5, "one step: outr", rel_err(go, outr), 1e-5);
+    check(rel_err(grec, rec) < 1e-5, "one step: state", rel_err(grec, rec), 1e-5);
     bool ring_same = memcmp(gring.data(), ring.data(), nring * sizeof(float)) == 0;
     check(ring_same, "one step: ring, byte for byte (0 = same)", ring_same ? 0.0 : 1.0, 0.0);
 
@@ -282,8 +285,8 @@ static void run_shape(const char *name, DnShape s) {
         if (t >= 384) { last = std::max(last, e); last_sum += e; }
     }
     down(grec, d.rec, nrec);
-    check(worst < 1e-4, "512 steps: worst outr", worst, 1e-4);
-    check(rel_err(grec, rec) < 1e-4, "512 steps: final state", rel_err(grec, rec), 1e-4);
+    check(worst < 2e-5, "512 steps: worst outr", worst, 2e-5);
+    check(rel_err(grec, rec) < 2e-5, "512 steps: final state", rel_err(grec, rec), 2e-5);
     const double mid_mean = mid_sum / 128, last_mean = last_sum / 128;
     printf("  512 steps: outr error max / mean, steps 128-255 %.3e / %.3e, steps 384-511 %.3e / %.3e\n",
            mid, mid_mean, last, last_mean);
@@ -293,6 +296,8 @@ static void run_shape(const char *name, DnShape s) {
 }
 
 /* ---- bench ----------------------------------------------------------------- */
+/* The launch rate alone, for the per-kernel lines to be read against. */
+__global__ static void dn_bench_empty(void) {}
 static void bench(void) {
     DnShape s = {2048, 32, 16, 128, 128, 4, 1e-6f};
     const int NL = 30, TOK = 200;
@@ -328,14 +333,15 @@ static void bench(void) {
         CK(cudaEventRecord(e0));
         for (int t = 0; t < TOK; t++) for (int l = 0; l < NL; l++) {
             const DnLayerDev &d = vs[l];
-            if (which == 0) dn_ab_gates<<<s.vh, 256>>>(d.x, d.wab, d.alog, d.dtbias, s.hidden, s.vh, d.beta, d.g);
-            else if (which == 1) dn_conv_silu<<<(conv_dim + 255) / 256, 256>>>(d.qkvz, d.wconv, d.ring, conv_dim, s.convk, d.conv_out);
-            else dn_rec_norm<<<s.vh, s.vdim, dn_rec_smem(&s)>>>(d.conv_out, d.qkvz + conv_dim, d.beta, d.g, d.normw, d.rec,
-                     s.vh / s.vk, s.kdim, s.vdim, key_dim_tot, 1.f / sqrtf((float)s.kdim), s.eps, d.outr);
+            if (which == 0) dn_conv_silu<<<(conv_dim + 255) / 256, 256>>>(d.qkvz, d.wconv, d.ring, conv_dim, s.convk, d.conv_out);
+            else if (which == 1) dn_head<<<s.vh, dn_head_threads(&s), dn_head_smem(&s)>>>(d.x, d.wab, d.alog, d.dtbias,
+                     d.conv_out, d.qkvz + conv_dim, d.normw, d.rec, s.hidden, s.vh, s.vh / s.vk, s.kdim, s.vdim,
+                     dn_split(&s), key_dim_tot, 1.f / sqrtf((float)s.kdim), s.eps, d.beta, d.g, d.outr);
+            else dn_bench_empty<<<1, 32>>>();
         }
         CK(cudaGetLastError());
         CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaEventElapsedTime(&ms, e0, e1));
-        static const char *nm[3] = {"dn_ab_gates", "dn_conv_silu", "dn_rec_norm"};
+        static const char *nm[3] = {"dn_conv_silu", "dn_head", "empty kernel"};
         printf("  %-22s %7.2f us per layer, back to back (kernel or launch rate, whichever is slower)\n", nm[which], 1000.0 * ms / (TOK * NL));
     }
     for (auto &d : ds) dev_free(d);
