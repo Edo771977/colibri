@@ -680,11 +680,11 @@ main 3baa7da0 (#59: in_proj_b and in_proj_a in one buffer, one matmul).
 refused the DLL as older than its source; the operator rebuilt both, DLL
 first: coli_cuda.dll 759808 bytes, 2026-09-28 07:10:55, sha256 prefix
 C01A046FA26BDA6B; qwen36_clang.exe 375808 bytes, 07:10:58, sha256 prefix
-BE69679E694B1490. misure-envab.ps1; its stamp matches section 8's
-(keep-alive OFF absent / ON =1, heat.caldo.bin in both arms, sidecar
-verified, build conditions differing in the executable and the DLL,
-loaded in all 12 runs, unchanged), cap 256, bits 4, N_NEW=128,
-prompt25.txt. Banner,
+BE69679E694B1490. misure-envab.ps1; the conditions it stamps match
+section 8's: the keep-alive absent in OFF and =1 in ON; heat.caldo.bin
+in both arms, loaded in all 12 runs and unchanged; its sidecar verified,
+with only the executable and the DLL differing from the build
+conditions; cap 256, bits 4, N_NEW=128, prompt25.txt. Banner,
 [place] and residency (6859/10240) identical in all 12 runs; the text
 identical within and between the arms, 4a000cc01f310b64, the same hash
 as before the change; 8.0 LFRU swaps per run in both arms; miss(CPU)
@@ -718,10 +718,12 @@ The generated text on this prompt is unchanged: the end-to-end check to
 go with the byte-level test of #59 (c/tests/test_qwen36_dn_ba.c). a+b
 reads 0.66-0.72 ms/token, ~22-24 us per layer for the one fused call,
 against 0.80-1.03 in section 9's four arms (~13-17 us per call, two per
-layer). Those are other runs on another day, and the difference, 0.08-
-0.37 depending on the pairing, is within the drift section 9 shows for
-this timer in one configuration (9a ON 0.80 against 9b OFF 1.03), so it
-does not separate the OpenMP region's cost from the rest (the
+layer). Those are other runs on another day. The difference is
+0.08-0.37 depending on the pairing, every pairing lower in section 10;
+the drift section 9 shows for this timer in one configuration is 0.23
+(9a ON 0.80 against 9b OFF 1.03), and half the pairings exceed it. Not
+being an A/B, it does not separate the OpenMP region's cost from the
+rest (the
 arithmetic, a serial 2048-term reduction per row, and the reads of the
 f32 weights). The upper bound when the change was proposed, had the
 whole cost been the region, was about half of 0.80-1.03.
@@ -800,7 +802,7 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
-  - Clocks in sections 8 and 9, and how each deltanet GPU call splits
+  - Clocks in sections 8 to 10, and how each deltanet GPU call splits
     between round trip and kernel (section 9's dn-split separates the
     a/b matmuls and the norm from the two calls; the rest still rests
     on section 5's durations).
@@ -809,4 +811,5 @@ Control Panel settings not helping.
     its step() times, not logged.
   - The keep-alive on another card, another driver, or Linux.
   - The keep-alive's power draw, its effect with a heat table beyond
-    sections 8 and 9a (two runs of six pairs), and on long generations.
+    sections 8, 9a and 10 (three runs of six pairs), and on long
+    generations.
