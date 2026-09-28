@@ -1,7 +1,8 @@
 Qwen3.6-35B-A3B on the CUDA tier: where the dense GEMV time goes, and the
 GPU power states behind it.
 27 September 2026, on the operator's machine: one session (sections
-1-7) and three evening runs (sections 8 and 9).
+1-7), three evening runs (sections 8 and 9), and one run the next
+morning (section 10).
 
 The session started as an A/B of one CPU-side change and ended somewhere
 else. In order:
@@ -51,6 +52,11 @@ else. In order:
      resolution; clocks not logged). dn-split puts 0.80-1.03 ms/token in
      the two tiny a/b matmuls, and an estimated ~30-60 us of non-kernel
      time on each of deltanet's 60 GPU calls per token.
+ 10. 28 September, morning, main 3baa7da0 (the a/b matmuls fused into
+     one call, #59): the text unchanged (4a000cc01f310b64); a+b reads
+     0.66-0.72 ms/token against 0.80-1.03 the evening before (different
+     runs, not an A/B); the keep-alive a third time, -1.77, [-2.61,
+     -0.93], 6/6, the ON arm at 22.93 ms/token.
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -59,7 +65,7 @@ Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
 evidence.sha256 exists for them.
 
-The next section describes sections 1 to 6. Sections 7 to 9 rebuilt the
+The next section describes sections 1 to 6. Sections 7 to 10 rebuilt the
 DLL and/or the engine and ran under misure-envab.ps1; their builds and
 hashes are given there.
 
@@ -667,6 +673,52 @@ of that is the start and join of the OpenMP region and how much the
 arithmetic (a serial 2048-term reduction per row, no -ffast-math) is
 not separated by the timer. The gated RMSNorm is 0.13-0.15 ms/token.
 
+--- 10. 28 September, morning: the fused a/b matmul, and the keep-alive -----
+
+main 3baa7da0 (#59: in_proj_b and in_proj_a in one buffer, one matmul).
+#59 also changed comments in c/backend_cuda.cu, so misure-envab.ps1 first
+refused the DLL as older than its source; the operator rebuilt both, DLL
+first: coli_cuda.dll 759808 bytes, 2026-09-28 07:10:55, sha256 prefix
+C01A046FA26BDA6B; qwen36_clang.exe 375808 bytes, 07:10:58, sha256 prefix
+BE69679E694B1490. misure-envab.ps1, the same arguments as section 8
+(keep-alive, heat.caldo.bin in both arms, sidecar verified, loaded in all
+12 runs, unchanged), cap 256, bits 4, N_NEW=128, prompt25.txt. Banner,
+[place] and residency (6859/10240) identical in all 12 runs; the text
+identical within and between the arms, 4a000cc01f310b64, the same hash
+as before the change; 8.0 LFRU swaps per run in both arms; miss(CPU)
+6240 OFF, 6240/6241 ON. Clocks not logged.
+
+  delta appaiati (ON - OFF), ms/token
+  -0.90   -1.60   -1.60   -3.30   -1.60   -1.60
+  media    -1.77   sd  0.80   se  0.33   df 5
+  intervallo 95 %:  [-2.61 ; -0.93]   ampiezza +-0.84
+  negativi 6/6
+  OFF prima:  -0.90  -1.60  -1.60
+  ON prima:   -1.60  -3.30  -1.60
+  differenza fra le medie dei due gruppi: 0.80 ms/token
+
+  OFF step 24.70, moe 11.37, attn 2.29, dn 8.65, head 1.34, cpu-miss 4.19
+  ON  step 22.93, moe 10.92, attn 2.07, dn 7.83, head 1.05, cpu-miss 4.14
+
+  dn-split     qkvz   a+b    norm   out    (dn-gpu 3810/3810 both)
+  OFF          3.37   0.72   0.13   2.02
+  ON           2.81   0.66   0.13   1.79
+
+Recomputed: mean -1.767, sd 0.802, se 0.327, half-width 0.842.
+
+The text hash is the end-to-end check on the real model that the fused
+a/b matmul changed no result. a+b reads 0.66-0.72 ms/token, against
+0.80-1.03 in section 9's four arms. Those are other runs on another day,
+so the ~0.1-0.3 difference is not a measured effect; it is smaller than
+the ~0.4-0.5 expected when the change was proposed, which suggests the
+cost of those matmuls is mostly their arithmetic (a serial 2048-term
+reduction per row), not the OpenMP region.
+
+The keep-alive's third repetition with the heat table: with section 8
+(-2.37, [-3.76, -0.98]) and 9a (-0.57, [-4.46, +3.33], one outlier run),
+two of three runs exclude zero and all point the same way. The ON arm,
+22.93 ms/token, is the fastest configuration measured in this record.
+
 --- what this means ----------------------------------------------------------
 
 On this machine, in every decode that was logged, the card holds P2 for a
@@ -688,7 +740,8 @@ first run, the only one with a clock log. In its final version, step()
 end-to-end cost visible in the log end times (to within 2-3 s). With
 the heat table in both arms (section 8): -2.37, [-3.76, -0.98], 6/6;
 repeated that evening (section 9a): -0.57, [-4.46, +3.33], 5/6, one
-outlier run widening it.
+outlier run widening it; and the next morning (section 10): -1.77,
+[-2.61, -0.93], 6/6.
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
