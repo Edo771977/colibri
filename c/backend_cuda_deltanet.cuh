@@ -27,7 +27,7 @@
  * most likely the cost of a launch on the reference Windows machine, not
  * measured then (docs/qwen36-deltanet-gpu-plan.md, stage 1, first run; the
  * test's bench now has an empty kernel for it). Now the gates live in dn_head, whose blocks are already one per
- * head, and each column's key rows are split across DN_SPLIT threads.
+ * head, and each column's key rows are split across dn_split() threads.
  *
  * The CPU reference is deltanet() in qwen36.c. Where the order is the CPU's:
  *   - the conv is the same loop per channel;
@@ -134,7 +134,7 @@ __global__ static void dn_conv_silu(const float *__restrict__ qkv, const float *
  * t / vdim, so a warp reads consecutive columns of one state row.
  * wab: [2*vh][H], b rows first; rec: [vh][kdim][vdim]; z: the z half of
  * qkvz; beta, g: [vh], written for the tests; outr: [vh][vdim]. */
-__global__ static void dn_head(const float *__restrict__ x, const float *__restrict__ wab,
+__global__ static void __launch_bounds__(1024) dn_head(const float *__restrict__ x, const float *__restrict__ wab,
                                const float *__restrict__ alog, const float *__restrict__ dtbias,
                                const float *__restrict__ conv_out, const float *__restrict__ z,
                                const float *__restrict__ normw, float *__restrict__ rec,

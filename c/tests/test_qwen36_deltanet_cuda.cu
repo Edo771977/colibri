@@ -9,9 +9,10 @@
  *
  * For the 35B shapes (hidden 2048, 32 value heads, 16 key heads, head dims
  * 128, conv width 4), the CI tiny fixture's (hidden 64, 8 and 4 heads, head
- * dims 8), and three made-up shapes for the paths those two do not reach
+ * dims 8), and six made-up shapes for the paths those two do not reach
  * (kdim > vdim, kdim above the block size, a vdim that is not a power of
- * two, above and below a warp, three value heads per key head):
+ * two, above and below a warp, three value heads per key head, a key-row
+ * slice left empty, fewer than four slices):
  *   1. one step from a random state: beta and g within an ELEMENTWISE
  *      relative tolerance (a long-memory head has a g a thousand times
  *      smaller than the others, and g is the error that compounds),
@@ -29,10 +30,12 @@
  *      the same way). An emulation of the kernels' arithmetic on the host
  *      (not the device expf) gave errors of 1e-7 to 2e-6; the first run on
  *      an RTX 4070 Ti SUPER, with the earlier three kernels (one thread per
- *      state column), measured 1e-7 to 2.5e-6. The bounds, 2e-6 to 2e-5,
- *      are 8 to 38 times those errors (g, unchanged at 1e-5, about 5).
- *      dn_head sums in another order and has not run yet when these were
- *      set.
+ *      state column), measured 1e-7 to 2.5e-6. A host emulation of dn_head
+ *      (its sum order, FMAs, the device expf as 0-2 ulp) over 40 seeds gave
+ *      at worst 1.33e-5 on a 512-step outr and 4.3e-6 on g. The bounds:
+ *      conv_out 2e-6, one step 1e-5 (g 2e-5), 512 steps 5e-5, about 4 to 5
+ *      times those worst cases. dn_head had not run on a GPU when they
+ *      were set.
  * The errors are printed, so the tolerances can be tightened with data.
  *
  * --bench: the 35B shape, 30 layers of state (60 MiB, more than the 48 MB
@@ -252,7 +255,7 @@ static void run_shape(const char *name, DnShape s) {
     down(gb, d.beta, s.vh); down(gg, d.g, s.vh); down(gc, d.conv_out, conv_dim); down(go, d.outr, value_dim);
     down(gring, d.ring, nring); down(grec, d.rec, nrec);
     check(rel_err_elem(gb, beta, 1e-30) < 1e-5, "one step: beta, per element", rel_err_elem(gb, beta, 1e-30), 1e-5);
-    check(rel_err_elem(gg, g, 1e-30) < 1e-5, "one step: g, per element", rel_err_elem(gg, g, 1e-30), 1e-5);
+    check(rel_err_elem(gg, g, 1e-30) < 2e-5, "one step: g, per element", rel_err_elem(gg, g, 1e-30), 2e-5);
     check(rel_err(gc, conv_out) < 2e-6, "one step: conv_out", rel_err(gc, conv_out), 2e-6);
     check(rel_err(go, outr) < 1e-5, "one step: outr", rel_err(go, outr), 1e-5);
     check(rel_err(grec, rec) < 1e-5, "one step: state", rel_err(grec, rec), 1e-5);
@@ -287,8 +290,8 @@ static void run_shape(const char *name, DnShape s) {
         if (t >= 384) { last = std::max(last, e); last_sum += e; }
     }
     down(grec, d.rec, nrec);
-    check(worst < 2e-5, "512 steps: worst outr", worst, 2e-5);
-    check(rel_err(grec, rec) < 2e-5, "512 steps: final state", rel_err(grec, rec), 2e-5);
+    check(worst < 5e-5, "512 steps: worst outr", worst, 5e-5);
+    check(rel_err(grec, rec) < 5e-5, "512 steps: final state", rel_err(grec, rec), 5e-5);
     const double mid_mean = mid_sum / 128, last_mean = last_sum / 128;
     printf("  512 steps: outr error max / mean, steps 128-255 %.3e / %.3e, steps 384-511 %.3e / %.3e\n",
            mid, mid_mean, last, last_mean);
@@ -360,7 +363,10 @@ int main(int argc, char **argv) {
     run_shape("tiny", DnShape{64, 8, 4, 8, 8, 4, 1e-6f});
     run_shape("kdim > vdim, vdim 24", DnShape{96, 6, 3, 40, 24, 4, 1e-6f});
     run_shape("vdim 48", DnShape{128, 4, 2, 16, 48, 3, 1e-6f});
-    run_shape("rep 3, kdim above the block", DnShape{96, 6, 2, 160, 96, 4, 1e-6f});
+    run_shape("rep 3, kdim 160", DnShape{96, 6, 2, 160, 96, 4, 1e-6f});
+    run_shape("kdim above the block (96 threads)", DnShape{96, 4, 2, 160, 24, 4, 1e-6f});
+    run_shape("kdim 5, an empty key-row slice", DnShape{64, 4, 2, 5, 8, 4, 1e-6f});
+    run_shape("vdim 300, split 3", DnShape{64, 2, 1, 3, 300, 4, 1e-6f});
     printf("deltanet cuda: %s\n", g_fail ? "FAIL" : "ok");
     return g_fail ? 1 : 0;
 }

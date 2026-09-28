@@ -201,8 +201,9 @@ state column, used 32 blocks of 128 threads. So the gates moved into the
 recurrence kernel (one launch less per layer) and each column's key rows
 were split across four threads (dn_head, #65: the plan's four kernels are
 now dn_conv_silu and dn_head). The tolerances were tightened to 2e-6 -
-2e-5 from the first run's errors, which are the old kernels'; dn_head sums
-in another order and is checked by its own first run.
+5e-5, about 4-5 times the worst case of a host emulation of dn_head over 40
+seeds (the first run's errors are the old kernels'); dn_head is checked by
+its own first run.
 
 ### Stage 2 — one backend entry point per layer
 
