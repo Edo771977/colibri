@@ -1,6 +1,6 @@
 # Qwen3.6 DeltaNet decode on the GPU — plan
 
-Status: **stages 0-2 done; stage 3a (engine, opt-in `COLI_DN_GPU`) in review, not yet measured on the card.** Written 28 September 2026 from the
+Status: **stages 0-3a done. `COLI_DN_GPU=1` (opt-in): step() 22.25 -> 17.72 ms/token, 95 % [-5.05, -4.02], 6/6 pairs, text identical (`docs/experiments/qwen36-deltanet-gpu-2026-09-28-raw.txt`). Next: stage 3b (serve).** Written 28 September 2026 from the
 measurements in `docs/experiments/qwen36-gpu-clocks-2026-09-27-raw.txt`
 (sections 5 and 8-10). Each stage below is a separate PR with its own tests
 and, where it touches ms/token, its own A/B. Estimates are marked as such.
@@ -349,6 +349,28 @@ Validation before merge:
   branch goes through the same `dn_gpu_fatal` but has no fake switch yet).
   The tiny-model and real-model checks above are still to run on the card.
   The marker says N/M; the A/B script only checks it is there, so read N.
+
+**First run of 3a (28 September 2026, RTX 4070 Ti SUPER, main 29c2af7d;
+`docs/experiments/qwen36-deltanet-gpu-2026-09-28-raw.txt`).**
+
+- **Correctness.** `CONSIST=1` on the real model stood in for the
+  tiny-model acceptance, whose fixture needs torch on the operator's
+  machine. Both arms passed: the worst relative gap was 2.9e-7 with the
+  flag at 0 and 3.1e-7 at 1, tolerance 1e-2, with 30/30 layers on the
+  path at 1.
+- **A/B, `COLI_DN_GPU` 0 vs 1.** Six pairs, heat table, keep-alive in
+  both arms. step() went from 22.25 to 17.72 ms/token, a paired delta of
+  -4.53 with 95 % [-5.05, -4.02], and 6/6 pairs negative. The generated
+  text is identical between the arms.
+- **dn.** It fell from 7.55 to 3.75 ms/token, which is 125 us a layer,
+  against 120.4 in the stage 2 bench.
+- **The other 0.7 ms/token** is a lower MoE time (shared expert and
+  CPU misses) that this run does not explain.
+
+**Left for stage 3b:** the server (`SERVE=1`) with per-request failure,
+dnstate following its layer's projections in auto-place, a fake switch
+for a failed download, and N == M in the A/B's marker check. Making the
+flag the default is a separate decision once the server path is in.
 
 ### Stage 4 — only if stage 3's numbers say so
 
