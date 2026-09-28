@@ -174,6 +174,30 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *ga
 /* Not a DLL export: answered by the loader (does this DLL have it?) or by the
  * directly-linked backend (yes). */
 int coli_cuda_has_group_x_broadcast(void);
+
+/* Qwen3.6 DeltaNet decode, one call per layer (docs/qwen36-deltanet-gpu-plan.md,
+ * stage 2). A handle owns one layer's device state (the recurrent state
+ * [vh][kdim][vdim] and the conv ring [conv_dim][convk-1], the host's layouts),
+ * its small weights and scratch, allocated once; it BORROWS the placed dnproj
+ * (I = H, O = conv_dim + value_dim) and dnout (I = value_dim, O = H), which
+ * must be on one device and outlive it. create refuses, with a line on stderr,
+ * anything else. decode: x [H] in, out [H] out, one synchronize; on a 0 the
+ * state may have advanced, so upload or zero it before the next decode.
+ * All optional in the loader: ask coli_cuda_has_deltanet() first. */
+typedef struct ColiCudaDeltaNet ColiCudaDeltaNet;
+COLI_CUDA_DLLEXPORT int coli_cuda_deltanet_create(ColiCudaDeltaNet **handle,
+        ColiCudaTensor *dnproj, ColiCudaTensor *dnout,
+        int H, int vh, int vk, int kdim, int vdim, int convk, float eps,
+        const float *wab, const float *alog, const float *dtbias,
+        const float *wconv, const float *normw);
+COLI_CUDA_DLLEXPORT int coli_cuda_deltanet_decode(ColiCudaDeltaNet *handle, const float *x, float *out);
+COLI_CUDA_DLLEXPORT int coli_cuda_deltanet_state_upload(ColiCudaDeltaNet *handle, const float *rec, const float *ring);
+COLI_CUDA_DLLEXPORT int coli_cuda_deltanet_state_download(ColiCudaDeltaNet *handle, float *rec, float *ring);
+COLI_CUDA_DLLEXPORT int coli_cuda_deltanet_state_zero(ColiCudaDeltaNet *handle);
+COLI_CUDA_DLLEXPORT size_t coli_cuda_deltanet_bytes(const ColiCudaDeltaNet *handle);
+COLI_CUDA_DLLEXPORT void coli_cuda_deltanet_free(ColiCudaDeltaNet *handle);
+/* Not a DLL export: answered by the loader or by the directly-linked backend. */
+int coli_cuda_has_deltanet(void);
 COLI_CUDA_DLLEXPORT const float *coli_cuda_expert_group_take(int device);
 
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
