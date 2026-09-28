@@ -2986,6 +2986,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
  * the server. */
 static int dn_gpu_mode(void) {
     const char *e = getenv("COLI_DN_GPU");
+    /* SERVE=1 and DN_DBG keep the CPU path: not even the =0 reservation,
+     * which would only take VRAM from the experts */
+    if (e && ((getenv("SERVE") && getenv("SERVE")[0] == '1') || getenv("DN_DBG"))) {
+        static int told;
+        if (!told) {
+            told = 1;
+            fprintf(stderr, "[qwen36] COLI_DN_GPU=%s ignored under %s: %s\n", e,
+                    getenv("DN_DBG") ? "DN_DBG" : "SERVE=1",
+                    getenv("DN_DBG") ? "DN_DBG reads layer 0 on the CPU path"
+                                     : "the server path is not wired yet (plan stage 3b)");
+        }
+        return -1;
+    }
     if (!e) return -1;
     if (!strcmp(e, "1")) return 1;
     if (!strcmp(e, "0")) return 0;
@@ -3073,7 +3086,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         double t0 = tm_now();
         if (!m->dn_on_dev[layer]) {
             if (!qt_dn_state_upload(layer, rec, ring)) {
-                /* nothing on the device moved: the host copy stands */
+                /* the host copy is still the state (the device copy may be
+                 * half-written, and is never read again): CPU from here on */
                 fprintf(stderr, "[qwen36] DeltaNet layer %d: state upload failed, CPU from here on\n", layer);
                 m->dn_gpu_on[layer] = 0;
                 goto cpu_path;
@@ -4441,14 +4455,6 @@ static void dn_offer_state(Model *m) {
  * reserved the same VRAM and stops here. */
 static void dn_gpu_setup(Model *m) {
     if (dn_gpu_mode() != 1) return;
-    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
-        fprintf(stderr, "[qwen36] COLI_DN_GPU=1 ignored under SERVE=1: the server path is not wired yet (plan stage 3b)\n");
-        return;
-    }
-    if (getenv("DN_DBG")) {
-        fprintf(stderr, "[qwen36] COLI_DN_GPU=1 ignored: DN_DBG reads layer 0 on the CPU path\n");
-        return;
-    }
     Cfg *c = &m->c;
     unsigned char *on = calloc((size_t)c->n_layers, 1), *dev = calloc((size_t)c->n_layers, 1);
     if (!on || !dev) { free(on); free(dev); fprintf(stderr, "[qwen36] COLI_DN_GPU=1: out of memory, CPU path\n"); return; }

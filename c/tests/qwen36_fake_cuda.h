@@ -27,6 +27,7 @@
 #include <time.h>
 
 #include "../backend_cuda.h"
+#include "../qwen36_tier.h"   /* qt_dn_state_bytes: the fake handle reports what the real one allocates */
 
 struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; const float *sc; };
 
@@ -223,7 +224,7 @@ int coli_cuda_deltanet_state_zero(ColiCudaDeltaNet *h) {
     return 1;
 }
 size_t coli_cuda_deltanet_bytes(const ColiCudaDeltaNet *h) {
-    return h ? (h->nrec + h->nring) * sizeof(float) : 0;
+    return h ? qt_dn_state_bytes(h->H, h->vh, h->vk, h->kdim, h->vdim, h->convk) : 0;
 }
 void coli_cuda_deltanet_free(ColiCudaDeltaNet *h) {
     if (!h) return;

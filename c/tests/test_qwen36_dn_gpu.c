@@ -284,6 +284,21 @@ int main(void) {
     arm_down(&m);
     fake_dn_absent = 0;
 
+    printf("ON arm under SERVE=1\n");
+    setenv("SERVE", "1", 1);
+    arm_up(&m, "1", "dnproj=0,dnout=0,dnstate=0");
+    int served_offers = 0;
+    for (int o = 0; o < G_offer_n; o++) if (!strcmp(G_offer[o].name, "dnstate")) served_offers++;
+    ck(served_offers == 0 && m.dn_gpu_on == NULL, "SERVE=1: no dnstate reservation, no layer on the path (stage 3b)");
+    arm_down(&m);
+    unsetenv("SERVE");
+
+    printf("handle bytes\n");
+    arm_up(&m, "1", "dnproj=0,dnout=0,dnstate=0");
+    ck(coli_cuda_deltanet_bytes(G_dn[0]) == qt_dn_state_bytes(H, VH, VK, KD, VD, CK),
+       "the fake handle reports qt_dn_state_bytes (qt_dn_init compares them on the card)");
+    arm_down(&m);
+
     printf("dn gpu: %s\n", fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }

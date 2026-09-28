@@ -231,8 +231,9 @@ final state 2.6e-7, tolerance 5e-5). Bench, 35B shape, 30 layers, 200
 tokens, keep-alive on: one decode call 120.4 us per layer, against 139.7
 us for today's two `coli_cuda_matmul` calls alone -- without the CPU work
 between them, about 114 us per layer by stage 0. Estimate, not measured in
-the engine: about 3.7-4 ms per token of the ~21, which stage 3's A/B has
-to confirm.
+the engine: 30 x (139.7 + 114 - 120.4) us, about 3.7-4 ms per token of the
+21.2 ms step stage 0 measured (22.93 in section 10), which stage 3's A/B
+has to confirm.
 
 ### Stage 3 — engine integration, opt-in
 
@@ -309,15 +310,31 @@ Validation before merge:
   `"dnstate"` offer per eligible layer (`qt_dn_state_bytes`), after the
   other offers, and leaves the dnproj/dnout offers as they are. A layer
   takes the new path only when all three landed on one device; otherwise
-  it keeps the two-call path, with a line. This keeps `COLI_PLACE` and the
-  `[place]` line unchanged and never costs a layer its existing GPU path;
-  the price is that on a tight card the placer may split a layer's three.
+  it keeps the two-call path, with a line. This keeps the existing
+  `COLI_PLACE` names and the `[place]` line unchanged and never costs a
+  layer its existing GPU path. The prices:
+  - an explicit `COLI_PLACE` must now also name `dnstate=<dev>`, or no
+    layer takes the path (0/N, with a line per layer);
+  - auto-place puts each offer on the device with the most room, so on
+    two or more GPUs a layer's three usually split and most layers stay
+    on the two-call path, their state still reserved (about 3 MB each);
+    on one tight card the same waste happens when dnproj or dnout is
+    refused on price and the state is not. Placing dnstate on its layer's
+    projection device is left for stage 3b;
+  - the offer charges the handle's payload (`qt_dn_state_bytes`, 2.83 MiB
+    a layer on the 35B), like the other trunk offers, not the allocator's
+    rounding (4 MiB for one such cudaMalloc): about 35 MiB over 30 layers
+    comes out of the 1 GiB headroom. `qt_dn_init` warns if the backend's
+    `coli_cuda_deltanet_bytes` ever differs from `qt_dn_state_bytes`.
 - **A failed decode or download stops the run** (state zeroed, exit 3)
   instead of failing the request: the plumbing for per-request failure
   comes with the server in stage 3b. A failed state upload is still
   recoverable -- the host copy is authoritative -- and sends that layer
   back to the CPU with a line.
-- **SERVE=1 and DN_DBG ignore `COLI_DN_GPU=1`** with a line (stage 3b).
+- **SERVE=1 and DN_DBG ignore `COLI_DN_GPU`** (0 or 1) with a line, and
+  reserve nothing (stage 3b). When the tier does not start (no CUDA, or a
+  cap below the expert count) the flag does nothing either, without a
+  line; `misure-envab.ps1` notices through the missing marker.
   The segment adapter refuses to run with the path on.
 - The marker `[qwen36] DeltaNet decode on the GPU: N/M layers` prints only
   with N > 0; with N = 0 a different line says the CPU path stays.
@@ -328,8 +345,10 @@ Validation before merge:
   sequence of prompts, decodes, pin snapshot and restore, prompt without
   reset and resets must match the flag-off run byte for byte, with the
   expected numbers of uploads and downloads; plus the refusals and the
-  failure paths. The tiny-model and real-model checks above are still to
-  run on the card.
+  failure paths (a failed decode, a failed upload; the failed-download
+  branch goes through the same `dn_gpu_fatal` but has no fake switch yet).
+  The tiny-model and real-model checks above are still to run on the card.
+  The marker says N/M; the A/B script only checks it is there, so read N.
 
 ### Stage 4 — only if stage 3's numbers say so
 

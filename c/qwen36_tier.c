@@ -856,6 +856,12 @@ int qt_dn_init(int layer, int dnout_handle, int device,
                                           H, vh, vk, kdim, vdim, convk, eps, wab, alog, dtbias, wconv, normw))
         why = "the backend refused the handle";
     if(why){ fprintf(stderr,"[qtier] DeltaNet layer %d stays on the two-call path: %s\n", layer, why); return 0; }
+    /* the "dnstate" offer charged qt_dn_state_bytes before the handle existed:
+     * say so if the backend's allocation has drifted from it */
+    size_t got = coli_cuda_deltanet_bytes(G_dn[layer]), want = qt_dn_state_bytes(H, vh, vk, kdim, vdim, convk);
+    if(got != want)
+        fprintf(stderr,"[qtier] DeltaNet layer %d: the handle holds %zu bytes, the dnstate offer charged %zu "
+                       "(qt_dn_state_bytes is out of step with coli_cuda_deltanet_create)\n", layer, got, want);
     return 1;
 }
 int qt_dn_ready(int layer){ return layer >= 0 && layer < QT_DN_MAX_LAYERS && G_dn[layer] != NULL; }

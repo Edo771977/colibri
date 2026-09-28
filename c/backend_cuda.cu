@@ -2722,7 +2722,7 @@ extern "C" void coli_cuda_dense_stats(int device, uint64_t *calls, uint64_t *wei
  * resets the recurrent state and fails the request (the plan's rule: never
  * run the CPU on a half-advanced state).
  *
- * For stage 3: the handle's bytes (coli_cuda_deltanet_bytes, ~2.6 MB a layer
+ * For stage 3: the handle's bytes (coli_cuda_deltanet_bytes, ~3.0 MB a layer
  * on the 35B) are not in ctx->tensor_bytes, so the tier charges them to its
  * own budget; and the handles go before the projections they borrow, before
  * qt_shutdown frees G_dnp / G_dense and before coli_cuda_shutdown. The fault
