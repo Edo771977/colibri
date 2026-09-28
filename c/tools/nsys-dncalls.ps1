@@ -102,9 +102,19 @@ $tUs = Get-Unit $cStart @{ "ns" = 0.001; "us" = 1.0; "ms" = 1000.0 }
 if ((Get-Unit $cDur @{ "ns" = 0.001; "us" = 1.0; "ms" = 1000.0 }) -ne $tUs) { throw "Start e Duration hanno unita' diverse in $Csv." }
 $bFactor = Get-Unit $cBytes @{ "B" = 1.0; "KB" = 1e3; "KiB" = 1024.0; "MB" = 1e6; "MiB" = 1048576.0; "GB" = 1e9 }
 
+# nsys scrive i decimali con il separatore della lingua di Windows: su un
+# Windows italiano "Bytes (MB)" vale "0,008" e "508,559" (lm_head int8), fra
+# virgolette nel CSV. I tempi sono interi. Si accetta quindi il punto oppure
+# UNA virgola decimale; un numero con separatori delle migliaia ferma lo
+# script invece di essere letto mille volte piu' piccolo o piu' grande.
 function To-Num([string]$s) {
     $v = 0.0
-    if (-not [double]::TryParse($s, [Globalization.NumberStyles]::Float, $inv, [ref]$v)) { throw "valore non numerico '$s' in $Csv." }
+    $t = $s.Trim()
+    if ($t -match '^-?\d+,\d+$') { $t = $t.Replace(",", ".") }
+    if ($t -notmatch '^-?\d+(\.\d+)?([eE][-+]?\d+)?$' -or
+        -not [double]::TryParse($t, [Globalization.NumberStyles]::Float, $inv, [ref]$v)) {
+        throw "valore non numerico '$s' in $Csv (atteso un numero con punto o virgola decimale, senza separatori delle migliaia)."
+    }
     $v
 }
 
