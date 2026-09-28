@@ -2,12 +2,23 @@
 # di una traccia Nsight Systems del motore qwen36. Tappa 0 di
 # docs/qwen36-deltanet-gpu-plan.md: quanto di ogni chiamata NON e' kernel.
 #
-# SI LANCIA DA cmd, dalla cartella c\, dopo
+# SI LANCIA DA cmd, dalla cartella c\, dopo due corse uguali (COLI_TIMERS=1),
+# la prima senza profiler, la seconda sotto Nsight:
+#     copy /Y heat.caldo.bin heat.bin      (se si usa HEAT_FILE=heat.bin)
+#     qwen36_clang.exe 256 4 prompt25.txt > s0-base.log 2>&1
+#     copy /Y heat.caldo.bin heat.bin      (il motore riscrive heat.bin all'uscita)
 #     nsys profile -t cuda ... -o s0 qwen36_clang.exe 256 4 prompt25.txt > s0-nsys.log 2>&1
 #     nsys stats --report cuda_gpu_trace --format csv --output s0 s0.nsys-rep
 # con UNA riga:
 #
-#     powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\nsys-dncalls.ps1 -Csv s0_cuda_gpu_trace.csv -Log s0-nsys.log [-BaseLog s0-base.log]
+#     powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\nsys-dncalls.ps1 -Csv s0_cuda_gpu_trace.csv -BaseLog s0-base.log
+#
+# Su Windows, con nsys 2026.3.2 e i suoi default, nsys NON scrive nella sua
+# uscita quella del programma che profila: s0-nsys.log contiene solo le righe di nsys (Collecting data...,
+# Generated ...), nessuna riga [timers] (28 settembre 2026; il 27 una
+# ricerca di 'step() total' nel log di nsys non aveva trovato nulla). Il log con i numeri del motore e' quindi quello della corsa senza
+# profiler, -BaseLog. -Log resta per un log della corsa profilata che abbia
+# davvero le righe [timers].
 #
 # COSA CERCA. Una chiamata densa (coli_cuda_matmul, pageable) e', sulla
 # timeline della GPU e sul suo stream: una copia Host-to-Device, UN kernel
@@ -33,15 +44,21 @@
 # Le chiamate con altre operazioni GPU dentro lo span (i caricamenti di
 # expert che il motore fa sullo stesso stream anche in decode) restano nelle
 # medie, come restano nella parete del motore, e vengono contate.
-# Con -Log (il log della corsa profilata, COLI_TIMERS=1): il tempo a parete
-# medio per chiamata dai timer dn-split del motore, e quanto ne resta fuori
-# dallo span e fuori dal kernel. Con -BaseLog (una corsa uguale ma NON
-# profilata, subito prima): lo stesso a parete senza il profiler, contro il
-# kernel della traccia. Lo script avvisa (ATTENZIONE) se in un log mancano
+# Con -BaseLog (una corsa uguale ma NON profilata, subito prima): il tempo a
+# parete medio per chiamata dai timer dn-split del motore, contro il kernel
+# e lo span della traccia, e quanto ne resta fuori dallo span e fuori dal
+# kernel. Con -Log (la corsa profilata, se il suo log ha le righe [timers]):
+# lo stesso con il profiler. Prima della tabella, un riepilogo per stream:
+# operazioni, kernel e i nomi dei kernel piu' frequenti (per vedere, per
+# esempio, se lo spin del keep-alive c'e'). Lo script avvisa (ATTENZIONE) se in un log mancano
 # il keep-alive o la tabella heat, se c'e' lo staging pinned, se i due log
 # non sono della stessa configurazione; salta il confronto se qualche
 # chiamata e' andata sulla CPU o se traccia e log non contano le stesse
-# chiamate. Senza -Log non controlla niente del motore.
+# chiamate. Il confronto dei conteggi si fa con ogni log passato: le due
+# corse hanno la stessa configurazione, e di solito lo stesso piazzamento;
+# non e' garantito (il piazzamento automatico dipende dalla VRAM libera e
+# dalla tabella heat), ed e' questo controllo a dirlo: se i conteggi non
+# tornano il confronto salta. Senza log non controlla niente del motore.
 #
 # LIMITI. I tempi della traccia sono della GPU; la parete e' del motore, una
 # media sulle chiamate di decode. "Fuori dallo span" comprende tra l'altro
@@ -142,7 +159,7 @@ foreach ($r in $rows) {
     if ($cDev) { $key = [string]$r.$cDev + "/" + $key }
     if ($cCtx) { $key = [string]$r.$cCtx + "/" + $key }
     if (-not $byStream.ContainsKey($key)) { $byStream[$key] = New-Object System.Collections.Generic.List[object] }
-    $byStream[$key].Add([pscustomobject]@{ S = $s; E = $s + $d; D = $d; B = $b; Kind = $kind; Dense = ($kind -eq "K" -and $name -like "*quant_matmul*") })
+    $byStream[$key].Add([pscustomobject]@{ S = $s; E = $s + $d; D = $d; B = $b; Kind = $kind; Dense = ($kind -eq "K" -and $name -like "*quant_matmul*"); Name = $(if ($kind -eq "K") { $name } else { $null }) })
     $nOps++
 }
 
@@ -244,7 +261,7 @@ function Read-Timers([string]$path) {
     }
     if ($t -match 'step\(\) total: ([0-9.]+) ms/token') { $o.Step = [double]::Parse($Matches[1], $inv) }
     foreach ($k in @("Tokens", "Qkvz", "NProj")) {
-        if ($null -eq $o[$k]) { throw "$path non contiene le righe [timers] decode / dn-split / dn-gpu: la corsa va fatta con COLI_TIMERS=1 e un motore con i timer dn-split (#58)." }
+        if ($null -eq $o[$k]) { throw "$path non contiene le righe [timers] decode / dn-split / dn-gpu. Su Windows il log di nsys non ha l'uscita del motore: passa il log della corsa SENZA profiler con -BaseLog. Altrimenti la corsa va fatta con COLI_TIMERS=1 e un motore con i timer dn-split (#58)." }
     }
     if ($o.Tokens -le 0 -or $o.NCalls -le 0) { throw "${path}: nessun token di decode o nessuna chiamata DeltaNet registrata." }
     [pscustomobject]$o
@@ -266,11 +283,10 @@ foreach ($tm in $logs) {
     }
     $comparable[$tm.Path] = $ok
 }
-if ($Log) {
-    $tm = $logs[0]
+foreach ($tm in $logs) {
     if ($tm.NProj -ne $dnproj.Count -or $tm.NOut -ne $dnout.Count) {
-        $warn.Add("${Log}: il motore conta dnproj $($tm.NProj) e dnout $($tm.NOut) sulla GPU, la traccia ha $($dnproj.Count) coppie: traccia e log non sono della stessa corsa, o qualche coppia non e' stata riconosciuta. Confronto con la corsa profilata saltato.")
-        $comparable[$Log] = $false
+        $warn.Add("$($tm.Path): il motore conta dnproj $($tm.NProj) e dnout $($tm.NOut) sulla GPU, la traccia ha $($dnproj.Count) coppie: traccia e log non vengono da corse con la stessa configurazione, o qualche coppia non e' stata riconosciuta. Confronto saltato.")
+        $comparable[$tm.Path] = $false
     }
 }
 if ($Log -and $BaseLog) {
@@ -285,8 +301,20 @@ if ($Log -and $BaseLog) {
 "chiamate dense (kernel quant_matmul*): forma P $nP, forma O $nO, altre $nX (lm_head, attnproj...)"
 "coppie dnproj -> dnout di decode: $($dnproj.Count) | forme P senza dnout dopo (prefill riga per riga, o dnout sulla CPU): $nLoneP | attnout: $nAttn"
 "chiamate con altre operazioni GPU dentro lo span (caricamenti di expert sullo stesso stream), incluse nelle medie: dnproj {0}, dnout {1}" -f @($dnproj | Where-Object { $_.Foreign -gt 0 }).Count, @($dnout | Where-Object { $_.Foreign -gt 0 }).Count
-if (-not $Log) { "(senza -Log non e' controllato niente del motore: keep-alive, tabella heat, chiamate sulla CPU)" }
+if (-not $logs.Count) { "(senza -BaseLog ne' -Log non e' controllato niente del motore: keep-alive, tabella heat, chiamate sulla CPU)" }
 foreach ($w in $warn) { "ATTENZIONE: $w" }
+# Riepilogo per stream: il keep-alive gira su uno stream suo, gli expert su
+# un altro, le chiamate dense sullo stream 0.
+foreach ($key in @($byStream.Keys | Sort-Object)) {
+    $st = $byStream[$key]
+    $ks = @($st | Where-Object { $_.Kind -eq "K" })
+    $top = @($ks | ForEach-Object {
+            $n = [string]$_.Name
+            if ($n -match '^(void )?([A-Za-z_][A-Za-z0-9_:]*)') { $n = $Matches[2] }
+            $n } | Group-Object | Sort-Object -Property Count -Descending | Select-Object -First 3 | ForEach-Object { "{0} x{1}" -f $_.Name, $_.Count })
+    "stream {0}: {1} operazioni, {2} kernel, {3} copie su, {4} copie giu | kernel piu' frequenti: {5}" -f $key, $st.Count, $ks.Count,
+        @($st | Where-Object { $_.Kind -eq "H" }).Count, @($st | Where-Object { $_.Kind -eq "D" }).Count, $(if ($top.Count) { $top -join ", " } else { "nessuno" })
+}
 if ($dnproj.Count -eq 0) {
     throw "nessuna coppia dnproj -> dnout di decode nella traccia: il motore non ha messo dnproj e dnout sulla GPU, oppure le forme non sono quelle di Qwen3.6-35B-A3B."
 }
