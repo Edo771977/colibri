@@ -19,8 +19,16 @@
 #
 # I BRACCI, entrambi senza tabella heat (HEAT_FILE fuori dall'ambiente),
 # oppure entrambi con la STESSA tabella se si passa -HeatFile:
-#   OFF   la variabile -Var rimossa dall'ambiente.
+#   OFF   la variabile -Var rimossa dall'ambiente, oppure impostata a
+#         -OffValue se lo si passa.
 #   ON    -Var impostata a -Value (default "1").
+#
+# -OffValue serve alle variabili il cui "spento" non e' l'assenza. Per
+# esempio COLI_DN_GPU: con 0 il motore offre e riserva sulla GPU lo stato
+# DeltaNet ma decodifica sulla CPU, quindi la VRAM occupata e il
+# piazzamento sono gli stessi del braccio ON e cambia solo il percorso:
+#
+#     ... -Var COLI_DN_GPU -OffValue 0 -Marker "[qwen36] DeltaNet decode on the GPU:"
 #
 # -HeatFile <tabella congelata>, per esempio heat.caldo.bin lasciata da
 # misure-heatfile.ps1: prima di OGNI run, di tutti e due i bracci, lo script
@@ -65,6 +73,8 @@ param(
     [string] $Prompt      = "prompt25.txt",
     [string] $Var         = "",
     [string] $Value       = "1",
+    # Valore del braccio OFF. Vuoto (default): -Var rimossa dall'ambiente.
+    [string] $OffValue    = "",
     [string] $Marker      = "",
     # Il file che deve contenere il testo di -Marker. Vuoto: l'eseguibile.
     [string] $MarkerFile  = "",
@@ -108,6 +118,10 @@ if ($ScriptOwned -contains $Var) {
     throw "-Var $Var e' una delle variabili che lo script imposta da se' ($($ScriptOwned -join ', ')): non si puo' misurare con questo script."
 }
 if (-not $Value) { throw "-Value e' vuoto: il braccio ON sarebbe una variabile vuota, che il motore puo' leggere come assente." }
+if ($OffValue -and $OffValue -ceq $Value) {
+    throw "-OffValue e -Value sono entrambi '$Value': i due bracci sarebbero identici."
+}
+$OffDesc = if ($OffValue) { "$Var=$OffValue" } else { "$Var assente" }
 if (-not $Marker.Trim()) { throw "-Marker e' vuoto: senza la riga di prova non si puo' verificare che il braccio ON sia diverso da OFF." }
 if ($NNew -lt 2) {
     throw "-NNew $NNew non e' valido: servono almeno 2 token generati perche' ci sia un passo di decode da misurare."
@@ -409,7 +423,7 @@ if ($HeatFile) {
 
 # Parametri, deroghe e impronta del prompt vanno nel record insieme ai numeri.
 # Nessun path entra in una stringa di formato.
-$ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps | OFF: $Var assente | ON: $Var=$Value | heat: $HeatDesc | snap=$Snap" +
+$ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps | OFF: $OffDesc | ON: $Var=$Value | heat: $HeatDesc | snap=$Snap" +
     ("  | prompt={0} sha256 {1}" -f $Prompt, $hPrompt.Substring(0,16)) +
     ("  | built={0}" -f $(if ($Built) { $Built } else { "(vuoto) -- PROVENIENZA NON VERIFICATA" })) +
     ("  | allow-env={0}" -f $(if ($AllowEnv.Count) { ($AllowEnv -join ",") + " -- DEROGA" } else { "nessuna" }))
@@ -437,6 +451,7 @@ function Invoke-Engine([bool]$On, [string]$PromptFile, [string]$Log) {
         Remove-Item Env:\HEAT_FILE -ErrorAction SilentlyContinue
     }
     if ($On) { Set-Item -LiteralPath "Env:\$Var" -Value $Value }
+    elseif ($OffValue) { Set-Item -LiteralPath "Env:\$Var" -Value $OffValue }
     else     { Remove-Item -LiteralPath "Env:\$Var" -ErrorAction SilentlyContinue }
 
     # Il log va RIMOSSO prima della chiamata: se il lancio fallisse, un log
@@ -628,7 +643,7 @@ function Invoke-Arm([string]$Tag, [int]$Rep) {
         throw "ON rip ${Rep}: la riga '$Marker' non e' in $log. $Var=$Value non ha avuto effetto: staresti misurando due volte il braccio OFF."
     }
     if ($Tag -eq "OFF" -and $hasMarker) {
-        throw "OFF rip ${Rep}: la riga '$Marker' e' in $log, eppure $Var era fuori dall'ambiente. Il braccio OFF e' contaminato."
+        throw "OFF rip ${Rep}: la riga '$Marker' e' in $log, eppure il braccio era $OffDesc. Il braccio OFF e' contaminato."
     }
     $row = Read-Run $e.Text $log
     # Uno stdout vuoto farebbe passare a vuoto il confronto sul testo in coda.

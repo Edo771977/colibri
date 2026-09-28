@@ -1,6 +1,6 @@
 # Qwen3.6 DeltaNet decode on the GPU — plan
 
-Status: **stage 0 done (measurement), no engine code yet.** Written 28 September 2026 from the
+Status: **stages 0-2 done; stage 3a (engine, opt-in `COLI_DN_GPU`) in review, not yet measured on the card.** Written 28 September 2026 from the
 measurements in `docs/experiments/qwen36-gpu-clocks-2026-09-27-raw.txt`
 (sections 5 and 8-10). Each stage below is a separate PR with its own tests
 and, where it touches ms/token, its own A/B. Estimates are marked as such.
@@ -225,6 +225,15 @@ mandatory symbol unloads the backend), and `qwen36_tier.h` gets the
 state upload/download round trips, and a failure injected through the
 backend's `fault_injected()` hook at each step.
 
+**First run (28 September 2026, RTX 4070 Ti SUPER, #66).** Both tests
+passed (one call: output 2e-5 tolerance; 64 calls: worst output 4.2e-6,
+final state 2.6e-7, tolerance 5e-5). Bench, 35B shape, 30 layers, 200
+tokens, keep-alive on: one decode call 120.4 us per layer, against 139.7
+us for today's two `coli_cuda_matmul` calls alone -- without the CPU work
+between them, about 114 us per layer by stage 0. Estimate, not measured in
+the engine: about 3.7-4 ms per token of the ~21, which stage 3's A/B has
+to confirm.
+
 ### Stage 3 — engine integration, opt-in
 
 In `c/qwen36.c` / `c/qwen36_tier.c`, behind `COLI_DN_GPU=1`, decode only:
@@ -293,6 +302,34 @@ Validation before merge:
 - Real model: `PPL=1` flag on vs off, and one `misure-envab.ps1` A/B
   (`COLI_DN_GPU` 0 vs 1, six pairs, heat table, keep-alive on in both arms
   via `-AllowEnv`).
+
+**Stage 3a as built (#67).** Where it departs from the text above:
+
+- **Three offers, not one unit.** `COLI_DN_GPU` set (0 or 1) adds a
+  `"dnstate"` offer per eligible layer (`qt_dn_state_bytes`), after the
+  other offers, and leaves the dnproj/dnout offers as they are. A layer
+  takes the new path only when all three landed on one device; otherwise
+  it keeps the two-call path, with a line. This keeps `COLI_PLACE` and the
+  `[place]` line unchanged and never costs a layer its existing GPU path;
+  the price is that on a tight card the placer may split a layer's three.
+- **A failed decode or download stops the run** (state zeroed, exit 3)
+  instead of failing the request: the plumbing for per-request failure
+  comes with the server in stage 3b. A failed state upload is still
+  recoverable -- the host copy is authoritative -- and sends that layer
+  back to the CPU with a line.
+- **SERVE=1 and DN_DBG ignore `COLI_DN_GPU=1`** with a line (stage 3b).
+  The segment adapter refuses to run with the path on.
+- The marker `[qwen36] DeltaNet decode on the GPU: N/M layers` prints only
+  with N > 0; with N = 0 a different line says the CPU path stays.
+  `misure-envab.ps1` has `-OffValue`, so the A/B is
+  `-Var COLI_DN_GPU -OffValue 0`.
+- Test: `c/tests/test_qwen36_dn_gpu.c`, on the fake backend (no GPU): the
+  fake device runs the CPU `deltanet()` on its own copy of the state, and a
+  sequence of prompts, decodes, pin snapshot and restore, prompt without
+  reset and resets must match the flag-off run byte for byte, with the
+  expected numbers of uploads and downloads; plus the refusals and the
+  failure paths. The tiny-model and real-model checks above are still to
+  run on the card.
 
 ### Stage 4 — only if stage 3's numbers say so
 

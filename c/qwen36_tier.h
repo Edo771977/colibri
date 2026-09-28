@@ -19,7 +19,22 @@
  * CPU-only with zero overhead. */
 #ifndef QWEN36_TIER_H
 #define QWEN36_TIER_H
+#include <stddef.h>
 #include <stdint.h>
+
+/* Bytes one DeltaNet GPU handle holds on its device (coli_cuda_deltanet_create
+ * in backend_cuda.cu): fourteen buffers, each rounded up to 64 floats. Keep
+ * the two in step: this is what the "dnstate" offer charges the expert
+ * budget, before any handle exists. */
+static inline size_t qt_dn_state_bytes(int H, int vh, int vk, int kdim, int vdim, int convk){
+    const size_t conv = (size_t)2 * vk * kdim + (size_t)vh * vdim, val = (size_t)vh * vdim;
+    const size_t n[14] = { (size_t)H, conv + val, (size_t)2 * vh * H, (size_t)vh, (size_t)vh,
+                           conv * convk, (size_t)vdim, conv * (convk - 1), (size_t)vh * kdim * vdim,
+                           (size_t)vh, (size_t)vh, conv, val, (size_t)H };
+    size_t t = 0;
+    for (int i = 0; i < 14; i++) t += (n[i] + 63) & ~(size_t)63;
+    return t * sizeof(float);
+}
 
 #ifdef COLI_CUDA
 
@@ -98,6 +113,22 @@ int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device, i
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 int  qt_dense_count(void);
 
+/* Qwen3.6 DeltaNet decode on the GPU, one call per layer (COLI_DN_GPU=1,
+ * docs/qwen36-deltanet-gpu-plan.md stage 3). The handle wraps
+ * coli_cuda_deltanet_*: it borrows the layer's placed dnproj (G_dnp) and
+ * dnout (qt_dense handle), which must sit on `device`, the device the
+ * layer's "dnstate" offer landed on. qt_dn_init returns 1 when the layer
+ * takes the path, 0 when it stays on today's (a line on stderr says why).
+ * The handles are freed first thing in qt_shutdown, before what they borrow. */
+int  qt_dn_init(int layer, int dnout_handle, int device,
+                int H, int vh, int vk, int kdim, int vdim, int convk, float eps,
+                const float *wab, const float *alog, const float *dtbias,
+                const float *wconv, const float *normw);
+int  qt_dn_ready(int layer);
+int  qt_dn_decode(int layer, const float *x, float *out);
+int  qt_dn_state_upload(int layer, const float *rec, const float *ring);
+int  qt_dn_state_download(int layer, float *rec, float *ring);
+
 /* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
  * block scales and do NOT all fit in RAM. cap may be smaller than n_experts;
  * the tier copies what it uploads inside the qt_note call and keeps no
@@ -165,6 +196,11 @@ static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return -1;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dn_init(int a,int b,int c,int d,int e,int f,int g,int h,int i,float j,const float*k,const float*l,const float*m,const float*n,const float*o){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;return 0;}
+static inline int  qt_dn_ready(int a){(void)a;return 0;}
+static inline int  qt_dn_decode(int a,const float*b,float*c){(void)a;(void)b;(void)c;return 0;}
+static inline int  qt_dn_state_upload(int a,const float*b,const float*c){(void)a;(void)b;(void)c;return 0;}
+static inline int  qt_dn_state_download(int a,float*b,float*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_dense_count(void){return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}

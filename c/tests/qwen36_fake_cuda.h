@@ -162,4 +162,73 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const vo
     return 1;
 }
 
+/* coli_cuda_deltanet_* (COLI_DN_GPU): the handle keeps its own state buffers,
+ * the fake "device", and checks what the real create checks. decode calls
+ * fake_dn_decode_hook: a test that includes qwen36.c points it at the
+ * engine's own CPU deltanet() run on those buffers, so a GPU-path decode is
+ * the CPU path on the device copy of the state and must match it byte for
+ * byte. NULL (the default) makes decode fail. fake_dn_fail_decode fails it
+ * without the hook, fake_dn_fail_upload fails state_upload. */
+struct ColiCudaDeltaNet {
+    int H, vh, vk, kdim, vdim, convk, device;
+    const float *wab;
+    float *rec, *ring; size_t nrec, nring;
+};
+static int fake_dn_creates, fake_dn_decodes, fake_dn_uploads, fake_dn_downloads, fake_dn_frees;
+static int fake_dn_fail_decode, fake_dn_fail_upload, fake_dn_absent;
+static int (*fake_dn_decode_hook)(ColiCudaDeltaNet *h, const float *x, float *out) = NULL;
+int coli_cuda_has_deltanet(void) { return !fake_dn_absent; }
+int coli_cuda_deltanet_create(ColiCudaDeltaNet **handle, ColiCudaTensor *dnproj, ColiCudaTensor *dnout,
+                              int H, int vh, int vk, int kdim, int vdim, int convk, float eps,
+                              const float *wab, const float *alog, const float *dtbias,
+                              const float *wconv, const float *normw) {
+    (void)eps;
+    if (!handle) return 0;
+    *handle = NULL;
+    const int conv_dim = 2 * vk * kdim + vh * vdim, value_dim = vh * vdim;
+    if (!dnproj || !dnout || dnproj->device != dnout->device) return 0;
+    if (dnproj->I != H || dnproj->O != conv_dim + value_dim || dnout->I != value_dim || dnout->O != H) return 0;
+    if (!wab || !alog || !dtbias || !wconv || !normw || vh % vk || convk < 2) return 0;
+    ColiCudaDeltaNet *h = (ColiCudaDeltaNet *)calloc(1, sizeof *h);
+    if (!h) return 0;
+    h->H = H; h->vh = vh; h->vk = vk; h->kdim = kdim; h->vdim = vdim; h->convk = convk;
+    h->device = dnproj->device; h->wab = wab;
+    h->nrec = (size_t)vh * kdim * vdim; h->nring = (size_t)conv_dim * (convk - 1);
+    h->rec = (float *)calloc(h->nrec, sizeof(float)); h->ring = (float *)calloc(h->nring, sizeof(float));
+    if (!h->rec || !h->ring) { free(h->rec); free(h->ring); free(h); return 0; }
+    fake_dn_creates++;
+    *handle = h;
+    return 1;
+}
+int coli_cuda_deltanet_decode(ColiCudaDeltaNet *h, const float *x, float *out) {
+    if (!h || fake_dn_fail_decode || !fake_dn_decode_hook) return 0;
+    fake_dn_decodes++;
+    return fake_dn_decode_hook(h, x, out);
+}
+int coli_cuda_deltanet_state_upload(ColiCudaDeltaNet *h, const float *rec, const float *ring) {
+    if (!h || !rec || !ring || fake_dn_fail_upload) return 0;
+    memcpy(h->rec, rec, h->nrec * sizeof(float)); memcpy(h->ring, ring, h->nring * sizeof(float));
+    fake_dn_uploads++;
+    return 1;
+}
+int coli_cuda_deltanet_state_download(ColiCudaDeltaNet *h, float *rec, float *ring) {
+    if (!h || !rec || !ring) return 0;
+    memcpy(rec, h->rec, h->nrec * sizeof(float)); memcpy(ring, h->ring, h->nring * sizeof(float));
+    fake_dn_downloads++;
+    return 1;
+}
+int coli_cuda_deltanet_state_zero(ColiCudaDeltaNet *h) {
+    if (!h) return 0;
+    memset(h->rec, 0, h->nrec * sizeof(float)); memset(h->ring, 0, h->nring * sizeof(float));
+    return 1;
+}
+size_t coli_cuda_deltanet_bytes(const ColiCudaDeltaNet *h) {
+    return h ? (h->nrec + h->nring) * sizeof(float) : 0;
+}
+void coli_cuda_deltanet_free(ColiCudaDeltaNet *h) {
+    if (!h) return;
+    free(h->rec); free(h->ring); free(h);
+    fake_dn_frees++;
+}
+
 #endif /* QWEN36_FAKE_CUDA_H */
