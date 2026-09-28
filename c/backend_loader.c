@@ -98,6 +98,17 @@ typedef int            (*fn_expert_group_issue_x)(ColiCudaTensor *const *gates,
                                                   const int *rows, int count,
                                                   const float *x, int x_rows);
 typedef const float *  (*fn_expert_group_take)(int device);
+typedef int            (*fn_deltanet_create)(ColiCudaDeltaNet **handle,
+                                             ColiCudaTensor *dnproj, ColiCudaTensor *dnout,
+                                             int H, int vh, int vk, int kdim, int vdim, int convk, float eps,
+                                             const float *wab, const float *alog, const float *dtbias,
+                                             const float *wconv, const float *normw);
+typedef int            (*fn_deltanet_decode)(ColiCudaDeltaNet *handle, const float *x, float *out);
+typedef int            (*fn_deltanet_state_upload)(ColiCudaDeltaNet *handle, const float *rec, const float *ring);
+typedef int            (*fn_deltanet_state_download)(ColiCudaDeltaNet *handle, float *rec, float *ring);
+typedef int            (*fn_deltanet_state_zero)(ColiCudaDeltaNet *handle);
+typedef size_t         (*fn_deltanet_bytes)(const ColiCudaDeltaNet *handle);
+typedef void           (*fn_deltanet_free)(ColiCudaDeltaNet *handle);
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
                                               int R, int V, int K, int T, float attention_scale);
@@ -183,6 +194,13 @@ static struct {
     fn_expert_group_issue expert_group_issue;
     fn_expert_group_issue_x expert_group_issue_x;
     fn_expert_group_take expert_group_take;
+    fn_deltanet_create deltanet_create;
+    fn_deltanet_decode deltanet_decode;
+    fn_deltanet_state_upload deltanet_state_upload;
+    fn_deltanet_state_download deltanet_state_download;
+    fn_deltanet_state_zero deltanet_state_zero;
+    fn_deltanet_bytes  deltanet_bytes;
+    fn_deltanet_free   deltanet_free;
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
@@ -1442,6 +1460,16 @@ static int coli_cuda_load(void){
      * duplicates as it always did when this resolves to NULL. */
     RESOLVE_OPT(expert_group_issue_x, fn_expert_group_issue_x)
     RESOLVE(expert_group_take, fn_expert_group_take)
+    /* Qwen3.6 DeltaNet decode, one call per layer (plan stage 2). Optional:
+     * a DLL built before it leaves these NULL, coli_cuda_has_deltanet() says
+     * no, and the engine keeps the two-call path it has today. */
+    RESOLVE_OPT(deltanet_create, fn_deltanet_create)
+    RESOLVE_OPT(deltanet_decode, fn_deltanet_decode)
+    RESOLVE_OPT(deltanet_state_upload, fn_deltanet_state_upload)
+    RESOLVE_OPT(deltanet_state_download, fn_deltanet_state_download)
+    RESOLVE_OPT(deltanet_state_zero, fn_deltanet_state_zero)
+    RESOLVE_OPT(deltanet_bytes, fn_deltanet_bytes)
+    RESOLVE_OPT(deltanet_free, fn_deltanet_free)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
@@ -1670,6 +1698,47 @@ int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
  * with a one-row buffer would have it read total*D floats off the end. */
 int coli_cuda_has_group_x_broadcast(void){
     return g_cuda.available && g_cuda.expert_group_issue_x != NULL;
+}
+
+/* All seven or none: a DLL with a partial set (impossible from this tree,
+ * but cheap to refuse) is treated as not having the path at all. */
+int coli_cuda_has_deltanet(void){
+    return g_cuda.available && g_cuda.deltanet_create && g_cuda.deltanet_decode &&
+           g_cuda.deltanet_state_upload && g_cuda.deltanet_state_download &&
+           g_cuda.deltanet_state_zero && g_cuda.deltanet_bytes && g_cuda.deltanet_free;
+}
+int coli_cuda_deltanet_create(ColiCudaDeltaNet **handle, ColiCudaTensor *dnproj, ColiCudaTensor *dnout,
+                              int H, int vh, int vk, int kdim, int vdim, int convk, float eps,
+                              const float *wab, const float *alog, const float *dtbias,
+                              const float *wconv, const float *normw){
+    if(handle) *handle=NULL;
+    if(!coli_cuda_has_deltanet()) return 0;
+    return g_cuda.deltanet_create(handle, dnproj, dnout, H, vh, vk, kdim, vdim, convk, eps,
+                                  wab, alog, dtbias, wconv, normw);
+}
+int coli_cuda_deltanet_decode(ColiCudaDeltaNet *handle, const float *x, float *out){
+    if(!coli_cuda_has_deltanet()) return 0;
+    return g_cuda.deltanet_decode(handle, x, out);
+}
+int coli_cuda_deltanet_state_upload(ColiCudaDeltaNet *handle, const float *rec, const float *ring){
+    if(!coli_cuda_has_deltanet()) return 0;
+    return g_cuda.deltanet_state_upload(handle, rec, ring);
+}
+int coli_cuda_deltanet_state_download(ColiCudaDeltaNet *handle, float *rec, float *ring){
+    if(!coli_cuda_has_deltanet()) return 0;
+    return g_cuda.deltanet_state_download(handle, rec, ring);
+}
+int coli_cuda_deltanet_state_zero(ColiCudaDeltaNet *handle){
+    if(!coli_cuda_has_deltanet()) return 0;
+    return g_cuda.deltanet_state_zero(handle);
+}
+size_t coli_cuda_deltanet_bytes(const ColiCudaDeltaNet *handle){
+    if(!coli_cuda_has_deltanet()) return 0;
+    return g_cuda.deltanet_bytes(handle);
+}
+void coli_cuda_deltanet_free(ColiCudaDeltaNet *handle){
+    if(!handle || !coli_cuda_has_deltanet()) return;
+    g_cuda.deltanet_free(handle);
 }
 
 const float *coli_cuda_expert_group_take(int device){

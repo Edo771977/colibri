@@ -21,6 +21,7 @@
 #include <vector>
 #include <atomic>
 #include <thread>
+#include <new>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -2698,6 +2699,175 @@ extern "C" void coli_cuda_dense_stats(int device, uint64_t *calls, uint64_t *wei
     if (d2h_ms)       *d2h_ms       = index < 0 ? g_dense_d2h_ms    : g_dev_dense_d2h_ms[index];
     if (wall_ms)      *wall_ms      = index < 0 ? g_dense_wall_ms   : g_dev_dense_wall_ms[index];
 }
+
+/* ---- Qwen3.6 DeltaNet decode, one call per layer ---------------------------
+ * docs/qwen36-deltanet-gpu-plan.md, stage 2. One decode token of one DeltaNet
+ * layer on the device: upload the normed input, the dnproj GEMV, the stage 1
+ * kernels (backend_cuda_deltanet.cuh), the dnout GEMV, download the output,
+ * one synchronize. Today the same layer is two coli_cuda_matmul round trips
+ * with the CPU work between them.
+ *
+ * The handle owns the layer's device state (the recurrent state and the conv
+ * ring, in the host's layouts), its small weights (a/b, conv, A_log,
+ * dt_bias, the norm) and its scratch, all in one allocation made at create:
+ * nothing is allocated per call (a cudaFree would wait for the keep-alive's
+ * spin). It BORROWS the two placed projections: the caller keeps them alive
+ * for as long as the handle, and frees the handle first.
+ *
+ * Everything runs on the legacy stream 0, like coli_cuda_matmul, so the
+ * GEMVs, the kernels and the copies are ordered by the stream alone.
+ *
+ * On a 0 from decode the state may or may not have advanced: the caller must
+ * upload or zero it before the next decode, or stop using the handle. Stage 3
+ * resets the recurrent state and fails the request (the plan's rule: never
+ * run the CPU on a half-advanced state).
+ *
+ * For stage 3: the handle's bytes (coli_cuda_deltanet_bytes, ~2.6 MB a layer
+ * on the 35B) are not in ctx->tensor_bytes, so the tier charges them to its
+ * own budget; and the handles go before the projections they borrow, before
+ * qt_shutdown frees G_dnp / G_dense and before coli_cuda_shutdown. The fault
+ * hook gates decode at entry only; a failure after the state kernels (the
+ * plan's "fault at each step") needs the hook extended, with stage 3. */
+#include "backend_cuda_deltanet.cuh"
+
+struct ColiCudaDeltaNet {
+    int device;
+    DnShape s;
+    ColiCudaTensor *proj, *out;     /* borrowed */
+    float *block; size_t bytes;     /* one cudaMalloc */
+    DnLayerDev d;
+    float *x, *y;                   /* [H] input and output staging on the device */
+};
+
+extern "C" int coli_cuda_deltanet_create(ColiCudaDeltaNet **handle,
+        ColiCudaTensor *dnproj, ColiCudaTensor *dnout,
+        int H, int vh, int vk, int kdim, int vdim, int convk, float eps,
+        const float *wab, const float *alog, const float *dtbias,
+        const float *wconv, const float *normw) {
+    if (!handle) return 0;
+    *handle = nullptr;
+    DnShape s = {H, vh, vk, kdim, vdim, convk, eps};
+    const char *why = dn_shape_check(&s);
+    if (!why && (!dnproj || !dnout)) why = "a projection is not placed";
+    if (!why && dnproj->device != dnout->device) why = "dnproj and dnout are on different devices";
+    const int conv_dim = why ? 0 : dn_conv_dim(&s), value_dim = why ? 0 : dn_value_dim(&s);
+    if (!why && (dnproj->I != H || dnproj->O != conv_dim + value_dim)) why = "dnproj's shape does not match";
+    if (!why && (dnout->I != value_dim || dnout->O != H)) why = "dnout's shape does not match";
+    if (!why && ((dnproj->fmt == 4 && dnproj->gs <= 0) || (dnout->fmt == 4 && dnout->gs <= 0)))
+        why = "a grouped projection without its group size";
+#ifdef COLI_ANS
+    if (!why && (dnproj->compressed || dnout->compressed)) why = "a compressed projection";
+#endif
+    if (!why && (!wab || !alog || !dtbias || !wconv || !normw)) why = "a weight is missing";
+    DeviceContext *ctx = why ? nullptr : find_ctx(dnproj->device);
+    if (!why && !select_ctx(ctx)) why = "the device has no context";
+    if (why) { std::fprintf(stderr, "[cuda] deltanet handle refused: %s\n", why); return 0; }
+
+    /* one block, every buffer at a 64-float (256-byte) boundary */
+    const size_t n[] = {
+        (size_t)H,                               /* x */
+        (size_t)conv_dim + value_dim,            /* qkvz */
+        (size_t)2 * vh * H,                      /* wab */
+        (size_t)vh, (size_t)vh,                  /* alog, dtbias */
+        (size_t)conv_dim * convk,                /* wconv */
+        (size_t)vdim,                            /* normw */
+        (size_t)conv_dim * (convk - 1),          /* ring */
+        (size_t)vh * kdim * vdim,                /* rec */
+        (size_t)vh, (size_t)vh,                  /* beta, g */
+        (size_t)conv_dim,                        /* conv_out */
+        (size_t)value_dim,                       /* outr */
+        (size_t)H,                               /* y */
+    };
+    const int nb = (int)(sizeof n / sizeof *n);
+    size_t off[sizeof n / sizeof *n], total = 0;
+    for (int i = 0; i < nb; i++) { off[i] = total; total += (n[i] + 63) & ~(size_t)63; }
+    ColiCudaDeltaNet *h = new (std::nothrow) ColiCudaDeltaNet();
+    if (!h) { std::fprintf(stderr, "[cuda] deltanet handle refused: out of host memory\n"); return 0; }
+    if (!cuda_ok(cudaMalloc(&h->block, total * sizeof(float)), "deltanet handle allocation")) { delete h; return 0; }
+    h->device = dnproj->device; h->s = s; h->proj = dnproj; h->out = dnout; h->bytes = total * sizeof(float);
+    float *b = h->block;
+    h->x = b + off[0];
+    float *qkvz = b + off[1], *dwab = b + off[2], *dalog = b + off[3], *ddt = b + off[4];
+    float *dconv = b + off[5], *dnorm = b + off[6];
+    h->d.x = h->x; h->d.qkvz = qkvz; h->d.wab = dwab; h->d.alog = dalog; h->d.dtbias = ddt;
+    h->d.wconv = dconv; h->d.normw = dnorm;
+    h->d.ring = b + off[7]; h->d.rec = b + off[8]; h->d.beta = b + off[9]; h->d.g = b + off[10];
+    h->d.conv_out = b + off[11]; h->d.outr = b + off[12];
+    h->y = b + off[13];
+    int ok = cuda_ok(cudaMemcpy(dwab, wab, n[2] * sizeof(float), cudaMemcpyHostToDevice), "deltanet a/b upload")
+          && cuda_ok(cudaMemcpy(dalog, alog, n[3] * sizeof(float), cudaMemcpyHostToDevice), "deltanet A_log upload")
+          && cuda_ok(cudaMemcpy(ddt, dtbias, n[4] * sizeof(float), cudaMemcpyHostToDevice), "deltanet dt_bias upload")
+          && cuda_ok(cudaMemcpy(dconv, wconv, n[5] * sizeof(float), cudaMemcpyHostToDevice), "deltanet conv upload")
+          && cuda_ok(cudaMemcpy(dnorm, normw, n[6] * sizeof(float), cudaMemcpyHostToDevice), "deltanet norm upload")
+          && cuda_ok(cudaMemsetAsync(h->d.ring, 0, n[7] * sizeof(float), 0), "deltanet ring zero")
+          && cuda_ok(cudaMemsetAsync(h->d.rec, 0, n[8] * sizeof(float), 0), "deltanet state zero")
+          && cuda_ok(cudaStreamSynchronize(0), "deltanet handle synchronize");
+    if (!ok) { keepalive_yield(); cudaFree(h->block); delete h; return 0; }
+    *handle = h;
+    return 1;
+}
+
+extern "C" int coli_cuda_deltanet_decode(ColiCudaDeltaNet *h, const float *x, float *out) {
+    keepalive_on_first_use();
+    if (fault_injected()) return 0;
+    if (!h || !x || !out) return 0;
+    if (!select_ctx(find_ctx(h->device))) return 0;
+    const DnShape *s = &h->s;
+    const size_t xb = (size_t)s->hidden * sizeof(float);
+    const ColiCudaTensor *p = h->proj, *o = h->out;
+    if (!cuda_ok(cudaMemcpyAsync(h->x, x, xb, cudaMemcpyHostToDevice, 0), "deltanet input upload")) return 0;
+    quant_matmul_launch((float *)h->d.qkvz, h->x, p->weights, p->scales, p->fmt, 1, p->I, p->O,
+                        row_bytes(p->fmt, p->I), p->gs, p->ng);
+    if (!cuda_ok(cudaGetLastError(), "deltanet dnproj launch")) return 0;
+    if (!cuda_ok(dn_decode_middle(0, s, &h->d), "deltanet kernels launch")) return 0;
+    quant_matmul_launch(h->y, h->d.outr, o->weights, o->scales, o->fmt, 1, o->I, o->O,
+                        row_bytes(o->fmt, o->I), o->gs, o->ng);
+    if (!cuda_ok(cudaGetLastError(), "deltanet dnout launch")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(out, h->y, xb, cudaMemcpyDeviceToHost, 0), "deltanet output download")) return 0;
+    return cuda_ok(cudaStreamSynchronize(0), "deltanet synchronize");
+}
+
+/* rec: [vh][kdim][vdim], ring: [conv_dim][convk-1], the host's layouts
+ * (qwen36.c's DN_rec / DN_conv). Synchronous. */
+extern "C" int coli_cuda_deltanet_state_upload(ColiCudaDeltaNet *h, const float *rec, const float *ring) {
+    if (!h || !rec || !ring || !select_ctx(find_ctx(h->device))) return 0;
+    const DnShape *s = &h->s;
+    return cuda_ok(cudaMemcpy(h->d.rec, rec, (size_t)s->vh * s->kdim * s->vdim * sizeof(float),
+                              cudaMemcpyHostToDevice), "deltanet state upload")
+        && cuda_ok(cudaMemcpy(h->d.ring, ring, (size_t)dn_conv_dim(s) * (s->convk - 1) * sizeof(float),
+                              cudaMemcpyHostToDevice), "deltanet ring upload");
+}
+extern "C" int coli_cuda_deltanet_state_download(ColiCudaDeltaNet *h, float *rec, float *ring) {
+    if (!h || !rec || !ring || !select_ctx(find_ctx(h->device))) return 0;
+    const DnShape *s = &h->s;
+    return cuda_ok(cudaMemcpy(rec, h->d.rec, (size_t)s->vh * s->kdim * s->vdim * sizeof(float),
+                              cudaMemcpyDeviceToHost), "deltanet state download")
+        && cuda_ok(cudaMemcpy(ring, h->d.ring, (size_t)dn_conv_dim(s) * (s->convk - 1) * sizeof(float),
+                              cudaMemcpyDeviceToHost), "deltanet ring download");
+}
+extern "C" int coli_cuda_deltanet_state_zero(ColiCudaDeltaNet *h) {
+    if (!h || !select_ctx(find_ctx(h->device))) return 0;
+    const DnShape *s = &h->s;
+    /* cudaMemsetAsync on stream 0, the handle's stream: the compat header maps
+     * it for HIP (not cudaMemset), and the synchronize waits for stream 0 only,
+     * not for the keep-alive's spin or the expert stream. */
+    return cuda_ok(cudaMemsetAsync(h->d.rec, 0, (size_t)s->vh * s->kdim * s->vdim * sizeof(float), 0), "deltanet state zero")
+        && cuda_ok(cudaMemsetAsync(h->d.ring, 0, (size_t)dn_conv_dim(s) * (s->convk - 1) * sizeof(float), 0), "deltanet ring zero")
+        && cuda_ok(cudaStreamSynchronize(0), "deltanet zero synchronize");
+}
+/* Bytes the handle holds on its device, for the caller's VRAM accounting. */
+extern "C" size_t coli_cuda_deltanet_bytes(const ColiCudaDeltaNet *h) { return h ? h->bytes : 0; }
+/* Yields to the keep-alive like coli_cuda_tensor_free. The borrowed
+ * projections are not touched. */
+extern "C" void coli_cuda_deltanet_free(ColiCudaDeltaNet *h) {
+    if (!h) return;
+    keepalive_yield();
+    if (select_ctx(find_ctx(h->device))) cudaFree(h->block);
+    delete h;
+}
+/* Linked directly (no CUDA_DLL), so the entry points are always present.
+ * backend_loader.c has the other definition, which asks the DLL. */
+extern "C" int coli_cuda_has_deltanet(void) { return 1; }
 
 /* MXFP4 matmul, stateless. Separate from coli_cuda_matmul on purpose: that one
  * takes scales as const float* and caches an uploaded tensor, while MXFP4

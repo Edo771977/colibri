@@ -852,7 +852,7 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu backend_cuda.h
+cuda-dll: backend_cuda.cu backend_cuda.h backend_cuda_deltanet.cuh
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
@@ -882,7 +882,7 @@ cuda-dll: backend_cuda.cu backend_cuda.h
 # survives. No path is hardcoded — see the HIP SDK contract above.
 #
 #   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
-hip-dll: backend_cuda.cu backend_cuda.h backend_gpu_compat.h
+hip-dll: backend_cuda.cu backend_cuda.h backend_gpu_compat.h backend_cuda_deltanet.cuh
 	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
 	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
 	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
@@ -901,7 +901,7 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h backend_cuda_deltanet.cuh backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -1024,7 +1024,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_group_bcast_arms_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_keepalive_cuda.cu backend_cuda_deltanet.cuh tests/test_qwen36_deltanet_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_group_bcast_arms_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_keepalive_cuda.cu backend_cuda_deltanet.cuh tests/qwen36_deltanet_ref.h tests/test_qwen36_deltanet_cuda.cu tests/test_qwen36_deltanet_decode_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
@@ -1055,6 +1055,11 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# for byte, 512 steps with a bounded error; 35B and tiny-fixture shapes.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_cuda.cu -o qwen36_deltanet_cuda_test$(EXE) $(GPU_TEST_LIBS)
 	./qwen36_deltanet_cuda_test$(EXE)
+	# The same kernels behind the backend entry point (plan stage 2):
+	# coli_cuda_deltanet_decode against the engine's chain on the CPU (int8
+	# dnproj, deltanet(), int8 dnout), state round trips, the fault hook.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_decode_cuda.cu -o qwen36_deltanet_decode_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./qwen36_deltanet_decode_test$(EXE)
 	# fmt=1 per-row int8 with R rows per block (COLI_CUDA_I8_ROWS): the
 	# contract is BITWISE identity with the original kernel, not a tolerance,
 	# on shapes covering a short last block, O < R, and a strided I tail.
@@ -1179,6 +1184,7 @@ gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_keepalive_cuda.cu -o cuda_keepalive_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/bench_dense_gemv_cuda.cu -o dense_gemv_bench$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_cuda.cu -o qwen36_deltanet_cuda_test$(EXE) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_decode_cuda.cu -o qwen36_deltanet_decode_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1208,13 +1214,21 @@ dense-gemv-bench: dense_gemv_bench$(EXE)
 # The DeltaNet decode kernels' own numbers (plan stage 1): the two kernels
 # per layer, back to back and with a synchronize per layer, over 30 layers
 # of state. Needs ~0.1 GB of VRAM. Not part of make check: it needs a GPU.
-qwen36_deltanet_cuda_test$(EXE): backend_cuda_deltanet.cuh backend_gpu_compat.h tests/test_qwen36_deltanet_cuda.cu
+qwen36_deltanet_cuda_test$(EXE): backend_cuda_deltanet.cuh backend_gpu_compat.h tests/qwen36_deltanet_ref.h tests/test_qwen36_deltanet_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_cuda.cu -o qwen36_deltanet_cuda_test$(EXE) $(GPU_TEST_LIBS)
-deltanet-cuda-test: qwen36_deltanet_cuda_test$(EXE)
+# Stage 2: the entry point (coli_cuda_deltanet_*), the whole backend compiled
+# in; --bench times one decode call per layer against today's two
+# coli_cuda_matmul calls, with the keep-alive on. ~1 GB of VRAM for the bench.
+qwen36_deltanet_decode_test$(EXE): backend_cuda.cu backend_cuda.h backend_cuda_deltanet.cuh backend_gpu_compat.h tests/qwen36_deltanet_ref.h tests/test_qwen36_deltanet_decode_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_decode_cuda.cu -o qwen36_deltanet_decode_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+deltanet-cuda-test: qwen36_deltanet_cuda_test$(EXE) qwen36_deltanet_decode_test$(EXE)
 	./qwen36_deltanet_cuda_test$(EXE)
-deltanet-cuda-bench: qwen36_deltanet_cuda_test$(EXE)
+	./qwen36_deltanet_decode_test$(EXE)
+deltanet-cuda-bench: qwen36_deltanet_cuda_test$(EXE) qwen36_deltanet_decode_test$(EXE)
 	./qwen36_deltanet_cuda_test$(EXE) --bench
+	./qwen36_deltanet_decode_test$(EXE) --bench
 
 # NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
 # hand it a define matching nothing and link a runtime it never calls -- a

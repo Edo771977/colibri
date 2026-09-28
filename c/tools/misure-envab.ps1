@@ -308,7 +308,7 @@ if ($MarkerFile) {
     }
     $mfFix  = "ricompila $MarkerFile (per coli_cuda.dll: make cuda-dll, dal prompt x64 Native Tools)"
     # Stessa guardia di staleness dell'eseguibile, per i sorgenti della DLL.
-    foreach ($src in @("backend_cuda.cu","backend_cuda.h","backend_gpu_compat.h")) {
+    foreach ($src in @("backend_cuda.cu","backend_cuda.h","backend_gpu_compat.h","backend_cuda_deltanet.cuh")) {
         if (-not (Test-Path -LiteralPath $src)) { throw "manca $src nella cartella di lavoro ($WorkDir): il controllo di staleness di $MarkerFile passerebbe a vuoto." }
         if ((Get-Item -LiteralPath $src).LastWriteTime -gt $mfItem.LastWriteTime) {
             throw "$src e' piu' recente di ${mfPath}: $mfFix, altrimenti misuri una DLL che non e' quella dell'albero."
