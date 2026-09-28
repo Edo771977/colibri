@@ -55,8 +55,8 @@ else. In order:
  10. 28 September, morning, main 3baa7da0 (the a/b matmuls fused into
      one call, #59): the text unchanged (4a000cc01f310b64); a+b reads
      0.66-0.72 ms/token against 0.80-1.03 the evening before (different
-     runs, not an A/B); the keep-alive a third time, -1.77, [-2.61,
-     -0.93], 6/6, the ON arm at 22.93 ms/token.
+     runs, not an A/B); the keep-alive with the heat table a third
+     time, -1.77, [-2.61, -0.93], 6/6, the ON arm at 22.93 ms/token.
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -680,13 +680,15 @@ main 3baa7da0 (#59: in_proj_b and in_proj_a in one buffer, one matmul).
 refused the DLL as older than its source; the operator rebuilt both, DLL
 first: coli_cuda.dll 759808 bytes, 2026-09-28 07:10:55, sha256 prefix
 C01A046FA26BDA6B; qwen36_clang.exe 375808 bytes, 07:10:58, sha256 prefix
-BE69679E694B1490. misure-envab.ps1, the same arguments as section 8
-(keep-alive, heat.caldo.bin in both arms, sidecar verified, loaded in all
-12 runs, unchanged), cap 256, bits 4, N_NEW=128, prompt25.txt. Banner,
+BE69679E694B1490. misure-envab.ps1; its stamp matches section 8's
+(keep-alive OFF absent / ON =1, heat.caldo.bin in both arms, sidecar
+verified, build conditions differing in the executable and the DLL,
+loaded in all 12 runs, unchanged), cap 256, bits 4, N_NEW=128,
+prompt25.txt. Banner,
 [place] and residency (6859/10240) identical in all 12 runs; the text
 identical within and between the arms, 4a000cc01f310b64, the same hash
 as before the change; 8.0 LFRU swaps per run in both arms; miss(CPU)
-6240 OFF, 6240/6241 ON. Clocks not logged.
+6240 OFF, 6240/6241 ON. No clock log was pasted.
 
   delta appaiati (ON - OFF), ms/token
   -0.90   -1.60   -1.60   -3.30   -1.60   -1.60
@@ -708,20 +710,27 @@ as before the change; 8.0 LFRU swaps per run in both arms; miss(CPU)
   OFF          3.37   0.72   0.13   2.02
   ON           2.81   0.66   0.13   1.79
 
-Recomputed: mean -1.767, sd 0.802, se 0.327, half-width 0.842.
+Recomputed: mean -1.767, sd 0.802, se 0.327, half-width 0.841. The
+order split, 0.80, is the size of the sd, with the -3.30 pair in the
+ON-first group.
 
-The text hash is the end-to-end check on the real model that the fused
-a/b matmul changed no result. a+b reads 0.66-0.72 ms/token, against
-0.80-1.03 in section 9's four arms. Those are other runs on another day,
-so the ~0.1-0.3 difference is not a measured effect; it is smaller than
-the ~0.4-0.5 expected when the change was proposed, which suggests the
-cost of those matmuls is mostly their arithmetic (a serial 2048-term
-reduction per row), not the OpenMP region.
+The generated text on this prompt is unchanged: the end-to-end check to
+go with the byte-level test of #59 (c/tests/test_qwen36_dn_ba.c). a+b
+reads 0.66-0.72 ms/token, ~22-24 us per layer for the one fused call,
+against 0.80-1.03 in section 9's four arms (~13-17 us per call, two per
+layer). Those are other runs on another day, and the difference, 0.08-
+0.37 depending on the pairing, is within the drift section 9 shows for
+this timer in one configuration (9a ON 0.80 against 9b OFF 1.03), so it
+does not separate the OpenMP region's cost from the rest (the
+arithmetic, a serial 2048-term reduction per row, and the reads of the
+f32 weights). The upper bound when the change was proposed, had the
+whole cost been the region, was about half of 0.80-1.03.
 
 The keep-alive's third repetition with the heat table: with section 8
 (-2.37, [-3.76, -0.98]) and 9a (-0.57, [-4.46, +3.33], one outlier run),
 two of three runs exclude zero and all point the same way. The ON arm,
-22.93 ms/token, is the fastest configuration measured in this record.
+22.93 ms/token, is the lowest arm mean in this record (section 8's ON
+arm: 23.30, another day and other binaries, not an A/B).
 
 --- what this means ----------------------------------------------------------
 
@@ -781,7 +790,8 @@ Control Panel settings not helping.
   - The per-call breakdown of section 2 without the profiler, and whether
     P3 also slows the small h2d/d2h copies.
   - The power and thermal cost of running locked.
-  - Any replication in another session or after a reboot.
+  - Replication after a reboot, and of sections 1-6 in another
+    session (section 10 repeats only the keep-alive, the next morning).
   - The heat table in sections 1-7: every run there is without one.
   - The generated text in sections 2 to 6 (no guard script compared it).
   - The expert kernels' own slowdown in P3: the graph path records no
