@@ -156,8 +156,8 @@ the two calls of a layer the stream has no operation for a median 127.5
 us (profiled), which holds the CPU part of deltanet, ~114 us a layer by
 the timers of one run, plus the host ends of the two calls. Most of the
 gain is that CPU work moving to the device, and most of that work is
-l2norm + recurrence (2.0 of 3.43 ms/token): the fused recurrence-and-
-norm kernel matters most. Re-estimated with that run's deltanet, 7.32
+l2norm + recurrence (2.0 of 3.43 ms/token, one timer for both): the
+recurrence and l2norm kernels matter most. Re-estimated with that run's deltanet, 7.32
 ms/token (~244 us a layer): ~100-125 us a layer, a gain of roughly
 3.5-4.3 ms/token (an estimate; against section 10's 7.83 it would be
 ~4.1-4.8). On Windows the nsys log does not carry the engine's output;

@@ -777,23 +777,25 @@ Two findings about the tools:
   - nsys on Windows does not write the profiled program's output to its
     own: s0-nsys.log holds only nsys's lines ("Collecting data...",
     "Generated: ...s0.nsys-rep"). On 27 September the operator's
-    Select-String for "step() total" and "lm_head" on section 5's nsys
-    log (nsys-run.log) printed nothing either; that was pasted in the
-    session and is not quoted in section 5. So the
+    Select-String -SimpleMatch for 'step() total', 'lm_head ', 'error'
+    and 'Error' on section 5's nsys log (nsys-run.log) printed nothing
+    either: the operator's paste in that session shows the command
+    followed directly by the next prompt. Section 5 does not quote it. So the
     engine's timers exist only for the unprofiled run, and the script
     compares the trace with that run (-BaseLog), not with the profiled
     one.
   - nsys stats writes "Bytes (MB)" with the Windows locale's decimal
-    comma: the script's first attempt, on the first run's trace, stopped on
+    comma: the script's first attempt (commit 7c6f6105), on the first
+    run's trace by the file times, stopped on
     "508,559", lm_head's int8 upload (248320 x 2048 bytes = 508.559 MB).
     The script reads it since #62.
 
 The unprofiled run (the script's line): 127 decode tokens, step() 21.2
 ms/token, keep-alive active, heat table loaded; dn-gpu n = N for both
 projections (the script, as of 2fb4303d, prints the per-call wall only
-then). N itself was not pasted for this run, and with -BaseLog alone
-that script did not compare it with the trace's 3810 pairs; the first
-run's log read 3810/3810. The tail of the first run's unprofiled log, pasted, read
+then), and N = 3810: the script's "30 layer DeltaNet per token" is
+N / 127. With -BaseLog alone that script did not compare N with the
+trace's pairs; they are equal, 3810. The tail of the first run's unprofiled log, pasted, read
 step() 22.2 ms/token and
 
   dn-sub       proj 3.2 | conv 0.5 | l2n+rec 2.0 | norm+out 1.6
