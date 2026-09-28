@@ -1,8 +1,9 @@
 Qwen3.6-35B-A3B on the CUDA tier: where the dense GEMV time goes, and the
 GPU power states behind it.
 27 September 2026, on the operator's machine: one session (sections
-1-7), three evening runs (sections 8 and 9), and one run the next
-morning (section 10).
+1-7), three evening runs (sections 8 and 9), one run the next morning
+(section 10), and that afternoon the Nsight run of the DeltaNet GPU
+plan's stage 0 (section 11).
 
 The session started as an A/B of one CPU-side change and ended somewhere
 else. In order:
@@ -57,6 +58,15 @@ else. In order:
      0.66-0.72 ms/token against 0.80-1.03 the evening before (different
      runs, not an A/B); the keep-alive with the heat table a third
      time, -1.77, [-2.61, -0.93], 6/6, the ON arm at 22.93 ms/token.
+ 11. 28 September, afternoon, main 2fb4303d: stage 0 of
+     docs/qwen36-deltanet-gpu-plan.md, one unprofiled and one profiled
+     run with the keep-alive and the heat table, read with
+     c/tools/nsys-dncalls.ps1. Per deltanet GPU call, wall minus kernel
+     is 34.6 us for dnproj and 29.6 for dnout, 1.9 ms/token over the 30
+     layers: at the low end of the ~30-60 us the plan assumed. The
+     kernels ran at their benchmark time (dnproj median 42.8 us, min
+     42.2). Between the two calls of a layer the stream is idle for a
+     median 127.5 us, the CPU part of deltanet.
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -734,6 +744,123 @@ two of three runs exclude zero and all point the same way. The ON arm,
 22.93 ms/token, is the lowest arm mean in this record (section 8's ON
 arm: 23.30, another day and other binaries, not an A/B).
 
+--- 11. 28 September, afternoon: stage 0, the deltanet GPU calls under Nsight -
+
+Stage 0 of docs/qwen36-deltanet-gpu-plan.md. main 2fb4303d (#60-#62:
+the plan, c/tools/nsys-dncalls.ps1 and its fixes; no engine or DLL
+change since section 10). The binaries were not rebuilt after section
+10; their hashes were not re-read. A fresh cmd window, from c\:
+
+  set PATH=C:\msys64\clang64\bin;%PATH%
+  SNAP=C:\modelli\qwen36_i4_gs64, COLI_CUDA=1, COLI_GPUS=0, COLI_TIMERS=1,
+  N_NEW=128, COLI_CUDA_KEEPALIVE=1, HEAT_FILE=heat.bin
+  copy /Y heat.caldo.bin heat.bin
+  qwen36_clang.exe 256 4 prompt25.txt > s0-base.log 2>&1
+  copy /Y heat.caldo.bin heat.bin
+  nsys profile -t cuda --sample=none --cpuctxsw=none -o s0 ... (same
+      command) > s0-nsys.log 2>&1
+  nsys stats --report cuda_gpu_trace --format csv --output s0 s0.nsys-rep
+  nsys-dncalls.ps1 -Csv s0_cuda_gpu_trace.csv -BaseLog s0-base.log
+
+Nsight Systems 2026.3.2. No guard script checked the environment, so
+what else the window had set is not known. The block ran twice. The
+first time (s0-base.log at 14:52), its profiled log was overwritten at
+15:36 by another command (the file then held a cmd error line), so that
+trace was not used. The second time, every
+s0* file was deleted first. The numbers below are from the second
+run's trace and its unprofiled log, which the operator pasted as the
+script's output only.
+
+Two findings about the tools:
+  - nsys on Windows does not write the profiled program's output to its
+    own: s0-nsys.log holds only nsys's lines ("Collecting data...",
+    "Generated: ...s0.nsys-rep"). The same happened on 27 September
+    (section 5's Select-String on nsys-run.log printed nothing). So the
+    engine's timers exist only for the unprofiled run, and the script
+    compares the trace with that run (-BaseLog), not with the profiled
+    one.
+  - nsys stats writes "Bytes (MB)" with the Windows locale's decimal
+    comma ("508,559" is lm_head's int8 upload, 248320 x 2048 bytes); the
+    script reads it since #62.
+
+The unprofiled run (the script's line): 127 decode tokens, step() 21.2
+ms/token, keep-alive active, heat table loaded; dn-gpu 3810/3810 for
+both projections (the script compares its per-call wall only when n = N
+and the trace's pairs match; it did). The first run's unprofiled log,
+pasted in full, read step() 22.2 ms/token and
+
+  dn-sub       proj 3.2 | conv 0.5 | l2n+rec 2.0 | norm+out 1.6
+  dn-split     qkvz 2.44 | a+b 0.80 | norm 0.13 | out 1.43
+  deltanet 7.32 ms/token; qtier cpu-miss 4.33; VRAM hit rate 87.2 %
+
+One run each, another hour than section 10: not an A/B with it.
+
+The trace: 97565 GPU operations on 2 streams; 4560 dnproj-shaped calls
+(8 KiB up, 48 KiB down), of which 3810 are followed by a dnout (the
+decode) and 750 are not (the prefill, 25 rows x 30 layers, one call per
+row); 1270 attnout. 3 dnproj and 4 dnout calls had another operation
+(an expert upload) inside their span. Microseconds, profiled:
+
+                                 n    mean  median   p10    p90    min
+  dnproj  H2D                 3810     1.0     1.0    0.9    1.1    0.8
+          H2D -> kernel       3810    16.0    12.4   10.0   21.9    1.2
+          kernel              3810    44.0    42.8   42.5   43.4   42.2
+          kernel -> D2H       3810     2.2     1.8    1.2    2.3    1.0
+          D2H                 3810     3.6     3.7    3.2    3.8    2.6
+          span                3810    66.8    61.7   59.2   72.4   49.3
+  dnout   H2D                 3810     1.4     1.3    1.3    1.6    1.2
+          H2D -> kernel       3810    12.2    10.4    1.6   18.5    1.1
+          kernel              3810    16.1    15.8   15.6   16.1   15.4
+          kernel -> D2H       3810     2.8     1.9    1.2    2.4    1.1
+          D2H                 3810     2.0     2.1    1.7    2.2    1.0
+          span                3810    34.6    31.8   22.3   40.9   20.9
+  pause, end of dnproj -> start of dnout
+                              3810   137.0   127.5  111.3  158.2   98.8
+
+Against the unprofiled run's dn-split wall per call (means):
+
+                 wall    span   kernel   wall - span   wall - kernel
+  dnproj         78.7    66.8     44.0          11.8            34.6
+  dnout          45.7    34.6     16.1          11.0            29.6
+
+  wall - kernel over 30 layers: 1.9 ms/token
+
+Reading it:
+  - The kernels ran at P2 speed throughout: dnproj's median is 0.6 us
+    above its minimum and its p90 1.2 us above, against section 5's
+    median at twice the minimum without the keep-alive. No clock log
+    was taken.
+  - wall - kernel is the number stage 0 asked for. The kernel durations
+    come from the profiled run and the wall from the unprofiled one;
+    that GPU-side kernel time is the same in both is assumed. The span
+    and the gaps inside it are profiled, and the profiler lengthens API
+    calls, so the split of wall - kernel between "inside the span" and
+    "outside" is approximate; the total is not affected by that.
+  - The largest non-kernel piece inside the span is the gap between the
+    upload and the kernel (median 12.4 and 10.4 us): the synchronous
+    pageable copy returning to the host and the launch that follows.
+  - The pause between the two calls of a layer, median 127.5 us, is the
+    CPU part of deltanet plus the host tail of dnproj and head of dnout,
+    profiled. The first run's timers put the CPU part at ~114 us a layer
+    (a+b 0.80 + conv 0.5 + l2n+rec 2.0 + norm 0.13 = 3.43 ms/token over
+    30 layers).
+  - The trace shows 2 streams where 3 were expected: the default stream
+    of the dense calls, the expert stream (ctx->stream) and the
+    keep-alive's own (keepalive_spin, c/backend_cuda.cu:1827-1905). Which
+    two they are was not read; the script prints a per-stream summary
+    since this PR. The P2 kernel times say the card did not drop; that
+    the keep-alive ran in the profiled run is not shown by this trace.
+
+For the plan: the non-kernel share per call is at the low end of the
+assumed range, not well below it, so stage 1 goes ahead. Most of what
+the single-call path would save is the ~114 us of CPU work per layer,
+not the round trip (one of the two ~30 us round trips remains). The
+estimate with these numbers, per layer: one round trip ~30-35 us, the
+two GEMV kernels ~60, the new small kernels unknown (~10-30 us with
+their launches, a guess): ~100-125 us against ~244 today (7.32 ms/token
+/ 30), a gain of roughly 3.5-4.3 ms/token (an estimate, inside the
+plan's 2.7-4.5).
+
 --- what this means ----------------------------------------------------------
 
 On this machine, in every decode that was logged, the card holds P2 for a
@@ -802,10 +929,9 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
-  - Clocks in sections 8 to 10, and how each deltanet GPU call splits
-    between round trip and kernel (section 9's dn-split separates the
-    a/b matmuls and the norm from the two calls; the rest still rests
-    on section 5's durations).
+  - Clocks in sections 8 to 11. How each deltanet GPU call splits
+    between round trip and kernel is measured in section 11, once, with
+    the kernel from a profiled run and the wall from an unprofiled one.
   - Clocks in the keep-alive's second and third runs: that the final
     version, with its 50 ms pauses on frees, holds P2 is inferred from
     its step() times, not logged.

@@ -1,6 +1,6 @@
 # Qwen3.6 DeltaNet decode on the GPU — plan
 
-Status: **proposal, no code yet.** Written 28 September 2026 from the
+Status: **stage 0 done (measurement), no engine code yet.** Written 28 September 2026 from the
 measurements in `docs/experiments/qwen36-gpu-clocks-2026-09-27-raw.txt`
 (sections 5 and 8-10). Each stage below is a separate PR with its own tests
 and, where it touches ms/token, its own A/B. Estimates are marked as such.
@@ -146,6 +146,19 @@ by size (8 KiB up, 48 KiB down for dnproj; 16 KiB up, 8 KiB down for dnout),
 and the host-side gaps between them. If the non-kernel share per call is
 well below ~30 us, the gain above shrinks and this plan is reconsidered
 before stage 1.
+
+**Result (28 September 2026, record section 11).** Wall minus kernel per
+call is 34.6 us for dnproj and 29.6 for dnout (unprofiled wall, profiled
+kernel), 1.9 ms/token over the 30 layers: at the low end of the range,
+not well below it, so stage 1 goes ahead. The kernels ran at their
+benchmark time (dnproj median 42.8 us). The stream is idle for a median
+127.5 us between the two calls of a layer, and the CPU part of deltanet
+is ~114 us a layer by the timers: most of the gain is that CPU work
+moving to the device, not the round trip, so the recurrence and norm
+kernels matter most. Re-estimated: ~100-125 us a layer against ~244, a
+gain of roughly 3.5-4.3 ms/token (an estimate). On Windows the nsys log
+does not carry the engine's output; the per-call wall comes from an
+unprofiled run of the same configuration.
 
 ### Stage 1 — kernels and their tests (no engine change)
 
