@@ -23,9 +23,10 @@
  * Two launches per layer. The first version had three (a separate kernel
  * for a, b and the gates) and gave each value column of the state to one
  * thread: 32 blocks of 128 threads on the 35B, 29 us per layer for the
- * recurrence alone, and ~6-7 us for each small kernel, which on the
- * reference Windows machine is about what a launch costs (record: stage 1
- * bench). Now the gates live in dn_head, whose blocks are already one per
+ * recurrence alone, and ~6-7 us for each small kernel, whose work is tiny:
+ * most likely the cost of a launch on the reference Windows machine, not
+ * measured then (docs/qwen36-deltanet-gpu-plan.md, stage 1, first run; the
+ * test's bench now has an empty kernel for it). Now the gates live in dn_head, whose blocks are already one per
  * head, and each column's key rows are split across DN_SPLIT threads.
  *
  * The CPU reference is deltanet() in qwen36.c. Where the order is the CPU's:
@@ -79,13 +80,16 @@ static inline size_t dn_head_smem(const DnShape *s) {
 }
 
 /* NULL when the shape is supported, else why not. */
+/* The plan's stage 1 named four kernels (dn_ab_gates, dn_conv_silu,
+ * dn_l2norm_rep, dn_recurrence_norm); here they are two: dn_conv_silu, and
+ * dn_head for the other three. */
 static inline const char *dn_shape_check(const DnShape *s) {
     if (!s) return "no shape";
     if (s->hidden <= 0 || s->vh <= 0 || s->vk <= 0 || s->kdim <= 0 || s->vdim <= 0)
         return "a dimension is not positive";
     if (s->vh % s->vk) return "value heads are not a multiple of key heads";
     if (s->convk < 2) return "conv kernel narrower than 2";
-    if (s->vdim > 1024) return "value head dim above 1024 (one thread per value column)";
+    if (s->vdim > 1024) return "value head dim above 1024 (at least one thread per value column)";
     if (dn_head_smem(s) > 48 * 1024) return "q, k, the partial sums and the reduction scratch exceed 48 KiB of shared memory";
     return NULL;
 }

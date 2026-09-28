@@ -194,12 +194,15 @@ passed on all five shapes: errors 1e-7 to 2.5e-6 against the CPU copy, the
 repeat byte for byte, no growth over 512 steps. The bench, 35B shape, 30
 layers of state: 38.2 us per layer back to back, 48.7 with a synchronize
 after each layer; alone, dn_ab_gates 7.35, dn_conv_silu 6.26 and
-dn_rec_norm 29.0 us. The two small kernels cost about what a launch costs
-on that machine, and the recurrence, one thread per state column, used 32
-blocks of 128 threads. So the gates moved into the recurrence kernel (one
-launch less per layer) and each column's key rows were split across four
-threads (dn_head); the tolerances were tightened to 2e-6 - 2e-5 from these
-numbers.
+dn_rec_norm 29.0 us. The two small kernels do almost no work, so their
+time is most likely the launch cost on that machine (not measured; the
+bench now has an empty kernel for it), and the recurrence, one thread per
+state column, used 32 blocks of 128 threads. So the gates moved into the
+recurrence kernel (one launch less per layer) and each column's key rows
+were split across four threads (dn_head, #65: the plan's four kernels are
+now dn_conv_silu and dn_head). The tolerances were tightened to 2e-6 -
+2e-5 from the first run's errors, which are the old kernels'; dn_head sums
+in another order and is checked by its own first run.
 
 ### Stage 2 — one backend entry point per layer
 

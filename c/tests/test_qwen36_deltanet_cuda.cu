@@ -27,10 +27,12 @@
  *      steps 128-255, on the mean error per window (the decay makes the
  *      recurrence contractive; an error that grows means it is not carried
  *      the same way). An emulation of the kernels' arithmetic on the host
- *      (not the device expf) gave errors of 1e-7 to 2e-6, and so did the
- *      first run on an RTX 4070 Ti SUPER (1e-7 to 2.5e-6, three kernels,
- *      one thread per state column): the bounds, 2e-6 to 2e-5, leave a
- *      margin of 4 to 20 over those.
+ *      (not the device expf) gave errors of 1e-7 to 2e-6; the first run on
+ *      an RTX 4070 Ti SUPER, with the earlier three kernels (one thread per
+ *      state column), measured 1e-7 to 2.5e-6. The bounds, 2e-6 to 2e-5,
+ *      are 8 to 38 times those errors (g, unchanged at 1e-5, about 5).
+ *      dn_head sums in another order and has not run yet when these were
+ *      set.
  * The errors are printed, so the tolerances can be tightened with data.
  *
  * --bench: the 35B shape, 30 layers of state (60 MiB, more than the 48 MB
@@ -330,6 +332,7 @@ static void bench(void) {
            1000.0 * ms / (TOK * NL), ms / TOK);
     const int conv_dim = dn_conv_dim(&s), key_dim_tot = s.vk * s.kdim;
     for (int which = 0; which < 3; which++) {
+        if (which == 2) { dn_bench_empty<<<1, 32>>>(); CK(cudaDeviceSynchronize()); }   /* loaded before timing */
         CK(cudaEventRecord(e0));
         for (int t = 0; t < TOK; t++) for (int l = 0; l < NL; l++) {
             const DnLayerDev &d = vs[l];
