@@ -1,7 +1,8 @@
 Qwen3.6-35B-A3B on the CUDA tier: where the dense GEMV time goes, and the
 GPU power states behind it.
 27 September 2026, on the operator's machine: one session (sections
-1-7) and three evening runs (sections 8 and 9).
+1-7), three evening runs (sections 8 and 9), and one run the next
+morning (section 10).
 
 The session started as an A/B of one CPU-side change and ended somewhere
 else. In order:
@@ -51,6 +52,11 @@ else. In order:
      resolution; clocks not logged). dn-split puts 0.80-1.03 ms/token in
      the two tiny a/b matmuls, and an estimated ~30-60 us of non-kernel
      time on each of deltanet's 60 GPU calls per token.
+ 10. 28 September, morning, main 3baa7da0 (the a/b matmuls fused into
+     one call, #59): the text unchanged (4a000cc01f310b64); a+b reads
+     0.66-0.72 ms/token against 0.80-1.03 the evening before (different
+     runs, not an A/B); the keep-alive with the heat table a third
+     time, -1.77, [-2.61, -0.93], 6/6, the ON arm at 22.93 ms/token.
 
 The engine half of COLI_DENSE_IDOT (item 1) was reverted in 30aa0789:
 main does not have the variable.
@@ -59,7 +65,7 @@ Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
 evidence.sha256 exists for them.
 
-The next section describes sections 1 to 6. Sections 7 to 9 rebuilt the
+The next section describes sections 1 to 6. Sections 7 to 10 rebuilt the
 DLL and/or the engine and ran under misure-envab.ps1; their builds and
 hashes are given there.
 
@@ -667,6 +673,67 @@ of that is the start and join of the OpenMP region and how much the
 arithmetic (a serial 2048-term reduction per row, no -ffast-math) is
 not separated by the timer. The gated RMSNorm is 0.13-0.15 ms/token.
 
+--- 10. 28 September, morning: the fused a/b matmul, and the keep-alive -----
+
+main 3baa7da0 (#59: in_proj_b and in_proj_a in one buffer, one matmul).
+#59 also changed comments in c/backend_cuda.cu, so misure-envab.ps1 first
+refused the DLL as older than its source; the operator rebuilt both, DLL
+first: coli_cuda.dll 759808 bytes, 2026-09-28 07:10:55, sha256 prefix
+C01A046FA26BDA6B; qwen36_clang.exe 375808 bytes, 07:10:58, sha256 prefix
+BE69679E694B1490. misure-envab.ps1; the conditions it stamps match
+section 8's: the keep-alive absent in OFF and =1 in ON; heat.caldo.bin
+in both arms, loaded in all 12 runs and unchanged; its sidecar verified,
+with only the executable and the DLL differing from the build
+conditions; cap 256, bits 4, N_NEW=128, prompt25.txt. Banner,
+[place] and residency (6859/10240) identical in all 12 runs; the text
+identical within and between the arms, 4a000cc01f310b64, the same hash
+as before the change; 8.0 LFRU swaps per run in both arms; miss(CPU)
+6240 OFF, 6240/6241 ON. No clock log was pasted.
+
+  delta appaiati (ON - OFF), ms/token
+  -0.90   -1.60   -1.60   -3.30   -1.60   -1.60
+  media    -1.77   sd  0.80   se  0.33   df 5
+  intervallo 95 %:  [-2.61 ; -0.93]   ampiezza +-0.84
+  negativi 6/6
+  OFF prima:  -0.90  -1.60  -1.60
+  ON prima:   -1.60  -3.30  -1.60
+  differenza fra le medie dei due gruppi: 0.80 ms/token
+
+  OFF step 24.70, moe 11.37, attn 2.29, dn 8.65, head 1.34, cpu-miss 4.19
+  ON  step 22.93, moe 10.92, attn 2.07, dn 7.83, head 1.05, cpu-miss 4.14
+
+  dn-sub       proj   conv   l2n+rec   norm+out
+  OFF          4.10   0.45   1.93      2.17
+  ON           3.47   0.43   2.00      1.92
+
+  dn-split     qkvz   a+b    norm   out    (dn-gpu 3810/3810 both)
+  OFF          3.37   0.72   0.13   2.02
+  ON           2.81   0.66   0.13   1.79
+
+Recomputed: mean -1.767, sd 0.802, se 0.327, half-width 0.841. The
+order split, 0.80, is the size of the sd, with the -3.30 pair in the
+ON-first group.
+
+The generated text on this prompt is unchanged: the end-to-end check to
+go with the byte-level test of #59 (c/tests/test_qwen36_dn_ba.c). a+b
+reads 0.66-0.72 ms/token, ~22-24 us per layer for the one fused call,
+against 0.80-1.03 in section 9's four arms (~13-17 us per call, two per
+layer). Those are other runs on another day. The difference is
+0.08-0.37 depending on the pairing, every pairing lower in section 10;
+the drift section 9 shows for this timer in one configuration is 0.23
+(9a ON 0.80 against 9b OFF 1.03), and half the pairings exceed it. Not
+being an A/B, it does not separate the OpenMP region's cost from the
+rest (the
+arithmetic, a serial 2048-term reduction per row, and the reads of the
+f32 weights). The upper bound when the change was proposed, had the
+whole cost been the region, was about half of 0.80-1.03.
+
+The keep-alive's third repetition with the heat table: with section 8
+(-2.37, [-3.76, -0.98]) and 9a (-0.57, [-4.46, +3.33], one outlier run),
+two of three runs exclude zero and all point the same way. The ON arm,
+22.93 ms/token, is the lowest arm mean in this record (section 8's ON
+arm: 23.30, another day and other binaries, not an A/B).
+
 --- what this means ----------------------------------------------------------
 
 On this machine, in every decode that was logged, the card holds P2 for a
@@ -688,7 +755,8 @@ first run, the only one with a clock log. In its final version, step()
 end-to-end cost visible in the log end times (to within 2-3 s). With
 the heat table in both arms (section 8): -2.37, [-3.76, -0.98], 6/6;
 repeated that evening (section 9a): -0.57, [-4.46, +3.33], 5/6, one
-outlier run widening it.
+outlier run widening it; and the next morning (section 10): -1.77,
+[-2.61, -0.93], 6/6.
 
 It is a weak candidate for the factor 2.1 between the kernel readings of
 20 and 21 September (docs/qwen36-cuda-tier.md, the note under the dense
@@ -724,7 +792,8 @@ Control Panel settings not helping.
   - The per-call breakdown of section 2 without the profiler, and whether
     P3 also slows the small h2d/d2h copies.
   - The power and thermal cost of running locked.
-  - Any replication in another session or after a reboot.
+  - Replication after a reboot, and of sections 1-6 in another
+    session (section 10 repeats only the keep-alive, the next morning).
   - The heat table in sections 1-7: every run there is without one.
   - The generated text in sections 2 to 6 (no guard script compared it).
   - The expert kernels' own slowdown in P3: the graph path records no
@@ -733,7 +802,7 @@ Control Panel settings not helping.
   - The driver version, and whether "CUDA - Force P2 State" (NVIDIA
     Profile Inspector) or the global Control Panel setting behave
     differently from the per-program one.
-  - Clocks in sections 8 and 9, and how each deltanet GPU call splits
+  - Clocks in sections 8 to 10, and how each deltanet GPU call splits
     between round trip and kernel (section 9's dn-split separates the
     a/b matmuls and the norm from the two calls; the rest still rests
     on section 5's durations).
@@ -742,4 +811,5 @@ Control Panel settings not helping.
     its step() times, not logged.
   - The keep-alive on another card, another driver, or Linux.
   - The keep-alive's power draw, its effect with a heat table beyond
-    sections 8 and 9a (two runs of six pairs), and on long generations.
+    sections 8, 9a and 10 (three runs of six pairs), and on long
+    generations.
