@@ -150,15 +150,19 @@ before stage 1.
 **Result (28 September 2026, record section 11).** Wall minus kernel per
 call is 34.6 us for dnproj and 29.6 for dnout (unprofiled wall, profiled
 kernel), 1.9 ms/token over the 30 layers: at the low end of the range,
-not well below it, so stage 1 goes ahead. The kernels ran at their
-benchmark time (dnproj median 42.8 us). The stream is idle for a median
-127.5 us between the two calls of a layer, and the CPU part of deltanet
-is ~114 us a layer by the timers: most of the gain is that CPU work
-moving to the device, not the round trip, so the recurrence and norm
-kernels matter most. Re-estimated: ~100-125 us a layer against ~244, a
-gain of roughly 3.5-4.3 ms/token (an estimate). On Windows the nsys log
-does not carry the engine's output; the per-call wall comes from an
-unprofiled run of the same configuration.
+not well below it, so stage 1 goes ahead. At least 90 % of the dnproj
+kernels took within 1.2 us of their minimum (median 42.8 us). Between
+the two calls of a layer the stream has no operation for a median 127.5
+us (profiled), which holds the CPU part of deltanet, ~114 us a layer by
+the timers of one run, plus the host ends of the two calls. Most of the
+gain is that CPU work moving to the device, and most of that work is
+l2norm + recurrence (2.0 of 3.43 ms/token): the fused recurrence-and-
+norm kernel matters most. Re-estimated with that run's deltanet, 7.32
+ms/token (~244 us a layer): ~100-125 us a layer, a gain of roughly
+3.5-4.3 ms/token (an estimate; against section 10's 7.83 it would be
+~4.1-4.8). On Windows the nsys log does not carry the engine's output;
+the per-call wall comes from an unprofiled run of the same
+configuration.
 
 ### Stage 1 — kernels and their tests (no engine change)
 

@@ -13,8 +13,8 @@
 #
 # Su Windows nsys NON scrive nella sua uscita quella del programma che
 # profila: s0-nsys.log contiene solo le righe di nsys (Collecting data...,
-# Generated ...), nessuna riga [timers] (28 settembre 2026, e lo stesso il
-# 27). Il log con i numeri del motore e' quindi quello della corsa senza
+# Generated ...), nessuna riga [timers] (28 settembre 2026; il 27 una
+# ricerca nel log di nsys non aveva trovato nulla). Il log con i numeri del motore e' quindi quello della corsa senza
 # profiler, -BaseLog. -Log resta per un log della corsa profilata che abbia
 # davvero le righe [timers].
 #
