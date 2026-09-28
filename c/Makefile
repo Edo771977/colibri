@@ -1024,7 +1024,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_group_bcast_arms_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_keepalive_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_int8_rows_cuda.cu tests/test_grouped_down_rows_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_group_bcast_arms_cuda.cu tests/test_dense_pinned_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_keepalive_cuda.cu backend_cuda_deltanet.cuh tests/test_qwen36_deltanet_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
@@ -1050,6 +1050,11 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_keepalive_cuda.cu -o cuda_keepalive_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_keepalive_test$(EXE)
 	./cuda_keepalive_test$(EXE) --exit-without-shutdown
+	# Qwen3.6 DeltaNet decode kernels (backend_cuda_deltanet.cuh, plan stage
+	# 1) against a CPU copy of deltanet(): one step, the same step twice byte
+	# for byte, 512 steps with a bounded error; 35B and tiny-fixture shapes.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_cuda.cu -o qwen36_deltanet_cuda_test$(EXE) $(GPU_TEST_LIBS)
+	./qwen36_deltanet_cuda_test$(EXE)
 	# fmt=1 per-row int8 with R rows per block (COLI_CUDA_I8_ROWS): the
 	# contract is BITWISE identity with the original kernel, not a tolerance,
 	# on shapes covering a short last block, O < R, and a strided I tail.
@@ -1173,6 +1178,7 @@ gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_keepalive_cuda.cu -o cuda_keepalive_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/bench_dense_gemv_cuda.cu -o dense_gemv_bench$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_cuda.cu -o qwen36_deltanet_cuda_test$(EXE) $(GPU_TEST_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1198,6 +1204,17 @@ dense_gemv_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h test
 	"$(GPUCC)" $(GPUFLAGS) tests/bench_dense_gemv_cuda.cu -o dense_gemv_bench$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 dense-gemv-bench: dense_gemv_bench$(EXE)
 	./dense_gemv_bench$(EXE)
+
+# The DeltaNet decode kernels' own numbers (plan stage 1): the three kernels
+# per layer, back to back and with a synchronize per layer, over 30 layers
+# of state. Needs ~0.1 GB of VRAM. Not part of make check: it needs a GPU.
+qwen36_deltanet_cuda_test$(EXE): backend_cuda_deltanet.cuh backend_gpu_compat.h tests/test_qwen36_deltanet_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/test_qwen36_deltanet_cuda.cu -o qwen36_deltanet_cuda_test$(EXE) $(GPU_TEST_LIBS)
+deltanet-cuda-test: qwen36_deltanet_cuda_test$(EXE)
+	./qwen36_deltanet_cuda_test$(EXE)
+deltanet-cuda-bench: qwen36_deltanet_cuda_test$(EXE)
+	./qwen36_deltanet_cuda_test$(EXE) --bench
 
 # NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
 # hand it a define matching nothing and link a runtime it never calls -- a
@@ -2271,7 +2288,7 @@ bench: iobench$(EXE)
 .PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
-	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench dense-gemv-bench cuda-dll hip-dll portable \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench dense-gemv-bench deltanet-cuda-test deltanet-cuda-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
