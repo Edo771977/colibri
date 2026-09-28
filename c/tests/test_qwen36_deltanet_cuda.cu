@@ -8,22 +8,34 @@
  * Keep it in step with qwen36.c.
  *
  * For the 35B shapes (hidden 2048, 32 value heads, 16 key heads, head dims
- * 128, conv width 4) and the CI tiny fixture's (hidden 64, 8 and 4 heads,
- * head dims 8):
- *   1. one step from a random state: beta, g, conv_out, outr and the state
- *      within tolerance of the CPU; the ring advanced byte for byte;
- *   2. the same step run twice from the same state gives the same bytes
- *      (no atomics, fixed-order reductions);
+ * 128, conv width 4), the CI tiny fixture's (hidden 64, 8 and 4 heads, head
+ * dims 8), and three made-up shapes for the paths those two do not reach
+ * (kdim > vdim, kdim above the block size, a vdim that is not a power of
+ * two, above and below a warp, three value heads per key head):
+ *   1. one step from a random state: beta and g within an ELEMENTWISE
+ *      relative tolerance (a long-memory head has a g a thousand times
+ *      smaller than the others, and g is the error that compounds),
+ *      conv_out, outr and the state within tolerance of the largest value;
+ *      the ring advanced byte for byte; head 0 has a dt_bias above 20, the
+ *      softplus branch that returns its argument;
+ *   2. the same step run twice from the same state, the outputs poisoned
+ *      with NaN in between: the same bytes in every output and in the ring
+ *      and the state (no atomics, fixed-order reductions);
  *   3. 512 steps from a zero state, each input fresh, both sides carrying
  *      their own state: every step's outr and the final state within a
  *      bound, and the error of the last 128 steps no more than twice that of
- *      steps 128-255 (the decay makes the recurrence contractive; an error
- *      that grows means it is not being carried the same way).
+ *      steps 128-255, on the mean error per window (the decay makes the
+ *      recurrence contractive; an error that grows means it is not carried
+ *      the same way). An emulation of the kernels' arithmetic on the host
+ *      (not the device expf) gave errors of 1e-7 to 2e-6: the bounds, 1e-5
+ *      to 1e-4, leave a margin of about 50.
  * The errors are printed, so the tolerances can be tightened with data.
  *
- * --bench: the 35B shape, 30 layers of state (60 MiB, more than the L2),
+ * --bench: the 35B shape, 30 layers of state (60 MiB, more than the 48 MB
+ * L2 of the reference RTX 4070 Ti SUPER; a card with a larger L2 holds it),
  * per-layer time of the three kernels back to back and with a synchronize
- * after every layer, and each kernel alone.
+ * after every layer, and each kernel alone back to back (for the two small
+ * kernels that is launch throughput as much as kernel time).
  *
  * Build: nvcc -O3 -std=c++17 -arch=native tests/test_qwen36_deltanet_cuda.cu
  */
@@ -133,10 +145,12 @@ static float urand(float lo, float hi) {
 }
 static void fill(std::vector<float> &v, float lo, float hi) { for (auto &e : v) e = urand(lo, hi); }
 
-/* Weights and per-token inputs in the ranges the model uses: x RMS-normed,
- * dt_bias so that softplus(dt_bias) spans 0.001..0.1 and A = exp(A_log) 1..16
- * (the HF initialisation), so exp(g) spans roughly 0.2..1: long memory, the
- * harder case for an error carried in the state. */
+/* Weights and per-token inputs: x in the range of an RMS-normed vector,
+ * A = exp(A_log) in 1..16, and dt_bias such that softplus(dt_bias) spans
+ * 0.001..0.1 (a Mamba2-style dt range, chosen here, not read from the
+ * checkpoint). With a of std ~0.6 that puts exp(g) between about 0.01 and
+ * 1, most heads near 1: long memory, the harder case for an error carried in
+ * the state. Head 0 gets dt_bias 25, above softplus's threshold of 20. */
 struct Layer {
     std::vector<float> wab, alog, dtbias, wconv, normw;
 };
@@ -148,6 +162,7 @@ static Layer make_layer(const DnShape *s) {
     for (auto &e : L.wab) e *= ws;
     L.alog.resize(s->vh); for (auto &e : L.alog) e = logf(urand(1.f, 16.f));
     L.dtbias.resize(s->vh); for (auto &e : L.dtbias) { float dt = expf(urand(logf(0.001f), logf(0.1f))); e = logf(expm1f(dt)); }
+    L.dtbias[0] = 25.f;
     L.wconv.resize((size_t)conv_dim * s->convk); fill(L.wconv, -0.6f, 0.6f);
     L.normw.resize(s->vdim); fill(L.normw, 0.5f, 1.5f);
     return L;
@@ -194,6 +209,14 @@ static double rel_err(const std::vector<float> &got, const std::vector<float> &r
     }
     return num / den;
 }
+/* max over elements of |got - ref| / max(|ref|, floor): every element
+ * relative to itself, for the per-head gates */
+static double rel_err_elem(const std::vector<float> &got, const std::vector<float> &ref, double floor) {
+    double worst = 0;
+    for (size_t i = 0; i < ref.size(); i++)
+        worst = std::max(worst, (double)fabsf(got[i] - ref[i]) / std::max((double)fabsf(ref[i]), floor));
+    return worst;
+}
 static void check(bool ok, const char *what, double v, double tol) {
     printf("  %-44s %.3e  (tol %.0e)  %s\n", what, v, tol, ok ? "ok" : "FAIL");
     if (!ok) g_fail++;
@@ -223,27 +246,29 @@ static void run_shape(const char *name, DnShape s) {
     std::vector<float> gb, gg, gc, go, gring, grec;
     down(gb, d.beta, s.vh); down(gg, d.g, s.vh); down(gc, d.conv_out, conv_dim); down(go, d.outr, value_dim);
     down(gring, d.ring, nring); down(grec, d.rec, nrec);
-    check(rel_err(gb, beta) < 1e-5, "one step: beta", rel_err(gb, beta), 1e-5);
-    check(rel_err(gg, g) < 1e-5, "one step: g", rel_err(gg, g), 1e-5);
+    check(rel_err_elem(gb, beta, 1e-30) < 1e-5, "one step: beta, per element", rel_err_elem(gb, beta, 1e-30), 1e-5);
+    check(rel_err_elem(gg, g, 1e-30) < 1e-5, "one step: g, per element", rel_err_elem(gg, g, 1e-30), 1e-5);
     check(rel_err(gc, conv_out) < 1e-5, "one step: conv_out", rel_err(gc, conv_out), 1e-5);
     check(rel_err(go, outr) < 1e-4, "one step: outr", rel_err(go, outr), 1e-4);
     check(rel_err(grec, rec) < 1e-4, "one step: state", rel_err(grec, rec), 1e-4);
     bool ring_same = memcmp(gring.data(), ring.data(), nring * sizeof(float)) == 0;
     check(ring_same, "one step: ring, byte for byte (0 = same)", ring_same ? 0.0 : 1.0, 0.0);
 
-    /* 2. the same step again from the same state: the same bytes */
+    /* 2. the same step again from the same state, outputs poisoned: the same bytes */
     up(d.ring, ring0); up(d.rec, rec0);
+    CK(cudaMemset(d.beta, 0xFF, s.vh * sizeof(float))); CK(cudaMemset(d.g, 0xFF, s.vh * sizeof(float)));
+    CK(cudaMemset(d.conv_out, 0xFF, conv_dim * sizeof(float))); CK(cudaMemset(d.outr, 0xFF, value_dim * sizeof(float)));
     CK(dn_decode_middle(0, &s, &v)); CK(cudaDeviceSynchronize());
-    std::vector<float> go2, grec2;
-    down(go2, d.outr, value_dim); down(grec2, d.rec, nrec);
-    bool det = memcmp(go2.data(), go.data(), value_dim * sizeof(float)) == 0 &&
-               memcmp(grec2.data(), grec.data(), nrec * sizeof(float)) == 0;
-    check(det, "repeat: outr and state byte for byte (0 = same)", det ? 0.0 : 1.0, 0.0);
+    std::vector<float> gb2, gg2, gc2, go2, gring2, grec2;
+    down(gb2, d.beta, s.vh); down(gg2, d.g, s.vh); down(gc2, d.conv_out, conv_dim); down(go2, d.outr, value_dim);
+    down(gring2, d.ring, nring); down(grec2, d.rec, nrec);
+    bool det = gb2 == gb && gg2 == gg && gc2 == gc && go2 == go && gring2 == gring && grec2 == grec;
+    check(det, "repeat: every output, ring, state byte for byte (0 = same)", det ? 0.0 : 1.0, 0.0);
 
     /* 3. 512 steps from a zero state */
     std::fill(ring.begin(), ring.end(), 0.f); std::fill(rec.begin(), rec.end(), 0.f);
     up(d.ring, ring); up(d.rec, rec);
-    double worst = 0, mid = 0, last = 0;
+    double worst = 0, mid = 0, last = 0, mid_sum = 0, last_sum = 0;
     for (int t = 0; t < 512; t++) {
         make_token(&s, x, qkvz);
         dn_ref_step(&s, x.data(), qkvz.data(), L.wab.data(), L.alog.data(), L.dtbias.data(), L.wconv.data(),
@@ -253,14 +278,17 @@ static void run_shape(const char *name, DnShape s) {
         down(go, d.outr, value_dim);
         double e = rel_err(go, outr);
         worst = std::max(worst, e);
-        if (t >= 128 && t < 256) mid = std::max(mid, e);
-        if (t >= 384) last = std::max(last, e);
+        if (t >= 128 && t < 256) { mid = std::max(mid, e); mid_sum += e; }
+        if (t >= 384) { last = std::max(last, e); last_sum += e; }
     }
     down(grec, d.rec, nrec);
-    check(worst < 2e-3, "512 steps: worst outr", worst, 2e-3);
-    check(rel_err(grec, rec) < 2e-3, "512 steps: final state", rel_err(grec, rec), 2e-3);
-    printf("  512 steps: outr error, steps 128-255 %.3e, steps 384-511 %.3e\n", mid, last);
-    check(last <= 2.0 * mid + 1e-6, "512 steps: last 128 <= 2 x steps 128-255", last, 2.0 * mid + 1e-6);
+    check(worst < 1e-4, "512 steps: worst outr", worst, 1e-4);
+    check(rel_err(grec, rec) < 1e-4, "512 steps: final state", rel_err(grec, rec), 1e-4);
+    const double mid_mean = mid_sum / 128, last_mean = last_sum / 128;
+    printf("  512 steps: outr error max / mean, steps 128-255 %.3e / %.3e, steps 384-511 %.3e / %.3e\n",
+           mid, mid_mean, last, last_mean);
+    const double grow = 2.0 * std::max(mid_mean, 1e-8);
+    check(last_mean <= grow, "512 steps: mean of 384-511 <= 2 x mean of 128-255", last_mean, grow);
     dev_free(d);
 }
 
@@ -281,7 +309,8 @@ static void bench(void) {
         vs[l] = view(ds[l]);
     }
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-    for (int l = 0; l < NL; l++) CK(dn_decode_middle(0, &s, &vs[l]));   /* warm-up */
+    /* warm-up: as long as a timed pass, so the clocks have ramped */
+    for (int t = 0; t < TOK; t++) for (int l = 0; l < NL; l++) CK(dn_decode_middle(0, &s, &vs[l]));
     CK(cudaDeviceSynchronize());
     float ms = 0;
     CK(cudaEventRecord(e0));
@@ -307,7 +336,7 @@ static void bench(void) {
         CK(cudaGetLastError());
         CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaEventElapsedTime(&ms, e0, e1));
         static const char *nm[3] = {"dn_ab_gates", "dn_conv_silu", "dn_rec_norm"};
-        printf("  %-22s %7.2f us per layer, back to back\n", nm[which], 1000.0 * ms / (TOK * NL));
+        printf("  %-22s %7.2f us per layer, back to back (kernel or launch rate, whichever is slower)\n", nm[which], 1000.0 * ms / (TOK * NL));
     }
     for (auto &d : ds) dev_free(d);
 }
@@ -320,6 +349,9 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--bench")) { bench(); return 0; }
     run_shape("35B", DnShape{2048, 32, 16, 128, 128, 4, 1e-6f});
     run_shape("tiny", DnShape{64, 8, 4, 8, 8, 4, 1e-6f});
+    run_shape("kdim > vdim, vdim 24", DnShape{96, 6, 3, 40, 24, 4, 1e-6f});
+    run_shape("vdim 48", DnShape{128, 4, 2, 16, 48, 3, 1e-6f});
+    run_shape("rep 3, kdim above the block", DnShape{96, 6, 2, 160, 96, 4, 1e-6f});
     printf("deltanet cuda: %s\n", g_fail ? "FAIL" : "ok");
     return g_fail ? 1 : 0;
 }
