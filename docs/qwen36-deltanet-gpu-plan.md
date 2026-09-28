@@ -1,6 +1,6 @@
 # Qwen3.6 DeltaNet decode on the GPU — plan
 
-Status: **stages 0-3a done. `COLI_DN_GPU=1` (opt-in): step() 22.25 -> 17.72 ms/token, 95 % [-5.05, -4.02], 6/6 pairs, text identical (`docs/experiments/qwen36-deltanet-gpu-2026-09-28-raw.txt`). Next: stage 3b (serve).** Written 28 September 2026 from the
+Status: **stages 0-2 done; stage 3a merged and measured, `COLI_DN_GPU=1` opt-in: step() 22.25 -> 17.72 ms/token, 95 % [-5.05, -4.02], 6/6 pairs (`docs/experiments/qwen36-deltanet-gpu-2026-09-28-raw.txt`). Open from 3a's validation: `PPL=1` on vs off. Next: stage 3b (serve).** Written 28 September 2026 from the
 measurements in `docs/experiments/qwen36-gpu-clocks-2026-09-27-raw.txt`
 (sections 5 and 8-10). Each stage below is a separate PR with its own tests
 and, where it touches ms/token, its own A/B. Estimates are marked as such.
@@ -347,7 +347,7 @@ Validation before merge:
   expected numbers of uploads and downloads; plus the refusals and the
   failure paths (a failed decode, a failed upload; the failed-download
   branch goes through the same `dn_gpu_fatal` but has no fake switch yet).
-  The tiny-model and real-model checks above are still to run on the card.
+  The card checks: see "First run of 3a" below.
   The marker says N/M; the A/B script only checks it is there, so read N.
 
 **First run of 3a (28 September 2026, RTX 4070 Ti SUPER, main 29c2af7d;
@@ -358,14 +358,21 @@ Validation before merge:
   machine. Both arms passed: the worst relative gap was 2.9e-7 with the
   flag at 0 and 3.1e-7 at 1, tolerance 1e-2, with 30/30 layers on the
   path at 1.
-- **A/B, `COLI_DN_GPU` 0 vs 1.** Six pairs, heat table, keep-alive in
-  both arms. step() went from 22.25 to 17.72 ms/token, a paired delta of
+- **A/B, `COLI_DN_GPU` 0 vs 1.** Six pairs, heat table, keep-alive set
+  for both arms (that it ran is not shown in the output). step() went from 22.25 to 17.72 ms/token, a paired delta of
   -4.53 with 95 % [-5.05, -4.02], and 6/6 pairs negative. The generated
   text is identical between the arms.
 - **dn.** It fell from 7.55 to 3.75 ms/token, which is 125 us a layer,
   against 120.4 in the stage 2 bench.
-- **The other 0.7 ms/token** is a lower MoE time (shared expert and
-  CPU misses) that this run does not explain.
+- **The other 0.7 ms/token** is mostly a lower MoE time (-0.62; the
+  shared expert and the CPU misses moved) plus ~0.1 outside step()'s
+  phases, which this run does not explain.
+- **Not run from the validation list above:** the tiny fixture (replaced
+  by CONSIST on the real model), `PPL=1` on vs off (no reference file
+  for the real model yet), and the stage 1-2 CUDA tests on this build.
+  The pin save/restore and prefix-reuse sequence runs only in
+  `c/tests/test_qwen36_dn_gpu.c`, on the fake backend. On the card only
+  the upload and decode ran, not the state download.
 
 **Left for stage 3b:** the server (`SERVE=1`) with per-request failure,
 dnstate following its layer's projections in auto-place, a fake switch
