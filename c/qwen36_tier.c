@@ -545,7 +545,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * the caller repeat every device in COLI_GPUS as well -- forgetting that
      * would silently drop a component back to the CPU mid-A/B. */
     {
-        static const char *comps[] = {"lmhead","dnproj","dnout","attnout","attnproj"};
+        static const char *comps[] = {"lmhead","dnproj","dnout","attnout","attnproj","dnstate"};
         for(size_t ci=0; ci<sizeof comps/sizeof *comps; ci++)
             for(int l=0; l<nl && G.ndev<QT_MAX_DEV; l++){
                 int d=qt_place_of(comps[ci],l);
@@ -665,7 +665,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             else fprintf(stderr,"[qtier] lm_head-Device %d nicht verfuegbar -> CPU\n",ld);
         }
         /* every other component's devices, deduplicated */
-        static const char *comps[] = {"dnproj","dnout","attnout","attnproj"};
+        static const char *comps[] = {"dnproj","dnout","attnout","attnproj","dnstate"};
         for(size_t ci=0; ci<sizeof comps/sizeof *comps; ci++)
             for(int l=0; l<nl; l++){
                 int d=qt_place_of(comps[ci],l);
@@ -834,6 +834,49 @@ int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
     G_dnp[layer].on = 0;
     return 0;
+}
+
+/* ---- DeltaNet decode handles (COLI_DN_GPU=1) ---------------------------- */
+static ColiCudaDeltaNet *G_dn[QT_DN_MAX_LAYERS];
+int qt_dn_init(int layer, int dnout_handle, int device,
+               int H, int vh, int vk, int kdim, int vdim, int convk, float eps,
+               const float *wab, const float *alog, const float *dtbias,
+               const float *wconv, const float *normw){
+    const char *why = NULL;
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS) why = "layer out of range";
+    else if(G_dn[layer]) why = "already has a handle";
+    else if(!coli_cuda_has_deltanet()) why = "coli_cuda.dll predates coli_cuda_deltanet_* (make cuda-dll)";
+    else if(device == QT_PLACE_CPU) why = "its state (dnstate) was not placed";
+    else if(!G_dnp[layer].on || !G_dnp[layer].t) why = "dnproj is not on a GPU";
+    else if(dnout_handle < 0 || dnout_handle >= G_dense_n || !G_dense[dnout_handle].on || !G_dense[dnout_handle].t)
+        why = "dnout is not on a GPU";
+    else if(G_dnp[layer].dev != device || G_dense[dnout_handle].dev != device)
+        why = "dnproj, dnout and the state are not on one device";
+    if(!why && !coli_cuda_deltanet_create(&G_dn[layer], G_dnp[layer].t, G_dense[dnout_handle].t,
+                                          H, vh, vk, kdim, vdim, convk, eps, wab, alog, dtbias, wconv, normw))
+        why = "the backend refused the handle";
+    if(why){ fprintf(stderr,"[qtier] DeltaNet layer %d stays on the two-call path: %s\n", layer, why); return 0; }
+    /* the "dnstate" offer charged qt_dn_state_bytes before the handle existed:
+     * say so if the backend's allocation has drifted from it */
+    size_t got = coli_cuda_deltanet_bytes(G_dn[layer]), want = qt_dn_state_bytes(H, vh, vk, kdim, vdim, convk);
+    if(got != want)
+        fprintf(stderr,"[qtier] DeltaNet layer %d: the handle holds %zu bytes, the dnstate offer charged %zu "
+                       "(qt_dn_state_bytes is out of step with coli_cuda_deltanet_create)\n", layer, got, want);
+    return 1;
+}
+int qt_dn_ready(int layer){ return layer >= 0 && layer < QT_DN_MAX_LAYERS && G_dn[layer] != NULL; }
+int qt_dn_decode(int layer, const float *x, float *out){
+    return qt_dn_ready(layer) && coli_cuda_deltanet_decode(G_dn[layer], x, out);
+}
+int qt_dn_state_upload(int layer, const float *rec, const float *ring){
+    return qt_dn_ready(layer) && coli_cuda_deltanet_state_upload(G_dn[layer], rec, ring);
+}
+int qt_dn_state_download(int layer, float *rec, float *ring){
+    return qt_dn_ready(layer) && coli_cuda_deltanet_state_download(G_dn[layer], rec, ring);
+}
+static void dn_free_all(void){
+    for(int l = 0; l < QT_DN_MAX_LAYERS; l++)
+        if(G_dn[l]){ coli_cuda_deltanet_free(G_dn[l]); G_dn[l] = NULL; }
 }
 
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
@@ -1328,6 +1371,7 @@ void qt_stats(void){
 }
 
 static void dense_free_all(void){
+    dn_free_all();   /* the DeltaNet handles borrow G_dnp and G_dense: first */
     for(int h = 0; h < G_dense_n; h++){ if(G_dense[h].t) coli_cuda_tensor_free(G_dense[h].t); G_dense[h].t = NULL; G_dense[h].on = 0; }
     G_dense_n = 0;
     if(G_lmh.t) coli_cuda_tensor_free(G_lmh.t);

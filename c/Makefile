@@ -2047,6 +2047,12 @@ tests/test_qwen36_tier_dense$(EXE): tests/test_qwen36_tier_dense.c tests/qwen36_
 tests/test_qwen36_trunk_place$(EXE): tests/test_qwen36_trunk_place.c tests/qwen36_fake_cuda.h qwen36.c expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# COLI_DN_GPU (docs/qwen36-deltanet-gpu-plan.md stage 3): the GPU decode path
+# and the state hand-offs, on the fake backend running the engine's own CPU
+# deltanet() as the "device" -- byte for byte against the CPU arm.
+tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c tests/qwen36_fake_cuda.h qwen36.c expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 

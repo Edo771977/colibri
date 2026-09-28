@@ -737,6 +737,12 @@ typedef struct {
     int *active_of;         /* [n_layers] original->active idx (Phase 2: identity for all layers) */
     float **DN_rec;         /* [n_layers] recurrent state S[h]=[kdim,vdim] for DeltaNet layers (NULL for attn) */
     float **DN_conv;        /* [n_layers] conv ring [conv_dim, convk-1] for DeltaNet layers (NULL for attn) */
+    /* COLI_DN_GPU=1 (docs/qwen36-deltanet-gpu-plan.md, stage 3), per layer:
+     * dn_gpu_on -- the layer's S == 1 decode is one backend call
+     * (qt_dn_decode); dn_on_dev -- its recurrent state and conv ring live on
+     * the device right now, so DN_rec/DN_conv are stale until
+     * dn_state_to_host(). NULL: no layer takes the path. */
+    unsigned char *dn_gpu_on, *dn_on_dev;
     uint64_t clock, hits, miss;
     /* Telemetria per la dashboard (Brain/Profile): tempo di lettura esperti
      * accumulato dall'avvio, e bitmap degli esperti toccati nel turno. */
@@ -2958,6 +2964,69 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
  *   (q scaled by 1/sqrt(kdim)); recurrence S[h]*=exp(g); kv=k@S; delta=(v-kv)*beta;
  *   S+=k (x) delta; out=q@S; per-head Gated RMSNorm (plain weight) -> out_proj. */
 
+/* ---- DeltaNet decode on the GPU (COLI_DN_GPU) ------------------------------
+ * docs/qwen36-deltanet-gpu-plan.md, stage 3. With COLI_DN_GPU=1 every
+ * DeltaNet layer whose dnproj, dnout and "dnstate" landed on one device runs
+ * its decode (S == 1) as one backend call, the state kept on the device.
+ * Every reader or writer of DN_rec/DN_conv outside that call works on the
+ * host copy, so each first brings the state home (dn_state_to_host):
+ * deltanet() on any other path (a prompt, S > 1), the pin snapshot; and
+ * whoever overwrites the host copy (reset_recurrent, pin_restore) marks the
+ * device copy stale. The next GPU decode uploads the host copy again.
+ *
+ * COLI_DN_GPU=0 offers and reserves the same VRAM but runs the CPU: the OFF
+ * arm of the A/B, with residency and the [place] line identical to the ON
+ * arm's. Unset: neither. SERVE=1 and DN_DBG keep the CPU path for now.
+ *
+ * A failed state upload leaves the host copy authoritative: that layer goes
+ * back to the CPU, with a line. A failed decode or download cannot be
+ * recovered -- the device state may be a token ahead of the host's -- so the
+ * run stops (exit 3) after zeroing the state: never the CPU on top of a
+ * half-advanced state. Failing only the request instead is stage 3b, with
+ * the server. */
+static int dn_gpu_mode(void) {
+    const char *e = getenv("COLI_DN_GPU");
+    /* SERVE=1 and DN_DBG keep the CPU path: not even the =0 reservation,
+     * which would only take VRAM from the experts */
+    if (e && ((getenv("SERVE") && getenv("SERVE")[0] == '1') || getenv("DN_DBG"))) {
+        static int told;
+        if (!told) {
+            told = 1;
+            fprintf(stderr, "[qwen36] COLI_DN_GPU=%s ignored under %s: %s\n", e,
+                    getenv("DN_DBG") ? "DN_DBG" : "SERVE=1",
+                    getenv("DN_DBG") ? "DN_DBG reads layer 0 on the CPU path"
+                                     : "the server path is not wired yet (plan stage 3b)");
+        }
+        return -1;
+    }
+    if (!e) return -1;
+    if (!strcmp(e, "1")) return 1;
+    if (!strcmp(e, "0")) return 0;
+    static int warned;
+    if (!warned) { warned = 1; fprintf(stderr, "[qwen36] COLI_DN_GPU=%s ignored: 0 or 1\n", e); }
+    return -1;
+}
+static int g_dn_force_cpu;                              /* tests: the fake device runs deltanet() itself */
+static void (*g_dn_fatal_hook)(int layer, const char *what);   /* tests: instead of exit */
+static void reset_recurrent(Model *m);
+static void dn_gpu_fatal(Model *m, int layer, const char *what) {
+    fprintf(stderr, "[qwen36] DeltaNet GPU decode, layer %d: %s. The recurrent state cannot be "
+                    "trusted: zeroed, stopping (COLI_DN_GPU=1)\n", layer, what);
+    reset_recurrent(m);
+    if (g_dn_fatal_hook) { g_dn_fatal_hook(layer, what); return; }
+    exit(3);
+}
+static void dn_state_to_host(Model *m, int layer) {
+    if (!m->dn_on_dev || !m->dn_on_dev[layer]) return;
+    m->dn_on_dev[layer] = 0;
+    if (!qt_dn_state_download(layer, m->DN_rec[layer], m->DN_conv[layer]))
+        dn_gpu_fatal(m, layer, "the state download failed");
+}
+static void dn_all_to_host(Model *m) {
+    if (!m->dn_on_dev) return;
+    for (int i = 0; i < m->c.n_layers; i++) if (!m->c.is_attn[i]) dn_state_to_host(m, i);
+}
+
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
@@ -3010,6 +3079,29 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
 
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
+
+    if (!g_dn_force_cpu && S == 1 && m->dn_gpu_on && m->dn_gpu_on[layer]) {
+        extern double g_dn_sub[4], g_dn_split[4];
+        extern long g_dn_calls, g_dn_gpu[2];
+        double t0 = tm_now();
+        if (!m->dn_on_dev[layer]) {
+            if (!qt_dn_state_upload(layer, rec, ring)) {
+                /* the host copy is still the state (the device copy may be
+                 * half-written, and is never read again): CPU from here on */
+                fprintf(stderr, "[qwen36] DeltaNet layer %d: state upload failed, CPU from here on\n", layer);
+                m->dn_gpu_on[layer] = 0;
+                goto cpu_path;
+            }
+            m->dn_on_dev[layer] = 1;
+        }
+        if (!qt_dn_decode(layer, x, out)) { dn_gpu_fatal(m, layer, "the decode call failed"); return; }
+        /* the whole call in the proj slots: dn-split's qkvz, dn-sub's proj */
+        if (tm_on()) { double t = tm_now(); g_dn_split[0] += t - t0; g_dn_sub[0] += t - t0;
+                       g_dn_calls++; g_dn_gpu[0]++; g_dn_gpu[1]++; }
+        return;
+    }
+cpu_path:
+    if (!g_dn_force_cpu) dn_state_to_host(m, layer);
 
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s * H;
@@ -3464,6 +3556,7 @@ static void pin_drop(void){
 
 static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
     Cfg *c = &m->c;
+    dn_all_to_host(m);   /* COLI_DN_GPU: the snapshot reads the host copy */
     size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     Q36PinState *st = reuse;
@@ -3523,6 +3616,7 @@ static int pin_restore(Model *m, const int *ids, int n){
                 if (c->is_attn[i]) continue;
                 if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
                 if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
+                if (m->dn_on_dev) m->dn_on_dev[i] = 0;   /* the host copy is the state now */
             }
             m->kv_len = k->len;
             kv_prefix_clear(&m->kvp);
@@ -3543,6 +3637,8 @@ static void reset_recurrent(Model *m){
      * forget what it was built from, or the two disagree in favour of the one
      * nobody can check. */
     kv_prefix_clear(&m->kvp);
+    /* the host copy is the state now (zero): a device copy is stale */
+    if (m->dn_on_dev) memset(m->dn_on_dev, 0, (size_t)c->n_layers);
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]) continue;
         if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -4330,6 +4426,57 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
             wn, now_s()-t0);
 }
 
+/* COLI_DN_GPU set (0 or 1): offer each DeltaNet layer's device state --
+ * what one coli_cuda_deltanet handle holds, qt_dn_state_bytes -- as its own
+ * trunk component, "dnstate", so it comes out of the expert budget like the
+ * projections. After the other offers: the placer serves offers in order,
+ * so on a tight card the state is what stays out. Only for layers whose
+ * projections have dense-i8 copies, the only ones that can be placed.
+ * The plan had one offer per layer for dnproj, dnout and the state together;
+ * three offers keep COLI_PLACE and the [place] line as they are, and a layer
+ * whose three did not land on one device keeps today's two-call path. */
+static void dn_offer_state(Model *m) {
+    if (dn_gpu_mode() < 0) return;
+    Cfg *c = &m->c;
+    size_t b = qt_dn_state_bytes(c->hidden, c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk);
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_attn[i]) continue;
+        const float *sc = NULL;
+        int have = 0;
+        for (int j = 0; j < g_qdw_n; j++)
+            if (g_qdw[j].w == m->L[i].dn_qkv || g_qdw[j].w == m->L[i].dn_z) have++;
+        if (have != 2 || !qdw_int8(m->L[i].dn_out, c->dn_vheads * c->dn_vdim, c->hidden, &sc)) continue;
+        qt_trunk_offer("dnstate", i, b);
+    }
+}
+
+/* COLI_DN_GPU=1, after the projections are placed: one handle per eligible
+ * layer, and the marker line misure-envab.ps1 checks. =0 offered and
+ * reserved the same VRAM and stops here. */
+static void dn_gpu_setup(Model *m) {
+    if (dn_gpu_mode() != 1) return;
+    Cfg *c = &m->c;
+    unsigned char *on = calloc((size_t)c->n_layers, 1), *dev = calloc((size_t)c->n_layers, 1);
+    if (!on || !dev) { free(on); free(dev); fprintf(stderr, "[qwen36] COLI_DN_GPU=1: out of memory, CPU path\n"); return; }
+    int n = 0, nd = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_attn[i]) continue;
+        nd++;
+        Layer *l = &m->L[i];
+        if (qt_dn_init(i, l->h_dnout - 1, qt_place_of("dnstate", i),
+                       c->hidden, c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->eps,
+                       l->dn_b, l->dn_alog, l->dn_dtbias, l->dn_conv, l->dn_norm)) { on[i] = 1; n++; }
+    }
+    /* The marker only when something moved: misure-envab.ps1 takes it as
+     * proof that the ON arm differs from the OFF arm. */
+    if (!n) {
+        fprintf(stderr, "[qwen36] COLI_DN_GPU=1: no DeltaNet layer can decode on the GPU (0/%d), CPU path\n", nd);
+        free(on); free(dev); return;
+    }
+    fprintf(stderr, "[qwen36] DeltaNet decode on the GPU: %d/%d layers (COLI_DN_GPU=1)\n", n, nd);
+    m->dn_gpu_on = on; m->dn_on_dev = dev;
+}
+
 int main(int argc, char **argv) {
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
      * do. Without it this engine takes one thread per logical CPU, which on an
@@ -4502,6 +4649,7 @@ int main(int argc, char **argv) {
     }
     trunk_offer_out(&m);
     trunk_offer_attnproj(&m);
+    dn_offer_state(&m);
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
@@ -4555,6 +4703,7 @@ int main(int argc, char **argv) {
         }
         trunk_place_out(&m);
         trunk_place_attnproj(&m);
+        dn_gpu_setup(&m);
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
          * slots along the way. */
@@ -4922,6 +5071,11 @@ static int qwen36_segment_session_run(void *session_impl,
         memcpy(request->output, request->input, request->input_bytes);
     pthread_mutex_lock(&engine->run_lock);
     Model *model = &engine->model;
+    if (model->dn_gpu_on) {   /* COLI_DN_GPU is set up in main() only: never here */
+        pthread_mutex_unlock(&engine->run_lock);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Qwen3.6 Segment runs DeltaNet on the CPU only");
+    }
     model->K = session->K; model->V = session->V;
     model->DN_rec = session->DN_rec; model->DN_conv = session->DN_conv;
     model->max_t = (int)session->context_tokens;
