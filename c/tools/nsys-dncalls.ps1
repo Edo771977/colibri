@@ -4,15 +4,17 @@
 #
 # SI LANCIA DA cmd, dalla cartella c\, dopo due corse uguali (COLI_TIMERS=1),
 # la prima senza profiler, la seconda sotto Nsight:
+#     copy /Y heat.caldo.bin heat.bin      (se si usa HEAT_FILE=heat.bin)
 #     qwen36_clang.exe 256 4 prompt25.txt > s0-base.log 2>&1
+#     copy /Y heat.caldo.bin heat.bin      (il motore riscrive heat.bin all'uscita)
 #     nsys profile -t cuda ... -o s0 qwen36_clang.exe 256 4 prompt25.txt > s0-nsys.log 2>&1
 #     nsys stats --report cuda_gpu_trace --format csv --output s0 s0.nsys-rep
 # con UNA riga:
 #
 #     powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\nsys-dncalls.ps1 -Csv s0_cuda_gpu_trace.csv -BaseLog s0-base.log
 #
-# Su Windows nsys NON scrive nella sua uscita quella del programma che
-# profila: s0-nsys.log contiene solo le righe di nsys (Collecting data...,
+# Su Windows, con nsys 2026.3.2 e i suoi default, nsys NON scrive nella sua
+# uscita quella del programma che profila: s0-nsys.log contiene solo le righe di nsys (Collecting data...,
 # Generated ...), nessuna riga [timers] (28 settembre 2026; il 27 una
 # ricerca nel log di nsys non aveva trovato nulla). Il log con i numeri del motore e' quindi quello della corsa senza
 # profiler, -BaseLog. -Log resta per un log della corsa profilata che abbia
@@ -53,8 +55,10 @@
 # non sono della stessa configurazione; salta il confronto se qualche
 # chiamata e' andata sulla CPU o se traccia e log non contano le stesse
 # chiamate. Il confronto dei conteggi si fa con ogni log passato: le due
-# corse hanno la stessa configurazione, e il piazzamento non cambia fra una
-# corsa e l'altra. Senza log non controlla niente del motore.
+# corse hanno la stessa configurazione, e di solito lo stesso piazzamento;
+# non e' garantito (il piazzamento automatico dipende dalla VRAM libera e
+# dalla tabella heat), ed e' questo controllo a dirlo: se i conteggi non
+# tornano il confronto salta. Senza log non controlla niente del motore.
 #
 # LIMITI. I tempi della traccia sono della GPU; la parete e' del motore, una
 # media sulle chiamate di decode. "Fuori dallo span" comprende tra l'altro
@@ -298,6 +302,7 @@ if ($Log -and $BaseLog) {
 "coppie dnproj -> dnout di decode: $($dnproj.Count) | forme P senza dnout dopo (prefill riga per riga, o dnout sulla CPU): $nLoneP | attnout: $nAttn"
 "chiamate con altre operazioni GPU dentro lo span (caricamenti di expert sullo stesso stream), incluse nelle medie: dnproj {0}, dnout {1}" -f @($dnproj | Where-Object { $_.Foreign -gt 0 }).Count, @($dnout | Where-Object { $_.Foreign -gt 0 }).Count
 if (-not $logs.Count) { "(senza -BaseLog ne' -Log non e' controllato niente del motore: keep-alive, tabella heat, chiamate sulla CPU)" }
+foreach ($w in $warn) { "ATTENZIONE: $w" }
 # Riepilogo per stream: il keep-alive gira su uno stream suo, gli expert su
 # un altro, le chiamate dense sullo stream 0.
 foreach ($key in @($byStream.Keys | Sort-Object)) {
@@ -310,7 +315,6 @@ foreach ($key in @($byStream.Keys | Sort-Object)) {
     "stream {0}: {1} operazioni, {2} kernel, {3} copie su, {4} copie giu | kernel piu' frequenti: {5}" -f $key, $st.Count, $ks.Count,
         @($st | Where-Object { $_.Kind -eq "H" }).Count, @($st | Where-Object { $_.Kind -eq "D" }).Count, $(if ($top.Count) { $top -join ", " } else { "nessuno" })
 }
-foreach ($w in $warn) { "ATTENZIONE: $w" }
 if ($dnproj.Count -eq 0) {
     throw "nessuna coppia dnproj -> dnout di decode nella traccia: il motore non ha messo dnproj e dnout sulla GPU, oppure le forme non sono quelle di Qwen3.6-35B-A3B."
 }
