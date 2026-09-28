@@ -16,15 +16,16 @@ layers; `dn-split` and `dn-sub` of that arm):
 |---|---|---|
 | `qkvz` projection | 2.81 | GPU call: upload x, int8 GEMV, download 12288 floats, sync |
 | `a`+`b` matmuls | 0.66 | CPU, one OpenMP region, 64 x 2048 f32 |
-| conv + SiLU | 0.43 | CPU |
+| gates + conv + SiLU | 0.43 | CPU (`dn-sub` conv: the beta/g loop and the conv) |
 | l2norm + recurrence | 2.00 | CPU, 32 heads x 128 x 128 state |
 | gated RMSNorm | 0.13 | CPU |
 | `out` projection | 1.79 | GPU call: upload 4096 floats, int8 GEMV, download, sync |
 
 That is ~94 and ~60 us per GPU call. Section 5's Nsight run put the kernels
 alone at a 42 and 15 us minimum (benchmark 44-55 and 17-27 us); the same
-run's engine medians were 84 and 30 us, but with the card in P3 and no
-keep-alive. So each call carries an **estimated** ~30-60 us that is not
+run's engine medians were 84 and 30 us, without the keep-alive and with
+no clock log (P3 is inferred from sections 5-6), and the 15/30 us row is
+the 1024-row grid, dnout mixed with attnout. So each call carries an **estimated** ~30-60 us that is not
 kernel: two copies, a launch and a blocking wait. Pinned staging showed no
 measured gain (record section 9b, interval [-1.44, +2.34]; the 21 September
 record measured it slower). The CPU work between the two calls is ~3.2 ms.
@@ -41,8 +42,8 @@ work is pending when the next layer's call starts.
 
 ## Model and engine facts the design rests on
 
-- Dimensions (`c/qwen36.c`, `deltanet()` and the config checks; 12288 =
-  8192 + 4096 in record section 5): `vh` = 32 value heads, `vk` = 16 key
+- Dimensions (`c/qwen36.c`, `deltanet()` and the config checks; the
+  record's 12288-row dnproj = 8192 + 4096, its binaries section): `vh` = 32 value heads, `vk` = 16 key
   heads (`rep` = 2), `kdim` = `vdim` = 128, `convk` = 4, hidden 2048,
   `conv_dim` = 8192, `value_dim` = 4096.
 - Per layer: recurrent state 32 x 128 x 128 f32 = 2 MiB, conv ring 8192 x 3
@@ -61,16 +62,20 @@ work is pending when the next layer's call starts.
   all 30 of each are on the GPU (`dn-gpu` 3810/3810); on two cards many
   layers would be split. **So eligibility is per layer**: a layer takes the
   new path only if both its projections and its new state are on the same
-  device; every other layer keeps today's two-call path.
+  device; every other layer runs as it would without the flag (see stage
+  3 for what a unit refused on price costs).
 - **Prefill.** `qt_dnproj_matmul` already runs on the GPU for every prompt
   row (S > 1); only `dnout` is decode-only. The conv, recurrence and norm of
   prefill stay on the CPU in this plan.
-- **Every place the recurrent state is read or replaced outside
-  `deltanet()`**, in `c/qwen36.c`: the snapshot save and restore (~3487,
-  ~3524), `reset_recurrent` (~3540, reached from `generate`, `consist_reset`,
-  `tf_nll`/PPL and serve), serve's `pin_save`/`pin_restore` (~4118-4135;
-  `pin_save` can run right after a one-row prefill), and `DN_DBG`, which
-  dumps layer-0 intermediates. The segment adapter (`qwen36_segment_*`,
+- **Every place the recurrent state is read or replaced outside the
+  decode step**, in `c/qwen36.c`: the pin state save and restore
+  (`q36_pin_state_save` ~3487, `pin_restore` ~3524, used by serve at
+  ~4118-4135; `pin_save` can run right after a one-row prefill),
+  `reset_recurrent` (~3540, reached from `generate`, `consist_reset`,
+  `tf_nll`/PPL and serve), and any S > 1 call of `deltanet()` itself (a
+  prefill, including serve's prefix-reuse prefill that skips the reset,
+  ~4096-4122). Inside `deltanet()`, `DN_DBG` dumps layer-0 intermediates.
+  The segment adapter (`qwen36_segment_*`,
   ~4727-5019) swaps in per-session buffers and reads/writes them directly;
   it is CPU-only today (it refuses a non-CPU backend mask and advertises a
   CPU numeric class), and **this plan keeps it CPU-only**, with an assert.
@@ -195,40 +200,63 @@ In `c/qwen36.c` / `c/qwen36_tier.c`, behind `COLI_DN_GPU=1`, decode only:
   with `qt_trunk_offer` before `qt_init`, so they come out of the expert
   budget instead of the 1 GiB headroom. Because auto-place prices each
   offer on its own and puts it on the device with the most room, `dnproj`,
-  `dnout` and the state of a layer are offered **as one unit** (or pinned
-  to one device); a layer whose unit does not fit keeps the CPU path.
+  `dnout` and the state of a layer are offered **as one unit**: one offer
+  under a new component name replacing today's separate dnproj and dnout
+  offers, with both placements looked up by that name (`qt_place_of`
+  matches any offered name and `qt_init` subtracts every offer, so the
+  tier API allows it). Consequences to accept or solve: an explicit
+  `COLI_PLACE` has no word for the unit yet; the `[place] auto:` line would
+  report the unit instead of dnproj; a unit refused on price loses today's
+  two-call GPU path for that layer too (not only the new one); and qwen38
+  shares the tier code. Only with `COLI_DN_GPU` set: unset, the offers stay
+  as they are today.
 - **Ownership per layer.** A flag per eligible layer says whether the
   device or the host holds its state. Every site listed above calls
-  `dn_state_to_host()` for all layers first; the next GPU decode uploads
-  again. `DN_DBG` forces the CPU path. The segment adapter asserts the flag
-  is never set.
-- **Failures.** A failure before the layer's state kernels have run leaves
-  the device state at token t-1: download it, and that layer uses the CPU
-  from here on, with one stderr line. A failure after them (the state has
+  `dn_state_to_host()` for all layers first, and the S > 1 path of
+  `deltanet()` itself requires host ownership (it does not rely on
+  `pin_restore` having run first); the next GPU decode uploads again.
+  `DN_DBG` forces the CPU path. The segment adapter asserts the flag is
+  never set.
+- **Failures.** A failure before the layer's state kernels have run (the
+  first of them is `dn_conv_silu`, which advances the ring) leaves the
+  device state at token t-1: download it, and that layer uses the CPU from
+  here on, with one stderr line. A failure after them (the state has
   already advanced to t) or a failing download (sticky CUDA error) cannot
   be recovered: `reset_recurrent` (which also clears the prefix cache) and
   fail the request. Never run the CPU on top of a half-advanced state.
+  "Fail the request" needs plumbing that does not exist: `deltanet()` and
+  `layers_forward_range()` return void and `step()` has no error return, so
+  a failure flag has to be added and checked by generate, serve, CONSIST
+  and `tf_nll`. And `fault_injected()` gates only compute entry points
+  today, not uploads or downloads, so testing the download branch means
+  extending the hook.
 - **A/B.** The OFF arm must carry the same VRAM offers, or residency and the
   `[place] auto:` line differ between arms and `misure-envab.ps1` refuses
   the run. So `COLI_DN_GPU=0` means "offer and reserve, run on the CPU",
   unset means neither, and the A/B is `=0` vs `=1`. `misure-envab.ps1`
   needs an `-OffValue` parameter for that (its OFF arm removes the variable
   today). A marker line, e.g. `[qwen36] DeltaNet decode on the GPU: N/30
-  layers`, names how many layers took the path.
+  layers`, names how many layers took the path; the `=0` arm must not
+  print it, since the script refuses an OFF log that contains the marker.
 - `dn-split`/`dn-gpu` keep meaning something: on a GPU-path layer the
   whole call goes in one slot, and `dn-gpu` counts it.
 
 Validation before merge:
 
 - `make check`; the stage 1-2 CUDA tests on the card.
-- **Tiny model**: the CI token check runs with `COLI_DENSE_I8=0`, where
-  nothing is placed, so it would never reach the GPU path. The tiny
-  acceptance is flag on vs flag off, both with `COLI_DENSE_I8=1`, compared
-  within a tolerance, with `CONSIST=1` (CPU prefill against S==1 decode,
-  with resets), which also exercises the state handoffs. The fixture is
-  `c/tools/make_qwen36_tiny.py`.
-- A test that runs prefill -> decode -> snapshot -> restore -> decode ->
-  serve `pin_save`/`pin_restore` with the flag on, against the flag off.
+- **Tiny model, on the card, by hand** (the CI job has no GPU and builds
+  without CUDA). The CI token check runs with `COLI_DENSE_I8=0`, where
+  nothing is placed, so it could never reach the GPU path. The tiny
+  acceptance is a CUDA build, `COLI_CUDA=1`, cap 8 (the tier starts only
+  with cap equal to the fixture's 8 experts), `COLI_PLACE` unset,
+  `COLI_DENSE_I8=1`, `CONSIST=1` (CPU prefill against S==1 decode, with
+  resets), flag on vs flag off within a tolerance, and the marker must
+  read 6/6 layers (the fixture's 6 DeltaNet layers of 8): without that
+  check, "within tolerance" also passes when every layer stayed on the
+  CPU. The fixture is `c/tools/make_qwen36_tiny.py`.
+- A test that runs prefill -> decode -> `pin_save` -> `pin_restore` ->
+  decode, and decode -> serve's prefix-reuse prefill -> decode, with the
+  flag on, against the flag off.
 - Real model: `PPL=1` flag on vs off, and one `misure-envab.ps1` A/B
   (`COLI_DN_GPU` 0 vs 1, six pairs, heat table, keep-alive on in both arms
   via `-AllowEnv`).
@@ -245,8 +273,8 @@ on only after that.
 
 - Prefill's conv/recurrence/norm on the GPU, and the segment adapter.
 - HIP: compiled out, stubs only.
-- Layers whose `dnproj`, `dnout` and state do not fit on one device: they
-  keep today's path.
+- Layers whose `dnproj`, `dnout` and state do not fit on one device as a
+  unit: they do not take the new path (stage 3 says what they lose).
 - Attention layers (10 of 40) and their `attnproj`/`attnout` round trips,
   which have the same shape of cost; the same pattern could follow.
 - The shared expert (3.6 ms/token on the CPU) and the CPU misses (4.1
