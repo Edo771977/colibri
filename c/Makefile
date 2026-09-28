@@ -1205,7 +1205,7 @@ dense_gemv_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h test
 dense-gemv-bench: dense_gemv_bench$(EXE)
 	./dense_gemv_bench$(EXE)
 
-# The DeltaNet decode kernels' own numbers (plan stage 1): the three kernels
+# The DeltaNet decode kernels' own numbers (plan stage 1): the two kernels
 # per layer, back to back and with a synchronize per layer, over 30 layers
 # of state. Needs ~0.1 GB of VRAM. Not part of make check: it needs a GPU.
 qwen36_deltanet_cuda_test$(EXE): backend_cuda_deltanet.cuh backend_gpu_compat.h tests/test_qwen36_deltanet_cuda.cu
