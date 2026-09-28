@@ -1,0 +1,211 @@
+Qwen3.6-35B-A3B: DeltaNet decode on the GPU, one backend call per layer
+(COLI_DN_GPU, docs/qwen36-deltanet-gpu-plan.md stage 3a, #67).
+28 September 2026, evening, on the operator's machine (RTX 4070 Ti
+SUPER, Ryzen 9 7950X, Windows, qwen36_i4_gs64, cap 256, 4 bits).
+
+Summary:
+
+  1. CONSIST=1 on the real model, COLI_DN_GPU=0 and =1: CONSIST OK both,
+     4 arms, worst relative gap 2.853e-07 (=0) and 3.112e-07 (=1),
+     tolerance 1e-2. The =1 run printed "DeltaNet decode on the GPU:
+     30/30 layers", so its 43 decode steps went through the new call.
+  2. misure-envab.ps1, COLI_DN_GPU 0 vs 1, six pairs, heat table, the
+     keep-alive meant to be on in both arms: step() 22.25 -> 17.72 ms/token, paired
+     delta -4.53, 95 % [-5.05, -4.02], 6 of 6 pairs negative. (The
+     keep-alive: set as instructed, see section 2 for what the output
+     shows of it.) The generated text is identical within each arm AND between the arms
+     (4a000cc01f310b64, the same as sections 8-10 of
+     qwen36-gpu-clocks-2026-09-27-raw.txt).
+
+Everything below is from output the operator pasted in the session. The
+logs stay on the operator's machine; none is committed and no
+evidence.sha256 exists for them.
+
+--- builds ----------------------------------------------------------------
+
+main 29c2af7d (the merge of #67), pulled as a fast-forward from ce8698b4.
+In C:\colibri-fork\c (the x64 Native Tools prompt, as instructed; the
+paste shows the commands, not the prompt):
+
+  make cuda-dll CC=clang CUDA_ARCH=sm_89          (nvcc, CUDA v13.4)
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native
+  copy /Y qwen36.exe qwen36_clang.exe
+
+As misure-envab.ps1 printed them (its hashes are the first 16 hex digits):
+
+  eseguibile: .\qwen36_clang.exe | 384000 byte | 2026-09-28 21:42:10 | sha256 4C00D30ADCC5FB4F
+  build-config: clang|-D_FILE_OFFSET_BITS=64 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -DCOLI_CUDA|-lm -fopenmp  -lpsapi -lpthread -Wl,--stack,8388608 |CUDA=0|CUDA_DLL=1|ARCH=native|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=0
+  coli_cuda.dll: 819712 byte | 2026-09-28 21:42:02 | sha256 230CA632A2CEA752
+
+The CONSIST runs of section 1 ran after this build and before the A/B,
+in the same window as pasted; their binaries' hashes were not re-read.
+
+--- 1. CONSIST=1 ------------------------------------------------------------
+
+  set SNAP=C:\modelli\qwen36_i4_gs64
+  set COLI_CUDA=1
+  set COLI_GPUS=0
+  set CONSIST=1
+  set COLI_DN_GPU=0
+  qwen36_clang.exe 256 4 prompt25.txt > dn0.log 2>&1
+  set COLI_DN_GPU=1
+  qwen36_clang.exe 256 4 prompt25.txt > dn1.log 2>&1
+  findstr /C:"CONSIST" /C:"DeltaNet" /C:"COLI_DN_GPU" dn0.log dn1.log
+
+  dn0.log:[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+  dn0.log:[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+  dn0.log:[qwen36] DeltaNet conv: across threads (QWEN36_CONV_OMP=0 restores the serial pass)
+  dn0.log:CONSIST prefill vs decode: 25 tokens, tol 1.0e-02 | 43 decode steps to run
+  dn0.log:CONSIST OK: 4 arms, worst relative gap 2.853e-07
+  dn1.log:[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+  dn1.log:[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+  dn1.log:[qwen36] DeltaNet decode on the GPU: 30/30 layers (COLI_DN_GPU=1)
+  dn1.log:[qwen36] DeltaNet conv: across threads (QWEN36_CONV_OMP=0 restores the serial pass)
+  dn1.log:CONSIST prefill vs decode: 25 tokens, tol 1.0e-02 | 43 decode steps to run
+  dn1.log:CONSIST OK: 4 arms, worst relative gap 3.112e-07
+
+CONSIST compares arm A (the whole prompt in one step(), S = 25) with
+arms that prefill a prefix and decode the rest one token at a time
+(split points 24, 19, 12, 2: 1 + 6 + 13 + 23 = 43 decode steps); with =1
+those decode steps are the new call on all 30 layers. It stands in for
+the plan's tiny-model acceptance, which needs torch on the operator's
+machine to build the fixture. What it cannot see: anything both arms
+share (its own comment in c/qwen36.c). The S > 1 prefill is not purely
+the CPU: it still runs the placed dnproj GEMV on the GPU for every row
+(qt_dnproj_matmul), and the new handle borrows that same device tensor,
+so a defect in the placed dnproj weights is shared and invisible here.
+What CONSIST does cover at =1 is the new call's own work -- the conv,
+the recurrence, the gated norm and dnout on the GPU (the prefill does
+out_proj through the CPU path) -- and the state upload. The gap with =1
+is of the order of float rounding, four orders below the tolerance. No
+other lines were read from the two logs.
+
+--- 2. A/B -------------------------------------------------------------------
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Var COLI_DN_GPU -OffValue 0 -Marker "[qwen36] DeltaNet decode on the GPU:" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE
+
+  parametri: cap=256 bits=4 N_NEW=128 rip=6 | OFF: COLI_DN_GPU=0 | ON: COLI_DN_GPU=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=C:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_KEEPALIVE -- DEROGA
+  marker: [qwen36] DeltaNet decode on the GPU:  (testo trovato in C:\colibri-fork\c\qwen36_clang.exe)
+  heat: C:\colibri-fork\c\heat.caldo.bin | 40972 byte | 40 layer x 256 esperti | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | costruita su un prompt sha256 6A4F0BCF64192EA3, diverso dal prompt misurato (come CROSS) | heat.caldo.bin.sha256: tabella= verificata | condizioni della costruzione diverse da questa corsa: allow_env, eseguibile, dll
+
+  rip 1 (OFF prima)  OFF  22.50  ON  17.70  delta  -4.80 ms/token
+  rip 2 (ON prima )  OFF  22.30  ON  17.40  delta  -4.90 ms/token
+  rip 3 (OFF prima)  OFF  22.40  ON  17.90  delta  -4.50 ms/token
+  rip 4 (ON prima )  OFF  21.60  ON  18.00  delta  -3.60 ms/token
+  rip 5 (OFF prima)  OFF  22.30  ON  17.40  delta  -4.90 ms/token
+  rip 6 (ON prima )  OFF  22.40  ON  17.90  delta  -4.50 ms/token
+
+  tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 12 run
+  banner del motore identico in tutti i run:
+    == qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+  [place] auto: identica in tutti i 12 run
+  residenza identica in tutti i run: 6812/10240
+  testo generato identico fra i run di ogni braccio (sha256 dello stdout letto, senza la riga [meta]):
+    OFF   4a000cc01f310b64
+    ON    4a000cc01f310b64
+  testo generato IDENTICO fra i due bracci (sullo stdout letto)
+
+  --- delta appaiati (ON - OFF), ms/token ---
+  -4.80   -4.90   -4.50   -3.60   -4.90   -4.50
+  media    -4.53   sd  0.49   se  0.20   df 5
+  intervallo 95 %:  [-5.05 ; -4.02]   ampiezza +-0.52
+  negativi 6/6
+
+  --- controllo POSIZIONE (ABBA) ---
+  OFF prima:  -4.80  -4.50  -4.90
+  ON prima:   -4.90  -3.60  -4.50
+  differenza fra le medie dei due gruppi: -0.40 ms/token
+
+  --- medie per braccio ---
+  OFF    step  22.25  moe  10.64  attn  1.99  dn  7.55  head  0.99
+         (shared)  3.44  (router)  0.62  wait  0.33
+         issue  1.64  cpu-miss  4.15  take  0.43  sh-ovl  3.45  hit  86.7 %  swaps  8.0  miss 6463
+         dn-sub:   proj  3.30  conv  0.45  l2n+rec  1.95  norm+out  1.80
+         dn-split: qkvz  2.69  a+b  0.62  norm  0.13  out  1.68  | GPU: dnproj 3810/3810, dnout 3810/3810
+  ON     step  17.72  moe  10.02  attn  1.99  dn  3.75  head  0.98
+         (shared)  3.07  (router)  0.64  wait  0.40
+         issue  1.63  cpu-miss  3.83  take  0.50  sh-ovl  3.08  hit  86.7 %  swaps  8.0  miss 6463/6464
+         dn-sub:   proj  3.73  conv  0.00  l2n+rec  0.00  norm+out  0.00
+         dn-split: qkvz  3.75  a+b  0.00  norm  0.00  out  0.00  | GPU: dnproj 3810/3810, dnout 3810/3810
+
+The OFF arm is =0: the dnstate bytes are charged to the expert budget in
+both arms (the handles are allocated only at =1), so the [place] line
+and the residency (6812/10240) are the same in all twelve runs, as the
+design intended.
+
+The keep-alive. The operator was told to run `set COLI_CUDA_KEEPALIVE=1`
+before the script; the paste starts at the script's command line, so
+that line is not in it. The stamp shows `allow-env=COLI_CUDA_KEEPALIVE --
+DEROGA`, and the script refuses to run when a name given to -AllowEnv
+is not set (c/tools/misure-envab.ps1), so the variable was present; its
+value is not printed, the engine turns the
+keep-alive on only for exactly "1", and no log was checked for
+"[cuda] keep-alive active:" (the marker checked was the DeltaNet one).
+That the keep-alive ran in these runs is therefore not shown, as in
+section 9b of the 27 September record.
+
+--- reading --------------------------------------------------------------------
+
+  - dn: 7.55 -> 3.75 ms/token (-3.80). The OFF arm's dn is the
+    today's-path cost the plan started from (7.83 in section 10 of the
+    27 September record). On the ON arm the whole call sits in the proj
+    slot by design (plan stage 3, "dn-split/dn-gpu keep meaning
+    something"), so dn-sub/dn-split show 0 in the other slots; dnproj
+    and dnout count 3810/3810 in both arms (30 layers x 127 decode
+    tokens). In the ON arm those two counters count the same single call
+    (c/qwen36.c increments both), not two GEMV calls.
+  - 3.75 ms/token over 30 layers is 125 us a layer, against 120.4 us
+    for one call in the stage 2 bench (docs/qwen36-deltanet-gpu-plan.md,
+    stage 2 "First run"): the bench's number holds in the engine to
+    within ~5 us a layer.
+  - The plan estimated 3.7-4 ms/token. dn alone gives -3.80; step() fell
+    by 4.53. The other 0.73: moe -0.62, head -0.01, attn unchanged, and
+    about -0.10 in the part of step() outside the four phases (22.25 -
+    21.17 = 1.08 OFF, 17.72 - 16.74 = 0.98 ON). Inside moe the sub-timers
+    moved as shared 3.44 -> 3.07, cpu-miss 4.15 -> 3.83, sh-ovl 3.45 ->
+    3.08, wait +0.07, take +0.07; they overlap (shared and sh-ovl are
+    nearly the same quantity), so they are not a breakdown of the -0.62.
+    Why the MoE part is faster with the DeltaNet off the CPU is NOT
+    measured. Candidates, none tested:
+    the CPU team does no DeltaNet work between the MoE sections of
+    consecutive layers (cache, memory bandwidth), or fewer hand-offs of
+    the OpenMP team per token.
+  - The miss count reads 6463 in all six OFF runs and 6463 or 6464 in
+    the ON runs (the script prints the distinct values). Residency and
+    hit rate are identical; one miss in ~6460 is not a factor here, but
+    why at least one ON run differs by one is not known (the distinct
+    values do not say how many ON runs read 6464).
+  - Position: -0.40 between the two orders, inside the spread of the
+    deltas (sd 0.49). Rep 4 (ON first) is the smallest delta: the
+    fastest OFF run (21.60) paired with the slowest ON run (18.00).
+  - In throughput terms (step() only, not the end-to-end wall): 44.9 ->
+    56.4 tokens/s.
+
+--- what this run did NOT measure ----------------------------------------------
+
+  - Clocks, and whether the keep-alive actually ran (see section 2).
+  - Longer generations (N_NEW 128 only), other prompts, other caps.
+  - PPL=1: the real model has no reference file here. CONSIST (section
+    1) is the correctness check that ran.
+  - SERVE=1: COLI_DN_GPU is ignored there until stage 3b.
+  - The end-to-end wall, prefill, and the time to first token.
+  - The engine's failure recovery on the card: it is tested on the fake
+    backend only (c/tests/test_qwen36_dn_gpu.c: a failed decode and a
+    failed upload; a failed download has no fake switch and is not
+    tested at all). The backend's own fault hook ran on the card in
+    stage 2's test.
+  - The state download. CONSIST resets with reset_recurrent, which marks
+    the device copy stale without downloading, and a plain generate has
+    no pin snapshot, so only the upload and the decode ran on the card.
+  - A replication in another session or after a reboot.
+  - The VRAM cost as such. Residency here is 6812/10240 against 6859
+    in sections 9-10 of the 27 September record, 47 experts, which fits
+    30 x 2.83 MiB of dnstate at ~1.8 MiB an expert; but that compares
+    different runs and binaries, not an A/B.
+  - Where the remaining ~125 us a layer goes (kernels, launches, the
+    round trip). For scale, the stage 1 bench (`make deltanet-cuda-bench`)
+    that the operator pasted with the stage 2 run, earlier on 28
+    September and not committed anywhere else, read on this card:
+    "back to back: 24.91 us per layer" for dn_conv_silu + dn_head,
+    dn_conv_silu 5.67, dn_head 20.79, "empty kernel 5.50 us per layer"
+    (the launch rate).
