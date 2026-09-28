@@ -100,11 +100,26 @@ function Get-Unit([string]$col, [hashtable]$table) {
 }
 $tUs = Get-Unit $cStart @{ "ns" = 0.001; "us" = 1.0; "ms" = 1000.0 }
 if ((Get-Unit $cDur @{ "ns" = 0.001; "us" = 1.0; "ms" = 1000.0 }) -ne $tUs) { throw "Start e Duration hanno unita' diverse in $Csv." }
+$nsInt = ($tUs -eq 0.001)
 $bFactor = Get-Unit $cBytes @{ "B" = 1.0; "KB" = 1e3; "KiB" = 1024.0; "MB" = 1e6; "MiB" = 1048576.0; "GB" = 1e9 }
+$bComma  = ($bFactor -ne 1.0)
 
-function To-Num([string]$s) {
+# nsys scrive i decimali con il separatore della lingua di Windows: su un
+# Windows italiano "Bytes (MB)" vale "0,008" e "508,559" (lm_head int8), fra
+# virgolette nel CSV. Si accetta quindi il punto oppure, nella sola colonna
+# dei byte e solo se l'unita' non e' il byte, UNA virgola decimale. Un
+# separatore delle migliaia non si distingue da un decimale quando c'e' un
+# solo gruppo ("1.234", "8,192"): per questo i tempi in ns devono essere
+# interi (lo sono) e i byte in B non accettano la virgola.
+function To-Num([string]$s, [string]$col, [switch]$Int, [switch]$Comma) {
     $v = 0.0
-    if (-not [double]::TryParse($s, [Globalization.NumberStyles]::Float, $inv, [ref]$v)) { throw "valore non numerico '$s' in $Csv." }
+    $t = $s.Trim()
+    if ($Int -and $t -notmatch '^-?\d+$') { throw "tempo non intero '$s' nella colonna '$col' di ${Csv}: in ns nsys scrive interi, un punto o una virgola qui sarebbe un separatore delle migliaia." }
+    if ($Comma -and $t -match '^-?\d+,\d+$') { $t = $t.Replace(",", ".") }
+    if ($t -notmatch '^-?\d+(\.\d+)?([eE][-+]?\d+)?$' -or
+        -not [double]::TryParse($t, [Globalization.NumberStyles]::Float, $inv, [ref]$v)) {
+        throw "valore non numerico '$s' nella colonna '$col' di $Csv (atteso un numero con il punto decimale, o con UNA virgola decimale nella colonna dei byte)."
+    }
     $v
 }
 
@@ -118,10 +133,10 @@ foreach ($r in $rows) {
     elseif ($name -match 'Host-to-Device|HtoD')            { $kind = "H" }
     elseif ($name -match 'Device-to-Host|DtoH')            { $kind = "D" }
     else                                                   { $kind = "O" }
-    $s = (To-Num $r.$cStart) * $tUs
-    $d = (To-Num $r.$cDur) * $tUs
+    $s = (To-Num $r.$cStart $cStart -Int:$nsInt) * $tUs
+    $d = (To-Num $r.$cDur $cDur -Int:$nsInt) * $tUs
     $b = 0.0
-    if ($kind -eq "H" -or $kind -eq "D") { $b = (To-Num $r.$cBytes) * $bFactor }
+    if ($kind -eq "H" -or $kind -eq "D") { $b = (To-Num $r.$cBytes $cBytes -Comma:$bComma) * $bFactor }
     # Lo stream 7 di due schede sono due stream: la chiave include scheda e contesto.
     $key = [string]$r.$cStrm
     if ($cDev) { $key = [string]$r.$cDev + "/" + $key }
