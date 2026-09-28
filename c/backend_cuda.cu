@@ -2720,7 +2720,14 @@ extern "C" void coli_cuda_dense_stats(int device, uint64_t *calls, uint64_t *wei
  * On a 0 from decode the state may or may not have advanced: the caller must
  * upload or zero it before the next decode, or stop using the handle. Stage 3
  * resets the recurrent state and fails the request (the plan's rule: never
- * run the CPU on a half-advanced state). */
+ * run the CPU on a half-advanced state).
+ *
+ * For stage 3: the handle's bytes (coli_cuda_deltanet_bytes, ~2.6 MB a layer
+ * on the 35B) are not in ctx->tensor_bytes, so the tier charges them to its
+ * own budget; and the handles go before the projections they borrow, before
+ * qt_shutdown frees G_dnp / G_dense and before coli_cuda_shutdown. The fault
+ * hook gates decode at entry only; a failure after the state kernels (the
+ * plan's "fault at each step") needs the hook extended, with stage 3. */
 #include "backend_cuda_deltanet.cuh"
 
 struct ColiCudaDeltaNet {
@@ -2775,7 +2782,7 @@ extern "C" int coli_cuda_deltanet_create(ColiCudaDeltaNet **handle,
     size_t off[sizeof n / sizeof *n], total = 0;
     for (int i = 0; i < nb; i++) { off[i] = total; total += (n[i] + 63) & ~(size_t)63; }
     ColiCudaDeltaNet *h = new (std::nothrow) ColiCudaDeltaNet();
-    if (!h) return 0;
+    if (!h) { std::fprintf(stderr, "[cuda] deltanet handle refused: out of host memory\n"); return 0; }
     if (!cuda_ok(cudaMalloc(&h->block, total * sizeof(float)), "deltanet handle allocation")) { delete h; return 0; }
     h->device = dnproj->device; h->s = s; h->proj = dnproj; h->out = dnout; h->bytes = total * sizeof(float);
     float *b = h->block;
@@ -2792,9 +2799,9 @@ extern "C" int coli_cuda_deltanet_create(ColiCudaDeltaNet **handle,
           && cuda_ok(cudaMemcpy(ddt, dtbias, n[4] * sizeof(float), cudaMemcpyHostToDevice), "deltanet dt_bias upload")
           && cuda_ok(cudaMemcpy(dconv, wconv, n[5] * sizeof(float), cudaMemcpyHostToDevice), "deltanet conv upload")
           && cuda_ok(cudaMemcpy(dnorm, normw, n[6] * sizeof(float), cudaMemcpyHostToDevice), "deltanet norm upload")
-          && cuda_ok(cudaMemset(h->d.ring, 0, n[7] * sizeof(float)), "deltanet ring zero")
-          && cuda_ok(cudaMemset(h->d.rec, 0, n[8] * sizeof(float)), "deltanet state zero")
-          && cuda_ok(cudaDeviceSynchronize(), "deltanet handle synchronize");
+          && cuda_ok(cudaMemsetAsync(h->d.ring, 0, n[7] * sizeof(float), 0), "deltanet ring zero")
+          && cuda_ok(cudaMemsetAsync(h->d.rec, 0, n[8] * sizeof(float), 0), "deltanet state zero")
+          && cuda_ok(cudaStreamSynchronize(0), "deltanet handle synchronize");
     if (!ok) { keepalive_yield(); cudaFree(h->block); delete h; return 0; }
     *handle = h;
     return 1;
@@ -2841,9 +2848,12 @@ extern "C" int coli_cuda_deltanet_state_download(ColiCudaDeltaNet *h, float *rec
 extern "C" int coli_cuda_deltanet_state_zero(ColiCudaDeltaNet *h) {
     if (!h || !select_ctx(find_ctx(h->device))) return 0;
     const DnShape *s = &h->s;
-    return cuda_ok(cudaMemset(h->d.rec, 0, (size_t)s->vh * s->kdim * s->vdim * sizeof(float)), "deltanet state zero")
-        && cuda_ok(cudaMemset(h->d.ring, 0, (size_t)dn_conv_dim(s) * (s->convk - 1) * sizeof(float)), "deltanet ring zero")
-        && cuda_ok(cudaDeviceSynchronize(), "deltanet zero synchronize");
+    /* cudaMemsetAsync on stream 0, the handle's stream: the compat header maps
+     * it for HIP (not cudaMemset), and the synchronize waits for stream 0 only,
+     * not for the keep-alive's spin or the expert stream. */
+    return cuda_ok(cudaMemsetAsync(h->d.rec, 0, (size_t)s->vh * s->kdim * s->vdim * sizeof(float), 0), "deltanet state zero")
+        && cuda_ok(cudaMemsetAsync(h->d.ring, 0, (size_t)dn_conv_dim(s) * (s->convk - 1) * sizeof(float), 0), "deltanet ring zero")
+        && cuda_ok(cudaStreamSynchronize(0), "deltanet zero synchronize");
 }
 /* Bytes the handle holds on its device, for the caller's VRAM accounting. */
 extern "C" size_t coli_cuda_deltanet_bytes(const ColiCudaDeltaNet *h) { return h ? h->bytes : 0; }

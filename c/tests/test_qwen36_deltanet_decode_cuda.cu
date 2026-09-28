@@ -7,7 +7,10 @@
  * deltanet()'s middle (dn_ref_step, qwen36_deltanet_ref.h), the int8 dnout
  * GEMV. For the 35B shapes and the CI tiny fixture's:
  *   1. one call from a random state: the output and the state within
- *      tolerance of the CPU, the ring byte for byte;
+ *      tolerance of the CPU; the ring's older columns byte for byte (they
+ *      are the old ring shifted), its newest column -- this token's qkv,
+ *      the dnproj GEMV's output, summed on the device in another order --
+ *      within tolerance;
  *   2. 64 calls in a row, both sides carrying their own state: every output
  *      and the final state within a bound;
  *   3. the same call twice from the same state: the same bytes;
@@ -120,9 +123,18 @@ static void run_shape(const char *name, DnShape s) {
     ref_layer(c, x, ring, rec, out);
     check_flag(coli_cuda_deltanet_decode(c.h, x.data(), gout.data()) != 0, "decode returns 1");
     check_flag(coli_cuda_deltanet_state_download(c.h, grec.data(), gring.data()) != 0, "state_download");
-    check(rel_err(gout, out) < 1e-5, "one call: output", rel_err(gout, out), 1e-5);
+    check(rel_err(gout, out) < 2e-5, "one call: output", rel_err(gout, out), 2e-5);
     check(rel_err(grec, rec) < 1e-5, "one call: state", rel_err(grec, rec), 1e-5);
-    check_flag(gring == ring, "one call: ring byte for byte");
+    {
+        const int cols = s.convk - 1; bool old_same = true;
+        std::vector<float> gnew, cnew;
+        for (size_t cc = 0; cc < nring / cols; cc++) {
+            for (int k = 0; k < cols - 1; k++) old_same &= gring[cc * cols + k] == ring[cc * cols + k];
+            gnew.push_back(gring[cc * cols + cols - 1]); cnew.push_back(ring[cc * cols + cols - 1]);
+        }
+        check_flag(old_same, "one call: ring, older columns byte for byte");
+        check(rel_err(gnew, cnew) < 1e-5, "one call: ring, newest column (this token's qkv)", rel_err(gnew, cnew), 1e-5);
+    }
 
     /* 3. the same call again from the same state: the same bytes */
     std::vector<float> gout2(s.hidden, NAN);
@@ -171,6 +183,7 @@ static void run_shape(const char *name, DnShape s) {
     int rb = coli_cuda_deltanet_create(&bad, c.to, c.tp, s.hidden, s.vh, s.vk, s.kdim, s.vdim, s.convk, s.eps,
                                        c.L.wab.data(), c.L.alog.data(), c.L.dtbias.data(), c.L.wconv.data(), c.L.normw.data());
     check_flag(rb == 0 && bad == nullptr, "create refuses swapped projections (and clears the handle)");
+    bad = (ColiCudaDeltaNet *)1;
     rb = coli_cuda_deltanet_create(&bad, c.tp, c.to, s.hidden, s.vh, s.vk, s.kdim, s.vdim, s.convk, s.eps,
                                    c.L.wab.data(), nullptr, c.L.dtbias.data(), c.L.wconv.data(), c.L.normw.data());
     check_flag(rb == 0 && bad == nullptr, "create refuses a missing weight");

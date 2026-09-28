@@ -128,8 +128,8 @@ static void run_shape(const char *name, DnShape s) {
 
     /* 2. the same step again from the same state, outputs poisoned: the same bytes */
     up(d.ring, ring0); up(d.rec, rec0);
-    CK(cudaMemset(d.beta, 0xFF, s.vh * sizeof(float))); CK(cudaMemset(d.g, 0xFF, s.vh * sizeof(float)));
-    CK(cudaMemset(d.conv_out, 0xFF, conv_dim * sizeof(float))); CK(cudaMemset(d.outr, 0xFF, value_dim * sizeof(float)));
+    CK(cudaMemsetAsync(d.beta, 0xFF, s.vh * sizeof(float), 0)); CK(cudaMemsetAsync(d.g, 0xFF, s.vh * sizeof(float), 0));
+    CK(cudaMemsetAsync(d.conv_out, 0xFF, conv_dim * sizeof(float), 0)); CK(cudaMemsetAsync(d.outr, 0xFF, value_dim * sizeof(float), 0));   /* Async: HIP maps it, not cudaMemset */
     CK(dn_decode_middle(0, &s, &v)); CK(cudaDeviceSynchronize());
     std::vector<float> gb2, gg2, gc2, go2, gring2, grec2;
     down(gb2, d.beta, s.vh); down(gg2, d.g, s.vh); down(gc2, d.conv_out, conv_dim); down(go2, d.outr, value_dim);
