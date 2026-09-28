@@ -47,7 +47,9 @@
 # media sulle chiamate di decode. "Fuori dallo span" comprende tra l'altro
 # la copia di staging del driver per la memoria pageable, la latenza di
 # sottomissione delle chiamate API, il ritorno dalle attese sincrone, i
-# controlli di coli_cuda_matmul e i due tm_now() del timer: la traccia CUDA
+# controlli di coli_cuda_matmul, i due tm_now() del timer e l'attesa di un
+# caricamento di expert ancora in corso sullo stream quando la chiamata
+# comincia (per dnout finisce invece nella pausa): la traccia CUDA
 # da sola non li separa. Il profiler allunga le chiamate API: per questo
 # esiste -BaseLog.
 
@@ -152,10 +154,22 @@ foreach ($key in @($byStream.Keys)) {
         $i = $dk[$q]
         $lo = -1;          if ($q -gt 0)             { $lo = $dk[$q - 1] }
         $hi = $ops.Count;  if ($q + 1 -lt $dk.Count) { $hi = $dk[$q + 1] }
-        $hIdx = -1
+        $hIdx = -1; $suspect = -1
         for ($j = $i - 1; $j -gt $lo; $j--) {
-            if ($ops[$j].Kind -eq "H" -and ((Near $ops[$j].B $DnprojUp) -or (Near $ops[$j].B $OutUp))) { $hIdx = $j; break }
+            if ($ops[$j].Kind -ne "H" -or -not ((Near $ops[$j].B $DnprojUp) -or (Near $ops[$j].B $OutUp))) { continue }
+            # Con expert int8 o int4 per riga la copia delle scale di un expert
+            # e' di 8 KiB anche lei. Una copia subito dopo una copia grande o
+            # dopo un kernel non denso (offset_to_signed_s4) e' sospetta: vale
+            # solo se prima, fino al kernel denso precedente, non ce n'e'
+            # un'altra (un caricamento finito appena prima della chiamata).
+            if ($j -gt 0 -and (($ops[$j - 1].Kind -eq "H" -and $ops[$j - 1].B -gt 65536 * 1.05) -or
+                               ($ops[$j - 1].Kind -eq "K" -and -not $ops[$j - 1].Dense))) {
+                if ($suspect -lt 0) { $suspect = $j }
+                continue
+            }
+            $hIdx = $j; break
         }
+        if ($hIdx -lt 0) { $hIdx = $suspect }
         $dIdx = -1
         for ($j = $i + 1; $j -lt $hi; $j++) { if ($ops[$j].Kind -eq "D") { $dIdx = $j; break } }
         if ($hIdx -lt 0 -or $dIdx -lt 0) { $nX++; continue }
@@ -205,7 +219,7 @@ function Read-Timers([string]$path) {
     $t = Get-Content -LiteralPath $path -Raw
     $o = [ordered]@{ Path = $path; Tokens = $null; Qkvz = $null; Out = $null; NProj = $null; NOut = $null; NCalls = $null; Step = $null
                      KeepAlive = $t.Contains("[cuda] keep-alive active:"); Heat = $t.Contains("[qtier] HEAT_FILE loaded:")
-                     Pinned = $t.Contains("[cuda] dense pinned staging") }
+                     Pinned = $t.Contains("[cuda] dense pinned staging active:") }
     if ($t -match '\[timers\] decode: (\d+) tokens') { $o.Tokens = [int]$Matches[1] }
     if ($t -match 'dn-split: qkvz ([0-9.]+) \| a\+b [0-9.]+ \| norm [0-9.]+ \| out ([0-9.]+) ms/token') {
         $o.Qkvz = [double]::Parse($Matches[1], $inv); $o.Out = [double]::Parse($Matches[2], $inv)
@@ -287,6 +301,7 @@ function Compare-Wall([string]$tag, $tm, [double]$kProj, [double]$sProj, [double
     "  per chiamata (us)        parete   span GPU   kernel   fuori dallo span   non-kernel"
     "  dnproj                 {0,8} {1,10} {2,8} {3,18} {4,12}" -f (Fmt $wProj), (Fmt $sProj), (Fmt $kProj), (Fmt ($wProj - $sProj)), (Fmt ($wProj - $kProj))
     "  dnout                  {0,8} {1,10} {2,8} {3,18} {4,12}" -f (Fmt $wOut), (Fmt $sOut), (Fmt $kOut), (Fmt ($wOut - $sOut)), (Fmt ($wOut - $kOut))
+    "  span delle sole chiamate senza caricamenti dentro: dnproj {0}, dnout {1} -- con molte chiamate disturbate, 'non-kernel' e' un limite superiore" -f (Fmt $script:sProjClean), (Fmt $script:sOutClean)
     "  ({0} layer DeltaNet per token: non-kernel {1} ms/token in tutto)" -f ($tm.NCalls / $tm.Tokens).ToString("0.##", $inv),
         (Fmt ((($wProj - $kProj) + ($wOut - $kOut)) * $tm.NCalls / $tm.Tokens / 1000.0))
 }
@@ -296,6 +311,10 @@ if ($logs.Count) {
     $sProj = ($dnproj | ForEach-Object { $_.DE - $_.HS } | Measure-Object -Average).Average
     $kOut  = ($dnout  | ForEach-Object { $_.KE - $_.KS } | Measure-Object -Average).Average
     $sOut  = ($dnout  | ForEach-Object { $_.DE - $_.HS } | Measure-Object -Average).Average
+    $cp = @($dnproj | Where-Object { $_.Foreign -eq 0 }); $co = @($dnout | Where-Object { $_.Foreign -eq 0 })
+    $script:sProjClean = [double]::NaN; $script:sOutClean = [double]::NaN
+    if ($cp.Count) { $script:sProjClean = ($cp | ForEach-Object { $_.DE - $_.HS } | Measure-Object -Average).Average }
+    if ($co.Count) { $script:sOutClean  = ($co | ForEach-Object { $_.DE - $_.HS } | Measure-Object -Average).Average }
     ""
     "medie della traccia contro la parete dei timer dn-split (medie anche loro):"
     if ($Log)     { Compare-Wall "corsa profilata ($Log)" $logs[0] $kProj $sProj $kOut $sOut }
