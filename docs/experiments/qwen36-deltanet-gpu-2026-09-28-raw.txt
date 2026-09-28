@@ -24,7 +24,8 @@ evidence.sha256 exists for them.
 --- builds ----------------------------------------------------------------
 
 main 29c2af7d (the merge of #67), pulled as a fast-forward from ce8698b4.
-In the x64 Native Tools prompt, C:\colibri-fork\c:
+In C:\colibri-fork\c (the x64 Native Tools prompt, as instructed; the
+paste shows the commands, not the prompt):
 
   make cuda-dll CC=clang CUDA_ARCH=sm_89          (nvcc, CUDA v13.4)
   make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native
@@ -202,5 +203,9 @@ section 9b of the 27 September record.
     30 x 2.83 MiB of dnstate at ~1.8 MiB an expert; but that compares
     different runs and binaries, not an A/B.
   - Where the remaining ~125 us a layer goes (kernels, launches, the
-    round trip); stage 1's bench put the two small kernels at ~24 us
-    back to back and an empty launch at ~5.4 us on this machine.
+    round trip). For scale, the stage 1 bench (`make deltanet-cuda-bench`)
+    that the operator pasted with the stage 2 run, earlier on 28
+    September and not committed anywhere else, read on this card:
+    "back to back: 24.91 us per layer" for dn_conv_silu + dn_head,
+    dn_conv_silu 5.67, dn_head 20.79, "empty kernel 5.50 us per layer"
+    (the launch rate).
