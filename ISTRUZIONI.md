@@ -12,8 +12,8 @@ al codice di questo fork e vanno ricontrollati dopo ogni aggiornamento da upstre
 | RAM | **64 GB DDR5 a 5200 MT/s**: 2×16 Corsair CMK32GX5M2E6000Z36 + 2×16 CMG32GX5M2E6000Z36 (4 banchi: con EXPO restano a 5200, non 6000) |
 | Scheda madre | ASUS TUF GAMING X670E-PLUS, BIOS **3881** (4 slot RAM, 4 slot M.2) |
 | GPU | NVIDIA GeForce RTX 4070 Ti SUPER 16 GB (Ada, `sm_89`), driver 616.64 |
-| Disco modelli (D:) | **Crucial T705 4 TB** nello slot **PCIe 5.0** in alto, sopra lo slot della GPU, con il suo dissipatore (quello della scheda madre è stato tolto) → `Gen5 x4`. Solo modelli: `D:\modelli` |
-| Disco di sistema (C:) | Silicon Power UD90 4 TB nello slot **PCIe 4.0 in basso a sinistra** → `Gen4 x4`. Nello slot "PCIe 3.0/SATA" girava a `Gen3 x2`, un quarto della banda |
+| Disco modelli (D:) | **Crucial T705 4 TB** nello slot **PCIe 5.0** in alto, sopra lo slot della GPU, con il suo dissipatore → `Gen5 x4`. Solo modelli: `D:\modelli` |
+| Disco di sistema (C:) | Silicon Power UD90 4 TB nello slot **PCIe 4.0 in basso a sinistra** → `Gen4 x4`. In un altro slot (le note di allora lo chiamavano M.2_2, probabilmente il "PCIe 3.0/SATA") girava a `Gen3 x2`, un quarto della banda |
 | Sistema | Windows 11; qwen36 compilato con clang (MSYS2 CLANG64, vedi sotto), gli altri motori con MinGW-w64; DLL CUDA con MSVC 2022 e CUDA 13.4 |
 
 ## Misure (17 settembre 2026, Qwen3.6-35B-A3B int4 gs64)
@@ -157,34 +157,40 @@ grande (`DIRECT=1`), confrontando `COLI_WIN_SYNC_DIRECT=1` e senza, a parità di
 ## 5. Aggiornamenti hardware
 
 **Fatti:** BIOS 1813 → 3881; RAM 32 → 64 GB a 5200 (4 banchi, due kit diversi: EXPO da solo
-tornava a 3600, la frequenza va messa a mano); UD90 dallo slot "PCIe 3.0/SATA" (`Gen3 x2`) a
-uno slot collegato a `Gen4 x4`, cioè da 1,6 a 5–6 GB/s.
+tornava a 3600, la frequenza va messa a mano); UD90 da uno slot collegato a `Gen3 x2` a
+uno collegato a `Gen4 x4` (le posizioni di allora non sono annotate), cioè da 1,6 a 5–6 GB/s.
 
 **29 settembre 2026, Crucial T705 4 TB.** Montato nello slot PCIe 5.0 in alto con il suo
 dissipatore; l'UD90 (sistema, C:) spostato nello slot PCIe 4.0 in basso a sinistra. I numeri
 M.2_x usati prima in queste note non corrispondevano agli slot reali, per questo ora gli slot
-sono descritti per posizione, come nell'immagine degli slot M.2 di ASUS.
+sono descritti per posizione (vedi la mappa degli slot M.2 nel manuale della scheda).
+
 - Collegamenti letti da Windows (`DEVPKEY_PciDevice_CurrentLinkSpeed/Width`): T705 `Gen5 x4`,
-  UD90 `Gen4 x4`, entrambi al massimo che supportano.
+  UD90 `Gen4 x4`, entrambi alla velocità e alla larghezza massime del dispositivo (quale
+  controller è quale si ricava dalla velocità massima, 5 contro 4).
 - Modello copiato con `robocopy C:\modelli\qwen36_i4_gs64 D:\modelli\qwen36_i4_gs64 /E /J /NP`:
-  97 file, 21,45 GB, nessun errore. Da ora `set SNAP=D:\modelli\qwen36_i4_gs64`; la copia su C:
+  97 file, 21,45 GiB secondo robocopy, nessun errore. Da ora `set SNAP=D:\modelli\qwen36_i4_gs64`; la copia su C:
   resta finché il motore non ha girato da D:.
 - `iobench.exe <disco>:\modelli\qwen36_i4_gs64\model-globals.safetensors 19 256 16 1`
   (letture dirette, 256 blocchi da 19 MB, 16 thread), tre giri a ordine alternato:
 
-  | Disco | giro 1 | giro 2 | giro 3 |
+  | Disco | giro 1 (GB/s) | giro 2 (GB/s) | giro 3 (GB/s) |
   |---|---|---|---|
-  | D: T705 | 11,94 | 12,19 | 12,11 GB/s |
-  | C: UD90 | 4,30 | 4,48 | 4,17 GB/s |
+  | D: T705 | 11,94 | 12,19 | 12,11 |
+  | C: UD90 | 4,30 | 4,48 | 4,17 |
 
-  Il T705 legge circa 2,8 volte più veloce. Due cautele: il file (1,8 GB) sul T705 era appena
-  stato scritto, e un SSD può leggere più in fretta i dati recenti (da ripetere fra qualche
-  giorno o su un modello grande); l'UD90 fa 4,3 GB/s contro i 5–6 di settembre con gli stessi
-  parametri, forse perché lo slot in basso passa dal chipset, forse perché ora porta il sistema
-  (non misurato).
+  Il T705 legge circa 2,8 volte più velocemente. Cautele:
+  - il file (1,8 GiB, senza esperti) è più piccolo dei 5,1 GB letti, quindi ogni zona è letta
+    più volte, e sul T705 era appena stato scritto: un SSD può servirlo dalla sua cache interna
+    (SLC). I 12 GB/s sono un tetto; da ripetere fra qualche giorno su uno shard di esperti;
+  - l'UD90 fa 4,3 GB/s contro i 5–6 di settembre, ma non è certo che allora file e build
+    fossero gli stessi (ora `iobench.exe` è compilato con clang). Forse lo slot in basso passa
+    dal chipset, forse pesa che ora porta il sistema: non misurato.
 
 **Da fare:**
 - **MemTest86**, almeno un giro completo: 4 banchi di due kit diversi, entro il periodo di reso.
+- **Rimisurare i due dischi** con la stessa build di `iobench.exe` e uno shard di esperti
+  (`model-000xx.safetensors`), a qualche giorno dalla copia.
 - **Modelli grandi sul T705**: GLM-5.2, DeepSeek V4 e Qwen3.8 leggono gli esperti dal disco, ed
   è lì che il T705 dovrebbe contare; per Qwen3.6 con la cache calda il disco pesa poco.
 - **Oltre i 64 GB**: ha senso solo per i modelli grandi, e ai prezzi attuali della DDR5 conviene
