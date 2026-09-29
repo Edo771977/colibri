@@ -12,8 +12,8 @@ al codice di questo fork e vanno ricontrollati dopo ogni aggiornamento da upstre
 | RAM | **64 GB DDR5 a 5200 MT/s**: 2×16 Corsair CMK32GX5M2E6000Z36 + 2×16 CMG32GX5M2E6000Z36 (4 banchi: con EXPO restano a 5200, non 6000) |
 | Scheda madre | ASUS TUF GAMING X670E-PLUS, BIOS **3881** (4 slot RAM, 4 slot M.2) |
 | GPU | NVIDIA GeForce RTX 4070 Ti SUPER 16 GB (Ada, `sm_89`), driver 616.64 |
-| Disco | Silicon Power UD90 4 TB in **M.2_3** → `Gen4 x4`. In M.2_2 girava a `Gen3 x2`, cioè un quarto della banda |
-| In arrivo | Crucial T705 4 TB PCIe 5.0 in M.2_1, dedicato ai modelli |
+| Disco modelli (D:) | **Crucial T705 4 TB** nello slot **PCIe 5.0** in alto, sopra lo slot della GPU, con il suo dissipatore (quello della scheda madre è stato tolto) → `Gen5 x4`. Solo modelli: `D:\modelli` |
+| Disco di sistema (C:) | Silicon Power UD90 4 TB nello slot **PCIe 4.0 in basso a sinistra** → `Gen4 x4`. Nello slot "PCIe 3.0/SATA" girava a `Gen3 x2`, un quarto della banda |
 | Sistema | Windows 11; qwen36 compilato con clang (MSYS2 CLANG64, vedi sotto), gli altri motori con MinGW-w64; DLL CUDA con MSVC 2022 e CUDA 13.4 |
 
 ## Misure (17 settembre 2026, Qwen3.6-35B-A3B int4 gs64)
@@ -101,7 +101,7 @@ set CUDA_EXPERT_GB=auto
 set COLI_PLACE=auto
 set HEAT_FILE=heat.bin
 set OMP_NUM_THREADS=16
-set SNAP=D:\modelli\qwen36_int4
+set SNAP=D:\modelli\qwen36_i4_gs64
 set N_NEW=200
 qwen36.exe 256 4 prompt.txt
 ```
@@ -157,13 +157,36 @@ grande (`DIRECT=1`), confrontando `COLI_WIN_SYNC_DIRECT=1` e senza, a parità di
 ## 5. Aggiornamenti hardware
 
 **Fatti:** BIOS 1813 → 3881; RAM 32 → 64 GB a 5200 (4 banchi, due kit diversi: EXPO da solo
-tornava a 3600, la frequenza va messa a mano); SSD da M.2_2 (`Gen3 x2`) a M.2_3 (`Gen4 x4`),
-cioè da 1,6 a 5–6 GB/s.
+tornava a 3600, la frequenza va messa a mano); UD90 dallo slot "PCIe 3.0/SATA" (`Gen3 x2`) a
+uno slot collegato a `Gen4 x4`, cioè da 1,6 a 5–6 GB/s.
+
+**29 settembre 2026, Crucial T705 4 TB.** Montato nello slot PCIe 5.0 in alto con il suo
+dissipatore; l'UD90 (sistema, C:) spostato nello slot PCIe 4.0 in basso a sinistra. I numeri
+M.2_x usati prima in queste note non corrispondevano agli slot reali, per questo ora gli slot
+sono descritti per posizione, come nell'immagine degli slot M.2 di ASUS.
+- Collegamenti letti da Windows (`DEVPKEY_PciDevice_CurrentLinkSpeed/Width`): T705 `Gen5 x4`,
+  UD90 `Gen4 x4`, entrambi al massimo che supportano.
+- Modello copiato con `robocopy C:\modelli\qwen36_i4_gs64 D:\modelli\qwen36_i4_gs64 /E /J /NP`:
+  97 file, 21,45 GB, nessun errore. Da ora `set SNAP=D:\modelli\qwen36_i4_gs64`; la copia su C:
+  resta finché il motore non ha girato da D:.
+- `iobench.exe <disco>:\modelli\qwen36_i4_gs64\model-globals.safetensors 19 256 16 1`
+  (letture dirette, 256 blocchi da 19 MB, 16 thread), tre giri a ordine alternato:
+
+  | Disco | giro 1 | giro 2 | giro 3 |
+  |---|---|---|---|
+  | D: T705 | 11,94 | 12,19 | 12,11 GB/s |
+  | C: UD90 | 4,30 | 4,48 | 4,17 GB/s |
+
+  Il T705 legge circa 2,8 volte più veloce. Due cautele: il file (1,8 GB) sul T705 era appena
+  stato scritto, e un SSD può leggere più in fretta i dati recenti (da ripetere fra qualche
+  giorno o su un modello grande); l'UD90 fa 4,3 GB/s contro i 5–6 di settembre con gli stessi
+  parametri, forse perché lo slot in basso passa dal chipset, forse perché ora porta il sistema
+  (non misurato).
 
 **Da fare:**
 - **MemTest86**, almeno un giro completo: 4 banchi di due kit diversi, entro il periodo di reso.
-- **Crucial T705 4 TB in M.2_1** (PCIe 5.0, unico slot Gen5, con dissipatore della scheda madre):
-  solo per i modelli. Serve per GLM-5.2, DeepSeek V4 e Qwen3.8, che leggono gli esperti dal disco.
+- **Modelli grandi sul T705**: GLM-5.2, DeepSeek V4 e Qwen3.8 leggono gli esperti dal disco, ed
+  è lì che il T705 dovrebbe contare; per Qwen3.6 con la cache calda il disco pesa poco.
 - **Oltre i 64 GB**: ha senso solo per i modelli grandi, e ai prezzi attuali della DDR5 conviene
   aspettare. Con 4 banchi non si va oltre ~5200.
 
@@ -171,7 +194,7 @@ cioè da 1,6 a 5–6 GB/s.
 
 | Tema | Stato |
 |---|---|
-| I/O parallelo su Windows (handle diretto `OVERLAPPED`) | **fatto e misurato.** Con l'SSD a Gen3 x2 valeva +8%; ora che il disco fa 5–6 GB/s le tre configurazioni si equivalgono. Tornerà utile col T705 |
+| I/O parallelo su Windows (handle diretto `OVERLAPPED`) | **fatto e misurato.** Con l'SSD a Gen3 x2 valeva +8%; con l'UD90 a 5–6 GB/s le tre configurazioni si equivalevano. Da rimisurare sul T705 (D:, ~12 GB/s) |
 | RAM di Qwen3.6: quantizzazione al caricamento + embedding int8 | **fatto.** RSS dopo il caricamento 9,23 → 4,82 GB. Il picco complessivo resta ~30 GB, perché arriva dal warmstart degli esperti: per quello serve `RAM_GB` |
 | **Kernel int8 AVX-512** | **fatto, da misurare.** I kernel caldi (proiezioni dense e esperti) avevano solo la versione AVX2: metà registro e metà FMA sul 7950X. `QWEN36_AVX512=0` torna ad AVX2 per il confronto |
 | **Uscita DeltaNet e shared expert sulla GPU** | da fare, ma **dopo** aver ridotto le chiamate GPU: da sole aggiungerebbero ~30 viaggi sincroni per token, più o meno quanto risparmiano |
