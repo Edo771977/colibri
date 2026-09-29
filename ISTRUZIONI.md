@@ -13,7 +13,7 @@ al codice di questo fork e vanno ricontrollati dopo ogni aggiornamento da upstre
 | Scheda madre | ASUS TUF GAMING X670E-PLUS, BIOS **3881** (4 slot RAM, 4 slot M.2) |
 | GPU | NVIDIA GeForce RTX 4070 Ti SUPER 16 GB (Ada, `sm_89`), driver 616.64 |
 | Disco modelli (D:) | **Crucial T705 4 TB** nello slot **PCIe 5.0** in alto, sopra lo slot della GPU, con il suo dissipatore (quello della scheda madre è stato tolto) → `Gen5 x4`. Solo modelli: `D:\modelli` |
-| Disco di sistema (C:) | Silicon Power UD90 4 TB in uno slot **PCIe 4.0 in basso** → `Gen4 x4`. Nello slot "PCIe 3.0/SATA" girava a `Gen3 x2`, un quarto della banda |
+| Disco di sistema (C:) | Silicon Power UD90 4 TB nello slot **PCIe 4.0 in basso a sinistra** → `Gen4 x4`. Nello slot "PCIe 3.0/SATA" girava a `Gen3 x2`, un quarto della banda |
 | Sistema | Windows 11; qwen36 compilato con clang (MSYS2 CLANG64, vedi sotto), gli altri motori con MinGW-w64; DLL CUDA con MSVC 2022 e CUDA 13.4 |
 
 ## Misure (17 settembre 2026, Qwen3.6-35B-A3B int4 gs64)
@@ -161,7 +161,7 @@ tornava a 3600, la frequenza va messa a mano); UD90 dallo slot "PCIe 3.0/SATA" (
 uno slot collegato a `Gen4 x4`, cioè da 1,6 a 5–6 GB/s.
 
 **29 settembre 2026, Crucial T705 4 TB.** Montato nello slot PCIe 5.0 in alto con il suo
-dissipatore; l'UD90 (sistema, C:) spostato in uno slot PCIe 4.0 in basso. I numeri
+dissipatore; l'UD90 (sistema, C:) spostato nello slot PCIe 4.0 in basso a sinistra. I numeri
 M.2_x usati prima in queste note non corrispondevano agli slot reali, per questo ora gli slot
 sono descritti per posizione, come nell'immagine degli slot M.2 di ASUS.
 - Collegamenti letti da Windows (`DEVPKEY_PciDevice_CurrentLinkSpeed/Width`): T705 `Gen5 x4`,
