@@ -173,7 +173,7 @@ sono descritti per posizione (vedi la mappa degli slot M.2 nel manuale della sch
   resta finché il motore non ha girato da D:. Il 3 ottobre il motore ha girato 24 volte da D:
   (l'A/B di `COLI_DENSE_IDOT`, `docs/experiments/qwen36-dense-idot-2026-10-03-raw.txt`): stessa
   residenza (6812/10240) e, nel braccio OFF, lo stesso testo generato dai run da C: del 28
-  settembre. Questo verifica solo quello che il motore ha letto; prima di cancellare la copia su
+  settembre. Questo verifica solo quello che il motore ha letto e usato; prima di cancellare la copia su
   C: conviene confrontare gli hash delle due cartelle.
 - `iobench.exe <disco>:\modelli\qwen36_i4_gs64\model-globals.safetensors 19 256 16 1`
   (letture dirette, 256 blocchi da 19 MB, 16 thread), tre giri a ordine alternato:
