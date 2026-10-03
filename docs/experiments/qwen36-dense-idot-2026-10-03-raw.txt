@@ -21,17 +21,21 @@ Summary:
      4a000cc01f310b64, is the one of the 28 September record
      (qwen36-deltanet-gpu-2026-09-28-raw.txt), so the f32 path is
      unchanged by #70 on the real model too.
-  4. The first engine runs from the T705: 24 runs, same residency
-     (6812/10240) and placement as before.
+  4. The first engine runs from the T705: 24 runs, residency 6812/10240
+     as in the 28 September record, the OFF arm's text identical to the
+     runs from C: of that record.
 
 Reading: under the CUDA tier the integer dot reaches only the matrices
-matmul_d runs on the CPU, at decode the router and the shared expert
-(docs/qwen36.md). Their timers moved by 0.07 (shared) and 0.01 (router)
-ms/token, and the shared expert overlaps the GPU's expert groups, so
-it does not shorten step(). Upstream's +22.6% was measured with no GPU,
-every dense GEMV on the CPU; it does not carry over to this setup.
-COLI_DENSE_IDOT stays opt-in (#70); nothing here argues for turning it
-on. Quality (PPL=1) was not measured.
+matmul_d runs on the CPU; with the whole trunk placed, at decode the
+router and the shared expert (docs/qwen36.md; the [place] line is not in
+the paste, but head ~1.0 ms/token and dnproj/dnout 3810/3810 match a full
+placement). Their timers moved by 0.07 (shared) and 0.01 (router)
+ms/token, and the shared expert runs while the GPU computes the resident
+experts, so a gain there is expected to be absorbed in the wait for the
+GPU. Upstream measured the dense trunk alone at +9.5% (6.71 -> 7.35
+tok/s) with no GPU, every dense GEMV on the CPU; that does not carry over
+to this setup. COLI_DENSE_IDOT stays opt-in (#70); nothing here argues
+for turning it on.
 
 Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
@@ -39,7 +43,7 @@ evidence.sha256 exists for them.
 
 --- builds ------------------------------------------------------------------
 
-Run A (section 1): branch claude/sleepy-johnson-agg34c at 0ec234c9,
+Run A (section 2): branch claude/sleepy-johnson-agg34c at 0ec234c9,
 fast-forwarded from 4bc6232; in C:\colibri-fork\c, the x64 Native
 Tools prompt:
 
@@ -49,7 +53,7 @@ Tools prompt:
 
   eseguibile: .\qwen36_clang.exe | 383488 byte | 2026-10-03 09:35:55 | sha256 9129FC66788CDC35
 
-Run B (section 2): the same window, `git pull` to 7549736, then the same
+Run B (section 1): the same window, `git pull` to 7549736, then the same
 make line. The paste shows a mistyped `t PATH=...` before it ("t" non e'
 riconosciuto): PATH was already set in that window, and the build
 output shows clang compiling and linking.
@@ -78,7 +82,7 @@ it would be avx512-vnni.
   heat: C:\colibri-fork\c\heat.caldo.bin | 40972 byte | 40 layer x 256 esperti | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | costruita su un prompt sha256 6A4F0BCF64192EA3, diverso dal prompt misurato (come CROSS) | heat.caldo.bin.sha256: tabella= verificata | condizioni della costruzione diverse da questa corsa: snap, allow_env, eseguibile, dll
 
 The script requires the marker in every ON log and in no OFF log, so
-the ON arm took the integer path in all twelve runs of each A/B. The
+the ON arm took the integer path in all six ON runs of each A/B. The
 keep-alive was set (the `set` line is in the paste this time); as in the
 28 September record no log was checked for "[cuda] keep-alive active:",
 so that it ran is not shown.
@@ -132,12 +136,13 @@ all 12 runs; engine banner identical
   OFF    step  18.28  moe  10.43  attn  2.02  dn  3.88  head  1.01
          (shared)  3.20  (router)  0.89  wait  0.41
          issue  1.56  cpu-miss  3.95  take  0.50  sh-ovl  3.20  hit  86.7 %  swaps  8.0  miss 6463/6464
+         dn-sub:   proj  3.87  conv  0.00  l2n+rec  0.00  norm+out  0.00
+         dn-split: qkvz  3.88  a+b  0.00  norm  0.00  out  0.00  | GPU: dnproj 3810/3810, dnout 3810/3810
   ON     step  18.82  moe  10.77  attn  2.13  dn  3.95  head  1.03
          (shared)  3.17  (router)  0.87  wait  0.46
          issue  1.65  cpu-miss  4.18  take  0.56  sh-ovl  3.18  hit  86.2 %  swaps  8.0  miss 6689
-
-  (dn-sub and dn-split as in run B: the whole DeltaNet call in the proj
-  slot, dnproj and dnout 3810/3810 in both arms.)
+         dn-sub:   proj  3.93  conv  0.00  l2n+rec  0.00  norm+out  0.00
+         dn-split: qkvz  3.94  a+b  0.00  norm  0.00  out  0.00  | GPU: dnproj 3810/3810, dnout 3810/3810
 
 --- 3. generated text (both runs) ---------------------------------------------
 
@@ -163,22 +168,42 @@ character is restored here.)
     kernel).
   - The two timers the integer dot can reach moved little: shared 3.13 ->
     3.06 and router 0.79 -> 0.78 in run B (3.20 -> 3.17, 0.89 -> 0.87 in
-    run A). The shared expert runs while the GPU computes the resident
-    experts (sh-ovl equals shared) and the CPU still waits for the GPU at
-    the end (wait 0.46-0.56), so a faster shared expert does not shorten
-    the layer anyway.
-  - The arms do not run the same workload: the text diverges at position
-    308, so from there the routing differs. The ON arm misses 6689
-    experts against 6463 (hit 86.2 % vs 86.7 %), and its cpu-miss is
-    0.17-0.23 ms/token higher. That is a consequence of the different
-    text, not of the kernel (the misses run matmul_qe, which the variable
-    does not touch), and it is the same size as what the shared expert
-    gained; the measurement cannot separate them further.
-  - Not measured: perplexity (PPL=1) with COLI_DENSE_IDOT=1, and CONSIST=1
-    on the real model with it (CONSIST is covered on the tiny fixture by
-    CI). The variable stays opt-in, so neither is needed for the default.
+    run A). The shared expert runs between qt_issue and qt_take, while the
+    GPU computes the resident experts (sh-ovl and shared time that same
+    block, so their near-equality is by construction, not evidence), and
+    the CPU then waits for the GPU (wait 0.41-0.56 ms/token across both
+    runs, a mean over 40 layers, ~10-14 us a layer). A faster shared
+    expert is therefore expected to be absorbed in that wait, not shown
+    to be in every layer.
+    In both runs the ON arm's wait went up (0.46 -> 0.56, 0.41 -> 0.46)
+    and so did take (0.54 -> 0.64, 0.50 -> 0.56): the GPU side changed
+    too, which the simple overlap picture does not predict; not explained.
+  - The arms do not run the same workload. The router goes through
+    matmul_d, so with COLI_DENSE_IDOT=1 its logits change from the first
+    token and a top-k pick can flip before the text diverges (position
+    308); after that the text differs as well. The ON arm misses 6689
+    experts against 6463 (hit 86.2 % vs 86.7 %) and its cpu-miss is
+    0.17 (run B) and 0.23 (run A) ms/token higher. Per miss the cost is
+    about the same, 3.85/6463 vs 4.02/6689 ms/token (+0.9 %; run A
+    +2.3 %): the extra cpu-miss comes from different routing, which the
+    variable causes, not from a slower miss kernel (the misses run
+    matmul_qe, which the variable does not touch). It is larger than the
+    0.03-0.07 the shared expert gained; the measurement cannot separate
+    the two further.
   - The T705: the 24 runs read the model from D:\modelli\qwen36_i4_gs64,
-    with residency and placement identical to the runs from C:. Run B's
-    OFF arm (17.43) is close to the 28 September ON arm (17.72, the same
-    configuration read from C:), but different sessions and builds, so
-    no disk effect is claimed.
+    with residency 6812/10240 as in the runs from C: of the 28 September
+    record (the [place] line is shown identical within each A/B only;
+    neither record quotes it, so placement across the two days is not
+    compared). Run B's OFF arm (17.43) is close to the 28 September ON
+    arm (17.72, the same configuration read from C:), but different
+    sessions and builds, so no disk effect is claimed. The OFF arm's text equals the 28 September
+    runs from C:, so what these runs read from D: gave the same numbers;
+    with 6812 of 10240 experts resident, the experts never read are not
+    checked by this.
+
+--- what this run did NOT measure -----------------------------------------------
+
+  - Perplexity (PPL=1) with COLI_DENSE_IDOT=1.
+  - CONSIST=1 on the real model with it (CONSIST with the integer dot is
+    covered on the tiny fixture by CI).
+  - The variable stays opt-in, so neither is needed for the default.

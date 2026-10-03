@@ -154,8 +154,10 @@ that host:
 Measured on the operator's box (RTX 4070 Ti SUPER, Ryzen 9 7950X, CUDA
 tier, DeltaNet on the GPU, six ABBA pairs): step() 17.43 -> 17.42 ms/token,
 paired delta -0.02, 95 % [-0.58, 0.54], no measurable effect; the shared
-expert's timer moved by 0.07 ms/token and it overlaps the GPU anyway
-(docs/experiments/qwen36-dense-idot-2026-10-03-raw.txt). It stays opt-in.
+expert's timer moved by 0.07 ms/token, and it runs while the GPU computes
+the resident experts (docs/experiments/qwen36-dense-idot-2026-10-03-raw.txt).
+It stays opt-in.
+
 CONSIST compares prefill with
 decode: where a matrix runs on the GPU in one and on the CPU in the other,
 the two arms differ by the activation rounding as well.
