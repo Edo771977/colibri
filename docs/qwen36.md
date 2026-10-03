@@ -89,7 +89,8 @@ changed with it, measured on the real gs64 container at full residency on an
   instead of 3 x top-k. A prompt row routed to an expert another row already
   used reads that expert from cache, not DRAM.
 - **Same tokens.** Activations stay f32 (the kernel also has an int8
-  activation mode, `mode 1`, not wired in here: same policy as `IDOT`). The
+  activation mode, `mode 1`, opt-in with `QWEN_EXPERT_ACT=int8`: same policy
+  as `IDOT`; see the integer dot section below). The
   only difference from the old path is the accumulation order inside a dot;
   a 1024-token greedy decode on the real container is byte-identical, and CI
   pins old vs new on a tiny int4 fixture at caps 1, 2, 8 and 16.
@@ -103,6 +104,69 @@ overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
 `QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The CUDA expert tier
 keeps its own path: it uploads the pair-layout int4 and computes misses from
 the int8 copy.
+
+## The dense trunk: integer dot products (`COLI_DENSE_IDOT=1`, opt-in)
+
+Ported from upstream (JustVugg/colibri dfec3a4b, 22 September 2026), where
+it is the default. Here it is **opt-in**, the house rule for a fast path that
+changes tokens (#1044, #1080), until it is measured on this fork's setups:
+with neither variable set the numbers are byte-identical to before.
+Upstream's `COLI_DENSE_BITS=4` / `COLI_DENSE_INT4` (int4 copies of the trunk)
+is not ported: it reads a component tag that here would have to be passed
+through `qdw_take`, which quantizes every matrix at load.
+
+`matmul_d`, the CPU GEMV of every dense matrix, multiplies the int8 weights
+by f32 activations, converting each weight byte to f32. With
+`COLI_DENSE_IDOT=1` it quantizes the activation to int8 once per call (one
+scale, amax/127, the `qrow_i8` contract) and the products are integer
+(`idot.h`: maddubs on AVX2, vpdpbusd on AVX-VNNI and AVX-512 VNNI), exact
+int32 sums scaled once per output. `QWEN_EXPERT_ACT=int8` does the same for
+the routed experts' kernel (`expert_ffn.h` mode 1). Each prints one line on
+stderr when it takes effect: `[qwen36] dense trunk on the CPU: integer dot
+(<kernel>), COLI_DENSE_IDOT=1` at the first integer GEMV, `[qwen36] routed
+experts: int8 activations` at the first expert layer.
+
+Upstream's measurement, Qwen3.6-35B-A3B, 8 threads, 300 decoded tokens,
+every expert resident in RAM, no GPU, perplexity on 4 x 512 tokens:
+
+| | tok/s | perplexity |
+|---|---|---|
+| f32 activations | 6.71 | 13.79 |
+| dense trunk integer dot | 7.35 | 13.92 (+1.0%) |
+| experts int8 activations | 7.20 | 13.80 (+0.1%) |
+| both | 8.23 (+22.6%) | 13.97 (+1.3%) |
+
+**What it touches under the CUDA expert tier (`COLI_CUDA=1`).** Less than on
+that host:
+
+- a dense matrix placed in VRAM keeps the GPU GEMV, f32 activations, where
+  the engine calls it on the device. `lmhead` and `dnproj` are used on the
+  device at prefill too; `attnout`, `attnproj` and `dnout` only at decode
+  (S == 1), so a prompt batch takes them through `matmul_d`. So does every
+  matrix the placer left on the CPU
+  (with a full trunk placement, at decode: the router and the shared
+  expert; with less VRAM also lm_head or some DeltaNet layers) and the edge
+  paths' lm_head;
+- the routed experts the tier misses are computed by `matmul_qe` on the
+  int8 copy with f32 activations, not by `expert_ffn.h` (which is off under
+  the tier), so `QWEN_EXPERT_ACT` changes nothing there.
+
+The gain on a GPU box is not measured yet. CONSIST compares prefill with
+decode: where a matrix runs on the GPU in one and on the CPU in the other,
+the two arms differ by the activation rounding as well.
+
+A NaN in the activation does not survive the quantizer (the vector max can
+drop it and the conversion turns it into -128), so with `COLI_DENSE_IDOT=1`
+a blow-up shows up as wrong numbers rather than NaN logits; upstream behaves
+the same.
+
+`tests/test_qwen36_dense_idot.c` pins the quantizer against the scalar
+contract (bit for bit, block sums exact), the default and `=0` against the
+f32 kernels byte for byte, `=1` against `matmul_q_idot` on the registry's own
+rows (byte for byte) with each row of a batch equal to the same row alone,
+and `QWEN_EXPERT_ACT`'s reader. CI checks on the tiny fixtures that the
+expert mode reaches the kernel (marker line, logits move, same ids) and that
+CONSIST holds with the integer dot on.
 
 ## Is the CPU half sync-bound or stream-bound?
 

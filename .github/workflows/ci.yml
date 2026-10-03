@@ -527,6 +527,15 @@ jobs:
           echo "::group::CONSIST cap=8 (dense int8, the default)"
           CONSIST=1 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json
           echo "::endgroup::"
+          # And on the opt-in integer dot (COLI_DENSE_IDOT=1): each row of a
+          # prompt batch is quantized on its own, so prefill and decode must
+          # still agree. The marker proves the arm ran the integer path.
+          echo "::group::CONSIST cap=8 (dense int8, integer dot)"
+          COLI_DENSE_IDOT=1 CONSIST=1 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json > consist_idot.log 2>&1 || { cat consist_idot.log; exit 1; }
+          grep -q "dense trunk on the CPU: integer dot" consist_idot.log || { echo "FAIL: COLI_DENSE_IDOT=1 did not engage"; cat consist_idot.log; exit 1; }
+          grep -q "CONSIST OK" consist_idot.log || { echo "FAIL: CONSIST with the integer dot"; cat consist_idot.log; exit 1; }
+          grep -E "CONSIST (OK|FAIL)" consist_idot.log
+          echo "::endgroup::"
       - name: Quantize-at-load is bit-identical to quantize-after-load (dense int8 on)
         run: |
           cd c
@@ -709,6 +718,23 @@ jobs:
             cmp ids_${cap}_0.txt ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; cat ids_${cap}_0.txt ids_${cap}_1.txt; exit 1; }
             echo "cap=$cap: identical ($(cat ids_${cap}_1.txt))"
           done
+          # QWEN_EXPERT_ACT=int8 (opt-in, expert_ffn.h mode 1) must reach the
+          # kernel: its line is printed, the logits move (int8 activations are
+          # not bit-identical to f32), and on this fixture the ids do not.
+          # The unit test pins only the flag reader; this pins the wiring.
+          for a in int8 f32; do
+            if [ "$a" = int8 ]; then export QWEN_EXPERT_ACT=int8; else unset QWEN_EXPERT_ACT; fi
+            COLI_DENSE_I8=0 DUMP=xa_$a.f32 SNAP=qwen36_tiny64_c \
+              ./qwen36 8 4 qwen36_tiny64/ref_full.json > xa_$a.log 2>&1 || true
+            grep -E "^C engine" xa_$a.log > xa_ids_$a.txt
+          done
+          unset QWEN_EXPERT_ACT
+          grep -q "routed experts: int8 activations" xa_int8.log || { echo "FAIL: QWEN_EXPERT_ACT=int8 did not engage"; cat xa_int8.log; exit 1; }
+          if grep -q "routed experts: int8 activations" xa_f32.log; then echo "FAIL: int8 activations without the flag"; exit 1; fi
+          test -s xa_int8.f32 && test -s xa_f32.f32 || { echo "FAIL: no logits dump"; exit 1; }
+          if cmp -s xa_int8.f32 xa_f32.f32; then echo "FAIL: QWEN_EXPERT_ACT=int8 left the logits unchanged: mode 1 never reached the kernel"; exit 1; fi
+          test -s xa_ids_int8.txt || { echo "FAIL: no ids with QWEN_EXPERT_ACT=int8"; cat xa_int8.log; exit 1; }
+          cmp xa_ids_f32.txt xa_ids_int8.txt || { echo "FAIL: ids differ with int8 expert activations"; cat xa_ids_f32.txt xa_ids_int8.txt; exit 1; }
           make tests/test_expert_ffn && ./tests/test_expert_ffn
       - name: A malformed container is refused, not read
         run: |
