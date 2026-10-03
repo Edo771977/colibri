@@ -1,18 +1,21 @@
-/* The dense trunk's integer path (COLI_DENSE_IDOT) and the experts'
- * activation mode (QWEN_EXPERT_ACT), ported from upstream dfec3a4b without
- * its COLI_DENSE_BITS=4 option.
+/* The dense trunk's integer path (COLI_DENSE_IDOT=1) and the experts'
+ * activation mode (QWEN_EXPERT_ACT=int8), ported from upstream dfec3a4b
+ * without its COLI_DENSE_BITS=4 option, and opt-in here.
  *
  * Pins, with no model:
  *  - dense_act_i8's vector path equals the scalar qrow_i8 contract bit for
  *    bit (same rounding, same scale) and its block sums are exact;
- *  - with COLI_DENSE_IDOT unset, matmul_d answers from the integer kernel:
+ *  - by default, and with COLI_DENSE_IDOT=0, matmul_d is the path before the
+ *    port: byte-identical to matmul_q per row and to matmul_q_batch for a
+ *    batch;
+ *  - with COLI_DENSE_IDOT=1 matmul_d answers from the integer kernel:
  *    byte-identical to matmul_q_idot on the registry's own int8 rows, within
  *    3% of the f32 reference, and every row of a prompt batch equals the
  *    same row computed alone (prefill and decode see the same numbers);
- *  - with COLI_DENSE_IDOT=0 (a child process: the flag is read once) matmul_d
- *    is the path before the port, byte-identical to matmul_q per row and to
- *    matmul_q_batch for a batch;
- *  - xf_act_mode is 1 by default and 0 under QWEN_EXPERT_ACT=f32. */
+ *  - xf_act_mode is 0 by default and 1 under QWEN_EXPERT_ACT=int8.
+ * Every flag is read once per process, so each arm but the default runs in a
+ * child. That moe_xf_run passes xf_act_mode() to the kernel is checked
+ * end to end by CI (the tiny int4 gs64 fixture: marker line, logits move). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,21 +59,44 @@ static void setup(void) {
     qdw_register(g_W, I, O);
 }
 
-/* --child classic: COLI_DENSE_IDOT=0 is set by the parent. */
-static int child_classic(void) {
+/* The path before the port: matmul_q per row, matmul_q_batch for a batch. */
+static int check_classic(void) {
     setup();
     if (g_qdw_n != 1) return 90;
     float *y = malloc((size_t)S * O * sizeof(float)), *r = malloc((size_t)S * O * sizeof(float));
+    int rc = 0;
     matmul_d(y, g_x, g_W, 1, I, O);
     matmul_q(r, g_x, g_qdw[0].q, g_qdw[0].sc, I, O);
-    if (memcmp(y, r, (size_t)O * sizeof(float))) return 91;
+    if (memcmp(y, r, (size_t)O * sizeof(float))) rc = 91;
     matmul_d(y, g_x, g_W, S, I, O);
     matmul_q_batch(r, g_x, g_qdw[0].q, g_qdw[0].sc, S, I, O);
-    if (memcmp(y, r, (size_t)S * O * sizeof(float))) return 92;
+    if (!rc && memcmp(y, r, (size_t)S * O * sizeof(float))) rc = 92;
+    free(y); free(r);
+    return rc;
+}
+/* --child idot: COLI_DENSE_IDOT=1 is set by the parent. */
+static int child_idot(void) {
+    setup();
+    if (g_qdw_n != 1) return 80;
+    float *ref = malloc((size_t)S * O * sizeof(float)), *y = malloc((size_t)S * O * sizeof(float));
+    float *k = malloc((size_t)S * O * sizeof(float)), *y1 = malloc((size_t)O * sizeof(float));
+    ref_matmul(ref, g_x, g_W, S, I, O);
+    matmul_d(y, g_x, g_W, S, I, O);
+    int8_t *xq = malloc((size_t)S * I); float sx[S];
+    for (int s = 0; s < S; s++) sx[s] = qrow_i8(g_x + (size_t)s * I, xq + (size_t)s * I, I);
+    matmul_q_idot(k, xq, sx, g_qdw[0].q, g_qdw[0].sc, S, I, O);
+    if (memcmp(y, k, (size_t)S * O * sizeof(float))) return 81;     /* not the integer kernel */
+    if (!(rel_gap(y, ref, S * O) < 3e-2)) return 82;                  /* too far from f32 */
+    for (int s = 0; s < S; s++) {
+        matmul_d(y1, g_x + (size_t)s * I, g_W, 1, I, O);
+        if (memcmp(y1, y + (size_t)s * O, (size_t)O * sizeof(float))) return 83;   /* batch row != row alone */
+    }
     return 0;
 }
-/* --child expert-f32: QWEN_EXPERT_ACT=f32 is set by the parent. */
-static int child_expert_f32(void) { return xf_act_mode() == 0 ? 0 : 93; }
+/* --child classic: COLI_DENSE_IDOT=0 is set by the parent. */
+static int child_classic(void) { return check_classic(); }
+/* --child expert-int8: QWEN_EXPERT_ACT=int8 is set by the parent. */
+static int child_expert_int8(void) { return xf_act_mode() == 1 ? 0 : 93; }
 
 static int child_status(const char *self, const char *arm) {
     char cmd[1536];
@@ -87,10 +113,19 @@ static int child_status(const char *self, const char *arm) {
 #endif
 }
 
+static int arm(const char *self, const char *var, const char *val, const char *child) {
+    setenv(var, val, 1);
+    int st = child_status(self, child);
+    unsetenv(var);
+    if (st) printf("  child %s exit %d\n", child, st);
+    return st;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--child")) {
+        if (!strcmp(argv[2], "idot")) return child_idot();
         if (!strcmp(argv[2], "classic")) return child_classic();
-        if (!strcmp(argv[2], "expert-f32")) return child_expert_f32();
+        if (!strcmp(argv[2], "expert-int8")) return child_expert_int8();
         return 99;
     }
     /* This gate owns the flags regardless of the caller's shell. */
@@ -112,40 +147,15 @@ int main(int argc, char **argv) {
         ck(bad != 2, "block sums are exact");
     }
 
-    printf("matmul_d, default (integer dot)\n");
-    {
-        setup();
-        ck(g_qdw_n == 1, "the matrix is in the int8 registry");
-        float *ref = malloc((size_t)S * O * sizeof(float)), *y = malloc((size_t)S * O * sizeof(float));
-        float *k = malloc((size_t)S * O * sizeof(float)), *y1 = malloc((size_t)O * sizeof(float));
-        ref_matmul(ref, g_x, g_W, S, I, O);
-        matmul_d(y, g_x, g_W, S, I, O);
-        int8_t *xq = malloc((size_t)S * I); float sx[S];
-        for (int s = 0; s < S; s++) sx[s] = qrow_i8(g_x + (size_t)s * I, xq + (size_t)s * I, I);
-        matmul_q_idot(k, xq, sx, g_qdw[0].q, g_qdw[0].sc, S, I, O);
-        ck(!memcmp(y, k, (size_t)S * O * sizeof(float)), "matmul_d equals matmul_q_idot on the registry's rows, byte for byte");
-        ck(rel_gap(y, ref, S * O) < 3e-2, "within 3% of the f32 reference (int8 weights x int8 activations), 5 rows");
-        int same = 1;
-        for (int s = 0; s < S; s++) {
-            matmul_d(y1, g_x + (size_t)s * I, g_W, 1, I, O);
-            if (memcmp(y1, y + (size_t)s * O, (size_t)O * sizeof(float))) same = 0;
-        }
-        ck(same, "every row of the batch equals the same row computed alone");
-        ck(xf_act_mode() == 1, "experts default to int8 activations (xf_act_mode 1)");
-        free(ref); free(y); free(k); free(y1); free(xq);
-    }
+    printf("defaults (no flag set)\n");
+    ck(check_classic() == 0, "matmul_d is the f32-activation path: matmul_q per row, matmul_q_batch for a batch, byte for byte");
+    ck(xf_act_mode() == 0, "experts keep f32 activations (xf_act_mode 0)");
 
     printf("the switches (child processes: each flag is read once)\n");
-    setenv("COLI_DENSE_IDOT", "0", 1);
-    int st = child_status(argv[0], "classic");
-    unsetenv("COLI_DENSE_IDOT");
-    if (st) printf("  child classic exit %d\n", st);
-    ck(st == 0, "COLI_DENSE_IDOT=0: matmul_d equals matmul_q per row and matmul_q_batch for a batch, byte for byte");
-    setenv("QWEN_EXPERT_ACT", "f32", 1);
-    st = child_status(argv[0], "expert-f32");
-    unsetenv("QWEN_EXPERT_ACT");
-    if (st) printf("  child expert-f32 exit %d\n", st);
-    ck(st == 0, "QWEN_EXPERT_ACT=f32: xf_act_mode 0");
+    ck(arm(argv[0], "COLI_DENSE_IDOT", "1", "idot") == 0,
+       "COLI_DENSE_IDOT=1: matmul_d equals matmul_q_idot on the registry's rows byte for byte, within 3% of f32, batch rows equal rows alone");
+    ck(arm(argv[0], "COLI_DENSE_IDOT", "0", "classic") == 0, "COLI_DENSE_IDOT=0: the f32-activation path, byte for byte");
+    ck(arm(argv[0], "QWEN_EXPERT_ACT", "int8", "expert-int8") == 0, "QWEN_EXPERT_ACT=int8: xf_act_mode 1");
 
     if (fails) { printf("test_qwen36_dense_idot: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_dense_idot: the dense trunk's integer path\n");

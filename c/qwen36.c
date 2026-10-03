@@ -1220,12 +1220,17 @@ static int g_expert_is_int4 = 1;
  * int8 copy) and with QWEN_EXPERT_KERNEL=0, which keeps the historical
  * unpack-to-int8 path for A/Bs. Decided once from the container itself. */
 static int container_layer_is_int4(Model *m, int layer);
-/* The routed experts take the same integer path as the dense trunk
- * (expert_ffn.h mode 1: activation to int8 once per row, dpbusd against the
- * planar nibbles). Measured on the 35B: expert compute 22.7 to 15.9
- * ms/token for +0.1% perplexity. QWEN_EXPERT_ACT=f32 restores mode 0, f32
- * activations and the bit-identical contract with the pair kernels. */
-static int xf_act_mode(void){ static int v=-1; if(v<0){ const char *e=getenv("QWEN_EXPERT_ACT"); v=(e&&!strcmp(e,"f32"))?0:1; } return v; }
+/* QWEN_EXPERT_ACT=int8 (opt-in): the routed experts take the same integer
+ * path as the dense trunk (expert_ffn.h mode 1: activation to int8 once per
+ * row, dpbusd against the planar nibbles). Upstream (dfec3a4b) measured on
+ * the 35B, CPU only: expert compute 22.7 to 15.9 ms/token for +0.1%
+ * perplexity, and made it the default there. Here it is opt-in, the house
+ * rule for a fast path that changes tokens (#1044, #1080): unset or any
+ * other value keeps mode 0, f32 activations and the bit-identical contract
+ * with the pair kernels. Only where expert_ffn.h runs, so never under the
+ * CUDA expert tier (xf_mode). */
+static int xf_act_mode(void){ static int v=-1; if(v<0){ const char *e=getenv("QWEN_EXPERT_ACT"); v=(e&&(!strcmp(e,"int8")||!strcmp(e,"i8")))?1:0;
+    if(v) fprintf(stderr,"[qwen36] routed experts: int8 activations (QWEN_EXPERT_ACT=%s)\n",e); } return v; }
 static int xf_mode(Model *m) {
     static int v = -1;
     if (v >= 0) return v;
@@ -1338,38 +1343,40 @@ static void matmul_qe(float *y, const float *x, const int8_t *q, const float *sc
 #define QDW_MAX 1024
 static struct { const float *w; int8_t *q; float *sc; int I, O; } g_qdw[QDW_MAX];
 static int g_qdw_n = 0;
-/* ---- Dense trunk, integer dot products ------------------------------------
+/* ---- Dense trunk, integer dot products (COLI_DENSE_IDOT=1, opt-in) ---------
  *
- * Every dense GEMV of a token (DeltaNet projections and out_proj, attention
- * q/k/v/o, the shared expert, lm_head) used to multiply int8 weights by f32
- * activations: each weight byte converted to f32 and fed to an FMA, eight
- * weights per instruction. Measured on lm_head (248320 x 2048 int8, 508 MB)
- * that runs at 29 GB/s on a 16-core AVX-512 host whose memory bus does 80:
- * the kernel, not the bus, was the limit, and the dense part of a token is
- * 1.9 GB of int8 on the 35B, three times the routed experts.
+ * Ported from upstream dfec3a4b. matmul_d multiplies the int8 rows by f32
+ * activations, each weight byte converted to f32 and fed to an FMA, eight
+ * weights per instruction. With COLI_DENSE_IDOT=1 it quantizes the
+ * activation to int8 once per call (one scale, amax/127, the qrow_i8
+ * contract) and the dot is integer (idot.h: maddubs on AVX2, vpdpbusd on
+ * AVX-VNNI and AVX-512 VNNI), exact int32 sums scaled once per output. Not
+ * bit-identical to the f32 path, since the activation is rounded.
  *
- * The activation is now quantized to int8 once per call (one scale,
- * amax/127, the qrow_i8 contract the expert IDOT already uses) and the dot
- * is integer: 32 weights per instruction on AVX2 (maddubs), 64 on AVX-512
- * VNNI, exact int32 sums scaled once per output. Not bit-identical to the
- * f32 path (the activation is rounded): measured on the 35B, +1.0%
- * perplexity on 4 x 512 tokens, lm_head 12.6 to 10.2 ms/token, decode
- * 6.71 to 7.35 tok/s alone and 8.23 with the experts' int8 activations.
- * COLI_DENSE_IDOT=0 restores the f32-activation kernel.
+ * Upstream's numbers (35B, CPU only, 16-core AVX-512 host): lm_head ran at
+ * 29 GB/s on a bus that does 80, the kernel being the limit; with the integer
+ * dot +1.0% perplexity on 4 x 512 tokens, lm_head 12.6 to 10.2 ms/token,
+ * decode 6.71 to 7.35 tok/s (8.23 with the experts' int8 activations).
+ * Upstream made it the default; here it is opt-in, the house rule for a
+ * fast path that changes tokens (#1044, #1080), until it is measured on
+ * this fork's setups. Unset, or any value starting with '0', keeps the f32
+ * path byte for byte.
  *
- * Ported from upstream dfec3a4b without its COLI_DENSE_BITS=4 option: here
- * the trunk is quantized at load (qdw_take) before the component names are
- * known, so the int4 copy would never be built. Only matrices that matmul_d
- * runs on the CPU take this path; a matrix placed in VRAM keeps the GPU GEMV.
+ * Only matrices matmul_d runs on the CPU are affected: under the CUDA tier a
+ * matrix placed in VRAM keeps the GPU GEMV where the engine calls it (decode),
+ * while a prompt batch, an unplaced matrix and the edge paths go through
+ * matmul_d. Upstream's COLI_DENSE_BITS=4 (int4 trunk copies) is not ported:
+ * it reads a component tag that here would have to be passed through
+ * qdw_take, which quantizes every matrix at load before main's registration.
  * The block sums (xsg) are filled only for a caller that asks for them. */
-static int dense_idot_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_IDOT"); v=!(e&&*e=='0'); } return v; }
+static int dense_idot_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_IDOT"); v=(e&&*e&&*e!='0'); } return v; }
 /* One line, at the first GEMV that takes the integer path (so never on a run
- * where every dense matrix sits in VRAM or COLI_DENSE_IDOT=0): the A/B
- * script's proof that the ON arm ran it. */
+ * without COLI_DENSE_IDOT=1, nor on one where every dense matrix sits in
+ * VRAM): the A/B script's proof that the ON arm ran it. */
 static void dense_idot_say(void){
     static int said = 0;
     if (__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) return;
-    fprintf(stderr, "[qwen36] dense trunk on the CPU: integer dot (%s), COLI_DENSE_IDOT=0 restores f32 activations\n", IDOT_KERNEL);
+    fprintf(stderr, "[qwen36] dense trunk on the CPU: integer dot (%s), COLI_DENSE_IDOT=1\n", IDOT_KERNEL);
 }
 
 /* Activation -> int8 with one scale, plus the int32 sum of every block of 64
@@ -1512,6 +1519,11 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
                 return;
             }
             free(xq); free(sx);      /* out of memory: the f32 path below */
+            {
+                static int warned = 0;
+                if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+                    fprintf(stderr, "[qwen36] COLI_DENSE_IDOT: out of memory for the int8 activations, this GEMV fell back to f32 (numbers differ from the integer path)\n");
+            }
         }
         if (S > 1 && dense_batch_on())
             matmul_q_batch(y, x, g_qdw[i].q, g_qdw[i].sc, S, I, O);

@@ -144,15 +144,6 @@ static void run_arm(Model *m, const char *place, const char *what) {
 int main(void) {
     Model m;
 
-    /* The fake device multiplies the int8 rows by f32 activations, the
-     * contract the real GPU GEMV keeps, and arms 3 and 6 compare it byte for
-     * byte with matmul_d. Since the integer dot became the CPU default
-     * (COLI_DENSE_IDOT, tests/test_qwen36_dense_idot.c) matmul_d rounds the
-     * activation to int8 first, so the comparison holds only on the f32
-     * kernel: this gate pins that one. Set before the first matmul_d, which
-     * reads the flag once. */
-    setenv("COLI_DENSE_IDOT", "0", 1);
-
     /* The two names must be asked SEPARATELY, so give them different answers.
      * With both on device 0 the assertions below pass even when the names are
      * swapped inside trunk_place_out -- they would only be testing that a
