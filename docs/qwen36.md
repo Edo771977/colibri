@@ -151,9 +151,18 @@ that host:
   int8 copy with f32 activations, not by `expert_ffn.h` (which is off under
   the tier), so `QWEN_EXPERT_ACT` changes nothing there.
 
-The gain on a GPU box is not measured yet. CONSIST compares prefill with
-decode: where a matrix runs on the GPU in one and on the CPU in the other,
-the two arms differ by the activation rounding as well.
+Measured on the operator's box (RTX 4070 Ti SUPER, Ryzen 9 7950X, CUDA
+tier, DeltaNet on the GPU, six ABBA pairs): step() 17.43 -> 17.42 ms/token,
+paired delta -0.02, 95 % [-0.58, 0.54], no measurable effect. The shared
+expert's timer moved by 0.07 ms/token, and it runs while the GPU computes
+the resident experts. The comparison is not of the kernel alone: the router
+goes through `matmul_d` too, so the arms route differently and the ON arm
+missed more experts (cpu-miss +0.17 ms/token), at the same cost per miss
+(docs/experiments/qwen36-dense-idot-2026-10-03-raw.txt). It stays opt-in.
+
+CONSIST compares prefill with decode: where a matrix runs on the GPU in one
+and on the CPU in the other, the two arms differ by the activation rounding
+as well.
 
 A NaN in the activation does not survive the quantizer (the vector max can
 drop it and the conversion turns it into -128), so with `COLI_DENSE_IDOT=1`
