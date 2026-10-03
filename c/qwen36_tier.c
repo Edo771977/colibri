@@ -1141,9 +1141,22 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * did not get scheduled once before the run was over (0 uploads, 0 hits,
      * six entries still queued). No group is open here, so the wait cannot
      * meet a swap parked on issue_open. */
+    /* Under QT_UPLOAD_SYNC the LFRU tick runs between two drains: after the
+     * first, so the victims it can see do not depend on how far the uploader
+     * got (a still-queued upload is not a candidate); before the second, so
+     * the swaps it queues land here too. With the tick after the only drain
+     * (the default order) their newcomers became resident whenever the
+     * uploader got to them, and the engine's CACHE_ROUTE, which asks
+     * qt_is_resident before the next group, saw a race between runs. The
+     * default path keeps its order. */
+    int ticked=0;
+    if(G_upload_sync && layer==0){
+        while(G.inflight>0 && !G.th_stop) wait_take_locked();
+        if(!G.th_stop){ qt_lfru_tick_locked(); ticked=1; }
+    }
     if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
-    if(layer==0) qt_lfru_tick_locked();
+    if(layer==0 && !ticked) qt_lfru_tick_locked();
     G.issue_open=1;
     for(int k=0;k<K;k++){
         QSlot *s=qs(layer,eids[k]);

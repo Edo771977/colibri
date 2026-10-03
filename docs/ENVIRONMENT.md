@@ -15,7 +15,7 @@ what follows, but the sister engines read their own:
 | `colibri` | `c/colibri.c` | everything below except the three sections named for another engine |
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
-| `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, and its dense/CUDA-tier controls — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
+| `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, its dense/CUDA-tier controls, and the `CACHE_ROUTE` family (VRAM tier over RAM cache) — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
 | `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_PREFILL_BATCH`, `COLI_TIMERS` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
@@ -104,12 +104,12 @@ Format: `VAR` — default — effect.
 | `COUPLE` | unset | Path to a coupling-score file driving cross-layer expert prefetch (#176). When set, `couple_load` reads it. |
 | `COUPLE_K` | `8` | Top-K coupled experts per layer when `COUPLE` is set. |
 | `COUPLE_D` | `1` | Coupling lookahead depth (`1` or `2`) when `COUPLE` is set. |
-| `CACHE_ROUTE` | `0` (off) | Opt-in max-rank cache-aware MoE routing (pin∪LRU prefer within top-M). See [CACHE_ROUTE.md](CACHE_ROUTE.md). |
+| `CACHE_ROUTE` | `0` (off) | Opt-in max-rank cache-aware MoE routing (pin∪LRU prefer within top-M). Also read by `qwen36`, where the VRAM tier outranks the RAM cache. See [CACHE_ROUTE.md](CACHE_ROUTE.md). |
 | `ROUTE_J` | `2` | Sacred top ranks always taken when `CACHE_ROUTE=1`. |
 | `ROUTE_M` | `12` | Max-rank window for resident preference when `CACHE_ROUTE=1`. |
 | `ROUTE_P` | `0` | Cumulative mass window for CACHE_ROUTE (`0` = fixed M). |
 | `ROUTE_ALPHA` | `1` | Scale gate mass of substituted experts before renorm (`1` = off). |
-| `ROUTE_AGREE` | auto | Overlap% + KL vs true top-K; auto-on when `CACHE_ROUTE=1`. |
+| `ROUTE_AGREE` | auto | Overlap% + KL vs true top-K; auto-on when `CACHE_ROUTE=1`. Alone it changes nothing and prints the meters (always 100% / 0). |
 | `ROUTE_TRACE` | unset | If set to a path, logs every routing decision there (testing/analysis). |
 | `ABSORB` | `-1` (auto: absorbed for S≤4) | MLA attention absorption mode. |
 | `IDOT` | `1` | Integer dot-product kernel. `IDOT=0` uses exact f32 kernels (for A/B numerical checks). |
@@ -399,6 +399,9 @@ and the CPU/GPU execution split.
 | `COLI_DENSE_I8` | `1` (on) | Quantize resident dense matrices to per-row int8 at startup. `=0` keeps the f32 reference path for quality A/Bs. |
 | `COLI_DENSE_IDOT` | unset (off) | `=1`: `matmul_d`, the CPU GEMV of the dense trunk, quantizes the activation to int8 once per call and runs integer dot products (`idot.h`: maddubs on AVX2, vpdpbusd on AVX-VNNI / AVX-512 VNNI) instead of converting every int8 weight to f32, and prints `[qwen36] dense trunk on the CPU: integer dot` once. Changes the numbers, hence opt-in (the house rule below); upstream, where it is the default, measured +1.0% perplexity on the 35B. Under the CUDA tier a matrix placed in VRAM keeps the GPU GEMV (attnout, attnproj and dnout only at decode, so a prompt batch takes them on the CPU); the matrices left on the CPU take it. Unset or `=0`: the f32-activation path, byte for byte. See docs/qwen36.md. |
 | `QWEN_EXPERT_ACT` | unset (f32) | `=int8`: the routed experts' activation quantized to int8 once per row (`expert_ffn.h` mode 1), with one `[qwen36] routed experts: int8 activations` line. Only where `QWEN_EXPERT_KERNEL` runs, so not under the CUDA expert tier. Changes the numbers, hence opt-in; upstream measured +0.1% perplexity, expert compute 22.7 to 15.9 ms/token. |
+| `CACHE_ROUTE`, `ROUTE_J`, `ROUTE_M`, `ROUTE_P`, `ROUTE_ALPHA`, `ROUTE_AGREE` | off; 2, 12, 0, 1, auto | The GLM engine's cache-aware routing (rows in the colibri table above, docs/CACHE_ROUTE.md), read by `qwen36` too: a VRAM-resident expert outranks a RAM-resident one inside the window. Lossy; refused with `CONSIST=1`; for an A/B set `QT_UPLOAD_SYNC=1` in both arms, leave `PILOT` off and give each run a fresh copy of the same `HEAT_FILE`, or none (the engine rewrites it at exit). Under `CACHE_ROUTE=1` the meters are always on (`ROUTE_AGREE=0` does not silence them). `ROUTE_TRACE` is not read by `qwen36`. See docs/qwen36.md. |
+| `QT_UPLOAD_SYNC` | unset (off) | `=1`: every expert upload queued so far, including the swaps the layer-0 LFRU pass queues, lands before the next GPU group is formed. Costs the upload/compute overlap; for tests and for a reproducible `CACHE_ROUTE` A/B. |
+| `QT_NO_WARMSTART` | unset (off) | `=1`: skip the tier's warmstart, which otherwise fills the VRAM budget and loads the experts into RAM (every expert, unless `RAM_GB` bounds the cache) before the first token. Then the RAM cache fills lazily. |
 | `QWEN36_AVX512` | `1` (on where built) | On a build whose `-march` includes AVX-512 (`ARCH=native` on Zen 4/5 or a Xeon SP), the int8 GEMVs — the dense projections and the grouped expert kernel — take a 512-bit inner loop (`simd_i8f.h`) instead of the AVX2 one. `=0` restores the AVX2 kernels on the same binary, which is how to A/B it. The two differ in summation order, so results differ in the last bits; both are float accumulation of the same products. A build without AVX-512 ignores this variable. |
 | `QWEN36_QUANT_AT_LOAD` | `1` (on) | With `COLI_DENSE_I8` on, quantize each dense matrix right after it is read and release its f32 block, instead of loading the whole f32 trunk and quantizing afterwards: the f32 trunk and its int8 copy are never resident together, so peak RSS drops by roughly the f32 trunk size. Same int8 bytes (ids and logits byte-identical, pinned in CI). `=0` restores the old order. Off under `COLI_KEEP_F32`. |
 | `QWEN36_EMBED_I8` | `0` (off) | Opt-in. Quantize the token embedding to per-row int8 (~1.9 GB -> ~0.47 GB on the 35B) and dequantize one row per token. **Changes numerics** (every input row is rounded): measure output quality before relying on it. |
