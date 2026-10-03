@@ -26,8 +26,8 @@ Summary:
      runs from C: of that record.
 
 Reading: under the CUDA tier the integer dot reaches only the matrices
-matmul_d runs on the CPU; with the whole trunk placed, at decode the
-router and the shared expert (docs/qwen36.md; the [place] line is not in
+matmul_d runs on the CPU, which with the whole trunk placed are, at
+decode, the router and the shared expert (docs/qwen36.md; the [place] line is not in
 the paste, but head ~1.0 ms/token and dnproj/dnout 3810/3810 match a full
 placement). Their timers moved by 0.07 (shared) and 0.01 (router)
 ms/token, and the shared expert runs while the GPU computes the resident
@@ -185,7 +185,7 @@ character is restored here.)
     experts against 6463 (hit 86.2 % vs 86.7 %) and its cpu-miss is
     0.17 (run B) and 0.23 (run A) ms/token higher. Per miss the cost is
     about the same, 3.85/6463 vs 4.02/6689 ms/token (+0.9 %; run A
-    +2.3 %): the extra cpu-miss comes from different routing, which the
+    +2.2 %): the extra cpu-miss comes from different routing, which the
     variable causes, not from a slower miss kernel (the misses run
     matmul_qe, which the variable does not touch). It is larger than the
     0.03-0.07 the shared expert gained; the measurement cannot separate
@@ -196,10 +196,10 @@ character is restored here.)
     neither record quotes it, so placement across the two days is not
     compared). Run B's OFF arm (17.43) is close to the 28 September ON
     arm (17.72, the same configuration read from C:), but different
-    sessions and builds, so no disk effect is claimed. The OFF arm's text equals the 28 September
-    runs from C:, so what these runs read from D: gave the same numbers;
-    with 6812 of 10240 experts resident, the experts never read are not
-    checked by this.
+    sessions and builds, so no disk effect is claimed. The OFF arm's text
+    equals the 28 September runs from C:, so what these runs read from D:
+    gave the same numbers; with 6812 of 10240 experts resident, the
+    experts never read are not checked by this.
 
 --- what this run did NOT measure -----------------------------------------------
 
