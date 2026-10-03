@@ -104,6 +104,55 @@ overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
 keeps its own path: it uploads the pair-layout int4 and computes misses from
 the int8 copy.
 
+## The dense trunk: integer dot products (`COLI_DENSE_IDOT`)
+
+Ported from upstream (JustVugg/colibri dfec3a4b, 22 September 2026), without
+its `COLI_DENSE_BITS=4` / `COLI_DENSE_INT4` option: this engine quantizes the
+trunk at load (`QWEN36_QUANT_AT_LOAD`), before the component names that
+option reads are known, so the int4 copy would never be built.
+
+`matmul_d`, the CPU GEMV of every dense matrix, used to multiply the int8
+weights by f32 activations, converting each weight byte to f32. Now it
+quantizes the activation to int8 once per call (one scale, amax/127, the
+`qrow_i8` contract) and the products are integer (`idot.h`: maddubs on AVX2,
+vpdpbusd on AVX-VNNI and AVX-512 VNNI), exact int32 sums scaled once per
+output. Not bit-identical to the f32 path. The routed experts' own kernel
+(`expert_ffn.h`) takes int8 activations too (mode 1). Both are the default;
+`COLI_DENSE_IDOT=0` and `QWEN_EXPERT_ACT=f32` restore the f32 kernels. The
+first GEMV that takes the integer path prints
+`[qwen36] dense trunk on the CPU: integer dot (<kernel>), ...` once.
+
+Upstream's measurement, Qwen3.6-35B-A3B, 8 threads, 300 decoded tokens,
+every expert resident in RAM, no GPU, perplexity on 4 x 512 tokens:
+
+| | tok/s | perplexity |
+|---|---|---|
+| f32 activations | 6.71 | 13.79 |
+| dense trunk integer dot | 7.35 | 13.92 (+1.0%) |
+| experts int8 activations | 7.20 | 13.80 (+0.1%) |
+| both (the default) | 8.23 (+22.6%) | 13.97 (+1.3%) |
+
+**What it touches under the CUDA expert tier (`COLI_CUDA=1`).** Less than on
+that host:
+
+- a dense matrix placed in VRAM (lmhead, dnproj, dnout, attnproj, attnout)
+  keeps the GPU GEMV, f32 activations: only matrices `matmul_d` runs on the
+  CPU change, at decode the router and the shared expert;
+- the routed experts the tier misses are computed by `matmul_qe` on the
+  int8 copy with f32 activations, not by `expert_ffn.h` (which is off under
+  the tier), so `QWEN_EXPERT_ACT` changes nothing there.
+
+That gain on a GPU box is not measured. CONSIST compares prefill with
+decode; if a matrix runs on the GPU in one and on the CPU in the other, the
+two arms now differ by the activation rounding as well.
+
+`tests/test_qwen36_dense_idot.c` pins the quantizer against the scalar
+contract (bit for bit, block sums exact), `matmul_d` against
+`matmul_q_idot` on the registry's own rows (byte for byte), each row of a
+batch against the same row alone, and both switches in child processes.
+`tests/test_qwen36_trunk_place.c` compares the fake device with `matmul_d`
+byte for byte, so it pins `COLI_DENSE_IDOT=0`.
+
 ## Is the CPU half sync-bound or stream-bound?
 
 On a CUDA-tier host most of a decode token is CPU, and the three biggest CPU

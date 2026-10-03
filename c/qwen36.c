@@ -68,6 +68,7 @@ static int qwen36_max_ctx(void) {
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "simd_i8f.h"      /* AVX-512 int8 x f32 dot (QWEN36_AVX512) */
+#include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT) */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -1219,6 +1220,12 @@ static int g_expert_is_int4 = 1;
  * int8 copy) and with QWEN_EXPERT_KERNEL=0, which keeps the historical
  * unpack-to-int8 path for A/Bs. Decided once from the container itself. */
 static int container_layer_is_int4(Model *m, int layer);
+/* The routed experts take the same integer path as the dense trunk
+ * (expert_ffn.h mode 1: activation to int8 once per row, dpbusd against the
+ * planar nibbles). Measured on the 35B: expert compute 22.7 to 15.9
+ * ms/token for +0.1% perplexity. QWEN_EXPERT_ACT=f32 restores mode 0, f32
+ * activations and the bit-identical contract with the pair kernels. */
+static int xf_act_mode(void){ static int v=-1; if(v<0){ const char *e=getenv("QWEN_EXPERT_ACT"); v=(e&&!strcmp(e,"f32"))?0:1; } return v; }
 static int xf_mode(Model *m) {
     static int v = -1;
     if (v >= 0) return v;
@@ -1331,6 +1338,89 @@ static void matmul_qe(float *y, const float *x, const int8_t *q, const float *sc
 #define QDW_MAX 1024
 static struct { const float *w; int8_t *q; float *sc; int I, O; } g_qdw[QDW_MAX];
 static int g_qdw_n = 0;
+/* ---- Dense trunk, integer dot products ------------------------------------
+ *
+ * Every dense GEMV of a token (DeltaNet projections and out_proj, attention
+ * q/k/v/o, the shared expert, lm_head) used to multiply int8 weights by f32
+ * activations: each weight byte converted to f32 and fed to an FMA, eight
+ * weights per instruction. Measured on lm_head (248320 x 2048 int8, 508 MB)
+ * that runs at 29 GB/s on a 16-core AVX-512 host whose memory bus does 80:
+ * the kernel, not the bus, was the limit, and the dense part of a token is
+ * 1.9 GB of int8 on the 35B, three times the routed experts.
+ *
+ * The activation is now quantized to int8 once per call (one scale,
+ * amax/127, the qrow_i8 contract the expert IDOT already uses) and the dot
+ * is integer: 32 weights per instruction on AVX2 (maddubs), 64 on AVX-512
+ * VNNI, exact int32 sums scaled once per output. Not bit-identical to the
+ * f32 path (the activation is rounded): measured on the 35B, +1.0%
+ * perplexity on 4 x 512 tokens, lm_head 12.6 to 10.2 ms/token, decode
+ * 6.71 to 7.35 tok/s alone and 8.23 with the experts' int8 activations.
+ * COLI_DENSE_IDOT=0 restores the f32-activation kernel.
+ *
+ * Ported from upstream dfec3a4b without its COLI_DENSE_BITS=4 option: here
+ * the trunk is quantized at load (qdw_take) before the component names are
+ * known, so the int4 copy would never be built. Only matrices that matmul_d
+ * runs on the CPU take this path; a matrix placed in VRAM keeps the GPU GEMV.
+ * The block sums (xsg) are filled only for a caller that asks for them. */
+static int dense_idot_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_IDOT"); v=!(e&&*e=='0'); } return v; }
+/* One line, at the first GEMV that takes the integer path (so never on a run
+ * where every dense matrix sits in VRAM or COLI_DENSE_IDOT=0): the A/B
+ * script's proof that the ON arm ran it. */
+static void dense_idot_say(void){
+    static int said = 0;
+    if (__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) return;
+    fprintf(stderr, "[qwen36] dense trunk on the CPU: integer dot (%s), COLI_DENSE_IDOT=0 restores f32 activations\n", IDOT_KERNEL);
+}
+
+/* Activation -> int8 with one scale, plus the int32 sum of every block of 64
+ * (the K1b kernel subtracts 8*sum per group because its nibbles are unsigned).
+ * Vectorized: the scalar lrintf loop was measured at ~7 us for 4096 values,
+ * which times ~150 GEMVs per token is a millisecond thrown away. Rounding is
+ * to nearest even in both paths, so the vector path equals qrow_i8 bit for bit. */
+static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
+    float amax = 0.f;
+    int i = 0;
+#ifdef __AVX2__
+    {
+        __m256 am = _mm256_setzero_ps();
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        for (; i + 8 <= I; i += 8) am = _mm256_max_ps(am, _mm256_andnot_ps(sign, _mm256_loadu_ps(x + i)));
+        float tmp[8]; _mm256_storeu_ps(tmp, am);
+        for (int k = 0; k < 8; k++) if (tmp[k] > amax) amax = tmp[k];
+    }
+#endif
+    for (; i < I; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    float s = amax / 127.f; if (s < 1e-12f) s = 1e-12f;
+    float inv = 1.f / s;
+    i = 0;
+#ifdef __AVX2__
+    {
+        const __m256 vinv = _mm256_set1_ps(inv);
+        for (; i + 32 <= I; i += 32) {
+            __m256i a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i),      vinv));
+            __m256i b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 8),  vinv));
+            __m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
+            __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
+            /* packs interleave 128-bit lanes: fix the order with one permute */
+            __m256i ab = _mm256_packs_epi32(a, b), cd = _mm256_packs_epi32(c, d);
+            __m256i abcd = _mm256_packs_epi16(ab, cd);
+            abcd = _mm256_permutevar8x32_epi32(abcd, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            _mm256_storeu_si256((__m256i *)(xq + i), abcd);
+        }
+    }
+#endif
+    for (; i < I; i++) xq[i] = (int8_t)lrintf(x[i] * inv);
+    if (xsg) {
+        int ng = I / 64;
+        for (int g = 0; g < ng; g++) {
+            int32_t sum = 0;
+            for (int k = 0; k < 64; k++) sum += xq[g * 64 + k];
+            xsg[g] = sum;
+        }
+    }
+    return s;
+}
+
 #ifdef COLI_QWEN_BATCH_TEST
 static uint64_t g_qwen_matmul_d_calls;
 #endif
@@ -1408,6 +1498,21 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
     g_qwen_matmul_d_calls++;
 #endif
     for (int i = 0; i < g_qdw_n; i++) if (g_qdw[i].w == W && g_qdw[i].I == I) {
+        if (dense_idot_on()) {
+            /* integer dot: the activation rows to int8 once, then the per-row
+             * int8 kernel */
+            int8_t *xq = malloc((size_t)S * I);
+            float *sx = malloc((size_t)S * sizeof(float));
+            if (xq && sx) {
+                for (int s = 0; s < S; s++)
+                    sx[s] = dense_act_i8(x + (int64_t)s * I, I, xq + (int64_t)s * I, NULL);
+                matmul_q_idot(y, xq, sx, g_qdw[i].q, g_qdw[i].sc, S, I, O);
+                dense_idot_say();
+                free(xq); free(sx);
+                return;
+            }
+            free(xq); free(sx);      /* out of memory: the f32 path below */
+        }
         if (S > 1 && dense_batch_on())
             matmul_q_batch(y, x, g_qdw[i].q, g_qdw[i].sc, S, I, O);
         else
@@ -2753,9 +2858,9 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
                 exp[dst] = &ex[dst];
             }
             double t1 = timed ? tm_now() : 0;
-            if (kper == K) xf_moe_run(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, K, D, F, ridx, rval, exp, 0, scratch);
+            if (kper == K) xf_moe_run(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, K, D, F, ridx, rval, exp, xf_act_mode(), scratch);
             else {
-                xf_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, 0, scratch);
+                xf_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, xf_act_mode(), scratch);
                 float *os = out + (int64_t)s0 * D; for (int d = 0; d < D; d++) os[d] += tmp[d];
             }
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }

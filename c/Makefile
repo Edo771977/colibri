@@ -1270,7 +1270,7 @@ qwen36: qwen36$(EXE)
 endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h simd_i8f.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
+qwen36$(EXE): qwen36.c decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h simd_i8f.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
@@ -1358,6 +1358,10 @@ tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.
 
 # push_id / bpe_piece must refuse loudly, not crash, on a failed realloc during growth.
 tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# the dense trunk's integer path (COLI_DENSE_IDOT): quantizer contract, dispatch.
+tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c expert_ffn.h simd_i8f.h idot.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # #1653: added tokens are split out before the regex pre-tokenizer, HF-style.
