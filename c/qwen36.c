@@ -2924,17 +2924,20 @@ static void route_select(const float *pr, const uint8_t *keep, int E, int K,
     /* One flag per expert instead of a scan of the ranks taken so far: the
      * scan made this O(E * cap^2), 3 ms a call at ROUTE_M=256 on E=256. Same
      * selection, same ties (the lowest id wins, as in the plain loop). */
+    if (E < 0) E = 0;
     uint8_t taken_small[1024]; uint8_t *taken = E <= 1024 ? taken_small : calloc((size_t)E, 1);
     if (taken == taken_small) memset(taken_small, 0, (size_t)E);
-    if (!taken) cap = 0;                 /* out of memory: no ranking, every slot -1 below */
     for (int r = 0; r < cap; r++) {
         int best = -1; float bv = -1e30f;
         for (int e = 0; e < E; e++) {
             if (keep && !keep[e]) continue;
-            if (!taken[e] && pr[e] > bv) { bv = pr[e]; best = e; }
+            int t;
+            if (taken) t = taken[e];
+            else { t = 0; for (int j = 0; j < n; j++) if (rank[j] == e) { t = 1; break; } }   /* out of memory: the old scan */
+            if (!t && pr[e] > bv) { bv = pr[e]; best = e; }
         }
         if (best < 0) break;
-        taken[best] = 1;
+        if (taken) taken[best] = 1;
         rank[n] = best; rw[n] = bv; n++;
     }
     if (taken && taken != taken_small) free(taken);
@@ -2982,9 +2985,13 @@ static void route_select(const float *pr, const uint8_t *keep, int E, int K,
  * layer's RAM cache, 1 = in the RAM cache only (pinned or LRU), 0 = would be
  * read from disk. The tier path calls expert_get() for every chosen expert
  * before qt_issue, VRAM-resident or not, so an expert in VRAM but evicted
- * from RAM (RAM_GB caps the cache, and the tier keeps its copy) still costs a
- * disk read: it is ranked with the disk ones, not above the RAM ones.
- * Upstream ranks VRAM alone as 2; there every expert is RAM-resident. */
+ * from RAM (any cache cap below the expert count, the argv default 16
+ * included, or RAM_GB; the tier keeps its copy) still costs a disk read: it
+ * is ranked with the disk ones, not above the RAM ones. Upstream ranks VRAM
+ * alone as 2; at cap 256 on the 35B every expert is in RAM and the two agree.
+ * Not covered: within one token, the miss of a true top-J expert is fetched
+ * first and its LRU eviction can take a resident chosen after it, which then
+ * is read back from disk too (cap close to K). */
 typedef struct { Model *m; int layer; } RouteCtx;
 static int route_level(void *vctx, int e) {
     RouteCtx *rc = (RouteCtx *)vctx;
@@ -4749,6 +4756,11 @@ int main(int argc, char **argv) {
     g_route_p     = getenv("ROUTE_P")     ? (float)atof(getenv("ROUTE_P"))     : 0.f; /* cumulative-mass window for CACHE_ROUTE (0 = fixed M) */
     g_route_alpha = getenv("ROUTE_ALPHA") ? (float)atof(getenv("ROUTE_ALPHA")) : 1.f; /* scale substituted experts' gate mass before renorm (1 = off) */
     g_route_agree = getenv("ROUTE_AGREE") ? atoi(getenv("ROUTE_AGREE")) : g_cache_route; /* overlap% + KL vs the true top-K in the footer; auto-on under CACHE_ROUTE=1 */
+    if (g_cache_route && getenv("CONSIST") && atoi(getenv("CONSIST")) == 1) {
+        /* refused before the model loads; the reason is at the CONSIST call */
+        fprintf(stderr, "CONSIST: refused under CACHE_ROUTE=1 (routing follows the cache, which CONSIST keeps across its arms); unset CACHE_ROUTE\n");
+        return 1;
+    }
     if (g_route_j < 0) g_route_j = 0;                  /* the values route_select would use, so the lines below print them */
     if (g_route_m < 1) g_route_m = 1;
     if (g_route_m > ROUTE_RANK_MAX) g_route_m = ROUTE_RANK_MAX;

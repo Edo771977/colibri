@@ -116,15 +116,15 @@ int main(void) {
     check(st.agree_tot == 2 && st.agree_hit == 2, "agreement_counts_the_slots_actually_chosen_not_k");
     memset(keep, 1, sizeof keep);
 
-    /* more experts than the old scan was cheap for: same ranking on E=300 */
+    /* more experts than the stack flags hold: the calloc path, same ranking */
     {
-        enum { EB = 300 };
+        enum { EB = 1500 };
         float pb[EB]; int ib[K]; float vb[K]; RouteStats sb; memset(&sb, 0, sizeof sb);
-        for (int e = 0; e < EB; e++) pb[e] = (float)((e * 37) % EB);   /* a permutation of 0..299 */
+        for (int e = 0; e < EB; e++) pb[e] = (float)((e * 37) % EB);   /* a permutation of 0..EB-1 (gcd(37,1500)=1) */
         route_select(pb, NULL, EB, K, K, 12, 0.f, 1.f, lvl_none, NULL, ib, vb, &sb);
         int ok = 1;
         for (int k = 0; k < K; k++) { int want = -1; for (int e = 0; e < EB; e++) if ((int)pb[e] == EB - 1 - k) want = e; if (ib[k] != want) ok = 0; }
-        check(ok, "ranking_by_flags_picks_the_k_largest_in_order");
+        check(ok, "ranking_by_heap_flags_picks_the_k_largest_in_order");
     }
 
     if (fails) { printf("test_qwen36_cache_route: %d fallimenti\n", fails); return 1; }
