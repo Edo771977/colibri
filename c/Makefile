@@ -2011,6 +2011,10 @@ tests/test_qwen36_tier_multidev$(EXE): tests/test_qwen36_tier_multidev.c tests/q
 tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# QT_UPLOAD_SYNC also lands the swap the layer-0 LFRU tick queues (CACHE_ROUTE determinism).
+tests/test_qwen36_tier_sync_lfru$(EXE): tests/test_qwen36_tier_sync_lfru.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 # Same fake backend, but driving the ENGINE: the warmstart in qwen36.c hands the
 # tier raw pointers into the RAM expert slots, so only a test that includes
 # qwen36.c can prove the weights behind them are still there afterwards -- on an
