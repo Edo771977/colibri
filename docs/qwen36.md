@@ -154,8 +154,8 @@ Two consequences for measuring it:
   the layer-0 LFRU pass queues, lands before the group is formed
   (`tests/test_qwen36_tier_sync_lfru.c`), so residency follows the routing
   alone. One more input carries over between runs: `HEAT_FILE` seeds the
-  tier's heat and warmstart order and is rewritten at exit with the heat the
-  lever produced, so each run needs a fresh copy of the same file
+  tier's heat, its warmstart order and the automatic trunk placement, and is
+  rewritten at exit with the heat the lever produced, so each run needs a fresh copy of the same file
   (`tools/misure-envab.ps1 -HeatFile` copies it before every run) or no
   `HEAT_FILE` at all. The cache and the tier also only see the experts the
   lever chose, so residency and the true router drift apart over a long run.

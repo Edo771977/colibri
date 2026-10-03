@@ -6,13 +6,22 @@
  * parks while a group is open). CACHE_ROUTE asks qt_is_resident before the
  * next group, so under QT_UPLOAD_SYNC its routing still depended on the
  * uploader's timing: two runs of the same command could differ. Now, under
- * QT_UPLOAD_SYNC, the tick runs before the drain.
+ * QT_UPLOAD_SYNC, the tick runs between two drains: after the first, so the
+ * victims it can see do not depend on how far the uploader got (a
+ * still-queued upload is not a candidate); before the second, so its swaps
+ * land too.
  *
  * Fake CUDA backend, no GPU: one layer, two experts, budget for one. Expert
  * 0 resident and cold, expert 1 refused by the budget and hot; the tick
  * count is set so the next layer-0 issue runs the LFRU pass. Issuing expert 1
  * must find it resident (mask bit 0 set), expert 0 evicted, and nothing in
- * flight. With the old order the issue misses and the swap is still queued. */
+ * flight. With the old order the issue misses and the swap is still queued.
+ *
+ * Part 2, the victim choice: three experts, budget for two; expert 0
+ * resident (heat 50), expert 1 still uploading slowly (heat 1), expert 2
+ * refused (heat 100), the tick due. The tick must wait for expert 1 and
+ * evict it, the coldest, whatever the upload's speed; ticking before the
+ * first drain evicted expert 0 when the upload was slow. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +40,11 @@ static void check(int ok, const char *what) {
 
 static int issue_ok(int device, int count, const float *x) {
     (void)device; (void)count; (void)x; return 1;
+}
+static void slow_upload(int fmt) {
+    (void)fmt;
+    struct timespec ts = {0, 100000000};   /* 100 ms a tensor: the uploader is behind */
+    nanosleep(&ts, NULL);
 }
 
 int main(void) {
@@ -88,6 +102,42 @@ int main(void) {
     float out[D]; memset(out, 0, sizeof out); float val[1] = {1};
     qt_take(mask, val, 1, out);
     qt_shutdown();
+
+    /* ---- part 2: the victim does not depend on the uploader's speed ---- */
+    for (int slow = 0; slow < 2; slow++) {
+        snprintf(gb, sizeof gb, "%.15f", (double)(2 * exp_bytes + exp_bytes / 2) / 1073741824.0);
+        setenv("CUDA_EXPERT_GB", gb, 1);
+        fake_upload_hook = NULL;
+        if (!qt_init(1, 3, D, 32, 3, 1, 0, 1)) { printf("  FAIL: the tier does not start (part 2)\n"); return 1; }
+        static unsigned char g4b[3][D * 32 / 2], u4b[3][D * 32 / 2], d4b[3][D * 32 / 2];
+        static float scb[3][2 * 32 + D];
+        for (int e = 0; e < 3; e++) {
+            memset(g4b[e], (unsigned char)(e + 1), sizeof g4b[e]); memset(u4b[e], (unsigned char)(e + 2), sizeof u4b[e]);
+            memset(d4b[e], (unsigned char)(e + 3), sizeof d4b[e]); for (int i = 0; i < 2 * 32 + D; i++) scb[e][i] = 1.0f;
+        }
+        qt_note(0, 0, g4b[0], u4b[0], d4b[0], scb[0], scb[0] + 32, scb[0] + 64);
+        qt_fill_wait();
+        if (slow) fake_upload_hook = slow_upload;
+        qt_note(0, 1, g4b[1], u4b[1], d4b[1], scb[1], scb[1] + 32, scb[1] + 64);   /* takes the last room */
+        qt_note(0, 2, g4b[2], u4b[2], d4b[2], scb[2], scb[2] + 32, scb[2] + 64);   /* refused: budget full */
+        pthread_mutex_lock(&G.mx);
+        int e2_refused = !qs(0, 2)->resident && !qs(0, 2)->queued;
+        qs(0, 0)->heat = 50; qs(0, 1)->heat = 1; qs(0, 2)->heat = 100;
+        G.tick = 15;
+        pthread_mutex_unlock(&G.mx);
+        check(e2_refused, "part 2: expert 2 is refused while expert 1 takes the last room");
+        int e2 = 2;
+        mask = qt_issue(0, &e2, 1, x);
+        pthread_mutex_lock(&G.mx);
+        int s0 = qs(0, 0)->resident, s1 = qs(0, 1)->resident, s2 = qs(0, 2)->resident, inf = G.inflight;
+        pthread_mutex_unlock(&G.mx);
+        check(s0 && !s1 && s2, slow ? "slow upload: the coldest (expert 1) is evicted, not expert 0"
+                                     : "fast upload: the coldest (expert 1) is evicted");
+        check(inf == 0 && mask == 1u, "part 2: nothing in flight, the issue finds expert 2");
+        qt_take(mask, val, 1, out);
+        fake_upload_hook = NULL;
+        qt_shutdown();
+    }
 
     if (fails) { printf("test_qwen36_tier_sync_lfru: %d failure(s)\n", fails); return 1; }
     printf("test_qwen36_tier_sync_lfru: ok\n");
