@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 static int fails;
 static void check(int ok, const char *what) {
@@ -20,6 +21,7 @@ static void check(int ok, const char *what) {
 /* residency table for the callback: level per expert id */
 static int8_t g_lvl[64];
 static int lvl_table(void *ctx, int e) { (void)ctx; return g_lvl[e]; }
+static int lvl_none(void *ctx, int e) { (void)ctx; (void)e; return 0; }   /* any E: nothing resident */
 
 /* softmax row where expert e has mass proportional to (E - e): rank == id. */
 static void ranked_row(float *pr, int E) {
@@ -49,6 +51,18 @@ int main(void) {
     check(idx[2]==7 && idx[3]==2, "resident_expert_in_window_fills_before_the_unresident_ranking");
     check(st.swaps == 1 && st.swaps_vram == 0 && st.agree_hit == 3, "one_substitution_is_counted_once_and_not_as_vram");
     check(st.kl_sum > 0.0, "a_substitution_shows_up_as_positive_kl");
+    {   /* the meter's value, not only its sign: true top-K {0,1,2,3}, chosen
+         * {0,1,7,2}; rank 3 dropped is charged at the 1e-12 floor. */
+        double tsum = 1e-20, csum = 1e-20, kl = 0;
+        for (int t = 0; t < K; t++) tsum += pr[t];
+        csum += pr[0] + pr[1] + pr[7] + pr[2];
+        const int in_chosen[K] = {1, 1, 1, 0};
+        for (int t = 0; t < K; t++) {
+            double pt = pr[t] / tsum, pc = in_chosen[t] ? pr[t] / csum : 1e-12;
+            kl += pt * log(pt / pc);
+        }
+        check(fabs(st.kl_sum - kl) < 1e-4 * kl,   /* the engine sums in float */ "kl_is_true_mass_against_chosen_mass_with_a_1e-12_floor");
+    }
 
     /* the sacred top-J is taken even when a lower rank is resident and it is not */
     memset(g_lvl, 0, sizeof g_lvl); g_lvl[2] = 1; g_lvl[3] = 1; g_lvl[4] = 1; g_lvl[5] = 1; memset(&st, 0, sizeof st);
@@ -99,6 +113,19 @@ int main(void) {
     memset(keep, 0, sizeof keep); keep[3] = 1; keep[9] = 1;
     route_select(pr, keep, E, K, 2, 12, 0.f, 1.f, lvl_table, NULL, idx, val, &st);
     check(idx[0]==3 && idx[1]==9 && idx[2]==-1 && idx[3]==-1 && st.slots == 2, "short_candidate_list_pads_with_minus_one");
+    check(st.agree_tot == 2 && st.agree_hit == 2, "agreement_counts_the_slots_actually_chosen_not_k");
+    memset(keep, 1, sizeof keep);
+
+    /* more experts than the old scan was cheap for: same ranking on E=300 */
+    {
+        enum { EB = 300 };
+        float pb[EB]; int ib[K]; float vb[K]; RouteStats sb; memset(&sb, 0, sizeof sb);
+        for (int e = 0; e < EB; e++) pb[e] = (float)((e * 37) % EB);   /* a permutation of 0..299 */
+        route_select(pb, NULL, EB, K, K, 12, 0.f, 1.f, lvl_none, NULL, ib, vb, &sb);
+        int ok = 1;
+        for (int k = 0; k < K; k++) { int want = -1; for (int e = 0; e < EB; e++) if ((int)pb[e] == EB - 1 - k) want = e; if (ib[k] != want) ok = 0; }
+        check(ok, "ranking_by_flags_picks_the_k_largest_in_order");
+    }
 
     if (fails) { printf("test_qwen36_cache_route: %d fallimenti\n", fails); return 1; }
     printf("test_qwen36_cache_route: ok\n");

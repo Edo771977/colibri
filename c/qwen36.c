@@ -2921,16 +2921,23 @@ static void route_select(const float *pr, const uint8_t *keep, int E, int K,
     if (cap > ROUTE_RANK_MAX) cap = ROUTE_RANK_MAX;
     int rank[ROUTE_RANK_MAX]; float rw[ROUTE_RANK_MAX]; int8_t rl[ROUTE_RANK_MAX];
     int n = 0;
+    /* One flag per expert instead of a scan of the ranks taken so far: the
+     * scan made this O(E * cap^2), 3 ms a call at ROUTE_M=256 on E=256. Same
+     * selection, same ties (the lowest id wins, as in the plain loop). */
+    uint8_t taken_small[1024]; uint8_t *taken = E <= 1024 ? taken_small : calloc((size_t)E, 1);
+    if (taken == taken_small) memset(taken_small, 0, (size_t)E);
+    if (!taken) cap = 0;                 /* out of memory: no ranking, every slot -1 below */
     for (int r = 0; r < cap; r++) {
         int best = -1; float bv = -1e30f;
         for (int e = 0; e < E; e++) {
             if (keep && !keep[e]) continue;
-            int taken = 0; for (int j = 0; j < n; j++) if (rank[j] == e) { taken = 1; break; }
-            if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+            if (!taken[e] && pr[e] > bv) { bv = pr[e]; best = e; }
         }
         if (best < 0) break;
+        taken[best] = 1;
         rank[n] = best; rw[n] = bv; n++;
     }
+    if (taken && taken != taken_small) free(taken);
     int Kt = K < n ? K : n;             /* the true top-K is rank[0..Kt) */
     int win = n;
     if (P > 0.f && P < 1.f) {           /* cumulative-mass window: grow past K until P of the ranked mass */
@@ -2971,16 +2978,21 @@ static void route_select(const float *pr, const uint8_t *keep, int E, int K,
     st->kl_sum += kl; st->kl_n++;
 }
 
-/* Residency levels for route_select: 2 = in the VRAM tier, 1 = in this
- * layer's RAM cache (pinned or LRU), 0 = would be read from disk. */
+/* Residency levels for route_select: 2 = in the VRAM tier and in this
+ * layer's RAM cache, 1 = in the RAM cache only (pinned or LRU), 0 = would be
+ * read from disk. The tier path calls expert_get() for every chosen expert
+ * before qt_issue, VRAM-resident or not, so an expert in VRAM but evicted
+ * from RAM (RAM_GB caps the cache, and the tier keeps its copy) still costs a
+ * disk read: it is ranked with the disk ones, not above the RAM ones.
+ * Upstream ranks VRAM alone as 2; there every expert is RAM-resident. */
 typedef struct { Model *m; int layer; } RouteCtx;
 static int route_level(void *vctx, int e) {
     RouteCtx *rc = (RouteCtx *)vctx;
-    if (qt_is_resident(rc->layer, e)) return 2;
     pthread_mutex_lock(&g_pilot_mx);
     Slot *s = slot_indexed(rc->m, rc->layer, e);
     pthread_mutex_unlock(&g_pilot_mx);
-    return s ? 1 : 0;
+    if (!s) return 0;
+    return qt_is_resident(rc->layer, e) ? 2 : 1;
 }
 
 static void route_footer(FILE *f, const Model *m) {
@@ -4737,6 +4749,9 @@ int main(int argc, char **argv) {
     g_route_p     = getenv("ROUTE_P")     ? (float)atof(getenv("ROUTE_P"))     : 0.f; /* cumulative-mass window for CACHE_ROUTE (0 = fixed M) */
     g_route_alpha = getenv("ROUTE_ALPHA") ? (float)atof(getenv("ROUTE_ALPHA")) : 1.f; /* scale substituted experts' gate mass before renorm (1 = off) */
     g_route_agree = getenv("ROUTE_AGREE") ? atoi(getenv("ROUTE_AGREE")) : g_cache_route; /* overlap% + KL vs the true top-K in the footer; auto-on under CACHE_ROUTE=1 */
+    if (g_route_j < 0) g_route_j = 0;                  /* the values route_select would use, so the lines below print them */
+    if (g_route_m < 1) g_route_m = 1;
+    if (g_route_m > ROUTE_RANK_MAX) g_route_m = ROUTE_RANK_MAX;
     if (g_cache_route)
         fprintf(stderr, "[qwen36] CACHE_ROUTE=1 J=%d M=%d P=%.2f alpha=%.2f: VRAM tier > RAM cache > disk inside the top-M window (lossy: A/B it)\n",
                 g_route_j, g_route_m, g_route_p, g_route_alpha);
@@ -4972,6 +4987,14 @@ int main(int argc, char **argv) {
      * file's full_ids when there is one, the encoded prompt otherwise. It
      * needs no continuation of its own -- both arms replay the same tokens. */
     if (getenv("CONSIST") && atoi(getenv("CONSIST")) == 1) {
+        /* CONSIST keeps the caches between its arms on purpose (their state
+         * changes I/O, not arithmetic). Under CACHE_ROUTE the cache decides
+         * which experts run, so the arms would route differently and the gap
+         * would measure the lever, not the code: refused, not misreported. */
+        if (g_cache_route) {
+            fprintf(stderr, "CONSIST: refused under CACHE_ROUTE=1 (routing follows the cache, which CONSIST keeps across its arms); unset CACHE_ROUTE\n");
+            free(buf); free(arena); return 1;
+        }
         run_consist(&m, is_ref ? full : prompt, is_ref ? nfull : np);
         free(buf); free(arena); return 0;
     }

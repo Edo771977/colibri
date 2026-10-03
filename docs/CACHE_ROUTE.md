@@ -20,8 +20,10 @@ In `qwen36` a slot past the sacred top-`J` is filled, inside the top-`M`
 window, by the highest-ranked VRAM-resident expert, then the highest-ranked
 RAM-resident one, then the plain ranking. With no tier enabled the VRAM level
 is empty and the lever degrades to the single-level GLM behaviour. The knobs
-and meters are the same in both engines; the `qwen36` footer additionally
-splits the swap count into `N to VRAM`.
+are the same in both engines (`ROUTE_TRACE` is GLM-only); the `qwen36` footer
+additionally splits the swap count into `N to VRAM`, and its serve `STAT`
+line does not carry the route meters. In this fork's `qwen36` an expert is
+VRAM level only while it is in the RAM cache too (docs/qwen36.md).
 
 The only substitutable slots are ranks `J..K-1`. On a model that routes
 top-2, the default `ROUTE_J=2` leaves nothing to substitute and the footer
