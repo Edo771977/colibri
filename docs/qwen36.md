@@ -134,13 +134,15 @@ Under the CUDA tier with a cache that holds every expert in RAM (`cap 256`
 on the 35B, and the tier's warmstart loading every expert into RAM before
 the first token), the RAM level is always full, so only the VRAM level
 changes anything: a substitute is a VRAM-resident expert in place of one the
-CPU would compute (`cpu-miss`). With a cap below the expert count,
-`QT_NO_WARMSTART=1` or `RAM_GB`, the RAM cache is bounded or fills lazily,
-and the RAM level matters again. In this fork an expert counts as
+CPU would compute (`cpu-miss`). The tier runs only with a cap equal to the
+expert count; under it, `QT_NO_WARMSTART=1` (the RAM cache fills lazily) and
+`RAM_GB` (it is bounded) make the RAM level matter again. With a smaller cap
+there is no tier, and the lever is the single-level RAM behaviour of
+[CACHE_ROUTE.md](CACHE_ROUTE.md). In this fork an expert counts as
 VRAM-resident only if it is in the RAM cache as well: the tier path reads
 every chosen expert through the RAM cache before issuing the group, so one
-in VRAM but evicted from RAM would still cost a disk read (upstream ranks
-VRAM alone; there every expert is in RAM).
+in VRAM but evicted from RAM by `RAM_GB` would still cost a disk read
+(upstream has no `RAM_GB` and ranks VRAM alone).
 
 Two consequences for measuring it:
 
@@ -151,9 +153,11 @@ Two consequences for measuring it:
   both arms and leave `PILOT` off: every queued upload, including the swaps
   the layer-0 LFRU pass queues, lands before the group is formed
   (`tests/test_qwen36_tier_sync_lfru.c`), so residency follows the routing
-  alone. That holds at cap 256; with a smaller cap the parallel warmstart
-  decides by thread timing which experts the RAM cache keeps, and runs are
-  not reproducible. The cache and the tier also only see the experts the
+  alone. One more input carries over between runs: `HEAT_FILE` seeds the
+  tier's heat and warmstart order and is rewritten at exit with the heat the
+  lever produced, so each run needs a fresh copy of the same file
+  (`tools/misure-envab.ps1 -HeatFile` copies it before every run) or no
+  `HEAT_FILE` at all. The cache and the tier also only see the experts the
   lever chose, so residency and the true router drift apart over a long run.
 - **CONSIST** keeps the caches between its arms, so under the lever the arms
   would route differently: the engine refuses `CONSIST=1` with

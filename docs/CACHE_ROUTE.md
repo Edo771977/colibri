@@ -62,7 +62,7 @@ Footer / serve `STAT` when enabled:
 - `route_agree` — |chosen ∩ true top-K| / K
 - `route_kl` — mass KL (true top-K vs chosen)
 - `hit N%` — expert cache hit (disk residency)
-- `N to VRAM` (`qwen36` only) — of the swaps, how many landed on a tier-resident expert
+- `N to VRAM` (`qwen36` only, footer only: its serve `STAT` carries no route meters) — of the swaps, how many landed on a tier-resident expert
 
 ## A/B vs PILOT
 
