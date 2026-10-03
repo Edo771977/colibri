@@ -555,6 +555,35 @@ something inside the noise. `tests/bench_qwen36_decode_omp` still prints what
 the trade would cost at this host's two prices, so anyone tempted to write it
 again can see the answer before writing it.
 
+## Cache-aware routing (`CACHE_ROUTE`, off by default)
+
+Ported from upstream (JustVugg/colibri ec991814, 17 September 2026). The
+routed experts the caches miss are the lever's target. `CACHE_ROUTE=1` ports the
+GLM engine's max-rank re-routing ([CACHE_ROUTE.md](CACHE_ROUTE.md),
+arXiv:2412.00099) to this engine with two residency levels: inside the top-`M`
+window, a slot past the sacred top-`J` prefers an expert already in the VRAM
+tier, then one in the RAM cache, then the plain ranking. It is **lossy**: it
+changes which experts run, so the semantic contract is off while it is set and
+the footer prints what it cost, `route_agree` (overlap with the true top-K)
+and `route_kl` (mass KL), next to the swap and hit rates. Unset, the router
+is the original loop and the token ids are byte-identical; `ROUTE_AGREE=1`
+alone prints the meters at 100 % / 0 without touching routing.
+
+Qwen3.6 routes top-8 (plus the shared expert), so the default `ROUTE_J=2`
+leaves six substitutable slots per token; the tiny fixture routes top-2 and
+needs `ROUTE_J<2` to show any swap at all. A/B it the way the GLM doc does:
+same prompt and seed, tok/s and hit rate against agreement and KL, and treat
+`PPL=1` on a teacher-forced reference as the quality bar.
+
+Under the CUDA tier with a cache that holds every expert in RAM (`cap 256`
+on the 35B), the RAM level is always full, so only the VRAM level changes
+anything: a substitute is a VRAM-resident expert in place of one the CPU
+would compute (`cpu-miss`). The engine prints one line at startup when the
+lever is on, `[qwen36] CACHE_ROUTE=1 J=.. M=.. ...`. `route_kl` charges a
+true top-K expert that was dropped with a probability floor of 1e-12, so its
+values are large (the tiny fixture at `ROUTE_J=1` reads 8.6 for a 66 %
+agreement): compare it between settings, not against a scale.
+
 ## Which container?
 
 The gs64 container carries one scale per 64-weight group instead of one per
