@@ -170,7 +170,9 @@ sono descritti per posizione (vedi la mappa degli slot M.2 nel manuale della sch
   controller è quale si ricava dalla velocità massima, 5 contro 4).
 - Modello copiato con `robocopy C:\modelli\qwen36_i4_gs64 D:\modelli\qwen36_i4_gs64 /E /J /NP`:
   97 file, 21,45 GiB secondo robocopy, nessun errore. Da ora `set SNAP=D:\modelli\qwen36_i4_gs64`; la copia su C:
-  resta finché il motore non ha girato da D:.
+  resta finché il motore non ha girato da D:. Il 3 ottobre il motore ha girato 24 volte da D:
+  (l'A/B di `COLI_DENSE_IDOT`, `docs/experiments/qwen36-dense-idot-2026-10-03-raw.txt`), con la
+  stessa residenza e lo stesso piazzamento di prima: la copia su C: si può cancellare.
 - `iobench.exe <disco>:\modelli\qwen36_i4_gs64\model-globals.safetensors 19 256 16 1`
   (letture dirette, 256 blocchi da 19 MB, 16 thread), tre giri a ordine alternato:
 
