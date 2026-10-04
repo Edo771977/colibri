@@ -113,10 +113,12 @@ qwen36.exe 256 4 prompt.txt
   - `set COLI_DN_GPU=1`: la DeltaNet in decode sulla GPU, -4,5 ms/token
     (`docs/experiments/qwen36-deltanet-gpu-2026-09-28-raw.txt`);
   - `set CACHE_ROUTE=1` e `set ROUTE_J=4`: il router preferisce gli esperti già in VRAM dal
-    quinto in poi. Misurato il 4 ottobre: -1,6 ms/token sullo step (l'equivalente di ~57 → ~63
-    tok/s, ricavato dallo step e non misurato direttamente), con `QT_UPLOAD_SYNC=1` e
-    `COLI_CUDA_KEEPALIVE=1` in entrambi i bracci e 128 token generati; senza sync e su
-    generazioni lunghe non è misurato. Sulla perplexity di un solo testo di prova non si vede
+    quinto in poi. Misurato il 4 ottobre così come si usa, senza `QT_UPLOAD_SYNC`: -1,75 ms/token
+    sullo step, 17,30 → 15,55 (l'equivalente di ~58 → ~64 tok/s, ricavato dallo step e non
+    misurato direttamente), con `COLI_DN_GPU=1` e `COLI_CUDA_KEEPALIVE=1` in entrambi i bracci e
+    128 token generati (`docs/experiments/qwen36-cache-route-nosync-2026-10-04-raw.txt`; con
+    `QT_UPLOAD_SYNC=1` era -1,6, stesso testo e stesse sostituzioni); su generazioni lunghe non
+    è misurato. Sulla perplexity di un solo testo di prova non si vede
     alcun peggioramento (`docs/experiments/qwen36-cache-route-j4-2026-10-04-raw.txt`). Cambia
     il testo generato (nella prova, dal carattere 121): è una scelta, non un'ottimizzazione
     esatta. `ROUTE_J=2` ha dato -2,2 ms/token (in un'altra sessione e build) e +1,6% di

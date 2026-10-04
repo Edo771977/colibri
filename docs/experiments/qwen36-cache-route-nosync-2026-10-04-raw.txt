@@ -1,0 +1,156 @@
+Qwen3.6-35B-A3B: the CACHE_ROUTE=1 ROUTE_J=4 A/B WITHOUT QT_UPLOAD_SYNC,
+the normal mode, under the CUDA tier with the DeltaNet on the GPU.
+4 October 2026, afternoon, on the operator's machine (RTX 4070 Ti SUPER,
+Ryzen 9 7950X, Windows, qwen36_i4_gs64 read from D:, cap 256, 4 bits).
+Follows qwen36-cache-route-j4-2026-10-04-raw.txt (the same A/B with
+QT_UPLOAD_SYNC=1 in both arms).
+
+Summary:
+
+  1. misure-envab.ps1 -AllowTextDrift ON (#75), CACHE_ROUTE absent vs =1
+     with ROUTE_J=4, six pairs, heat table, COLI_DN_GPU=1 and
+     COLI_CUDA_KEEPALIVE=1 in both arms, QT_UPLOAD_SYNC NOT set: step()
+     17.30 -> 15.55 ms/token, paired delta -1.75, 95 % [-2.09, -1.41], 6 of
+     6 pairs negative.
+  2. The waiver was not needed: the six ON runs wrote one text, and it is
+     the ON text of the sync record (b967e6bd24da75bb); the OFF text is
+     4a000cc01f310b64, as in every earlier record. The route meters are the
+     sync record's to the digit (swap 6.4 %, 3119 of 48640, all to VRAM;
+     route_agree 93.6 %; route_kl 1.0377) in all six ON runs. On this
+     prompt and 128 tokens, dropping the sync changed neither the routing
+     nor the text.
+  3. Where it comes from, as before: cpu-miss 3.81 -> 1.94 ms/token, VRAM
+     hit 86.7 % -> 93.4 %, misses 6463 -> 3203.
+
+Reading: the setting recommended in ISTRUZIONI.md (COLI_DN_GPU=1,
+CACHE_ROUTE=1, ROUTE_J=4) is now measured as it is run, without
+QT_UPLOAD_SYNC: -1.75 ms/token, a tight interval, 6 of 6. Against the sync
+A/B (-1.57, [-1.78, -1.35]) the intervals overlap and the sessions and
+builds differ, so the two gains are not distinguished; both arms read
+faster here (OFF 17.30 against 17.42, ON 15.55 against 15.85), which
+does not separate the sync's own cost from the session.
+
+Everything below is from output the operator pasted in the session. The
+logs stay on the operator's machine; none is committed and no
+evidence.sha256 exists for them.
+
+--- build -------------------------------------------------------------------------
+
+A new cmd window was not opened: the first launch, in the window of the
+morning's runs, stopped at the environment guard before any run
+("queste variabili d'ambiente possono cambiare la misura e sono
+impostate: QT_UPLOAD_SYNC=1"). The operator cleared it (`set
+QT_UPLOAD_SYNC=`) and relaunched in the same window; the guard then
+listed nothing. The build was the one in the instructions given in the
+session, after `git pull` to main c73a8ff (the merge of #75, which changes
+no engine source since the morning's 31710bc; the stamp's waiver text is
+the wording of #75's second commit, so the tree had at least that, and
+main has nothing later):
+
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+
+  eseguibile: .\qwen36_clang.exe | 392704 byte | 2026-10-04 16:26:09 | sha256 BAF4DC0A5938C992
+  build-config: clang|-D_FILE_OFFSET_BITS=64 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -DCOLI_CUDA|-lm -fopenmp  -lpsapi -lpthread -Wl,--stack,8388608 |CUDA=0|CUDA_DLL=1|ARCH=native|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=0
+  coli_cuda.dll: 819712 byte | 2026-09-28 21:42:02 | sha256 230CA632A2CEA752
+
+The executable's hash differs from the morning's (936F5346924C2BB5, same
+size); the paste does not show the build or the `git pull`, only the
+script's stamp, so the commit is the one the instructions pulled, not one
+the paste prints.
+
+--- the command -----------------------------------------------------------------
+
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set ROUTE_J=4
+  set QT_UPLOAD_SYNC=
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var CACHE_ROUTE -Value 1 -Marker "[qwen36] CACHE_ROUTE=1" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE,COLI_DN_GPU,ROUTE_J -AllowTextDrift ON
+
+  parametri: cap=256 bits=4 N_NEW=128 rip=6 | OFF: CACHE_ROUTE assente | ON: CACHE_ROUTE=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_KEEPALIVE,COLI_DN_GPU,ROUTE_J -- DEROGA  | testo-variabile=ON -- DEROGA: i run di un braccio nominato possono scrivere testi diversi
+  marker: [qwen36] CACHE_ROUTE=1  (testo trovato in C:\colibri-fork\c\qwen36_clang.exe)
+  heat: C:\colibri-fork\c\heat.caldo.bin | 40972 byte | 40 layer x 256 esperti | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | costruita su un prompt sha256 6A4F0BCF64192EA3, diverso dal prompt misurato (come CROSS) | heat.caldo.bin.sha256: tabella= verificata | condizioni della costruzione diverse da questa corsa: snap, allow_env, eseguibile, dll
+
+The 1, 1 and 4 of the three variables set in the window are from the
+instructions given in the session, not from the paste (ROUTE_J=4 is
+confirmed by the route meters' "J=4" in every ON log); the stamp shows
+that the three were set (an -AllowEnv name that is not set stops the
+script) and that no other guarded variable was. ROUTE_J has an effect only
+with CACHE_ROUTE=1, so the OFF arm ran the plain router. As in the earlier
+records, no log was checked for "[cuda] keep-alive active:".
+
+Invariants: heat table unchanged and loaded in all 12 runs; engine banner
+identical (== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192
+pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==); [place] auto identical in
+all 12 runs; residency 6812/10240 in all runs.
+
+--- 1. the A/B --------------------------------------------------------------------
+
+  rip 1 (OFF prima)  OFF  17.20  ON  15.40  delta  -1.80 ms/token
+  rip 2 (ON prima )  OFF  17.20  ON  15.40  delta  -1.80 ms/token
+  rip 3 (OFF prima)  OFF  17.20  ON  15.60  delta  -1.60 ms/token
+  rip 4 (ON prima )  OFF  17.50  ON  15.50  delta  -2.00 ms/token
+  rip 5 (OFF prima)  OFF  17.50  ON  16.30  delta  -1.20 ms/token
+  rip 6 (ON prima )  OFF  17.20  ON  15.10  delta  -2.10 ms/token
+
+  media    -1.75   sd  0.32   se  0.13   df 5
+  intervallo 95 %:  [-2.09 ; -1.41]   ampiezza +-0.34
+  negativi 6/6
+  position (ABBA): OFF first -1.80 -1.60 -1.20, ON first -1.80 -2.00
+  -2.10, difference of the group means 0.43
+
+  OFF    step  17.30  moe   9.82  attn  1.87  dn  3.71  head  1.00
+         (shared)  3.04  (router)  0.70  wait  0.41
+         issue  1.46  cpu-miss  3.81  take  0.51  sh-ovl  3.04  hit  86.7 %  swaps  8.0  miss per rip: 6463 6463 6463 6464 6463 6463
+  ON     step  15.55  moe   8.14  attn  1.84  dn  3.69  head  0.99
+         (shared)  3.11  (router)  0.73  wait  0.60
+         issue  1.41  cpu-miss  1.94  take  0.69  sh-ovl  3.12  hit  93.4 %  swaps  8.0  miss per rip: 3204 3203 3203 3203 3203 3203
+  (dn-sub / dn-split: the whole DeltaNet call in the proj slot, dnproj and
+  dnout 3810/3810, in both arms)
+
+--- 2. text and route meters -------------------------------------------------------
+
+  braccio OFF: 1 testo in 6 run (verificato, nessuna deroga): sha256 4a000cc01f310b64
+  braccio ON: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 b967e6bd24da75bb
+  testo generato DIVERSO fra i due bracci -- solo ripetizione 1: primo carattere diverso alla posizione 121 (contata da 0, in unita' UTF-16, sullo stdout letto).
+    OFF   ...SO), poiché deve garantire che ogni pro
+    ON    ...OS), poiché deve garantire che ogni pro
+  (the paste shows "é" as "├®", the console code page)
+
+  findstr /C:"CACHE_ROUTE J=" /C:"route_agree" envab-ON-r*.log, r1 .. r6 identical:
+    CACHE_ROUTE J=4 M=12 P=0.00 alpha=1.00 | swap 6.4% (3119/48640, 3119 to VRAM)
+    route_agree 93.6% | route_kl 1.0377
+
+--- reading -----------------------------------------------------------------------
+
+  - Determinism without the sync: docs/qwen36.md says two runs under the
+    lever CAN differ without QT_UPLOAD_SYNC=1, because the asynchronous
+    uploader decides what is resident when the experts are chosen. Here
+    they did not: six ON runs, one text, one set of route meters, all
+    equal to the sync record's. Only the miss counts moved, by one, in one
+    run of each arm (OFF r4 6464, ON r1 3204), so residency timing did vary
+    a little without changing any choice the text depends on. That is one
+    prompt, 128 tokens and 8 LFRU swaps per run; a longer run, more swaps,
+    or PILOT=1 can still diverge, so the waiver and the docs' caution stay.
+  - The same work in both modes: with the same texts and the same
+    substitutions, this A/B and the sync one time the same decode
+    sequences, so the comparison between the two records is only between
+    sessions and builds. OFF 17.30 against 17.42, ON 15.55 against 15.85;
+    the 3 October OFF arm without sync read 17.43. The sync's own cost is
+    still not measured, and these numbers do not suggest a large one.
+  - Speed, as in the earlier records: the gain is cpu-miss (3.81 -> 1.94,
+    ms per decode token) and the misses over the run (6463 -> 3203,
+    prompt and decode rows); moe falls by 1.68, step() by 1.75; the
+    other timers move by 0.08 or less, wait and take excepted (0.41 ->
+    0.60 and 0.51 -> 0.69, wait being part of take), not attributed.
+  - Position: the ON-first pairs read 0.43 ms/token more negative than the
+    OFF-first ones (the sync record: -0.07). With six even pairs a
+    constant position effect cancels in the mean. Rip 5 (ON 16.30, the
+    slowest ON run, delta -1.20) carries about half of the difference:
+    with a delta of -1.80 there it would be 0.23.
+
+--- what this run did NOT measure ---------------------------------------------------
+
+  - The sync's own cost (the A/B QT_UPLOAD_SYNC absent vs =1 with the lever
+    on).
+  - Any prompt other than prompt25.txt, runs longer than 128 tokens, and
+    perplexity on more than one text.
