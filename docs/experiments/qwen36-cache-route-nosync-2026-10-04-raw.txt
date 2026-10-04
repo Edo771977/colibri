@@ -79,8 +79,11 @@ the window; the paste shows only the last two lines:
 
 The values of the three variables are from the instructions, not from
 the paste, except where a log confirms them: ROUTE_J=4 by the route
-meters' "J=4" in every ON log, COLI_DN_GPU by "GPU: dnproj 3810/3810,
-dnout 3810/3810" in both arms. The stamp shows that the three were set
+meters' "J=4" in every ON log, COLI_DN_GPU=1 by the dn-sub / dn-split
+timers, which put the whole DeltaNet call in the proj slot in both arms:
+only the GPU decode path books it so (c/qwen36.c, the qt_dn_decode
+branch); "dnproj 3810/3810, dnout 3810/3810" alone would also show a full
+trunk placement on the CPU path. The stamp shows that the three were set
 (an -AllowEnv name that is not set stops the script) and that no other
 guarded variable was. ROUTE_J has an effect only
 with CACHE_ROUTE=1, so the OFF arm ran the plain router. As in the earlier

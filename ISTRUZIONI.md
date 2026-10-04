@@ -116,7 +116,9 @@ qwen36.exe 256 4 prompt.txt
     quinto in poi. Misurato il 4 ottobre senza `QT_UPLOAD_SYNC` (il modo normale): -1,75
     ms/token sullo step, 17,30 → 15,55 (l'equivalente di ~58 → ~64 tok/s, ricavato dallo step e
     non misurato direttamente), su un solo prompt e 128 token generati, con `COLI_DN_GPU=1`,
-    `COLI_CUDA_KEEPALIVE=1` e una tabella heat fissa in entrambi i bracci: i tempi assoluti
+    `COLI_CUDA_KEEPALIVE=1` e una tabella heat fissa in entrambi i bracci (la stessa copia di
+    `heat.caldo.bin` prima di ogni run; con `HEAT_FILE=heat.bin` del blocco sopra la tabella si
+    riscrive a ogni uscita, e l'effetto di questo sulla leva non è misurato): i tempi assoluti
     valgono con il keep-alive acceso, e senza keep-alive il guadagno della leva non è misurato
     (`docs/experiments/qwen36-cache-route-nosync-2026-10-04-raw.txt`). Con `QT_UPLOAD_SYNC=1`
     era -1,6, stesso testo e stessi contatori di routing, in un'altra sessione e build: le due
