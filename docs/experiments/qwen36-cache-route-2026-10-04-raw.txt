@@ -1,0 +1,145 @@
+Qwen3.6-35B-A3B: cache-aware routing (CACHE_ROUTE=1, port of upstream
+ec991814, #72) under the CUDA tier with the DeltaNet on the GPU.
+4 October 2026, morning, on the operator's machine (RTX 4070 Ti SUPER,
+Ryzen 9 7950X, Windows, qwen36_i4_gs64 read from D:, cap 256, 4 bits).
+
+Summary:
+
+  1. misure-envab.ps1, CACHE_ROUTE absent vs =1 (defaults J=2 M=12 P=0
+     alpha=1), six pairs, heat table, COLI_DN_GPU=1, COLI_CUDA_KEEPALIVE=1
+     and QT_UPLOAD_SYNC=1 in both arms, main 3289754 (the merge of #72):
+     step() 18.37 -> 16.17 ms/token, paired delta -2.20, 95 % [-2.98,
+     -1.42], 6 of 6 pairs negative.
+  2. Where it comes from: cpu-miss 3.99 -> 1.60 ms/token, VRAM hit 86.7 %
+     -> 94.8 %, misses 6463 -> 2520. The lever substituted 8.2 % of the
+     chosen slots (4003 of 48640), every one with a VRAM-resident expert;
+     route_agree 91.8 %, route_kl 1.4637, the same in all six ON runs.
+  3. The generated text is identical within each arm (QT_UPLOAD_SYNC=1 made
+     the ON arm reproducible) and differs between the arms from UTF-16
+     position 83 of stdout. The OFF arm's text, 4a000cc01f310b64, is the
+     one of the 28 September and 3 October records.
+
+Not measured: the quality cost. The text changes early ("più critici di un
+sistema operativo (SO" against "fondamentali di un sistema operativo (OS")
+and reads as plausible, but no perplexity was taken; PPL=1 on a text file
+(docs/qwen36.md) is the next measurement. Nor the gain without
+QT_UPLOAD_SYNC, the normal mode: both arms here paid for synchronous
+uploads, and this OFF arm (18.37) is slower than the 3 October OFF arm
+without it (17.43, another session and build, so the sync's own cost is not
+known).
+
+Everything below is from output the operator pasted in the session. The
+logs stay on the operator's machine; none is committed and no
+evidence.sha256 exists for them.
+
+--- build -----------------------------------------------------------------------
+
+main fast-forwarded ecbdf67..3289754 (git log: 3289754 Merge pull request
+#72). In C:\colibri-fork\c, the x64 Native Tools prompt; the paste shows a
+mistyped `t PATH=...` ("t" non e' riconosciuto) before the build, PATH
+already set in that window, and a `PATH=...` line after it:
+
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+
+  eseguibile: .\qwen36_clang.exe | 392192 byte | 2026-10-04 07:57:16 | sha256 F09B34CACCD98FE6
+  build-config: clang|-D_FILE_OFFSET_BITS=64 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -DCOLI_CUDA|-lm -fopenmp  -lpsapi -lpthread -Wl,--stack,8388608 |CUDA=0|CUDA_DLL=1|ARCH=native|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=0
+  coli_cuda.dll: 819712 byte | 2026-09-28 21:42:02 | sha256 230CA632A2CEA752
+
+--- the command -----------------------------------------------------------------
+
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set QT_UPLOAD_SYNC=1
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var CACHE_ROUTE -Value 1 -Marker "[qwen36] CACHE_ROUTE=1" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE,COLI_DN_GPU,QT_UPLOAD_SYNC
+
+  parametri: cap=256 bits=4 N_NEW=128 rip=6 | OFF: CACHE_ROUTE assente | ON: CACHE_ROUTE=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_KEEPALIVE,COLI_DN_GPU,QT_UPLOAD_SYNC -- DEROGA
+  marker: [qwen36] CACHE_ROUTE=1  (testo trovato in C:\colibri-fork\c\qwen36_clang.exe)
+  heat: C:\colibri-fork\c\heat.caldo.bin | 40972 byte | 40 layer x 256 esperti | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | costruita su un prompt sha256 6A4F0BCF64192EA3, diverso dal prompt misurato (come CROSS) | heat.caldo.bin.sha256: tabella= verificata | condizioni della costruzione diverse da questa corsa: snap, allow_env, eseguibile, dll
+
+The script requires the marker in every ON log and in no OFF log, and
+copies heat.caldo.bin to heat.bin before every run (the engine rewrites
+heat.bin at exit). As in the earlier records, no log was checked for
+"[cuda] keep-alive active:", so that the keep-alive ran is not shown.
+
+Invariants: heat table unchanged and loaded in all 12 runs; engine banner
+identical (== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192
+pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==); [place] auto identical in
+all 12 runs; residency 6812/10240 in all runs.
+
+--- 1. the A/B --------------------------------------------------------------------
+
+  rip 1 (OFF prima)  OFF  18.00  ON  16.30  delta  -1.70 ms/token
+  rip 2 (ON prima )  OFF  19.60  ON  16.10  delta  -3.50 ms/token
+  rip 3 (OFF prima)  OFF  18.70  ON  16.20  delta  -2.50 ms/token
+  rip 4 (ON prima )  OFF  17.60  ON  16.00  delta  -1.60 ms/token
+  rip 5 (OFF prima)  OFF  17.80  ON  16.20  delta  -1.60 ms/token
+  rip 6 (ON prima )  OFF  18.50  ON  16.20  delta  -2.30 ms/token
+
+  media    -2.20   sd  0.74   se  0.30   df 5
+  intervallo 95 %:  [-2.98 ; -1.42]   ampiezza +-0.78
+  negativi 6/6
+  position (ABBA): OFF first -1.70 -2.50 -1.60, ON first -3.50 -1.60
+  -2.30, difference of the group means 0.53
+
+  OFF    step  18.37  moe  10.52  attn  2.03  dn  3.84  head  1.01
+         (shared)  3.19  (router)  0.78  wait  0.39
+         issue  1.73  cpu-miss  3.99  take  0.48  sh-ovl  3.19  hit  86.7 %  swaps  8.0  miss 6463
+         dn-sub:   proj  3.83  conv  0.00  l2n+rec  0.00  norm+out  0.00
+         dn-split: qkvz  3.83  a+b  0.00  norm  0.00  out  0.00  | GPU: dnproj 3810/3810, dnout 3810/3810
+  ON     step  16.17  moe   8.45  attn  2.00  dn  3.77  head  1.01
+         (shared)  3.33  (router)  0.91  wait  0.57
+         issue  1.64  cpu-miss  1.60  take  0.67  sh-ovl  3.33  hit  94.8 %  swaps  8.0  miss 2520
+         dn-sub:   proj  3.77  conv  0.00  l2n+rec  0.00  norm+out  0.00
+         dn-split: qkvz  3.77  a+b  0.00  norm  0.00  out  0.00  | GPU: dnproj 3810/3810, dnout 3810/3810
+
+--- 2. the route meters (the ON logs) ---------------------------------------------
+
+  findstr /C:"CACHE_ROUTE J=" /C:"route_agree" envab-ON-r*.log
+
+  envab-ON-r1.log:CACHE_ROUTE J=2 M=12 P=0.00 alpha=1.00 | swap 8.2% (4003/48640, 4003 to VRAM)
+  envab-ON-r1.log:route_agree 91.8% | route_kl 1.4637
+  (r2 .. r6: the same two lines, the same numbers)
+
+48640 slots = 8 experts x 40 layers x 152 routing rows: the 25 rows of the
+prompt (prompt25.txt, 25 tokens per the 28 September CONSIST line) and 127
+decode steps (N_NEW=128). The same count gives the hit rates: 6463 of 48640
+missed is 86.7 % hit, 2520 is 94.8 %.
+
+--- 3. generated text ------------------------------------------------------------
+
+  testo generato identico fra i run di ogni braccio:
+    OFF   4a000cc01f310b64
+    ON    92761c18914021a7
+  testo generato DIVERSO fra i due bracci: primo carattere diverso alla
+  posizione 83 (contata da 0, in unita' UTF-16, sullo stdout letto).
+    OFF   ...più critici di un sistema operativo (SO
+    ON    ...fondamentali di un sistema operativo (OS
+
+(The paste shows the OFF line's "ù" as "├╣", the console code page; the
+character is restored here.)
+
+--- reading -----------------------------------------------------------------------
+
+  - The gain is the lever's target: cpu-miss falls by 2.39 ms/token
+    (3.99 -> 1.60) because 3943 fewer experts a run are computed on the CPU
+    (6463 -> 2520 misses). moe falls by 2.07, step() by 2.20; attn, dn and
+    head move by 0.07 or less.
+  - What it costs elsewhere: the router 0.78 -> 0.91 (+0.13, route_select
+    ranks 12 instead of 8 and asks the residency of each), the shared
+    expert 3.19 -> 3.33, wait 0.39 -> 0.57 and take 0.48 -> 0.67 (the GPU
+    computes more of the experts, so its side of the overlap grows). These
+    are why the step gains less than cpu-miss falls.
+  - The rows differ between the arms after the text diverges, so the
+    misses compared are not of the same tokens; the meters are of the ON
+    arm's own routing.
+  - Determinism: with QT_UPLOAD_SYNC=1 the six ON runs wrote the same text
+    and the same meters, as docs/qwen36.md says they should.
+  - The LFRU swap count is 8.0 in both arms; the lever did not change how
+    often the tier moved experts on this run length.
+
+--- what this run did NOT measure ---------------------------------------------------
+
+  - Perplexity with and without the lever (PPL=1 on a text file, the next
+    run), and other settings (ROUTE_J=3 or 4: fewer substitutions).
+  - The gain without QT_UPLOAD_SYNC=1.
+  - Any prompt other than prompt25.txt, and runs longer than 128 tokens.
