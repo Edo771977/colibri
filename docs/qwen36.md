@@ -167,8 +167,9 @@ Two consequences for measuring it:
   work they do depends on timing (what is resident when the experts are
   chosen sets the hit rate and the step time), so the interval covers the
   lever together with that varying work, not one fixed sequence. In the one
-  A/B run so (prompt25.txt, 128 tokens, 4 October) the waiver was not
-  needed: six ON runs wrote one text, with the same substitutions as under
+  A/B without the sync (prompt25.txt, 128 tokens, 4 October) the waiver was
+  not needed: six ON runs wrote one text, the same text with the same
+  route meters (swap count, `route_agree`, `route_kl`) as under
   `QT_UPLOAD_SYNC=1`.
 - **CONSIST** keeps the caches between its arms, so under the lever the arms
   would route differently: the engine refuses `CONSIST=1` with
@@ -191,7 +192,8 @@ the sync A/B (docs/experiments/qwen36-cache-route-nosync-2026-10-04-raw.txt). Qu
 460-token Italian text, one run each and no interval: lever off 11.29,
 `ROUTE_J=2` 11.47 (+1.6 %), `ROUTE_J=4` 11.23 (-0.5 %); neither difference
 is established. `CACHE_ROUTE=1 ROUTE_J=4` is measured faster, with and
-without `QT_UPLOAD_SYNC=1`, over 128 generated tokens, with no quality cost
+without `QT_UPLOAD_SYNC=1`, on one prompt (prompt25.txt) and 128 generated
+tokens, with no quality cost
 this text can show (the perplexities were taken under the sync)
 (docs/experiments/qwen36-cache-route-2026-10-04-raw.txt,
 docs/experiments/qwen36-cache-route-j4-2026-10-04-raw.txt,
