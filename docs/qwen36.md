@@ -170,8 +170,13 @@ Measured on the operator's box (RTX 4070 Ti SUPER, CUDA tier, DeltaNet on the
 GPU, cap 256, `QT_UPLOAD_SYNC=1` in both arms, six ABBA pairs): step() 18.37
 -> 16.17 ms/token, paired delta -2.20, 95 % [-2.98, -1.42]; `cpu-miss` 3.99
 -> 1.60, VRAM hit 86.7 % -> 94.8 %, with 8.2 % of the slots substituted and
-`route_agree` 91.8 %. The quality cost is not measured yet
-(docs/experiments/qwen36-cache-route-2026-10-04-raw.txt).
+`route_agree` 91.8 %. With `ROUTE_J=4` (four sacred ranks of eight): 17.42 ->
+15.85 ms/token, delta -1.57, 95 % [-1.78, -1.35], 6.4 % substituted,
+`route_agree` 93.6 %. Quality, `PPL=1` on one 460-token Italian text: lever
+off 11.29, `ROUTE_J=2` 11.47 (+1.6 %), `ROUTE_J=4` 11.23, which is within
+the noise of one text. On this setup `CACHE_ROUTE=1 ROUTE_J=4` keeps most
+of the gain at no measurable cost (docs/experiments/qwen36-cache-route-2026-10-04-raw.txt,
+docs/experiments/qwen36-cache-route-j4-2026-10-04-raw.txt).
 
 ### Measuring the cost: `PPL=1` on a text file
 
