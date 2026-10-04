@@ -137,7 +137,9 @@ all 12 runs; residency 6812/10240 in all runs.
     equal to the sync record's. Of the counters printed per run (text,
     route meters, misses) only the misses moved, by one, in one run of each
     arm (OFF r4 6464, ON r1 3204). Why little can move, from the code
-    (c/qwen36_tier.c): after warmstart the only uploads in decode are the
+    (c/qwen36_tier.c): after warmstart, with the VRAM budget full (taken
+    here from the residency, 6812/10240 in every run: a free budget would
+    let decode queue plain uploads too), the only uploads in decode are the
     LFRU swaps, checked every 16 tokens at layer 0; the tick marks the
     victim non-resident at once in both modes, and only the newcomer's
     arrival is asynchronous (the uploader also waits for the in-flight
