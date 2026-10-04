@@ -1,6 +1,6 @@
 Qwen3.6-35B-A3B: CACHE_ROUTE's quality cost (PPL=1 on a text file, #73)
 and the A/B of ROUTE_J=4, under the CUDA tier with the DeltaNet on the GPU.
-4 October 2026, late morning, on the operator's machine (RTX 4070 Ti
+4 October 2026, morning, on the operator's machine (RTX 4070 Ti
 SUPER, Ryzen 9 7950X, Windows, qwen36_i4_gs64 read from D:, cap 256, 4
 bits). Follows qwen36-cache-route-2026-10-04-raw.txt (ROUTE_J=2).
 
@@ -11,11 +11,14 @@ Summary:
        lever off        ppl 11.29  NLL 2.4240  48.67 tok/s
        ROUTE_J=2        ppl 11.47  NLL 2.4401  63.04 tok/s  swap 9.4 %  agree 90.6 %
        ROUTE_J=4        ppl 11.23  NLL 2.4187  60.83 tok/s  swap 7.5 %  agree 92.5 %
-     ROUTE_J=4 is indistinguishable from the lever off on this text (its
-     NLL is 0.0053 lower: a lever that runs other experts cannot really
-     improve the model, so that is the noise of one 459-token text);
-     ROUTE_J=2 costs +0.0161 nats/token, +1.6 % perplexity, three times
-     that noise.
+     One text, one run each, no interval: ROUTE_J=2 reads +0.0161
+     nats/token (+1.6 % perplexity), ROUTE_J=4 -0.0053 (-0.5 %). The lever
+     is not expected to improve the model on average, so ROUTE_J=4's
+     negative difference says this text alone can move the NLL by about
+     that much; it is one draw, not a standard deviation, and ROUTE_J=2,
+     which substitutes more, may vary more. Neither difference is
+     established: a positive sign for ROUTE_J=2 is expected, its size is
+     not known.
   2. misure-envab.ps1, CACHE_ROUTE absent vs =1 with ROUTE_J=4 (set in the
      shell, read only by the ON arm), six pairs, the same conditions as the
      ROUTE_J=2 A/B (heat table, COLI_DN_GPU=1, COLI_CUDA_KEEPALIVE=1,
@@ -25,10 +28,15 @@ Summary:
      (3119 of 48640, all to VRAM), route_agree 93.6 %, route_kl 1.0377, the
      same in all six ON runs.
 
-Reading: ROUTE_J=4 keeps most of ROUTE_J=2's gain (-1.57 against -2.20
-ms/token, the two A/Bs in different sessions) with no quality cost this
-text can see; ROUTE_J=2 has a small one. The lever stays opt-in; for this
-setup `CACHE_ROUTE=1 ROUTE_J=4` is the measured choice.
+Reading: ROUTE_J=4 is measured faster than the plain router (-1.57
+ms/token, a tight interval) with no quality cost this one text can show.
+Whether ROUTE_J=2 is faster than ROUTE_J=4 (-2.20 against -1.57) or
+costlier in quality (+1.6 % against -0.5 %) is not established: the two
+A/Bs ran in different sessions and builds (OFF arms 18.37 and 17.42,
+intervals [-2.98, -1.42] and [-1.78, -1.35] overlapping), and the
+perplexities are one text each. The lever stays opt-in; `CACHE_ROUTE=1
+ROUTE_J=4` is the setting measured here, with QT_UPLOAD_SYNC=1 and 128
+generated tokens.
 
 Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
@@ -156,11 +164,15 @@ identical; [place] auto identical in all 12 runs; residency 6812/10240.
 --- reading -----------------------------------------------------------------------
 
   - Quality: the three NLLs are on the same 459 tokens, so their
-    differences are paired; with one text there is no interval, only the
-    scale the ROUTE_J=4 run gives (-0.0053 nats/token, which cannot be a
-    real gain). ROUTE_J=2's +0.0161 is three times that, a small cost;
-    ROUTE_J=4's is not separable from zero here. More text (several
-    files, a few thousand tokens) would narrow this.
+    differences are paired, but with one text there is no interval. The
+    runs are deterministic (QT_UPLOAD_SYNC=1, the same heat table), so the
+    uncertainty is which text, not run-to-run noise. Swapping in a rank
+    5-12 expert can lower the NLL of a given token, so ROUTE_J=4's -0.0053
+    is not impossible, only not expected on average; it marks how much one
+    text can move, not a bound. What would narrow it: more text (several
+    files, a few thousand tokens), or per-token NLLs from tf_nll, which
+    would give a paired standard error over the scored tokens at no extra
+    run.
   - The tok/s of section 1 are single runs, not an A/B, and include the
     full-vocabulary softmax of every scored token; section 2 is the speed
     measurement.
@@ -169,7 +181,7 @@ identical; [place] auto identical in all 12 runs; residency 6812/10240.
     run (6463 -> 3203, prompt and decode rows); the other timers' changes
     are not attributed (see the ROUTE_J=2 record's reading).
   - QT_UPLOAD_SYNC: this OFF arm (sync on) reads 17.42, the 3 October OFF
-    arm (no sync, same configuration otherwise) 17.43, the ROUTE_J=2
+    arm (no sync, build 7549736, otherwise the same configuration) 17.43, the ROUTE_J=2
     record's OFF arm (sync on) 18.37. Different sessions, so the sync's
     own cost is still not measured; these numbers do not suggest a large
     one.
