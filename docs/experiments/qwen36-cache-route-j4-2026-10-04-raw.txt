@@ -1,4 +1,4 @@
-Qwen3.6-35B-A3B: CACHE_ROUTE's quality cost (PPL=1 on a text file, #73)
+Qwen3.6-35B-A3B: CACHE_ROUTE's quality (PPL=1 on a text file, #73)
 and the A/B of ROUTE_J=4, under the CUDA tier with the DeltaNet on the GPU.
 4 October 2026, morning, on the operator's machine (RTX 4070 Ti
 SUPER, Ryzen 9 7950X, Windows, qwen36_i4_gs64 read from D:, cap 256, 4
@@ -164,9 +164,10 @@ identical; [place] auto identical in all 12 runs; residency 6812/10240.
 --- reading -----------------------------------------------------------------------
 
   - Quality: the three NLLs are on the same 459 tokens, so their
-    differences are paired, but with one text there is no interval. The
-    runs are deterministic (QT_UPLOAD_SYNC=1, the same heat table), so the
-    uncertainty is which text, not run-to-run noise. Swapping in a rank
+    differences are paired, but with one text there is no interval. Each
+    setting ran once; under the same conditions (QT_UPLOAD_SYNC=1, the same
+    heat table) section 2's repeats were identical, so the uncertainty is
+    taken to be which text, not run-to-run noise. Swapping in a rank
     5-12 expert can lower the NLL of a given token, so ROUTE_J=4's -0.0053
     is not impossible, only not expected on average; it marks how much one
     text can move, not a bound. What would narrow it: more text (several

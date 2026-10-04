@@ -171,7 +171,7 @@ GPU, cap 256, `QT_UPLOAD_SYNC=1` in both arms, six ABBA pairs): step() 18.37
 -> 16.17 ms/token, paired delta -2.20, 95 % [-2.98, -1.42]; `cpu-miss` 3.99
 -> 1.60, VRAM hit 86.7 % -> 94.8 %, with 8.2 % of the slots substituted and
 `route_agree` 91.8 %. With `ROUTE_J=4` (four sacred ranks of eight): 17.42 ->
-15.85 ms/token, delta -1.57, 95 % [-1.78, -1.35], 6.4 % substituted,
+15.85 ms/token, delta -1.57, 95 % [-1.78, -1.35], 6 of 6 pairs, keep-alive on in both arms, 6.4 % substituted,
 `route_agree` 93.6 % (another session and build than the `ROUTE_J=2` A/B,
 so the two gains are not directly comparable). Quality, `PPL=1` on one
 460-token Italian text, one run each and no interval: lever off 11.29,
