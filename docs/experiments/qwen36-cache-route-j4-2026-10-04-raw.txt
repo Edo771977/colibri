@@ -20,7 +20,7 @@ Summary:
      established: a positive sign for ROUTE_J=2 is expected, its size is
      not known.
   2. misure-envab.ps1, CACHE_ROUTE absent vs =1 with ROUTE_J=4 (set in the
-     shell, read only by the ON arm), six pairs, the same conditions as the
+     shell, in effect only in the ON arm), six pairs, the same conditions as the
      ROUTE_J=2 A/B (heat table, COLI_DN_GPU=1, COLI_CUDA_KEEPALIVE=1,
      QT_UPLOAD_SYNC=1 in both arms): step() 17.42 -> 15.85 ms/token, paired
      delta -1.57, 95 % [-1.78, -1.35], 6 of 6 negative. cpu-miss 3.83 ->
@@ -121,8 +121,10 @@ expert once), not the VRAM tier's.
   heat: ... sha256 2682CA6E4CD9744F ... tabella= verificata (as in the ROUTE_J=2 record)
 
 SNAP, COLI_CUDA, COLI_GPUS and HEAT_FILE, left set in the window by
-section 1, are among the variables the script sets itself; ROUTE_J is
-read only when CACHE_ROUTE=1, so the OFF arm ran the plain router.
+section 1, are among the variables the script sets itself; PPL had been
+cleared at the end of section 1 (`set PPL=`, and the script refuses PPL
+unless -AllowEnv names it); ROUTE_J has an effect only when CACHE_ROUTE=1,
+so the OFF arm ran the plain router.
 
 Invariants: heat table unchanged and loaded in all 12 runs; banner
 identical; [place] auto identical in all 12 runs; residency 6812/10240.
