@@ -62,6 +62,23 @@
 # due bracci lo script dice se coincide e, se no, da dove diverge, senza
 # rifiutare la corsa: una variabile che cambia l'aritmetica puo' cambiare il
 # testo.
+#
+# -AllowTextDrift ON (oppure OFF, oppure ON,OFF) toglie quel rifiuto per il
+# braccio nominato, e solo per lui: serve a una variabile che rende il testo
+# dipendente dai tempi, come CACHE_ROUTE=1 senza QT_UPLOAD_SYNC=1 (la scelta
+# degli esperti dipende da cosa e' gia' in VRAM in quell'istante,
+# docs/CACHE_ROUTE.md). Lo stamp dei parametri lo dichiara come DEROGA, e in
+# coda lo script stampa per ogni braccio quanti testi diversi ha scritto (un
+# braccio non nominato: uno solo, verificato) e, per un braccio che varia,
+# l'impronta di ogni run. Cosa cambia per la misura: le ripetizioni di quel
+# braccio non sono piu' lo stesso lavoro, e il lavoro stesso dipende dai tempi
+# (cosa e' caricato quando si sceglie l'esperto decide hit rate e tempo per
+# token), quindi sd e intervallo mescolano il rumore dei tempi con la
+# variazione fra sequenze, e la stima e' quella della leva insieme al suo
+# lavoro variabile, non di una sequenza fissa. Che i due bracci scrivano testi
+# diversi non e' una novita' della deroga: una leva che cambia l'aritmetica lo
+# fa anche senza. Il confronto fra i bracci usa la ripetizione 1 di ciascuno,
+# e dice quanti run di un braccio variabile coincidono con l'altro.
 
 param(
     [string] $Snap        = "C:\modelli\qwen36_i4_gs64",
@@ -87,7 +104,10 @@ param(
     [string] $WorkDir     = "",
     # Variabili d'ambiente che l'operatore dichiara innocue per questa misura.
     # Esplicito, per non dover disarmare il controllo intero.
-    [string[]] $AllowEnv  = @()
+    [string[]] $AllowEnv  = @(),
+    # Bracci (ON, OFF) i cui run possono scrivere testi diversi fra loro.
+    # Vuoto (default): ogni braccio deve ripetere lo stesso testo.
+    [string[]] $AllowTextDrift = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -122,6 +142,11 @@ if ($OffValue -and $OffValue -ceq $Value) {
     throw "-OffValue e -Value sono entrambi '$Value': i due bracci sarebbero identici."
 }
 $OffDesc = if ($OffValue) { "$Var=$OffValue" } else { "$Var assente" }
+# Come -AllowEnv: con -File "-AllowTextDrift ON,OFF" arriva come UN elemento.
+$AllowTextDrift = @($AllowTextDrift | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToUpperInvariant() } | Where-Object { $_ } | Select-Object -Unique)
+foreach ($d in $AllowTextDrift) {
+    if ($d -cne "ON" -and $d -cne "OFF") { throw "-AllowTextDrift '$d' non e' un braccio: i bracci sono ON e OFF (tutti e due: ON,OFF)." }
+}
 if (-not $Marker.Trim()) { throw "-Marker e' vuoto: senza la riga di prova non si puo' verificare che il braccio ON sia diverso da OFF." }
 if ($NNew -lt 2) {
     throw "-NNew $NNew non e' valido: servono almeno 2 token generati perche' ci sia un passo di decode da misurare."
@@ -160,7 +185,7 @@ $EnvBenign = '^CUDA_(PATH(_V[0-9_]+)?|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH
 # si nominano le due variabili QT_ che compaiono nei getenv del motore.
 $EnvSuspect = '^(COLI_|COLIBRI_|QWEN_|QWEN36_|QWEN38_|CUDA_|GOMP_|KMP_|OMP_|HEAT_|Q36_)' +
               '|^(QT_NO_WARMSTART|QT_UPLOAD_SYNC)$' +
-              '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW)$'
+              '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|PPL_CTX|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW|CACHE_ROUTE|ROUTE_J|ROUTE_M|ROUTE_P|ROUTE_ALPHA|ROUTE_AGREE|AMX|AMX_S_MIN)$'
 $EnvHits = @()
 foreach ($e in Get-ChildItem Env: ) {
     $n = $e.Name
@@ -239,7 +264,7 @@ if ($Built) {
 # mano. .build-config ne fa parte: se e' piu' recente dell'eseguibile, la
 # configurazione registrata non e' quella del binario.
 $QwenSrc = @(
-    "qwen36.c","qwen36_tier.c","qwen36_tier.h","expert_ffn.h","simd_i8f.h",
+    "qwen36.c","qwen36_tier.c","qwen36_tier.h","expert_ffn.h","simd_i8f.h","idot.h",
     "decode_batch.h","serve_poll.h","cli_args.h","st.h","json.h","compat.h",
     "omp_tune.h","kv_prefix.h","pin_pool.h",
     "edge_adapter_internal.h","edge_adapters.h","edge_runtime.h",
@@ -426,7 +451,8 @@ if ($HeatFile) {
 $ParamStamp = "parametri: cap=$Cap bits=$Bits N_NEW=$NNew rip=$Reps | OFF: $OffDesc | ON: $Var=$Value | heat: $HeatDesc | snap=$Snap" +
     ("  | prompt={0} sha256 {1}" -f $Prompt, $hPrompt.Substring(0,16)) +
     ("  | built={0}" -f $(if ($Built) { $Built } else { "(vuoto) -- PROVENIENZA NON VERIFICATA" })) +
-    ("  | allow-env={0}" -f $(if ($AllowEnv.Count) { ($AllowEnv -join ",") + " -- DEROGA" } else { "nessuna" }))
+    ("  | allow-env={0}" -f $(if ($AllowEnv.Count) { ($AllowEnv -join ",") + " -- DEROGA" } else { "nessuna" })) +
+    ("  | testo-variabile={0}" -f $(if ($AllowTextDrift.Count) { ($AllowTextDrift -join ",") + " -- DEROGA: i run di un braccio nominato possono scrivere testi diversi" } else { "nessuno" }))
 $ParamStamp
 "marker: $Marker  (testo trovato in $mfPath)"
 if ($MarkerStamp) { $MarkerStamp }
@@ -722,24 +748,42 @@ if ($residents.Count -ne 1) {
 # PowerShell lo legge (righe unite con LF, senza la riga [meta] in testa), non
 # sui byte scritti dal motore: due stdout che differiscono solo nei fine riga,
 # o in byte UTF-8 non validi, risultano uguali.
+# -AllowTextDrift toglie il rifiuto per il braccio nominato, non la stampa:
+# quanti testi diversi e l'impronta di ogni run vanno nel record.
+$drifted = @()
 foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
     $h = @(Get-Distinct @($grp.Group | ForEach-Object { $_.OutHash }))
+    $perRun = (($grp.Group | Sort-Object Rep | ForEach-Object { "{0,-3} rip {1}: sha256 {2}" -f $_.Arm, $_.Rep, $_.OutHash.Substring(0,16) }) -join "`n  ")
     if ($h.Count -ne 1) {
-        throw ("il testo generato NON e' identico fra i run del braccio {0}: le sue ripetizioni hanno scritto testi diversi. I testi sono nei log; qui l'impronta di ogni run.`n  {1}" -f $grp.Name,
-            (($grp.Group | ForEach-Object { "{0,-3} rip {1}: sha256 {2}" -f $_.Arm, $_.Rep, $_.OutHash.Substring(0,16) }) -join "`n  "))
+        if ($AllowTextDrift -notcontains $grp.Name) {
+            throw ("il testo generato NON e' identico fra i run del braccio {0}: le sue ripetizioni hanno scritto testi diversi. I testi sono nei log; qui l'impronta di ogni run.`n  {1}" -f $grp.Name, $perRun)
+        }
+        $drifted += ("braccio {0}: {1} testi diversi in {2} run (DEROGA -AllowTextDrift: le sue ripetizioni non sono lo stesso lavoro):`n  {3}" -f $grp.Name, $h.Count, @($grp.Group).Count, $perRun)
+    } elseif ($AllowTextDrift -contains $grp.Name) {
+        $drifted += ("braccio {0}: 1 testo in {1} run, identico nonostante la deroga -AllowTextDrift: sha256 {2}" -f $grp.Name, @($grp.Group).Count, $h[0].Substring(0,16))
+    } else {
+        $drifted += ("braccio {0}: 1 testo in {1} run (verificato, nessuna deroga): sha256 {2}" -f $grp.Name, @($grp.Group).Count, $h[0].Substring(0,16))
     }
 }
-$tOff = @($rows | Where-Object { $_.Arm -eq "OFF" })[0]
-$tOn = @($rows | Where-Object { $_.Arm -eq "ON" })[0]
-"testo generato identico fra i run di ogni braccio (sha256 dello stdout letto, senza la riga [meta]):"
+# Senza deroghe le righe per braccio non servono: vale la riga unica sotto.
+if (-not $AllowTextDrift.Count) { $drifted = @() }
+$tOff = @($rows | Where-Object { $_.Arm -eq "OFF" -and $_.Rep -eq 1 })[0]
+$tOn = @($rows | Where-Object { $_.Arm -eq "ON" -and $_.Rep -eq 1 })[0]
+if ($drifted.Count) {
+    $drifted
+    "impronta della ripetizione 1 di ogni braccio, quella confrontata sotto:"
+} else {
+    "testo generato identico fra i run di ogni braccio (sha256 dello stdout letto, senza la riga [meta]):"
+}
 "  OFF   {0}" -f $tOff.OutHash.Substring(0,16)
 "  ON    {0}" -f $tOn.OutHash.Substring(0,16)
 ""
-"--- testo fra i due bracci (dichiarato: non ferma la corsa) ---"
+"--- testo fra i due bracci (dichiarato: non ferma la corsa{0}) ---" -f $(if ($drifted.Count) { '; ripetizione 1 di ciascun braccio' } else { '' })
 # Confronto ORDINALE: con la cultura invariante -ceq tratta come uguali due
 # testi che differiscono per un carattere ignorabile (per esempio U+200B).
+$rep1 = $(if ($drifted.Count) { " -- solo ripetizione 1" } else { "" })
 if ([string]::Equals($tOff.Out, $tOn.Out, [StringComparison]::Ordinal)) {
-    "testo generato IDENTICO fra i due bracci (sullo stdout letto)"
+    "testo generato IDENTICO fra i due bracci (sullo stdout letto){0}" -f $rep1
 } else {
     $a = $tOff.Out; $b = $tOn.Out
     $n = [Math]::Min($a.Length, $b.Length); $i = 0
@@ -757,12 +801,20 @@ if ([string]::Equals($tOff.Out, $tOn.Out, [StringComparison]::Ordinal)) {
         ($s.Substring($from, $len) -replace "`n", " / ") -replace '\p{Cc}', '?'
     }
     if ($prefix) {
-        "testo generato DIVERSO fra i due bracci: il testo di {0} e' l'inizio dell'altro e finisce alla posizione {1} (contata da 0, in unita' UTF-16, sullo stdout letto)." -f $(if ($a.Length -lt $b.Length) { "OFF" } else { "ON" }), $n
+        "testo generato DIVERSO fra i due bracci{2}: il testo di {0} e' l'inizio dell'altro e finisce alla posizione {1} (contata da 0, in unita' UTF-16, sullo stdout letto)." -f $(if ($a.Length -lt $b.Length) { "OFF" } else { "ON" }), $n, $rep1
     } else {
-        "testo generato DIVERSO fra i due bracci: primo carattere diverso alla posizione {0} (contata da 0, in unita' UTF-16, sullo stdout letto)." -f $i
+        "testo generato DIVERSO fra i due bracci{1}: primo carattere diverso alla posizione {0} (contata da 0, in unita' UTF-16, sullo stdout letto)." -f $i, $rep1
     }
     "  OFF   ...{0}" -f (Get-Excerpt $a $i)
     "  ON    ...{0}" -f (Get-Excerpt $b $i)
+}
+# Sotto deroga, per ogni braccio che varia: quanti suoi run scrivono il testo
+# della ripetizione 1 dell'altro braccio.
+foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
+    if (@(Get-Distinct @($grp.Group | ForEach-Object { $_.OutHash })).Count -lt 2) { continue }
+    $other = $(if ($grp.Name -eq "ON") { $tOff } else { $tOn })
+    $same = @($grp.Group | Where-Object { [string]::Equals($_.Out, $other.Out, [StringComparison]::Ordinal) }).Count
+    "run {0} uguali al testo della ripetizione 1 di {1}: {2}/{3}" -f $grp.Name, $other.Arm, $same, @($grp.Group).Count
 }
 
 # ---- statistica sui delta appaiati ---------------------------------------
@@ -828,7 +880,8 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
         (($q | ForEach-Object { $_.ShOvl }   | Measure-Object -Average).Average),
         (($q | ForEach-Object { $_.Vram }    | Measure-Object -Average).Average),
         (($q | ForEach-Object { $_.Swaps }   | Measure-Object -Average).Average),
-        (($q | ForEach-Object { $_.Miss }    | Sort-Object -Unique) -join "/")
+        $(if (@($q | ForEach-Object { $_.Miss } | Sort-Object -Unique).Count -eq 1) { "$($q[0].Miss)" }
+          else { "per rip: " + (($q | Sort-Object Rep | ForEach-Object { "$($_.Miss)" }) -join " ") })
     # Sotto-parti di deltanet: solo se TUTTI i run del braccio le hanno.
     $sub = @(0..3 | ForEach-Object { $i = $_; ($q | ForEach-Object { $_.DnSub[$i] } | Measure-Object -Average).Average })
     if (-not @($q | Where-Object { [double]::IsNaN($_.DnSub[0]) }).Count) {

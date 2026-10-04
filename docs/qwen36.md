@@ -159,6 +159,14 @@ Two consequences for measuring it:
   (`tools/misure-envab.ps1 -HeatFile` copies it before every run) or no
   `HEAT_FILE` at all. The cache and the tier also only see the experts the
   lever chose, so residency and the true router drift apart over a long run.
+  To time the lever as it is normally run, without `QT_UPLOAD_SYNC`,
+  `tools/misure-envab.ps1 -AllowTextDrift ON` lets the ON arm's runs write
+  different texts: the stamp marks it as a waiver, and the tail prints how
+  many texts each arm wrote (the OFF arm must still write one) and every
+  ON run's hash. The ON repetitions are then not the same work, and which
+  work they do depends on timing (what is resident when the experts are
+  chosen sets the hit rate and the step time), so the interval covers the
+  lever together with that varying work, not one fixed sequence.
 - **CONSIST** keeps the caches between its arms, so under the lever the arms
   would route differently: the engine refuses `CONSIST=1` with
   `CACHE_ROUTE=1`.
