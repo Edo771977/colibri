@@ -159,6 +159,11 @@ Two consequences for measuring it:
   (`tools/misure-envab.ps1 -HeatFile` copies it before every run) or no
   `HEAT_FILE` at all. The cache and the tier also only see the experts the
   lever chose, so residency and the true router drift apart over a long run.
+  To time the lever as it is normally run, without `QT_UPLOAD_SYNC`,
+  `tools/misure-envab.ps1 -AllowTextDrift ON` lets the ON arm's runs write
+  different texts: the stamp marks it as a waiver and the tail prints how
+  many texts each arm wrote, so each paired delta then compares two
+  different token sequences.
 - **CONSIST** keeps the caches between its arms, so under the lever the arms
   would route differently: the engine refuses `CONSIST=1` with
   `CACHE_ROUTE=1`.
