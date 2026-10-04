@@ -109,6 +109,18 @@ qwen36.exe 256 4 prompt.txt
 - `HEAT_FILE` salva gli esperti più usati: dalla seconda esecuzione la VRAM parte già riempita bene.
 - `OMP_WAIT_POLICY=active` qui non va messo di default (vedi sezione 1): provarlo solo con una misura A/B.
 - Picco di RAM documentato ~29 GB (misurato con due GPU da 8 GB): con 32 GB chiudere i programmi pesanti.
+- Più veloce, misurato su questo PC (da impostare prima di `qwen36.exe`):
+  - `set COLI_DN_GPU=1`: la DeltaNet in decode sulla GPU, -4,5 ms/token
+    (`docs/experiments/qwen36-deltanet-gpu-2026-09-28-raw.txt`);
+  - `set CACHE_ROUTE=1` e `set ROUTE_J=4`: il router preferisce gli esperti già in VRAM dal
+    quinto in poi. Misurato il 4 ottobre: -1,6 ms/token sullo step (l'equivalente di ~57 → ~63
+    tok/s, ricavato dallo step e non misurato direttamente), con `QT_UPLOAD_SYNC=1` e
+    `COLI_CUDA_KEEPALIVE=1` in entrambi i bracci e 128 token generati; senza sync e su
+    generazioni lunghe non è misurato. Sulla perplexity di un solo testo di prova non si vede
+    alcun peggioramento (`docs/experiments/qwen36-cache-route-j4-2026-10-04-raw.txt`). Cambia
+    il testo generato (nella prova, dal carattere 121): è una scelta, non un'ottimizzazione
+    esatta. `ROUTE_J=2` ha dato -2,2 ms/token (in un'altra sessione e build) e +1,6% di
+    perplexity (su un solo testo): non è stabilito che sia più veloce né che costi di più.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)

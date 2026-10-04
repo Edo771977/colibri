@@ -1,0 +1,197 @@
+Qwen3.6-35B-A3B: CACHE_ROUTE's quality (PPL=1 on a text file, #73)
+and the A/B of ROUTE_J=4, under the CUDA tier with the DeltaNet on the GPU.
+4 October 2026, morning, on the operator's machine (RTX 4070 Ti
+SUPER, Ryzen 9 7950X, Windows, qwen36_i4_gs64 read from D:, cap 256, 4
+bits). Follows qwen36-cache-route-2026-10-04-raw.txt (ROUTE_J=2).
+
+Summary:
+
+  1. PPL=1 on one Italian text of 460 tokens (459 scored), one run per
+     setting, the same heat table copied before each run:
+       lever off        ppl 11.29  NLL 2.4240  48.67 tok/s
+       ROUTE_J=2        ppl 11.47  NLL 2.4401  63.04 tok/s  swap 9.4 %  agree 90.6 %
+       ROUTE_J=4        ppl 11.23  NLL 2.4187  60.83 tok/s  swap 7.5 %  agree 92.5 %
+     One text, one run each, no interval: ROUTE_J=2 reads +0.0161
+     nats/token (+1.6 % perplexity), ROUTE_J=4 -0.0053 (-0.5 %). The lever
+     is not expected to improve the model on average, so ROUTE_J=4's
+     negative difference says this text alone can move the NLL by about
+     that much; it is one draw, not a standard deviation, and ROUTE_J=2,
+     which substitutes more, may vary more. Neither difference is
+     established: a positive sign for ROUTE_J=2 is expected, its size is
+     not known.
+  2. misure-envab.ps1, CACHE_ROUTE absent vs =1 with ROUTE_J=4 (set in the
+     shell, in effect only in the ON arm), six pairs, the same conditions as the
+     ROUTE_J=2 A/B (heat table, COLI_DN_GPU=1, COLI_CUDA_KEEPALIVE=1,
+     QT_UPLOAD_SYNC=1 in both arms): step() 17.42 -> 15.85 ms/token, paired
+     delta -1.57, 95 % [-1.78, -1.35], 6 of 6 negative. cpu-miss 3.83 ->
+     1.99, VRAM hit 86.7 % -> 93.4 %, misses 6463 -> 3203; swap 6.4 %
+     (3119 of 48640, all to VRAM), route_agree 93.6 %, route_kl 1.0377, the
+     same in all six ON runs.
+
+Reading: ROUTE_J=4 is measured faster than the plain router (-1.57
+ms/token, a tight interval) with no quality cost this one text can show.
+Whether ROUTE_J=2 is faster than ROUTE_J=4 (-2.20 against -1.57) or
+costlier in quality (+1.6 % against -0.5 %) is not established: the two
+A/Bs ran in different sessions and builds (OFF arms 18.37 and 17.42,
+intervals [-2.98, -1.42] and [-1.78, -1.35] overlapping), and the
+perplexities are one text each. The lever stays opt-in; `CACHE_ROUTE=1
+ROUTE_J=4` is the setting measured here, with QT_UPLOAD_SYNC=1 and 128
+generated tokens.
+
+Everything below is from output the operator pasted in the session. The
+logs stay on the operator's machine; none is committed and no
+evidence.sha256 exists for them. testo.txt is not committed either: an
+Italian Wikipedia excerpt the operator pasted into Notepad; its content
+and hash are not in the paste.
+
+--- build -------------------------------------------------------------------------
+
+main 31710bc (the merge of #73); `git log -1` printed
+"31710bc Merge pull request #73 from Edo771977/claude/sleepy-johnson-agg34c".
+
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+
+  eseguibile: .\qwen36_clang.exe | 392704 byte | 2026-10-04 09:07:30 | sha256 936F5346924C2BB5
+  (as misure-envab.ps1 printed it in section 2; the PPL runs of section 1
+  used the same file, built before them in the same window)
+  coli_cuda.dll: 819712 byte | 2026-09-28 21:42:02 | sha256 230CA632A2CEA752
+
+--- 1. PPL=1 ----------------------------------------------------------------------
+
+The window had, from the commands given:
+
+  set SNAP=D:\modelli\qwen36_i4_gs64
+  set COLI_CUDA=1
+  set COLI_GPUS=0
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set QT_UPLOAD_SYNC=1
+  set HEAT_FILE=heat.bin
+
+then (the first attempts found no testo.txt, then an empty one: "[ppl] PPL=1
+needs a text of at least 2 tokens, got 0"; the operator filled the file and
+ran again):
+
+  set PPL=1
+  copy /Y heat.caldo.bin heat.bin
+  qwen36_clang.exe 256 4 testo.txt > ppl_off.txt 2> ppl_off.log
+  set CACHE_ROUTE=1
+  set ROUTE_J=2
+  copy /Y heat.caldo.bin heat.bin
+  qwen36_clang.exe 256 4 testo.txt > ppl_j2.txt 2> ppl_j2.log
+  set ROUTE_J=4
+  copy /Y heat.caldo.bin heat.bin
+  qwen36_clang.exe 256 4 testo.txt > ppl_j4.txt 2> ppl_j4.log
+
+  ppl_off.txt
+  TF-NLL: 2.4240 nats/token over 459 tokens | ppl = 11.29
+  Expert cache hit rate: 94.2% (hit=166443 miss=10240)
+  Speed: 48.67 tok/s (9.4s for 459 tokens) | PEAK RSS: 31.63 GB
+
+  ppl_j2.txt
+  TF-NLL: 2.4401 nats/token over 459 tokens | ppl = 11.47
+  Expert cache hit rate: 93.7% (hit=153035 miss=10240)
+  CACHE_ROUTE J=2 M=12 P=0.00 alpha=1.00 | swap 9.4% (13878/146880, 13878 to VRAM)
+  route_agree 90.6% | route_kl 1.7085
+  Speed: 63.04 tok/s (7.3s for 459 tokens) | PEAK RSS: 31.61 GB
+
+  ppl_j4.txt
+  TF-NLL: 2.4187 nats/token over 459 tokens | ppl = 11.23
+  Expert cache hit rate: 93.8% (hit=155478 miss=10240)
+  CACHE_ROUTE J=4 M=12 P=0.00 alpha=1.00 | swap 7.5% (11086/146880, 11086 to VRAM)
+  route_agree 92.5% | route_kl 1.2527
+  Speed: 60.83 tok/s (7.5s for 459 tokens) | PEAK RSS: 31.61 GB
+
+  findstr: "[ppl] text: 460 tokens, the first 1 as context, 459 scored" in
+  all three logs; "[qwen36] CACHE_ROUTE=1 J=2 ..." in ppl_j2.log and
+  "... J=4 ..." in ppl_j4.log.
+
+146880 slots = 8 x 40 x 459 routing rows (one prefill row for the context
+token, then 458 decode steps). The "Expert cache hit rate" line here is
+the RAM cache's (miss=10240 = 40 x 256, the warmstart loading every
+expert once), not the VRAM tier's.
+
+--- 2. the A/B, ROUTE_J=4 ---------------------------------------------------------
+
+  set ROUTE_J=4
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var CACHE_ROUTE -Value 1 -Marker "[qwen36] CACHE_ROUTE=1" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE,COLI_DN_GPU,QT_UPLOAD_SYNC,ROUTE_J
+
+  parametri: cap=256 bits=4 N_NEW=128 rip=6 | OFF: CACHE_ROUTE assente | ON: CACHE_ROUTE=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_KEEPALIVE,COLI_DN_GPU,QT_UPLOAD_SYNC,ROUTE_J -- DEROGA
+  marker: [qwen36] CACHE_ROUTE=1  (testo trovato in C:\colibri-fork\c\qwen36_clang.exe)
+  heat: ... sha256 2682CA6E4CD9744F ... tabella= verificata (as in the ROUTE_J=2 record)
+
+SNAP, COLI_CUDA, COLI_GPUS and HEAT_FILE, left set in the window by
+section 1, are among the variables the script sets itself; PPL had been
+cleared at the end of section 1 (`set PPL=`, and the script refuses PPL
+unless -AllowEnv names it); ROUTE_J has an effect only when CACHE_ROUTE=1,
+so the OFF arm ran the plain router.
+
+Invariants: heat table unchanged and loaded in all 12 runs; banner
+identical; [place] auto identical in all 12 runs; residency 6812/10240.
+
+  rip 1 (OFF prima)  OFF  17.40  ON  15.90  delta  -1.50 ms/token
+  rip 2 (ON prima )  OFF  17.40  ON  15.80  delta  -1.60 ms/token
+  rip 3 (OFF prima)  OFF  17.60  ON  16.00  delta  -1.60 ms/token
+  rip 4 (ON prima )  OFF  17.50  ON  15.70  delta  -1.80 ms/token
+  rip 5 (OFF prima)  OFF  17.50  ON  15.80  delta  -1.70 ms/token
+  rip 6 (ON prima )  OFF  17.10  ON  15.90  delta  -1.20 ms/token
+
+  media    -1.57   sd  0.21   se  0.08   df 5
+  intervallo 95 %:  [-1.78 ; -1.35]   ampiezza +-0.22
+  negativi 6/6
+  position (ABBA): OFF first -1.50 -1.60 -1.70, ON first -1.60 -1.80
+  -1.20, difference of the group means -0.07
+
+  OFF    step  17.42  moe  10.04  attn  1.80  dn  3.67  head  1.01
+         (shared)  3.09  (router)  0.78  wait  0.50
+         issue  1.50  cpu-miss  3.83  take  0.58  sh-ovl  3.09  hit  86.7 %  swaps  8.0  miss 6463
+  ON     step  15.85  moe   8.45  attn  1.82  dn  3.70  head  1.01
+         (shared)  3.22  (router)  0.77  wait  0.67
+         issue  1.49  cpu-miss  1.99  take  0.76  sh-ovl  3.22  hit  93.4 %  swaps  8.0  miss 3203
+  (dn-sub / dn-split: the whole DeltaNet call in the proj slot, dnproj and
+  dnout 3810/3810, in both arms)
+
+  testo generato identico fra i run di ogni braccio:
+    OFF   4a000cc01f310b64
+    ON    b967e6bd24da75bb
+  testo generato DIVERSO fra i due bracci alla posizione 121 (UTF-16):
+    OFF   ...SO), poiché deve garantire che ogni pro
+    ON    ...OS), poiché deve garantire che ogni pro
+  (the paste shows "é" as "├®", the console code page)
+
+  findstr on the ON logs, r1 .. r6 identical:
+    CACHE_ROUTE J=4 M=12 P=0.00 alpha=1.00 | swap 6.4% (3119/48640, 3119 to VRAM)
+    route_agree 93.6% | route_kl 1.0377
+
+--- reading -----------------------------------------------------------------------
+
+  - Quality: the three NLLs are on the same 459 tokens, so their
+    differences are paired, but with one text there is no interval. Each
+    setting ran once; under the same conditions (QT_UPLOAD_SYNC=1, the same
+    heat table) section 2's repeats were identical, so the uncertainty is
+    taken to be which text, not run-to-run noise. Swapping in a rank
+    5-12 expert can lower the NLL of a given token, so ROUTE_J=4's -0.0053
+    is not impossible, only not expected on average; it marks how much one
+    text can move, not a bound. What would narrow it: more text (several
+    files, a few thousand tokens), or per-token NLLs from tf_nll, which
+    would give a paired standard error over the scored tokens at no extra
+    run.
+  - The tok/s of section 1 are single runs, not an A/B, and include the
+    full-vocabulary softmax of every scored token; section 2 is the speed
+    measurement.
+  - Speed: ROUTE_J=4's -1.57 ms/token comes, as ROUTE_J=2's did, from
+    cpu-miss (3.83 -> 1.99, ms per decode token) and the misses over the
+    run (6463 -> 3203, prompt and decode rows); the other timers' changes
+    are not attributed (see the ROUTE_J=2 record's reading).
+  - QT_UPLOAD_SYNC: this OFF arm (sync on) reads 17.42, the 3 October OFF
+    arm (no sync, build 7549736, otherwise the same configuration) 17.43, the ROUTE_J=2
+    record's OFF arm (sync on) 18.37. Different sessions, so the sync's
+    own cost is still not measured; these numbers do not suggest a large
+    one.
+
+--- what this run did NOT measure ---------------------------------------------------
+
+  - Perplexity on more than one text; ROUTE_J=3 or other M / ALPHA values.
+  - The gain without QT_UPLOAD_SYNC=1 (the normal mode).
+  - Long generations (residency drift: the tier only sees the experts the
+    lever chose).
