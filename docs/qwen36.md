@@ -166,7 +166,11 @@ Two consequences for measuring it:
   ON run's hash. The ON repetitions are then not the same work, and which
   work they do depends on timing (what is resident when the experts are
   chosen sets the hit rate and the step time), so the interval covers the
-  lever together with that varying work, not one fixed sequence.
+  lever together with that varying work, not one fixed sequence. In the one
+  A/B without the sync (prompt25.txt, 128 tokens, 4 October) the waiver was
+  not needed: six ON runs wrote one text, the same text with the same
+  route meters (swap count, `route_agree`, `route_kl`) as under
+  `QT_UPLOAD_SYNC=1`.
 - **CONSIST** keeps the caches between its arms, so under the lever the arms
   would route differently: the engine refuses `CONSIST=1` with
   `CACHE_ROUTE=1`.
@@ -181,13 +185,19 @@ GPU, cap 256, `QT_UPLOAD_SYNC=1` in both arms, six ABBA pairs): step() 18.37
 `route_agree` 91.8 %. With `ROUTE_J=4` (four sacred ranks of eight): 17.42 ->
 15.85 ms/token, delta -1.57, 95 % [-1.78, -1.35], 6 of 6 pairs, keep-alive on in both arms, 6.4 % substituted,
 `route_agree` 93.6 % (another session and build than the `ROUTE_J=2` A/B,
-so the two gains are not directly comparable). Quality, `PPL=1` on one
+so the two gains are not directly comparable). The same `ROUTE_J=4` A/B
+without `QT_UPLOAD_SYNC`, the normal mode: 17.30 -> 15.55 ms/token, delta
+-1.75, 95 % [-2.09, -1.41], 6 of 6, with the same text and route meters as
+the sync A/B (docs/experiments/qwen36-cache-route-nosync-2026-10-04-raw.txt). Quality, `PPL=1` on one
 460-token Italian text, one run each and no interval: lever off 11.29,
 `ROUTE_J=2` 11.47 (+1.6 %), `ROUTE_J=4` 11.23 (-0.5 %); neither difference
-is established. `CACHE_ROUTE=1 ROUTE_J=4` is measured faster with no
-quality cost this text can show, under `QT_UPLOAD_SYNC=1` and 128 generated
-tokens (docs/experiments/qwen36-cache-route-2026-10-04-raw.txt,
-docs/experiments/qwen36-cache-route-j4-2026-10-04-raw.txt).
+is established. `CACHE_ROUTE=1 ROUTE_J=4` is measured faster, with and
+without `QT_UPLOAD_SYNC=1`, on one prompt (prompt25.txt) and 128 generated
+tokens, with no quality cost
+this text can show (the perplexities were taken under the sync)
+(docs/experiments/qwen36-cache-route-2026-10-04-raw.txt,
+docs/experiments/qwen36-cache-route-j4-2026-10-04-raw.txt,
+docs/experiments/qwen36-cache-route-nosync-2026-10-04-raw.txt).
 
 ### Measuring the cost: `PPL=1` on a text file
 
