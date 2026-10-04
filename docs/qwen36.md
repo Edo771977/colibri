@@ -166,6 +166,43 @@ Two consequences for measuring it:
 In serve mode the route meters are not in the `STAT` line; they are printed
 by the argv and `PPL=1` footers.
 
+Measured on the operator's box (RTX 4070 Ti SUPER, CUDA tier, DeltaNet on the
+GPU, cap 256, `QT_UPLOAD_SYNC=1` in both arms, six ABBA pairs): step() 18.37
+-> 16.17 ms/token, paired delta -2.20, 95 % [-2.98, -1.42]; `cpu-miss` 3.99
+-> 1.60, VRAM hit 86.7 % -> 94.8 %, with 8.2 % of the slots substituted and
+`route_agree` 91.8 %. The quality cost is not measured yet
+(docs/experiments/qwen36-cache-route-2026-10-04-raw.txt).
+
+### Measuring the cost: `PPL=1` on a text file
+
+`PPL=1` with a ref `.json` scores `full_ids` after `prompt_ids`, which needs
+a torch reference. Given a plain text file instead, the engine encodes it
+(raw text, no chat template) and scores the file's own tokens: the first
+`PPL_CTX` (default 1) are context, every later one is predicted from the ones
+before it, one decode step at a time, and the footer prints
+`TF-NLL: ... | ppl = ...` with the route meters under it. It is the ref path
+on the same ids, not an approximation (CI checks the two give the same line on
+the tiny fixture). Any natural text works; what matters is that both arms
+score the same file:
+
+```
+set PPL=1
+set QT_UPLOAD_SYNC=1
+copy /Y heat.caldo.bin heat.bin & set HEAT_FILE=heat.bin
+qwen36_clang.exe 256 4 testo.txt                     (lever off)
+set CACHE_ROUTE=1
+copy /Y heat.caldo.bin heat.bin
+qwen36_clang.exe 256 4 testo.txt                     (lever on)
+set CACHE_ROUTE=
+```
+
+The conditions are those of the determinism bullet above: `QT_UPLOAD_SYNC=1`,
+`PILOT` off, and the same heat table at the start of every run (the engine
+rewrites `HEAT_FILE` at exit, hence the copy before each run; or no
+`HEAT_FILE` at all). A text of a few hundred to a few thousand tokens keeps
+the run short (one decode step per token, and the KV grows with the text);
+`PPL=1` needs at least two.
+
 ## The dense trunk: integer dot products (`COLI_DENSE_IDOT=1`, opt-in)
 
 Ported from upstream (JustVugg/colibri dfec3a4b, 22 September 2026), where

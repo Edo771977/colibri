@@ -4833,7 +4833,12 @@ int main(int argc, char **argv) {
         free(txt);
         n_new = getenv("N_NEW") ? atoi(getenv("N_NEW")) : 64;
         if (n_new < 1) n_new = 1;
-        fprintf(stderr, "[enc] prompt tokens: %d | generating %d new tokens\n", np, n_new);
+        if (getenv("PPL") && atoi(getenv("PPL")) == 1) {
+            if (np < 2) { fprintf(stderr, "[ppl] PPL=1 needs a text of at least 2 tokens, got %d\n", np); return 1; }
+            fprintf(stderr, "[enc] text tokens: %d (PPL=1: scored, not continued)\n", np);
+        }
+        else
+            fprintf(stderr, "[enc] prompt tokens: %d | generating %d new tokens\n", np, n_new);
         if (getenv("ENC_DEBUG") && np <= 300) { fprintf(stderr, "[enc] prompt ids: "); for (int i=0;i<np;i++) fprintf(stderr, "%d ", prompt[i]); fprintf(stderr, "\n"); }
     }
 
@@ -5014,9 +5019,24 @@ int main(int argc, char **argv) {
         free(buf); free(arena); return 0;
     }
 
-    if (is_ref && getenv("PPL") && atoi(getenv("PPL")) == 1) {
+    /* PPL=1: teacher-forced NLL. With a ref .json it scores full_ids after
+     * prompt_ids. With a text file it scores the file's own tokens: the
+     * first PPL_CTX (default 1) are context, every later one is predicted
+     * from the ones before it, one decode step at a time. So the same text
+     * gives the same NLL under any setting that does not change the
+     * arithmetic, and a lossy lever (CACHE_ROUTE) shows its cost here
+     * without a torch reference. */
+    if (getenv("PPL") && atoi(getenv("PPL")) == 1 && (is_ref || np >= 2)) {
+        const int *pf = full; int pn = nfull, pctx = np;
+        if (!is_ref) {
+            pf = prompt; pn = np;
+            pctx = getenv("PPL_CTX") ? atoi(getenv("PPL_CTX")) : 1;
+            if (pctx < 1) pctx = 1;
+            if (pctx > pn - 1) pctx = pn - 1;
+            fprintf(stderr, "[ppl] text: %d tokens, the first %d as context, %d scored\n", pn, pctx, pn - pctx);
+        }
         double nll; double t = now_s();
-        int scored = tf_nll(&m, full, nfull, np, &nll);
+        int scored = tf_nll(&m, pf, pn, pctx, &nll);
         double dt = now_s() - t;
         double tot = m.hits + m.miss;
         printf("TF-NLL: %.4f nats/token over %d tokens | ppl = %.2f\n", nll, scored, exp(nll));

@@ -536,6 +536,34 @@ jobs:
           grep -q "CONSIST OK" consist_idot.log || { echo "FAIL: CONSIST with the integer dot"; cat consist_idot.log; exit 1; }
           grep -E "CONSIST (OK|FAIL)" consist_idot.log
           echo "::endgroup::"
+      - name: PPL=1 on a text file scores the same as on a ref of the same ids
+        run: |
+          cd c
+          make qwen36
+          # PPL=1 with a text file teacher-forces the file's own tokens (the
+          # first PPL_CTX as context). It must be the ref-file path on the same
+          # ids, not an approximation of it: build that ref from the ids the
+          # engine encoded (ENC_DEBUG) and demand the same TF-NLL line. The
+          # fixture has no tokenizer, so a copy gets the byte-level test one.
+          rm -rf qwen36_tiny_tok && cp -r qwen36_tiny_c qwen36_tiny_tok
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size "$(python3 -c "import json;print(json.load(open('qwen36_tiny/config.json'))['vocab_size'])")" qwen36_tiny_tok
+          printf 'The quick brown fox jumps over the lazy dog. Il sistema operativo gestisce la memoria.' > ppl_text.txt
+          PPL=1 ENC_DEBUG=1 SNAP=qwen36_tiny_tok ./qwen36 8 8 ppl_text.txt > ppl_text.out 2> ppl_text.err || { cat ppl_text.err; exit 1; }
+          grep -q "\[ppl\] text:" ppl_text.err || { echo "FAIL: text-mode PPL did not engage"; cat ppl_text.err; exit 1; }
+          python3 - <<'PY'
+          import json, re
+          m = re.search(r"prompt ids: ([0-9 ]+)", open("ppl_text.err").read())
+          assert m, "no [enc] prompt ids line: ENC_DEBUG prints it only for a text of at most 300 tokens"
+          ids = [int(x) for x in m.group(1).split()]
+          for c in (1, 10):
+              json.dump({"prompt_ids": ids[:c], "full_ids": ids}, open(f"ppl_ref_{c}.json", "w"))
+          PY
+          for c in 1 10; do
+            a=$(PPL=1 PPL_CTX=$c SNAP=qwen36_tiny_tok ./qwen36 8 8 ppl_text.txt 2>/dev/null | grep TF-NLL)
+            b=$(PPL=1 SNAP=qwen36_tiny_tok ./qwen36 8 8 ppl_ref_$c.json 2>/dev/null | grep TF-NLL)
+            echo "ctx=$c text: $a"; echo "ctx=$c ref:  $b"
+            test -n "$a" && test "$a" = "$b" || { echo "FAIL: text and ref PPL differ at PPL_CTX=$c"; exit 1; }
+          done
       - name: Quantize-at-load is bit-identical to quantize-after-load (dense int8 on)
         run: |
           cd c
