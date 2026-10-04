@@ -111,7 +111,7 @@ $EnvBenign = '^CUDA_(PATH(_V[0-9_]+)?|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH
 # si nominano le due variabili QT_ che compaiono nei getenv del motore.
 $EnvSuspect = '^(COLI_|COLIBRI_|QWEN_|QWEN36_|QWEN38_|CUDA_|GOMP_|KMP_|OMP_|HEAT_|Q36_)' +
               '|^(QT_NO_WARMSTART|QT_UPLOAD_SYNC)$' +
-              '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|PPL_CTX|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW|CACHE_ROUTE|ROUTE_J|ROUTE_M|ROUTE_P|ROUTE_ALPHA|ROUTE_AGREE)$'
+              '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|PPL_CTX|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW|CACHE_ROUTE|ROUTE_J|ROUTE_M|ROUTE_P|ROUTE_ALPHA|ROUTE_AGREE|AMX|AMX_S_MIN)$'
 $EnvHits = @()
 foreach ($e in Get-ChildItem Env: ) {
     $n = $e.Name
@@ -190,7 +190,7 @@ if ($Built) {
 # mano. .build-config ne fa parte: se e' piu' recente dell'eseguibile, la
 # configurazione registrata non e' quella del binario.
 $QwenSrc = @(
-    "qwen36.c","qwen36_tier.c","qwen36_tier.h","expert_ffn.h","simd_i8f.h",
+    "qwen36.c","qwen36_tier.c","qwen36_tier.h","expert_ffn.h","simd_i8f.h","idot.h",
     "decode_batch.h","serve_poll.h","cli_args.h","st.h","json.h","compat.h",
     "omp_tune.h","kv_prefix.h","pin_pool.h",
     "edge_adapter_internal.h","edge_adapters.h","edge_runtime.h",
@@ -691,7 +691,8 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
         (($q | ForEach-Object { $_.ShOvl }   | Measure-Object -Average).Average),
         (($q | ForEach-Object { $_.Vram }    | Measure-Object -Average).Average),
         (($q | ForEach-Object { $_.Swaps }   | Measure-Object -Average).Average),
-        (($q | ForEach-Object { $_.Miss }    | Sort-Object -Unique) -join "/")
+        $(if (@($q | ForEach-Object { $_.Miss } | Sort-Object -Unique).Count -eq 1) { "$($q[0].Miss)" }
+          else { "per rip: " + (($q | Sort-Object Rep | ForEach-Object { "$($_.Miss)" }) -join " ") })
 }
 
 ""
