@@ -14,8 +14,8 @@ Summary:
      -> 94.8 %, misses 6463 -> 2520. The lever substituted 8.2 % of the
      chosen slots (4003 of 48640), every one with a VRAM-resident expert;
      route_agree 91.8 %, route_kl 1.4637, the same in all six ON runs.
-  3. The generated text is identical within each arm (QT_UPLOAD_SYNC=1 made
-     the ON arm reproducible) and differs between the arms from UTF-16
+  3. The generated text is identical within each arm (with QT_UPLOAD_SYNC=1
+     the ON arm was reproducible) and differs between the arms from UTF-16
      position 83 of stdout. The OFF arm's text, 4a000cc01f310b64, is the
      one of the 28 September and 3 October records.
 
@@ -35,9 +35,9 @@ evidence.sha256 exists for them.
 --- build -----------------------------------------------------------------------
 
 main fast-forwarded ecbdf67..3289754 (git log: 3289754 Merge pull request
-#72). In C:\colibri-fork\c, the x64 Native Tools prompt; the paste shows a
-mistyped `t PATH=...` ("t" non e' riconosciuto) before the build, PATH
-already set in that window, and a `PATH=...` line after it:
+#72). In C:\colibri-fork\c; the paste shows a mistyped `t PATH=...` ("t"
+non e' riconosciuto) before the build, which still found clang and make,
+and a `PATH=...` line after it:
 
   make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
 
@@ -120,20 +120,26 @@ character is restored here.)
 
 --- reading -----------------------------------------------------------------------
 
-  - The gain is the lever's target: cpu-miss falls by 2.39 ms/token
-    (3.99 -> 1.60) because 3943 fewer experts a run are computed on the CPU
-    (6463 -> 2520 misses). moe falls by 2.07, step() by 2.20; attn, dn and
-    head move by 0.07 or less.
-  - What it costs elsewhere: the router 0.78 -> 0.91 (+0.13, route_select
-    ranks 12 instead of 8 and asks the residency of each), the shared
-    expert 3.19 -> 3.33, wait 0.39 -> 0.57 and take 0.48 -> 0.67 (the GPU
-    computes more of the experts, so its side of the overlap grows). These
-    are why the step gains less than cpu-miss falls.
+  - The gain is the lever's target: cpu-miss (ms per decode token) falls
+    by 2.39, 3.99 -> 1.60, and the misses over the whole run (prompt rows
+    and decode steps together) fall by 3943, 6463 -> 2520. moe falls by
+    2.07, step() by 2.20; attn, dn and head move by 0.07 or less.
+  - Other timers rose; none of the rises is attributed here. The (router)
+    timer covers only the gate matmul (c/qwen36.c, tm_add slot 4), which is
+    the same work in both arms, yet reads 0.78 -> 0.91; route_select runs
+    after it and is timed by no sub-counter, only inside moe, so the
+    lever's own ranking cost is not measured separately. The shared expert,
+    also the same work in both arms, reads 3.19 -> 3.33. wait 0.39 -> 0.57
+    is part of take 0.48 -> 0.67 (the take split), so the two are mostly
+    one rise; wait grows both when the GPU computes more experts and when
+    the CPU side finishes sooner, and the meters do not separate the two.
   - The rows differ between the arms after the text diverges, so the
     misses compared are not of the same tokens; the meters are of the ON
     arm's own routing.
-  - Determinism: with QT_UPLOAD_SYNC=1 the six ON runs wrote the same text
-    and the same meters, as docs/qwen36.md says they should.
+  - Determinism: with QT_UPLOAD_SYNC=1 the six ON runs wrote the same text,
+    the same route meters and the same miss count (the timers vary), as
+    docs/qwen36.md says they should. No ON arm without it was run, so that
+    it would not reproduce without it is not shown here.
   - The LFRU swap count is 8.0 in both arms; the lever did not change how
     often the tier moved experts on this run length.
 

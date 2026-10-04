@@ -187,13 +187,21 @@ score the same file:
 
 ```
 set PPL=1
+set QT_UPLOAD_SYNC=1
+copy /Y heat.caldo.bin heat.bin & set HEAT_FILE=heat.bin
 qwen36_clang.exe 256 4 testo.txt                     (lever off)
 set CACHE_ROUTE=1
+copy /Y heat.caldo.bin heat.bin
 qwen36_clang.exe 256 4 testo.txt                     (lever on)
+set CACHE_ROUTE=
 ```
 
-A text of a few hundred to a few thousand tokens keeps the run short (one
-decode step per token); `PPL=1` needs at least two.
+The conditions are those of the determinism bullet above: `QT_UPLOAD_SYNC=1`,
+`PILOT` off, and the same heat table at the start of every run (the engine
+rewrites `HEAT_FILE` at exit, hence the copy before each run; or no
+`HEAT_FILE` at all). A text of a few hundred to a few thousand tokens keeps
+the run short (one decode step per token, and the KV grows with the text);
+`PPL=1` needs at least two.
 
 ## The dense trunk: integer dot products (`COLI_DENSE_IDOT=1`, opt-in)
 

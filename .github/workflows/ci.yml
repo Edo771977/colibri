@@ -552,7 +552,9 @@ jobs:
           grep -q "\[ppl\] text:" ppl_text.err || { echo "FAIL: text-mode PPL did not engage"; cat ppl_text.err; exit 1; }
           python3 - <<'PY'
           import json, re
-          ids = [int(x) for x in re.search(r"prompt ids: ([0-9 ]+)", open("ppl_text.err").read()).group(1).split()]
+          m = re.search(r"prompt ids: ([0-9 ]+)", open("ppl_text.err").read())
+          assert m, "no [enc] prompt ids line: ENC_DEBUG prints it only for a text of at most 300 tokens"
+          ids = [int(x) for x in m.group(1).split()]
           for c in (1, 10):
               json.dump({"prompt_ids": ids[:c], "full_ids": ids}, open(f"ppl_ref_{c}.json", "w"))
           PY
