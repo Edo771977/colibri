@@ -259,8 +259,10 @@ Reading:
     separated. Nothing here attributes the dn rise either; one candidate
     is the same synchronisation, while the DeltaNet's per-row
     projections run on the GPU (in the prefill the rest of the DeltaNet
-    runs on the CPU). attention moves only +0.7 ms, which a device-wide
-    stall would also be expected to touch; that weakens the candidate.
+    runs on the CPU). attention, which in the prefill runs on the CPU
+    (c/qwen36.c: its projections use the GPU only for a single row),
+    moves only +0.7 ms, as a device stall would leave it; that fits the
+    candidate but does not show it.
   - The deltas of repetitions 4-6 (+0.25..+0.29) are larger than those
     of 1-3 (+0.14..+0.16), on both orders of the pair: the OFF arm got
     faster and the ON arm slower over the session. Not explained.
@@ -279,8 +281,11 @@ Reading:
     if the per-token gain measured over 127 decode steps held beyond
     them, which is not measured: the LFRU tick keeps moving the OFF
     arm's residents towards what is routed, and the routing can drift
-    from the prompt's experts as the text goes on. On a longer prompt the plan has
-    more evidence and up to 960 swaps, and neither side is measured.
+    from the prompt's experts as the text goes on, while the one-off
+    decode-side costs inside the -1.00 (the rebuild at the first decode
+    step, uploads still in flight) would amortise, which pushes the
+    other way. On a longer prompt the plan has more evidence and up to
+    960 swaps, and neither side is measured.
 
 --- what this run did NOT measure ---------------------------------------------------
 

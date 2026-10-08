@@ -775,8 +775,9 @@ in both arms; no sync; prompt25.txt; 128 tokens; six ABBA pairs):
 - each arm repeated its text, and the two texts differ;
 - the price, read from the same logs: TTFT 0.44 -> 0.65 s, +0.21 s, 95 %
   [+0.14, +0.28], 6 of 6 (the prefill's moe +152 ms, dn +51 ms); peak RSS
-  31.59 -> 31.60..31.62 GB. At 128 tokens the run is about 0.08 s slower
-  end to end. It would break even at about 210 generated tokens (~110 to
+  31.59 -> 31.60..31.62 GB. At 128 tokens the generation (prefill plus 127
+  decode steps) is about 0.08 s longer, computed per pair, 95 % [+0.01,
+  +0.15]. It would break even at about 210 generated tokens (~110 to
   ~380 across the two intervals) if the per-token gain held beyond 128
   tokens, which is not measured.
 
