@@ -643,6 +643,132 @@ overwrote the group's input and output mid-flight -- no CUDA error, only
 wrong numbers. qwen36 never called the dense path inside that window, so its
 outputs were unaffected.
 
+## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
+
+Opt-in, off by default. Ported from upstream (JustVugg/colibri 0fc8834b,
+e4a2e3c3, 7555e847, b842448a), without its in-place overwrite (below).
+
+**Why.** The warmstart fills VRAM from the heat file, i.e. from what earlier
+prompts routed to. A new prompt routes elsewhere, and the LFRU tick corrects
+that by one expert per sixteen tokens per device.
+
+**What it does.** With `QT_PREFILL_REPLAN=1`, after each prefill layer the
+engine hands the tier that layer's routing counts over the prompt rows
+(`qt_replan`, `c/qwen36_tier.c`). The tier swaps residents the prompt routed
+to least for the non-residents it routed to most, under these rules:
+
+- **Order.** Victims go by count, then heat, then slot index; newcomers by
+  count, then slot index. Both orders are total, so Linux and Windows pick
+  the same victims (qsort is not stable).
+- **Only while it pays.** A swap happens only while the newcomer's count is
+  strictly higher than its victim's.
+- **Cap.** At most `QT_PREFILL_REPLAN_MAX` swaps per layer (default 24). With
+  several cards the cap is shared, filled in device order.
+- **Budget-neutral.** Each swap is the victim-first swap the LFRU tick uses,
+  so VRAM use does not change.
+
+**Timing.** The swaps of layer L upload while layers L+1.. still compute.
+The 48-entry upload queue takes what it can at once: each entry is staged,
+i.e. copied, under the tier's lock on the prefill thread. The rest stays
+pending and starts at the next `qt_replan` call or on the layer-0 ticks,
+four per token. A new prompt's prefill drops what the last one left pending
+(`qt_replan_reset`).
+
+**The RAM side.** On the int4 container the warmstart drops the int8 RAM
+copy of every resident expert. Once a re-plan has run, the tier notes every
+swap (re-plan or LFRU), victims as queued and newcomers as resident
+(`qt_swapped_take`). At the start of each step the engine (`tier_sync_swapped`)
+then does two things, in parallel:
+- it rebuilds the int8 copy of each expert no longer resident;
+- it drops the int8 copy of each one now resident.
+
+The rebuild stays inside the step (the A/B's `step()` includes it), but
+off the serial miss path. Left to that path, upstream measured 2,000 re-plan
+victims at ~7 ms/token over the next 300 tokens.
+
+RSS comes back to where the warmstart put it once the newcomers have landed.
+Victims are noted when their swap is queued and newcomers only when they
+land, so a step can rebuild victims whose newcomers are still uploading. The
+peak is then higher, by ~3 MB per such victim, until a later step drops the
+newcomers' copies. Each step drains the whole ring, drops first and rebuilds
+second.
+
+Two differences from upstream:
+- Upstream rebuilt the victims but never dropped the newcomers' copies.
+  Dropping them is this port's addition.
+- Upstream rebuilt on every step and noted LFRU evictions with the
+  variable unset. Here nothing is noted until a re-plan has run, and the
+  engine does this only under `QT_PREFILL_REPLAN=1`, so the default path is
+  unchanged.
+
+**What this port leaves out: the in-place overwrite.** Upstream writes the
+newcomer into the victim's device buffers (`coli_cuda_tensor_overwrite`, a
+new `coli_cuda.dll` entry point). Here a re-plan swap is the LFRU swap as it
+was: the uploader frees the victim's three tensors and uploads the
+newcomer's, a cudaFree and a cudaMalloc each, which synchronise the device.
+Upstream measured that path at 1.3 s of prefill for 1,500 swaps. The cap
+bounds it at 24 × 40 = 960 swaps per prompt, and the swaps that drain during
+decode pay it inside the decode steps. The port needs no DLL rebuild.
+
+**Short prefills.** Any routed non-resident (count 1) beats a never-routed
+resident (count 0), so a step of two or three tokens (a chat continuation,
+a served suffix after prefix reuse) can still plan up to min(24, S × 8)
+swaps per layer on that little evidence. The same holds upstream. The
+operator's one-prompt CLI runs do not hit this.
+
+**Which experts run.** The counts are taken after the experts are chosen,
+and without `CACHE_ROUTE` placement never changes which experts run. It does
+change where some of them run: a GPU-resident expert is computed by the
+card's kernel and added to the output after the CPU's. So the last bits of a
+token's numbers, and in principle the text, can differ from a run with
+other residents. Text identity is observed, not guaranteed. Under
+`CACHE_ROUTE=1` the lever prefers residents, so the experts themselves
+change.
+
+**Counters.** The first three are printed only under `QT_PREFILL_REPLAN=1`:
+- `[qtier] replan: N swaps planned, M started, S skipped (slot moved since the
+  plan), D dropped (next prompt), K still pending, L swap notes lost (ring
+  full)`. The ring holds 8,192 notes; a lost note leaves a victim to the
+  lazy miss path and a newcomer with its int8 copy.
+- `[qtier] after the prefill: hit X %`, the hit rate from the end of the
+  prefill on, which is the number a re-plan moves. It is worded so that it
+  is not read as the `VRAM hit rate:` line, which covers the whole run.
+  `tools/misure-envab.ps1` prints it per arm as `dopo il prefill`.
+- `[qwen36] replan RAM: N int8 copies rebuilt ..., M dropped ...`.
+- `LFRU swaps` (always printed) still counts only the tick's swaps.
+- The startup line `[qwen36] QT_PREFILL_REPLAN=1: ...` shows that the
+  switch took effect (the tier must be on).
+- Before the exit statistics the engine waits for the uploads in flight, so
+  `resident N/M` does not count a swap's victim without its newcomer.
+
+**Determinism.** Under `QT_UPLOAD_SYNC=1`, every queued upload lands before
+the next group, and a pending pair a layer-0 tick starts lands before that
+same group. So a `CACHE_ROUTE` run stays reproducible
+(`tests/test_qwen36_tier_replan.c`, parts 3 and 4). Without the sync the
+newcomers land when the uploader gets to them, and an A/B needs
+`-AllowTextDrift ON` with or without `CACHE_ROUTE`.
+
+**Measured upstream, not here.** RTX 3070 8 GB, 35B per-row int4, heat file
+from six other prompts, four held-out prompts, 300 tokens, with the in-place
+overwrite and the eager rebuild:
+- decode VRAM hit rate 55-63 -> 73-75 % with the trunk on the CPU, and
+  42-50 -> 60-67 % with the trunk in VRAM;
+- in upstream's summary, MoE phase -2 to -5 ms/token and whole token
+  -8..-10 % with the trunk in VRAM, on three prompts of four;
+- TTFT +0.1..1.1 s.
+
+Without the overwrite, this port's TTFT and the cost of the swaps that drain
+during decode are expected to be higher. On the operator's 16 GB card the
+whole-run hit rate is already 86.7 % (93.4 % under `CACHE_ROUTE=1
+ROUTE_J=4`), so the room is smaller. Nothing is measured here yet.
+
+The A/B:
+
+    tools/misure-envab.ps1 -Var QT_PREFILL_REPLAN -Marker "[qwen36] QT_PREFILL_REPLAN=1" -AllowTextDrift ON
+
+The script times decode `step()` only: the prefill and TTFT cost is not in
+its numbers.
+
 ## The per-row int8 dense GEMV: R output rows per block (`COLI_CUDA_I8_ROWS`)
 
 The generic `quant_matmul` branch gives one block to one output row, so every

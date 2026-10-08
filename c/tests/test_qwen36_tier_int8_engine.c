@@ -224,9 +224,58 @@ static void case_int4(void) {
     free_model(&m);
 }
 
+/* --- QT_PREFILL_REPLAN on an int4 container: the RAM side of the swaps ----
+ * The warmstart dropped the int8 copy of every resident. After a re-plan
+ * swap, tier_sync_swapped (run by step() under QT_PREFILL_REPLAN=1) must give
+ * the victim its int8 block back, byte for byte, for the CPU path, and drop
+ * the newcomer's now-spare copy, so the swap leaves RSS where it was. */
+static void case_replan_int4(void) {
+    printf("int4 container, a re-plan swap\n");
+    Model m; build_model(&m); fill_int4(&m);
+
+    setenv("COLI_CUDA", "1", 1);
+    setenv("COLI_GPUS", "0", 1);
+    unsetenv("QT_NO_WARMSTART");
+    unsetenv("COLI_KEEP_INT8");
+    /* budget for two experts of the four */
+    size_t eb = 3 * dev_alloc_footprint((size_t)EXP_D * EXP_IH / 2) + 3 * dev_alloc_footprint((2 * EXP_IH + EXP_D) / 3 * sizeof(float));
+    char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(2 * eb + eb / 2) / 1073741824.0);
+    setenv("CUDA_EXPERT_GB", gb, 1);
+    fake_uploads = 0;
+
+    if (!qt_init(NL, NE, EXP_D, EXP_IH, NE, TOPK, 0 /* per-row */, 1 /* int4 */)) {
+        printf("  FAIL the tier does not start (two-expert budget)\n");
+        fails++; free_model(&m); unsetenv("CUDA_EXPERT_GB"); return;
+    }
+    tier_warmstart(&m, 1);
+    qt_fill_wait();
+    Slot *s0, *s2; expert_get(&m, 0, 0, &s0); expert_get(&m, 0, 2, &s2);
+    ck(qt_is_resident(0, 0) && qt_is_resident(0, 1) && !qt_is_resident(0, 2) && !qt_is_resident(0, 3),
+       "the warmstart placed experts 0 and 1, and left 2 and 3 in RAM");
+    ck(!s0->g && s2->g, "resident 0 lost its int8 copy, non-resident 2 kept it");
+    /* the prefill routes to 2 (moe offers each routed expert to the tier) */
+    for (int e = 2; e < NE; e++) { Slot *s; expert_get(&m, 0, e, &s); tier_offer_slot(0, e, s); }
+    uint32_t cnt[NE] = {0, 0, 5, 0};
+    ck(qt_replan(0, cnt, 24) == 1, "one swap planned: 2 in, 0 out");
+    for (int i = 0; i < 500 && !qt_is_resident(0, 2); i++) { struct timespec ts = {0, 2000000}; nanosleep(&ts, NULL); }
+    qt_fill_wait();
+    ck(qt_is_resident(0, 2) && !qt_is_resident(0, 0), "the swap landed");
+    tier_sync_swapped(&m);
+    ck(s0->g && bytes_intact(s0, 0), "the victim's int8 block is back, byte for byte");
+    ck(!s2->g && s2->g4, "the newcomer's int8 copy is dropped, its packed copy kept");
+    ck(g_rp_rebuilt == 1 && g_rp_dropped8 == 1, "one rebuilt, one dropped");
+    tier_sync_swapped(&m);
+    ck(g_rp_rebuilt == 1 && g_rp_dropped8 == 1, "a second call finds nothing to do");
+
+    qt_shutdown();
+    unsetenv("CUDA_EXPERT_GB");
+    free_model(&m);
+}
+
 int main(void) {
     case_int8();
     case_int4();
+    case_replan_int4();
     if (fails) { printf("FAILED %d\n", fails); return 1; }
     printf("OK test_qwen36_tier_int8_engine\n");
     return 0;

@@ -2468,6 +2468,25 @@ static void slot_ensure_int8(Model *m, Slot *s) {
     s->g = w; s->u = w + ng; s->d = w + ng + ng;
 }
 
+/* QT_PREFILL_REPLAN=1 (port of upstream 7555e847): after each prefill layer's
+ * routing, hand the CUDA tier that layer's counts over the prompt rows
+ * (qt_replan), so residents this prompt never routed to make way for the ones
+ * it routed to most, while the rest of the prefill still computes. Without
+ * CACHE_ROUTE placement never changes routing; under CACHE_ROUTE=1 it does
+ * (the lever prefers residents), so the text can change. Opt-in: on the
+ * operator's box it is not measured yet. QT_PREFILL_REPLAN_MAX caps the swaps
+ * per layer (24, upstream's choice). */
+static int prefill_replan_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *p = getenv("QT_PREFILL_REPLAN"); on = p && p[0] == '1' && p[1] == 0; }
+    return on;
+}
+static int prefill_replan_cap(void) {
+    static int cap = -1;
+    if (cap < 0) { const char *p = getenv("QT_PREFILL_REPLAN_MAX"); cap = p && *p ? atoi(p) : 24; if (cap < 0) cap = 0; }
+    return cap;
+}
+
 /* Segna l'esperto instradato per la bitmap HITS della dashboard. Vive qui,
  * fuori dalla regione QWEN36_NO_MAIN: expert_get la chiama anche nel build
  * del segment adapter, dove il resto della telemetria serve non esiste. */
@@ -2550,6 +2569,74 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
+}
+
+/* QT_PREFILL_REPLAN: keep the RAM side of the swaps where the warmstart left
+ * it, before the layers of a step run (port of upstream 7555e847's
+ * tier_rebuild_evicted, extended, and like the rest of the port only under
+ * QT_PREFILL_REPLAN, where upstream ran it on every step). On an int4
+ * container the warmstart dropped the int8 copy of every resident expert: a
+ * swap's victim needs it back for the CPU path, and a newcomer's is now
+ * spare. Left to the miss path, upstream measured 2,000 re-plan victims at ~7
+ * ms/token over the next 300 tokens (slot_ensure_int8, serially, inside the
+ * layers); here the victims are rebuilt in parallel at the start of the step,
+ * still inside the step, and the newcomers' copies dropped. Victims are noted
+ * when their swap is queued and newcomers when they land, so RSS is back
+ * where the warmstart put it only once the newcomers have landed: a step can
+ * rebuild victims whose newcomers are still uploading. The current residency
+ * decides, not the event: an expert swapped out and back in is treated as
+ * resident. The slots are read through the cache index, not expert_get, so
+ * the cache's hit counters do not move. */
+static uint64_t g_rp_rebuilt, g_rp_dropped8;
+static void tier_sync_swapped(Model *m) {
+    if (!qt_ready()) return;
+    Cfg *c = &m->c;
+    static int keep8 = -1;
+    if (keep8 < 0) keep8 = getenv("COLI_KEEP_INT8") != NULL;
+    /* The whole backlog at once (a prefill can note 2 x 24 x 40 swaps; what
+     * is left behind would only grow the ring until it overflows), each slot
+     * once (a duplicate would race its own rebuild in the loops below). */
+    size_t nslot = (size_t)c->n_layers * c->n_experts;
+    uint8_t *seen = NULL;
+    Slot **sl = NULL; uint8_t *res = NULL; int k = 0, cap = 0;
+    int ls[512], es[512], n;
+    while ((n = qt_swapped_take(ls, es, 512)) > 0) {
+        if (!seen && !(seen = calloc(nslot, 1))) break;
+        for (int i = 0; i < n; i++) {
+            if (ls[i] < 0 || ls[i] >= c->n_layers || es[i] < 0 || es[i] >= c->n_experts) continue;
+            size_t gi = (size_t)ls[i] * c->n_experts + es[i];
+            if (seen[gi]) continue;
+            seen[gi] = 1;
+            pthread_mutex_lock(&g_pilot_mx);
+            Slot *e = slot_indexed(m, ls[i], es[i]);
+            pthread_mutex_unlock(&g_pilot_mx);
+            if (!e) continue;
+            if (k == cap) {
+                int nc = cap ? 2 * cap : 512;
+                Slot **s2 = realloc(sl, (size_t)nc * sizeof *sl); if (s2) sl = s2;
+                uint8_t *r2 = s2 ? realloc(res, (size_t)nc) : NULL; if (r2) res = r2;
+                if (!s2 || !r2) break;
+                cap = nc;
+            }
+            sl[k] = e; res[k] = (uint8_t)qt_is_resident(ls[i], es[i]); k++;
+        }
+    }
+    uint64_t rb = 0, dr = 0;
+    /* drops first, then rebuilds, so the step's peak is not the sum */
+    #pragma omp parallel for schedule(dynamic, 4) reduction(+:dr)
+    for (int i = 0; i < k; i++) {
+        Slot *e = sl[i];
+        /* resident: the int8 block is spare when the packed copy is the
+         * tier's source (int4); an int8 container keeps its only copy */
+        if (res[i] && !keep8 && e->g && e->g4) { free(e->g); e->g = e->u = e->d = NULL; dr++; }
+    }
+    #pragma omp parallel for schedule(dynamic, 4) reduction(+:rb)
+    for (int i = 0; i < k; i++) {
+        Slot *e = sl[i];
+        if (!res[i] && !e->g && e->g4) { slot_ensure_int8(m, e); rb++; }
+    }
+    g_rp_rebuilt += rb; g_rp_dropped8 += dr;
+    free(seen); free(sl); free(res);
 }
 
 static void pin_hot_experts(Model *m) {
@@ -3041,6 +3128,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *shd = msc;
     int use_qt = qt_ready();
     int use_xf = !use_qt && xf_mode(m);
+    /* QT_PREFILL_REPLAN: this layer's routing counts over the prompt rows */
+    uint32_t *rp_cnt = (use_qt && S > 1 && prefill_replan_on()) ? calloc((size_t)E, sizeof(uint32_t)) : NULL;
+    if (rp_cnt && layer == 0) qt_replan_reset();   /* a new prompt: the last one's pending pairs no longer apply */
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
@@ -3101,6 +3191,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             uint32_t *freq_l = m->freq + (int64_t)layer * E;
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
+        if (rp_cnt) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) rp_cnt[idx[kk]]++;
         const float *xs = x + (int64_t)s*D;
         if (use_xf) {
             for (int kk = 0; kk < K; kk++) { xidx[s*K+kk] = idx[kk]; xval[s*K+kk] = val[kk]; }
@@ -3202,6 +3293,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
     }
+    /* every row of this layer is done: its swaps upload while the next layers compute */
+    if (rp_cnt) { qt_replan(layer, rp_cnt, prefill_replan_cap()); free(rp_cnt); }
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
@@ -3616,6 +3709,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
         pthread_mutex_unlock(&g_pilot_mx);
     }
+    if (prefill_replan_on()) tier_sync_swapped(m);
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) {
         /* The gather indexes embed by token id, so an id outside the vocabulary
@@ -3992,6 +4086,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
+    if (prefill_replan_on()) qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
@@ -4936,6 +5031,10 @@ int main(int argc, char **argv) {
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
+        if (prefill_replan_on())
+            fprintf(stderr, "[qwen36] QT_PREFILL_REPLAN=1: the VRAM residents follow each prompt's routing, up to %d swaps per layer%s\n",
+                    prefill_replan_cap(),
+                    g_cache_route ? " (under CACHE_ROUTE the text can change)" : "");
         /* Arm the take split only when the timers are on; qt_take reads no
          * clock otherwise, so the inference build is byte-for-byte the same
          * work it was. */
@@ -5104,6 +5203,12 @@ int main(int argc, char **argv) {
     double tot = m.hits + m.miss;
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
     tm_report();
+    if (prefill_replan_on() && qt_ready()) {
+        /* swaps still in flight at exit would read as missing residents */
+        qt_fill_wait();
+        fprintf(stderr, "[qwen36] replan RAM: %llu int8 copies rebuilt for swapped-out experts, %llu dropped for swapped-in ones\n",
+                (unsigned long long)g_rp_rebuilt, (unsigned long long)g_rp_dropped8);
+    }
     qt_stats();
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,

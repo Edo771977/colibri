@@ -108,9 +108,9 @@ $AllowEnv = @($AllowEnv | ForEach-Object { $_ -split ',' } | ForEach-Object { $_
 # CUDA_ resta rifiutato, compreso CUDA_VISIBLE_DEVICES.
 $EnvBenign = '^CUDA_(PATH(_V[0-9_]+)?|HOME|BIN_PATH|LIB_PATH|INC_PATH|CACHE_PATH)$'
 # QT_ collide con il namespace del framework Qt, quindi al posto del prefisso
-# si nominano le due variabili QT_ che compaiono nei getenv del motore.
+# si nominano le variabili QT_ che compaiono nei getenv del motore.
 $EnvSuspect = '^(COLI_|COLIBRI_|QWEN_|QWEN36_|QWEN38_|CUDA_|GOMP_|KMP_|OMP_|HEAT_|Q36_)' +
-              '|^(QT_NO_WARMSTART|QT_UPLOAD_SYNC)$' +
+              '|^(QT_NO_WARMSTART|QT_UPLOAD_SYNC|QT_PREFILL_REPLAN|QT_PREFILL_REPLAN_MAX)$' +
               '|^(HOT|NOSTREAM|PROF|WARMUP|SMOOTH|CONF_LIMIT|IDOT|RAM_GB|WIDE|CTX|MODEL|SERVE|PPL|PPL_CTX|TOK|PILOT|CONSIST|CONSIST_TOL|DUMP|DUMP_LAYERS|DN_DBG|ENC_DEBUG|OPENAI|SNAP|N_NEW|CACHE_ROUTE|ROUTE_J|ROUTE_M|ROUTE_P|ROUTE_ALPHA|ROUTE_AGREE|AMX|AMX_S_MIN)$'
 $EnvHits = @()
 foreach ($e in Get-ChildItem Env: ) {
