@@ -74,7 +74,7 @@ static struct {
      * its victim when queued and its newcomer when resident, as slot
      * indices, for qt_swapped_take. Bounded ring; what overflows is not
      * reported and the engine's lazy paths cover it. */
-    int rp_live; int *sw; int sw_h, sw_n;
+    int rp_live; int *sw; int sw_h, sw_n; uint64_t sw_lost;
     /* qt_stats_mark: the counters at the prefill/decode boundary */
     uint64_t mk_hits, mk_miss; int mk_on;
 } G;
@@ -1126,7 +1126,7 @@ void qt_fill_wait(void){
 static void swap_note_locked(int gi){
     if(!G.rp_live) return;
     if(!G.sw){ G.sw=malloc(QT_SW_CAP*sizeof(int)); if(!G.sw) return; G.sw_h=0; G.sw_n=0; }
-    if(G.sw_n==QT_SW_CAP) return;                     /* full: the engine's lazy paths cover it */
+    if(G.sw_n==QT_SW_CAP){ G.sw_lost++; return; }    /* full: counted; the miss path still rebuilds a victim lazily */
     G.sw[(G.sw_h+G.sw_n)%QT_SW_CAP]=gi; G.sw_n++;
 }
 int qt_swapped_take(int *layers,int *eids,int max){
@@ -1509,9 +1509,9 @@ void qt_stats(void){
                 dh+dm? 100.0*dh/(dh+dm) : 0.0, (unsigned long long)dh, (unsigned long long)dm);
     }
     if(G.rp_planned)
-        fprintf(stderr,"[qtier] replan: %llu swaps planned, %llu started, %llu skipped (slot moved since the plan), %llu dropped (next prompt), %d still pending\n",
+        fprintf(stderr,"[qtier] replan: %llu swaps planned, %llu started, %llu skipped (slot moved since the plan), %llu dropped (next prompt), %d still pending, %llu swap notes lost (ring full)\n",
                 (unsigned long long)G.rp_planned, (unsigned long long)G.rp_done, (unsigned long long)G.rp_skipped,
-                (unsigned long long)G.rp_dropped, G.rp_n-G.rp_i);
+                (unsigned long long)G.rp_dropped, G.rp_n-G.rp_i, (unsigned long long)G.sw_lost);
     { uint64_t calls=0,ex=0,rows=0; double h2d=0,kms=0,d2h=0;
       coli_cuda_group_stats(&calls,&ex,&rows,&h2d,&kms,&d2h);
       /* Three zeros used to print as if they were measurements. They are not:
@@ -1545,7 +1545,7 @@ void qt_shutdown(void){
     pthread_mutex_lock(&G.mx);
     free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0;
     G.rp_planned=G.rp_done=G.rp_skipped=G.rp_dropped=0; G.mk_on=0;
-    free(G.sw); G.sw=NULL; G.sw_h=G.sw_n=0; G.rp_live=0;
+    free(G.sw); G.sw=NULL; G.sw_h=G.sw_n=0; G.sw_lost=0; G.rp_live=0;
     pthread_mutex_unlock(&G.mx);
     const char *hf=getenv("HEAT_FILE");
     if(hf){

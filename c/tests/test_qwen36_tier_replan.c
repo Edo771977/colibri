@@ -17,9 +17,11 @@
  * as an LFRU swap has (CACHE_ROUTE determinism).
  * Part 4: under QT_UPLOAD_SYNC=1 a PENDING pair the layer-0 tick starts has
  * landed by that same group: the tick sits between the two drains.
- * The swapped ring (qt_swapped_take: victims when queued, newcomers when
- * resident, only once a re-plan has run), the stale-pair re-check and
- * qt_replan_reset are checked in parts 1 and 2.
+ * Part 0: the swapped ring stays empty through LFRU swaps until a re-plan
+ * has run, then notes them too (the default path records nothing).
+ * The swapped ring's contents (victims when queued, newcomers when
+ * resident), the stale-pair re-check and qt_replan_reset are checked in
+ * parts 1 and 2.
  * Fake CUDA backend, no GPU, no toolkit. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,6 +86,39 @@ static size_t exp_bytes(void) {
 static void set_budget(double experts) {
     char gb[64]; snprintf(gb, sizeof gb, "%.15f", experts * (double)exp_bytes() / 1073741824.0);
     setenv("CUDA_EXPERT_GB", gb, 1);
+}
+
+static void part0(void) {
+    /* one layer, three experts, budget for one: expert 0 resident and cold,
+     * 1 and 2 refused and hot; the next layer-0 issue runs the LFRU pass */
+    setenv("QT_UPLOAD_SYNC", "1", 1);   /* the swap lands inside qt_issue */
+    set_budget(1.5);
+    fake_uploads = 0; fake_upload_hook = NULL; fake_issue_hook = issue_ok;
+    check(qt_init(1, 3, D, IH, 3, 1, 0, 1), "part 0: tier starts");
+    static unsigned char g4[3][D * IH / 2], u4[3][D * IH / 2], d4[3][D * IH / 2];
+    static float sc[3][2 * IH + D];
+    for (int e = 0; e < 3; e++) {
+        memset(g4[e], (unsigned char)(e + 1), sizeof g4[e]); memset(u4[e], (unsigned char)(e + 1), sizeof u4[e]);
+        memset(d4[e], (unsigned char)(e + 1), sizeof d4[e]); for (int i = 0; i < 2 * IH + D; i++) sc[e][i] = 1.0f;
+        qt_note(0, e, g4[e], u4[e], d4[e], sc[e], sc[e] + IH, sc[e] + 2 * IH);
+    }
+    qt_fill_wait();
+    float x[D]; for (int i = 0; i < D; i++) x[i] = (float)i;
+    float out[D]; float val[1] = {1};
+    int ls[8], es[8];
+    pthread_mutex_lock(&G.mx); qs(0, 0)->heat = 0; qs(0, 1)->heat = 100; qs(0, 2)->heat = 50; G.tick = 15; uint64_t sw0 = G.swaps; pthread_mutex_unlock(&G.mx);
+    int eid = 1; uint32_t mask = qt_issue(0, &eid, 1, x); qt_take(mask, val, 1, out);
+    check(G.swaps == sw0 + 1 && qt_is_resident(0, 1) && !qt_is_resident(0, 0), "part 0: an LFRU swap, 1 in, 0 out");
+    check(qt_swapped_take(ls, es, 8) == 0, "part 0: before any re-plan the ring records nothing");
+    uint32_t cnt[3] = {0, 0, 0};
+    check(qt_replan(0, cnt, 24) == 0, "part 0: a re-plan with no counts plans nothing, but the ring is live from here");
+    pthread_mutex_lock(&G.mx); qs(0, 1)->heat = 0; qs(0, 2)->heat = 100; G.tick = 31; pthread_mutex_unlock(&G.mx);
+    eid = 2; mask = qt_issue(0, &eid, 1, x); qt_take(mask, val, 1, out);
+    int n = qt_swapped_take(ls, es, 8);
+    int has1 = 0, has2 = 0; for (int i = 0; i < n; i++) { if (es[i] == 1) has1 = 1; if (es[i] == 2) has2 = 1; }
+    check(n == 2 && has1 && has2, "part 0: after a re-plan the next LFRU swap notes its victim (1) and its newcomer (2)");
+    fake_issue_hook = NULL;
+    qt_shutdown();
 }
 
 static void part1(void) {
@@ -350,6 +385,7 @@ int main(void) {
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1);
     setenv("QT_NO_WARMSTART", "1", 1); setenv("HEAT_FILE", "", 1); setenv("COLI_PLACE", "off", 1);
     fake_ndev = 1;
+    part0();
     part1();
     part2();
     part3();

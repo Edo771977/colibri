@@ -682,10 +682,24 @@ then does two things, in parallel:
 - it rebuilds the int8 copy of each expert no longer resident;
 - it drops the int8 copy of each one now resident.
 
-That keeps two costs out of the decode step and RSS where the warmstart put
-it. Left to the miss path, upstream measured 2,000 re-plan victims at ~7
-ms/token over the next 300 tokens. Upstream rebuilt the victims but never
-dropped the newcomers' copies; dropping them is this port's addition.
+The rebuild stays inside the step (the A/B's `step()` includes it), but
+off the serial miss path. Left to that path, upstream measured 2,000 re-plan
+victims at ~7 ms/token over the next 300 tokens.
+
+RSS comes back to where the warmstart put it once the newcomers have landed.
+Victims are noted when their swap is queued and newcomers only when they
+land, so a step can rebuild victims whose newcomers are still uploading. The
+peak is then higher, by ~3 MB per such victim, until a later step drops the
+newcomers' copies. Each step drains the whole ring, drops first and rebuilds
+second.
+
+Two differences from upstream:
+- Upstream rebuilt the victims but never dropped the newcomers' copies.
+  Dropping them is this port's addition.
+- Upstream rebuilt on every step and noted LFRU evictions with the
+  variable unset. Here nothing is noted until a re-plan has run, and the
+  engine does this only under `QT_PREFILL_REPLAN=1`, so the default path is
+  unchanged.
 
 **What this port leaves out: the in-place overwrite.** Upstream writes the
 newcomer into the victim's device buffers (`coli_cuda_tensor_overwrite`, a
@@ -696,6 +710,12 @@ Upstream measured that path at 1.3 s of prefill for 1,500 swaps. The cap
 bounds it at 24 × 40 = 960 swaps per prompt, and the swaps that drain during
 decode pay it inside the decode steps. The port needs no DLL rebuild.
 
+**Short prefills.** Any routed non-resident (count 1) beats a never-routed
+resident (count 0), so a step of two or three tokens (a chat continuation,
+a served suffix after prefix reuse) can still plan up to min(24, S × 8)
+swaps per layer on that little evidence. The same holds upstream. The
+operator's one-prompt CLI runs do not hit this.
+
 **Which experts run.** The counts are taken after the experts are chosen,
 and without `CACHE_ROUTE` placement never changes which experts run. It does
 change where some of them run: a GPU-resident expert is computed by the
@@ -705,15 +725,17 @@ other residents. Text identity is observed, not guaranteed. Under
 `CACHE_ROUTE=1` the lever prefers residents, so the experts themselves
 change.
 
-**Counters, all printed only under `QT_PREFILL_REPLAN=1`:**
+**Counters.** The first three are printed only under `QT_PREFILL_REPLAN=1`:
 - `[qtier] replan: N swaps planned, M started, S skipped (slot moved since the
-  plan), D dropped (next prompt), K still pending`.
+  plan), D dropped (next prompt), K still pending, L swap notes lost (ring
+  full)`. The ring holds 8,192 notes; a lost note leaves a victim to the
+  lazy miss path and a newcomer with its int8 copy.
 - `[qtier] after the prefill: hit X %`, the hit rate from the end of the
   prefill on, which is the number a re-plan moves. It is worded so that it
   is not read as the `VRAM hit rate:` line, which covers the whole run.
   `tools/misure-envab.ps1` prints it per arm as `dopo il prefill`.
 - `[qwen36] replan RAM: N int8 copies rebuilt ..., M dropped ...`.
-- `LFRU swaps` still counts only the tick's swaps.
+- `LFRU swaps` (always printed) still counts only the tick's swaps.
 - The startup line `[qwen36] QT_PREFILL_REPLAN=1: ...` shows that the
   switch took effect (the tier must be on).
 - Before the exit statistics the engine waits for the uploads in flight, so

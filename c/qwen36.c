@@ -2573,49 +2573,70 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
 
 /* QT_PREFILL_REPLAN: keep the RAM side of the swaps where the warmstart left
  * it, before the layers of a step run (port of upstream 7555e847's
- * tier_rebuild_evicted, extended). On an int4 container the warmstart dropped
- * the int8 copy of every resident expert: a swap's victim needs it back for
- * the CPU path, and a newcomer's is now spare. Left to the miss path, upstream
- * measured 2,000 re-plan victims at ~7 ms/token over the next 300 tokens
- * (slot_ensure_int8 inside the decode step); here the victims are rebuilt in
- * parallel at the start of the step, and the newcomers' copies dropped, so the
- * swaps do not grow RSS. The current residency decides, not the event: an
- * expert swapped out and back in is treated as resident. Each slot once per
- * call (a duplicate would race its own rebuild). The slots are read through
- * the cache index, not expert_get, so the cache's hit counters do not move. */
+ * tier_rebuild_evicted, extended, and like the rest of the port only under
+ * QT_PREFILL_REPLAN, where upstream ran it on every step). On an int4
+ * container the warmstart dropped the int8 copy of every resident expert: a
+ * swap's victim needs it back for the CPU path, and a newcomer's is now
+ * spare. Left to the miss path, upstream measured 2,000 re-plan victims at ~7
+ * ms/token over the next 300 tokens (slot_ensure_int8, serially, inside the
+ * layers); here the victims are rebuilt in parallel at the start of the step,
+ * still inside the step, and the newcomers' copies dropped. Victims are noted
+ * when their swap is queued and newcomers when they land, so RSS is back
+ * where the warmstart put it only once the newcomers have landed: a step can
+ * rebuild victims whose newcomers are still uploading. The current residency
+ * decides, not the event: an expert swapped out and back in is treated as
+ * resident. The slots are read through the cache index, not expert_get, so
+ * the cache's hit counters do not move. */
 static uint64_t g_rp_rebuilt, g_rp_dropped8;
 static void tier_sync_swapped(Model *m) {
     if (!qt_ready()) return;
-    int ls[512], es[512];
-    int n = qt_swapped_take(ls, es, 512);
-    if (n <= 0) return;
     Cfg *c = &m->c;
     static int keep8 = -1;
     if (keep8 < 0) keep8 = getenv("COLI_KEEP_INT8") != NULL;
-    Slot *sl[512]; int res[512], k = 0;
-    for (int i = 0; i < n; i++) {
-        int dup = 0;
-        for (int j = 0; j < i; j++) if (ls[j] == ls[i] && es[j] == es[i]) { dup = 1; break; }
-        if (dup || ls[i] < 0 || ls[i] >= c->n_layers || es[i] < 0 || es[i] >= c->n_experts) continue;
-        pthread_mutex_lock(&g_pilot_mx);
-        Slot *e = slot_indexed(m, ls[i], es[i]);
-        pthread_mutex_unlock(&g_pilot_mx);
-        if (!e) continue;
-        sl[k] = e; res[k] = qt_is_resident(ls[i], es[i]); k++;
-    }
-    uint64_t rb = 0, dr = 0;
-    #pragma omp parallel for schedule(dynamic, 4) reduction(+:rb,dr)
-    for (int i = 0; i < k; i++) {
-        Slot *e = sl[i];
-        if (res[i]) {
-            /* resident: the int8 block is spare when the packed copy is the
-             * tier's source (int4); an int8 container keeps its only copy */
-            if (!keep8 && e->g && e->g4) { free(e->g); e->g = e->u = e->d = NULL; dr++; }
-        } else if (!e->g && e->g4) {
-            slot_ensure_int8(m, e); rb++;
+    /* The whole backlog at once (a prefill can note 2 x 24 x 40 swaps; what
+     * is left behind would only grow the ring until it overflows), each slot
+     * once (a duplicate would race its own rebuild in the loops below). */
+    size_t nslot = (size_t)c->n_layers * c->n_experts;
+    uint8_t *seen = NULL;
+    Slot **sl = NULL; uint8_t *res = NULL; int k = 0, cap = 0;
+    int ls[512], es[512], n;
+    while ((n = qt_swapped_take(ls, es, 512)) > 0) {
+        if (!seen && !(seen = calloc(nslot, 1))) break;
+        for (int i = 0; i < n; i++) {
+            if (ls[i] < 0 || ls[i] >= c->n_layers || es[i] < 0 || es[i] >= c->n_experts) continue;
+            size_t gi = (size_t)ls[i] * c->n_experts + es[i];
+            if (seen[gi]) continue;
+            seen[gi] = 1;
+            pthread_mutex_lock(&g_pilot_mx);
+            Slot *e = slot_indexed(m, ls[i], es[i]);
+            pthread_mutex_unlock(&g_pilot_mx);
+            if (!e) continue;
+            if (k == cap) {
+                int nc = cap ? 2 * cap : 512;
+                Slot **s2 = realloc(sl, (size_t)nc * sizeof *sl); if (s2) sl = s2;
+                uint8_t *r2 = s2 ? realloc(res, (size_t)nc) : NULL; if (r2) res = r2;
+                if (!s2 || !r2) break;
+                cap = nc;
+            }
+            sl[k] = e; res[k] = (uint8_t)qt_is_resident(ls[i], es[i]); k++;
         }
     }
+    uint64_t rb = 0, dr = 0;
+    /* drops first, then rebuilds, so the step's peak is not the sum */
+    #pragma omp parallel for schedule(dynamic, 4) reduction(+:dr)
+    for (int i = 0; i < k; i++) {
+        Slot *e = sl[i];
+        /* resident: the int8 block is spare when the packed copy is the
+         * tier's source (int4); an int8 container keeps its only copy */
+        if (res[i] && !keep8 && e->g && e->g4) { free(e->g); e->g = e->u = e->d = NULL; dr++; }
+    }
+    #pragma omp parallel for schedule(dynamic, 4) reduction(+:rb)
+    for (int i = 0; i < k; i++) {
+        Slot *e = sl[i];
+        if (!res[i] && !e->g && e->g4) { slot_ensure_int8(m, e); rb++; }
+    }
     g_rp_rebuilt += rb; g_rp_dropped8 += dr;
+    free(seen); free(sl); free(res);
 }
 
 static void pin_hot_experts(Model *m) {
