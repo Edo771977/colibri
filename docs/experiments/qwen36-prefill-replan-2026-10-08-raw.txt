@@ -13,8 +13,9 @@ Summary:
      pairs negative.
   2. Where it comes from: the re-plan planned 147 swaps during the
      25-token prefill, layer by layer, all started by exit (when is not
-     shown: the 48-entry queue takes what it can, the rest start four per
-     decode token); whole-run VRAM hit 93.4 % -> 97.7 %, misses 3203 -> 1133,
+     shown: the 48-entry queue takes what it can, the rest start at the
+     next layer's re-plan or, after the prefill, four per decode token);
+     whole-run VRAM hit 93.4 % -> 97.7 %, misses 3203 -> 1133,
      cpu-miss 2.01 -> 0.56 ms/token, moe 8.40 -> 7.14. From the end of the
      prefill on, the ON arm hit 98.2 %.
   3. The waiver was not needed: each arm wrote one text in six runs. The
@@ -146,8 +147,8 @@ misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
     (prompt and decode rows) by 2070. moe falls by 1.26 and step() by
     1.00. The 0.26 between them is outside the per-phase timers: step()
     minus moe, attn, dn and head reads 0.90 (OFF) and 1.16 (ON), which is
-    consistent with the int8 rebuild at the top of the first decode step
-    (not isolated). take rises 0.73 -> 0.87, and wait, which is part of
+    consistent with the int8 rebuilds at the top of the decode steps (not
+    isolated). take rises 0.73 -> 0.87, and wait, which is part of
     take, 0.64 -> 0.78. Candidates: more experts run on the GPU while
     the CPU side finishes sooner, and swaps whose cudaFree / cudaMalloc
     synchronise the device during decode. The meters do not separate
@@ -159,9 +160,9 @@ misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
   - Fewer substitutions (4.5 % against 6.4 % on 4 October, another
     session and build; today's OFF logs were not searched). That is
     consistent with more of each token's own top experts being resident,
-    leaving CACHE_ROUTE fewer slots to substitute. The 48640 rows include
+    leaving CACHE_ROUTE fewer slots to substitute. The 48640 slots cover
     the 25 prefill rows, which each layer routes before its own re-plan,
-    and the decode rows of a text that differs from position 121.
+    and the 127 decode rows of a text that differs from position 121.
     Whether the re-plan brings the text closer to the plain router's is
     not shown: at position 121 the two agree, and the hashes differ. No
     perplexity was taken, so the quality is not measured.
@@ -172,11 +173,14 @@ misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
     numbers. Each log prints them (`TTFT:`, `[timers] prefill`, and
     `PEAK RSS` for the memory), readable with
       findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" envab-*.log
-    The TTFT stops before the first decode step(), so it excludes the
-    int8 rebuild. The rest is: the rebuild of the 153 int8 copies runs at the
-    top of the first decode step(), inside its timer, and any upload
-    still running when decode began, or a pending pair a tick started,
-    costs inside decode too. The -1.00 is net of those.
+    These logs last only until the next misure-envab.ps1 run, which
+    deletes envab-*.log. The TTFT stops before the first decode step(),
+    so it excludes the int8 rebuilds. The decode-side part is in these
+    numbers: the int8 rebuilds run at the top of the decode step() after
+    each swap is queued (the prefill-queued victims at the first one),
+    inside its timer, and any upload still running when decode began, or
+    a pending pair a tick started, costs inside decode too. The -1.00 is
+    net of those.
   - The OFF arm reads 15.87 ms/token; on 4 October the same configuration
     read 15.55 (another session and build).
 
