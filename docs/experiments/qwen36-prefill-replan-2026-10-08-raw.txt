@@ -1,0 +1,162 @@
+Qwen3.6-35B-A3B: QT_PREFILL_REPLAN=1 (the port of upstream's prefill
+re-plan, #77) on top of CACHE_ROUTE=1 ROUTE_J=4, under the CUDA tier with
+the DeltaNet on the GPU, no QT_UPLOAD_SYNC.
+8 October 2026, evening, on the operator's machine (RTX 4070 Ti SUPER,
+Ryzen 9 7950X, Windows, qwen36_i4_gs64 read from D:, cap 256, 4 bits).
+
+Summary:
+
+  1. misure-envab.ps1, QT_PREFILL_REPLAN absent vs =1, six ABBA pairs,
+     heat table, CACHE_ROUTE=1 ROUTE_J=4 COLI_DN_GPU=1
+     COLI_CUDA_KEEPALIVE=1 in both arms, -AllowTextDrift ON: step() 15.87
+     -> 14.87 ms/token, paired delta -1.00, 95 % [-1.26, -0.74], 6 of 6
+     pairs negative.
+  2. Where it comes from: the re-plan made 147 swaps after the 25-token
+     prefill; whole-run VRAM hit 93.4 % -> 97.7 %, misses 3203 -> 1133,
+     cpu-miss 2.01 -> 0.56 ms/token, moe 8.40 -> 7.14. From the end of the
+     prefill on, the ON arm hit 98.2 %.
+  3. The waiver was not needed: each arm wrote one text in six runs. The
+     OFF text is the CACHE_ROUTE=1 ROUTE_J=4 text of the 4 October records
+     (b967e6bd24da75bb); the ON text (87ce3f1b34ce2d6b) differs from it
+     from UTF-16 position 121. The lever substituted fewer slots with the
+     re-plan: 4.5 % (2186 of 48640) in every ON run.
+
+Reading: on this prompt and 128 tokens, the re-plan is measured faster on
+top of the setting ISTRUZIONI.md recommends, with a tight interval. Not
+measured: the prefill and TTFT cost of the 147 swaps (the script times
+decode step() only), the quality with the re-plan (no perplexity was
+taken), other prompts, longer runs, and the re-plan without CACHE_ROUTE.
+
+Everything below is from output the operator pasted in the session. The
+logs stay on the operator's machine; none is committed and no
+evidence.sha256 exists for them.
+
+--- build -------------------------------------------------------------------------
+
+A new Visual Studio 2022 Developer Command Prompt (the paste starts with
+its banner), then:
+
+  cd /d C:\colibri-fork\c
+  set PATH=C:\msys64\clang64\bin;%PATH%;C:\msys64\usr\bin
+  git pull                                   (c73a8ff..5ed98e5, fast-forward: main at the merge of #77)
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+
+  eseguibile: .\qwen36_clang.exe | 404480 byte | 2026-10-08 21:19:17 | sha256 CED1C97A27121D71
+  build-config: clang|-D_FILE_OFFSET_BITS=64 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -DCOLI_CUDA|-lm -fopenmp  -lpsapi -lpthread -Wl,--stack,8388608 |CUDA=0|CUDA_DLL=1|ARCH=native|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=0
+  coli_cuda.dll: 819712 byte | 2026-09-28 21:42:02 | sha256 230CA632A2CEA752
+
+--- the command -----------------------------------------------------------------
+
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set CACHE_ROUTE=1
+  set ROUTE_J=4
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var QT_PREFILL_REPLAN -Value 1 -Marker "[qwen36] QT_PREFILL_REPLAN=1" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J -AllowTextDrift ON
+
+  parametri: cap=256 bits=4 N_NEW=128 rip=6 | OFF: QT_PREFILL_REPLAN assente | ON: QT_PREFILL_REPLAN=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J -- DEROGA  | testo-variabile=ON -- DEROGA: i run di un braccio nominato possono scrivere testi diversi
+  marker: [qwen36] QT_PREFILL_REPLAN=1  (testo trovato in C:\colibri-fork\c\qwen36_clang.exe)
+  heat: C:\colibri-fork\c\heat.caldo.bin | 40972 byte | 40 layer x 256 esperti | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | costruita su un prompt sha256 6A4F0BCF64192EA3, diverso dal prompt misurato (come CROSS) | heat.caldo.bin.sha256: tabella= verificata | condizioni della costruzione diverse da questa corsa: snap, allow_env, eseguibile, dll
+
+The four `set` lines are in the paste. The ON logs carry the route
+meters' "CACHE_ROUTE J=4", and both arms "GPU: dnproj 3810/3810, dnout
+3810/3810" with the whole DeltaNet call in the proj slot (the GPU decode
+path). As in the earlier records, no log was checked for "[cuda]
+keep-alive active:".
+
+Invariants: heat table unchanged and loaded in all 12 runs; engine banner
+identical (== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192
+pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==); [place] auto identical in
+all 12 runs; residency 6812/10240 in all runs (the engine waits for the
+uploads in flight before its exit statistics under QT_PREFILL_REPLAN=1).
+
+--- 1. the A/B --------------------------------------------------------------------
+
+  rip 1 (OFF prima)  OFF  15.90  ON  14.90  delta  -1.00 ms/token
+  rip 2 (ON prima )  OFF  16.00  ON  15.40  delta  -0.60 ms/token
+  rip 3 (OFF prima)  OFF  15.80  ON  14.50  delta  -1.30 ms/token
+  rip 4 (ON prima )  OFF  15.70  ON  14.80  delta  -0.90 ms/token
+  rip 5 (OFF prima)  OFF  15.80  ON  14.80  delta  -1.00 ms/token
+  rip 6 (ON prima )  OFF  16.00  ON  14.80  delta  -1.20 ms/token
+
+  media    -1.00   sd  0.24   se  0.10   df 5
+  intervallo 95 %:  [-1.26 ; -0.74]   ampiezza +-0.26
+  negativi 6/6
+  position (ABBA): OFF first -1.00 -1.30 -1.00, ON first -0.60 -0.90
+  -1.20, difference of the group means -0.20
+
+  OFF    step  15.87  moe   8.40  attn  1.82  dn  3.73  head  1.02
+         (shared)  3.27  (router)  0.82  wait  0.64
+         issue  1.34  cpu-miss  2.01  take  0.73  sh-ovl  3.27  hit  93.4 %  swaps  8.0  miss 3203
+  ON     step  14.87  moe   7.14  attn  1.82  dn  3.74  head  1.01
+         (shared)  3.33  (router)  0.80  wait  0.78
+         issue  1.33  cpu-miss  0.56  take  0.87  sh-ovl  3.33  hit  97.7 %  swaps  6.0  miss 1133
+         dopo il prefill: hit  98.2 %
+  (dn-sub / dn-split: the whole DeltaNet call in the proj slot, dnproj and
+  dnout 3810/3810, in both arms)
+
+The miss counts were the same in all six runs of each arm (the script
+prints a single value only when they are).
+
+--- 2. text ------------------------------------------------------------------------
+
+  braccio OFF: 1 testo in 6 run (verificato, nessuna deroga): sha256 b967e6bd24da75bb
+  braccio ON: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  testo generato DIVERSO fra i due bracci -- solo ripetizione 1: primo carattere diverso alla posizione 121 (contata da 0, in unita' UTF-16, sullo stdout letto).
+    OFF   ...OS), poiché deve garantire che ogni pro
+    ON    ...SO), poiché deve garantire che ogni pro
+  (the paste shows "é" as "├®", the console code page)
+
+At position 121 the ON arm reads "SO)", as the plain router's text did
+in the 4 October records (there "SO), poiché" against CACHE_ROUTE's "OS),
+poiché" at the same position). Its hash is not the plain router's
+(4a000cc01f310b64), so it differs from that text somewhere else; where is
+not in the paste.
+
+--- 3. the re-plan's counters (the ON logs) --------------------------------------
+
+  findstr /C:"replan" /C:"after the prefill" /C:"CACHE_ROUTE J=" envab-ON-r*.log
+  (r1 .. r6: the same four lines, the same numbers)
+
+  [qwen36] replan RAM: 153 int8 copies rebuilt for swapped-out experts, 153 dropped for swapped-in ones
+  [qtier] after the prefill: hit 98.2 % (39925 hits, 715 misses)
+  [qtier] replan: 147 swaps planned, 147 started, 0 skipped (slot moved since the plan), 0 dropped (next prompt), 0 still
+  CACHE_ROUTE J=4 M=12 P=0.00 alpha=1.00 | swap 4.5% (2186/48640, 2186 to VRAM)
+
+The replan line ends at "0 still" in the paste, i.e. "0 still pending";
+the rest of that line (the lost-notes count) is not in the paste. 153 =
+147 re-plan swaps + 6 LFRU swaps (the ON arm's "swaps 6.0"), each with one
+victim rebuilt and one newcomer dropped: the RAM side balanced. The OFF
+logs were not searched; on 4 October the same OFF configuration, with
+the same text and the same 3203 misses, substituted 6.4 % (3119 of
+48640).
+
+--- reading -----------------------------------------------------------------------
+
+  - The gain is the lever's target. cpu-miss falls by 1.45 ms per decode
+    token (2.01 -> 0.56), and the misses over the whole run (prompt and
+    decode rows) by 2070. moe falls by 1.26 and step() by 1.00. take
+    rises 0.73 -> 0.87, and wait, which is part of take, 0.64 -> 0.78:
+    more experts run on the GPU, and the CPU side finishes sooner. The
+    meters do not separate the two, and the rise is not attributed.
+  - The hit rates: 97.7 % covers the whole run, including the 25 prefill
+    rows routed before the re-plan; 98.2 % covers the decode only. The
+    OFF arm prints no decode-only line (it is printed under the re-plan
+    only).
+  - Fewer substitutions (4.5 % against 6.4 % on 4 October): with more of
+    each token's own top experts resident, CACHE_ROUTE has fewer slots
+    to substitute. Whether that brings the text closer to the plain
+    router's is not shown: at position 121 the two agree, and the hashes
+    differ. No perplexity was taken, so the quality is not measured.
+  - The swaps cost the prefill: 147 swaps, each a cudaFree and a
+    cudaMalloc per tensor in the uploader thread, plus the staging copies
+    under the tier's lock. The script does not time the prefill or the
+    TTFT, so that cost is not in these numbers.
+  - The OFF arm reads 15.87 ms/token; on 4 October the same configuration
+    read 15.55 (another session and build).
+
+--- what this run did NOT measure ---------------------------------------------------
+
+  - The TTFT / prefill cost of the re-plan.
+  - Perplexity with the re-plan.
+  - The re-plan without CACHE_ROUTE, other prompts, longer prompts (more
+    evidence per layer, and more swaps), runs longer than 128 tokens.
