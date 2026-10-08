@@ -760,14 +760,40 @@ overwrite and the eager rebuild:
 Without the overwrite, this port's TTFT and the cost of the swaps that drain
 during decode are expected to be higher. On the operator's 16 GB card the
 whole-run hit rate is already 86.7 % (93.4 % under `CACHE_ROUTE=1
-ROUTE_J=4`), so the room is smaller. Nothing is measured here yet.
+ROUTE_J=4`), so the room is smaller.
+
+**Measured here** (8 October; the RTX 4070 Ti SUPER; on top of
+`CACHE_ROUTE=1 ROUTE_J=4 COLI_DN_GPU=1`, keep-alive and a fixed heat table
+in both arms; no sync; prompt25.txt; 128 tokens; six ABBA pairs):
+- step() 15.87 -> 14.87 ms/token, delta -1.00, 95 % [-1.26, -0.74], 6 of 6;
+- the re-plan planned 147 swaps during the 25-token prefill, layer by
+  layer (all started by exit; when is not shown);
+- whole-run hit 93.4 -> 97.7 %, misses 3203 -> 1133, cpu-miss 2.01 -> 0.56
+  ms/token; decode-only hit 98.2 %;
+- CACHE_ROUTE's substitutions 4.5 % (6.4 % on 4 October without the
+  re-plan, another session and build; today's OFF logs not searched);
+- each arm repeated its text, and the two texts differ;
+- the price, read from the same logs: TTFT 0.44 -> 0.65 s, +0.21 s, 95 %
+  [+0.14, +0.28], 6 of 6 (the prefill's moe +152 ms, dn +51 ms); peak RSS
+  31.59 -> 31.60..31.62 GB. At 128 tokens the generation (prefill plus 127
+  decode steps) is about 0.08 s longer, computed per pair, 95 % [+0.01,
+  +0.15]. It would break even at about 210 generated tokens (~110 to
+  ~380 across the two intervals) if the per-token gain held beyond 128
+  tokens, which is not measured.
+
+Not measured: perplexity, other prompts and lengths, a heat table rewritten
+at each exit, and the re-plan without `CACHE_ROUTE` or keep-alive
+(docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt).
 
 The A/B:
 
     tools/misure-envab.ps1 -Var QT_PREFILL_REPLAN -Marker "[qwen36] QT_PREFILL_REPLAN=1" -AllowTextDrift ON
 
 The script times decode `step()` only: the prefill and TTFT cost is not in
-its numbers.
+its numbers. Every log prints them, and they can be read before the next
+run deletes the logs:
+
+    findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" envab-*.log
 
 ## The per-row int8 dense GEMV: R output rows per block (`COLI_CUDA_I8_ROWS`)
 

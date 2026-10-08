@@ -2471,10 +2471,16 @@ static void slot_ensure_int8(Model *m, Slot *s) {
 /* QT_PREFILL_REPLAN=1 (port of upstream 7555e847): after each prefill layer's
  * routing, hand the CUDA tier that layer's counts over the prompt rows
  * (qt_replan), so residents this prompt never routed to make way for the ones
- * it routed to most, while the rest of the prefill still computes. Without
+ * it routed to most, while the rest of the prefill still computes (as many as
+ * the upload queue takes; the rest start at the next layer's re-plan or on
+ * the decode ticks). Without
  * CACHE_ROUTE placement never changes routing; under CACHE_ROUTE=1 it does
- * (the lever prefers residents), so the text can change. Opt-in: on the
- * operator's box it is not measured yet. QT_PREFILL_REPLAN_MAX caps the swaps
+ * (the lever prefers residents), so the text can change. Opt-in; measured on
+ * the operator's box on top of CACHE_ROUTE=1 ROUTE_J=4 at -1.00 ms/token
+ * and +0.21 s to the first token: slower end to end at 128 tokens, breaking
+ * even at about 210 only if the per-token gain held beyond them (not
+ * measured; docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt).
+ * QT_PREFILL_REPLAN_MAX caps the swaps
  * per layer (24, upstream's choice). */
 static int prefill_replan_on(void) {
     static int on = -1;

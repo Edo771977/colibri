@@ -128,6 +128,26 @@ qwen36.exe 256 4 prompt.txt
     il testo generato (nella prova, dal carattere 121): è una scelta, non un'ottimizzazione
     esatta. `ROUTE_J=2` ha dato -2,2 ms/token (in un'altra sessione e build) e +1,6% di
     perplexity (su un solo testo): non è stabilito che sia più veloce né che costi di più.
+  - `set QT_PREFILL_REPLAN=1`, insieme ai tre sopra: mentre legge il prompt sceglie gli esperti
+    che il prompt usa di più e li porta in VRAM al posto di quelli che usa meno (gli scambi
+    partono durante il prompt o nei primi token generati). Misurato l'8 ottobre sopra `CACHE_ROUTE=1 ROUTE_J=4`:
+    -1,00 ms/token sullo step, 15,87 → 14,87 (l'equivalente di ~63 → ~67 tok/s, ricavato dallo
+    step e non misurato direttamente), intervallo 95 % [-1,26 ; -0,74], 6 coppie su 6, con
+    `COLI_CUDA_KEEPALIVE=1` e la tabella heat fissa in entrambi i bracci, su un solo prompt di
+    25 token e 128 token generati
+    (`docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt`). Il braccio senza re-plan qui
+    misura 15,87 contro il 15,55 del 4 ottobre: altra sessione e build, i tempi assoluti delle due
+    misure non si confrontano. La tabella heat era costruita su un altro prompt. Il
+    guadagno non è misurato con `HEAT_FILE=heat.bin` riscritta a ogni uscita (come nel blocco
+    sopra), né senza keep-alive. Il prezzo si paga prima della prima parola: il tempo fino alla
+    prima parola passa da 0,44 a 0,65 s (+0,21 s, intervallo 95 % [+0,14 ; +0,28], 6 coppie su
+    6), letto dagli stessi log; la RAM di picco resta praticamente la stessa (+0,01-0,03 GB su
+    31,6 GB). Con i 128 token della prova la generazione intera (prima parola più 127 passi)
+    dura circa 0,08 s in più, calcolato dalle due misure (intervallo 95 % [+0,01 ; +0,15], più
+    lunga in 5 coppie su 6). Se il guadagno per token restasse lo stesso oltre i 128 token (non
+    misurato), converrebbe da circa 210 token generati in su (fra ~110 e ~380 secondo gli
+    intervalli). Non misurati: la qualità (nessuna perplexity con il re-plan; il testo cambia),
+    prompt più lunghi e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)

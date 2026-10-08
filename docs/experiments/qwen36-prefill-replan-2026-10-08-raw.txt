@@ -1,0 +1,294 @@
+Qwen3.6-35B-A3B: QT_PREFILL_REPLAN=1 (the port of upstream's prefill
+re-plan, #77) on top of CACHE_ROUTE=1 ROUTE_J=4, under the CUDA tier with
+the DeltaNet on the GPU, no QT_UPLOAD_SYNC.
+8 October 2026, evening, on the operator's machine (RTX 4070 Ti SUPER,
+Ryzen 9 7950X, Windows, qwen36_i4_gs64 read from D:, cap 256, 4 bits).
+
+Summary:
+
+  1. misure-envab.ps1, QT_PREFILL_REPLAN absent vs =1, six ABBA pairs,
+     heat table, CACHE_ROUTE=1 ROUTE_J=4 COLI_DN_GPU=1
+     COLI_CUDA_KEEPALIVE=1 in both arms, -AllowTextDrift ON: step() 15.87
+     -> 14.87 ms/token, paired delta -1.00, 95 % [-1.26, -0.74], 6 of 6
+     pairs negative.
+  2. Where it comes from: the re-plan planned 147 swaps during the
+     25-token prefill, layer by layer, all started by exit (when is not
+     shown: the 48-entry queue takes what it can, the rest start at the
+     next layer's re-plan or, after the prefill, four per decode token);
+     whole-run VRAM hit 93.4 % -> 97.7 %, misses 3203 -> 1133,
+     cpu-miss 2.01 -> 0.56 ms/token, moe 8.40 -> 7.14. From the end of the
+     prefill on, the ON arm hit 98.2 %.
+  3. The waiver was not needed: each arm wrote one text in six runs. The
+     OFF text is the CACHE_ROUTE=1 ROUTE_J=4 text of the 4 October records
+     (b967e6bd24da75bb); the ON text (87ce3f1b34ce2d6b) differs from it
+     from UTF-16 position 121. CACHE_ROUTE substituted 4.5 % of the
+     slots (2186 of 48640) in every ON run; today's OFF logs were not
+     searched for the same meter.
+
+  4. The price, read from the same logs afterwards (section 4): TTFT
+     0.44 -> 0.65 s, paired delta +0.21 s, 95 % [+0.14, +0.28], 6 of 6
+     positive; the prefill's moe timer +152 ms and dn +51 ms; peak RSS
+     31.59 -> 31.60..31.62 GB.
+
+Reading: on this prompt, the re-plan is measured faster per decode token
+on top of the setting ISTRUZIONI.md recommends (-1.00 ms/token) and
+slower to the first token (+0.21 s). At this run's 128 tokens the whole
+generation (the prefill plus 127 decode steps) takes about 0.08 s longer:
+per repetition, TTFT delta + 127 x step() delta gives +0.083 s, 95 %
+[+0.015, +0.151], 5 pairs of 6 positive. It would break
+even at about 210 generated tokens (0.21 s / 1.00 ms; ~110 to ~380
+across the two intervals) if the -1.00 ms/token held beyond 128 tokens,
+which is not measured. Not measured: the quality with the re-plan (no perplexity was
+taken), other prompts, longer runs, and the re-plan without CACHE_ROUTE.
+
+Everything below is from output the operator pasted in the session. The
+logs stay on the operator's machine; none is committed and no
+evidence.sha256 exists for them.
+
+--- build -------------------------------------------------------------------------
+
+A new Visual Studio 2022 Developer Command Prompt (the paste starts with
+its banner), then:
+
+  cd /d C:\colibri-fork\c
+  set PATH=C:\msys64\clang64\bin;%PATH%;C:\msys64\usr\bin
+  git pull                                   (c73a8ff..5ed98e5, fast-forward: main at the merge of #77)
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+
+  eseguibile: .\qwen36_clang.exe | 404480 byte | 2026-10-08 21:19:17 | sha256 CED1C97A27121D71
+  build-config: clang|-D_FILE_OFFSET_BITS=64 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -DCOLI_CUDA|-lm -fopenmp  -lpsapi -lpthread -Wl,--stack,8388608 |CUDA=0|CUDA_DLL=1|ARCH=native|CUDA_ARCH=native|METAL=0|HIP=0|HIP_DLL=0|HIP_ARCH=native|VK=0
+  coli_cuda.dll: 819712 byte | 2026-09-28 21:42:02 | sha256 230CA632A2CEA752
+
+--- the command -----------------------------------------------------------------
+
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set CACHE_ROUTE=1
+  set ROUTE_J=4
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var QT_PREFILL_REPLAN -Value 1 -Marker "[qwen36] QT_PREFILL_REPLAN=1" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J -AllowTextDrift ON
+
+  parametri: cap=256 bits=4 N_NEW=128 rip=6 | OFF: QT_PREFILL_REPLAN assente | ON: QT_PREFILL_REPLAN=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J -- DEROGA  | testo-variabile=ON -- DEROGA: i run di un braccio nominato possono scrivere testi diversi
+  marker: [qwen36] QT_PREFILL_REPLAN=1  (testo trovato in C:\colibri-fork\c\qwen36_clang.exe)
+  heat: C:\colibri-fork\c\heat.caldo.bin | 40972 byte | 40 layer x 256 esperti | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | costruita su un prompt sha256 6A4F0BCF64192EA3, diverso dal prompt misurato (come CROSS) | heat.caldo.bin.sha256: tabella= verificata | condizioni della costruzione diverse da questa corsa: snap, allow_env, eseguibile, dll
+
+The four `set` lines are in the paste. The ON logs carry the route
+meters' "CACHE_ROUTE J=4", and both arms "GPU: dnproj 3810/3810, dnout
+3810/3810" with the whole DeltaNet call in the proj slot (the GPU decode
+path). As in the earlier records, no log was checked for "[cuda]
+keep-alive active:".
+
+Invariants: heat table unchanged and loaded in all 12 runs; engine banner
+identical (== qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192
+pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==); [place] auto identical in
+all 12 runs; residency 6812/10240 in all runs (the engine waits for the
+uploads in flight before its exit statistics under QT_PREFILL_REPLAN=1).
+
+--- 1. the A/B --------------------------------------------------------------------
+
+  rip 1 (OFF prima)  OFF  15.90  ON  14.90  delta  -1.00 ms/token
+  rip 2 (ON prima )  OFF  16.00  ON  15.40  delta  -0.60 ms/token
+  rip 3 (OFF prima)  OFF  15.80  ON  14.50  delta  -1.30 ms/token
+  rip 4 (ON prima )  OFF  15.70  ON  14.80  delta  -0.90 ms/token
+  rip 5 (OFF prima)  OFF  15.80  ON  14.80  delta  -1.00 ms/token
+  rip 6 (ON prima )  OFF  16.00  ON  14.80  delta  -1.20 ms/token
+
+  media    -1.00   sd  0.24   se  0.10   df 5
+  intervallo 95 %:  [-1.26 ; -0.74]   ampiezza +-0.26
+  negativi 6/6
+  position (ABBA): OFF first -1.00 -1.30 -1.00, ON first -0.60 -0.90
+  -1.20, difference of the group means -0.20
+
+  OFF    step  15.87  moe   8.40  attn  1.82  dn  3.73  head  1.02
+         (shared)  3.27  (router)  0.82  wait  0.64
+         issue  1.34  cpu-miss  2.01  take  0.73  sh-ovl  3.27  hit  93.4 %  swaps  8.0  miss 3203
+  ON     step  14.87  moe   7.14  attn  1.82  dn  3.74  head  1.01
+         (shared)  3.33  (router)  0.80  wait  0.78
+         issue  1.33  cpu-miss  0.56  take  0.87  sh-ovl  3.33  hit  97.7 %  swaps  6.0  miss 1133
+         dopo il prefill: hit  98.2 %
+  (dn-sub / dn-split: the whole DeltaNet call in the proj slot, dnproj and
+  dnout 3810/3810, in both arms)
+
+The miss counts were the same in all six runs of each arm (the script
+prints a single value only when they are).
+
+--- 2. text ------------------------------------------------------------------------
+
+  braccio OFF: 1 testo in 6 run (verificato, nessuna deroga): sha256 b967e6bd24da75bb
+  braccio ON: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  testo generato DIVERSO fra i due bracci -- solo ripetizione 1: primo carattere diverso alla posizione 121 (contata da 0, in unita' UTF-16, sullo stdout letto).
+    OFF   ...OS), poiché deve garantire che ogni pro
+    ON    ...SO), poiché deve garantire che ogni pro
+  (the paste shows "é" as "├®", the console code page)
+
+At position 121 the ON arm reads "SO)", as the plain router's text did
+in the two 4 October ROUTE_J=4 records (there "SO), poiché" against
+CACHE_ROUTE's "OS), poiché" at the same position; the ROUTE_J=2 record's
+texts part at position 83). Its hash is not the plain router's
+(4a000cc01f310b64), so it differs from that text somewhere else; where is
+not in the paste.
+
+--- 3. the re-plan's counters (the ON logs) --------------------------------------
+
+  findstr /C:"replan" /C:"after the prefill" /C:"CACHE_ROUTE J=" envab-ON-r*.log
+  (r1 .. r6: the same four lines, the same numbers)
+
+  [qwen36] replan RAM: 153 int8 copies rebuilt for swapped-out experts, 153 dropped for swapped-in ones
+  [qtier] after the prefill: hit 98.2 % (39925 hits, 715 misses)
+  [qtier] replan: 147 swaps planned, 147 started, 0 skipped (slot moved since the plan), 0 dropped (next prompt), 0 still
+  CACHE_ROUTE J=4 M=12 P=0.00 alpha=1.00 | swap 4.5% (2186/48640, 2186 to VRAM)
+
+The replan line ends at "0 still" in the paste, i.e. "0 still pending";
+the rest of that line (the lost-notes count) is not in the paste. 153
+rebuilt and 153 dropped is consistent with 147 re-plan swaps plus 6 LFRU
+swaps ("swaps 6.0" is the six-run mean; the script prints no per-run
+count), one victim rebuilt and one newcomer dropped each: the RAM side
+balanced, as far as these two counters show (they count the slots whose
+int8 copy changed when a step synced, and nothing syncs after the last
+step). The OFF logs were not searched; on 4 October the same OFF
+configuration (the nosync record's ON arm), with the same text and 3203
+misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
+
+--- reading -----------------------------------------------------------------------
+
+  - The gain is where the re-plan aims: cpu-miss falls by 1.45 ms per
+    decode token (2.01 -> 0.56), and the misses over the whole run
+    (prompt and decode rows) by 2070. moe falls by 1.26 and step() by
+    1.00. The 0.26 between them is outside the per-phase timers: step()
+    minus moe, attn, dn and head reads 0.90 (OFF) and 1.16 (ON), which is
+    consistent with the int8 rebuilds at the top of the decode steps (not
+    isolated). take rises 0.73 -> 0.87, and wait, which is part of
+    take, 0.64 -> 0.78. Candidates: more experts run on the GPU while
+    the CPU side finishes sooner, and swaps whose cudaFree / cudaMalloc
+    synchronise the device during decode. The meters do not separate
+    them, and the rise is not attributed.
+  - The hit rates: 97.7 % covers the whole run, including the 25 prefill
+    rows routed before the re-plan; 98.2 % covers the decode only. The
+    OFF arm prints no decode-only line (it is printed under the re-plan
+    only).
+  - Fewer substitutions (4.5 % against 6.4 % on 4 October, another
+    session and build; today's OFF logs were not searched). That is
+    consistent with more of each token's own top experts being resident,
+    leaving CACHE_ROUTE fewer slots to substitute. The 48640 slots cover
+    the 25 prefill rows, which each layer routes before its own re-plan,
+    and the 127 decode rows of a text that differs from position 121.
+    Whether the re-plan brings the text closer to the plain router's is
+    not shown: at position 121 the two agree, and the hashes differ. No
+    perplexity was taken, so the quality is not measured.
+  - What the swaps cost: 147 swaps, each a cudaFree and a cudaMalloc per
+    tensor in the uploader thread, plus the staging copies under the
+    tier's lock on the prefill thread. The script does not time the
+    prefill or the TTFT, so the prefill-side part is not in the A/B's
+    numbers; section 4 reads it from the logs (+0.21 s TTFT). The TTFT
+    stops before the first decode step(), so it excludes the int8
+    rebuilds. The decode-side part is in the A/B's
+    numbers: the int8 rebuilds run at the top of the decode step() after
+    each swap is queued (the prefill-queued victims at the first one),
+    inside its timer, and any upload still running when decode began, or
+    a pending pair a tick started, costs inside decode too. The -1.00 is
+    net of those.
+  - The OFF arm reads 15.87 ms/token; on 4 October the same configuration
+    read 15.55 (another session and build).
+
+--- 4. TTFT, prefill and peak RSS, read from the logs afterwards -----------------
+
+The operator ran, in the same folder (the operator states it was before
+any other misure-envab.ps1 run, which deletes and rewrites envab-*.log;
+the lines carry no stamp linking them to the A/B):
+
+  findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" envab-*.log
+
+  envab-OFF-r1.log:TTFT: 0.46 s (time to first token)
+  envab-OFF-r1.log:[timers] prefill: 25 tokens  dn=169 attn=33 moe=238(sh=33 rt=3) head=2 ms
+  envab-OFF-r1.log:PEAK RSS: 31.59 GB
+  envab-OFF-r2.log:TTFT: 0.48 s (time to first token)
+  envab-OFF-r2.log:[timers] prefill: 25 tokens  dn=161 attn=33 moe=259(sh=35 rt=3) head=2 ms
+  envab-OFF-r2.log:PEAK RSS: 31.59 GB
+  envab-OFF-r3.log:TTFT: 0.47 s (time to first token)
+  envab-OFF-r3.log:[timers] prefill: 25 tokens  dn=152 attn=32 moe=260(sh=31 rt=2) head=1 ms
+  envab-OFF-r3.log:PEAK RSS: 31.59 GB
+  envab-OFF-r4.log:TTFT: 0.43 s (time to first token)
+  envab-OFF-r4.log:[timers] prefill: 25 tokens  dn=149 attn=33 moe=231(sh=30 rt=3) head=2 ms
+  envab-OFF-r4.log:PEAK RSS: 31.59 GB
+  envab-OFF-r5.log:TTFT: 0.40 s (time to first token)
+  envab-OFF-r5.log:[timers] prefill: 25 tokens  dn=138 attn=31 moe=213(sh=30 rt=3) head=1 ms
+  envab-OFF-r5.log:PEAK RSS: 31.59 GB
+  envab-OFF-r6.log:TTFT: 0.41 s (time to first token)
+  envab-OFF-r6.log:[timers] prefill: 25 tokens  dn=139 attn=32 moe=217(sh=31 rt=3) head=1 ms
+  envab-OFF-r6.log:PEAK RSS: 31.59 GB
+  envab-ON-r1.log:TTFT: 0.62 s (time to first token)
+  envab-ON-r1.log:[timers] prefill: 25 tokens  dn=192 attn=32 moe=376(sh=29 rt=3) head=1 ms
+  envab-ON-r1.log:PEAK RSS: 31.60 GB
+  envab-ON-r2.log:TTFT: 0.62 s (time to first token)
+  envab-ON-r2.log:[timers] prefill: 25 tokens  dn=194 attn=34 moe=366(sh=34 rt=3) head=2 ms
+  envab-ON-r2.log:PEAK RSS: 31.62 GB
+  envab-ON-r3.log:TTFT: 0.63 s (time to first token)
+  envab-ON-r3.log:[timers] prefill: 25 tokens  dn=199 attn=33 moe=374(sh=34 rt=3) head=1 ms
+  envab-ON-r3.log:PEAK RSS: 31.62 GB
+  envab-ON-r4.log:TTFT: 0.69 s (time to first token)
+  envab-ON-r4.log:[timers] prefill: 25 tokens  dn=220 attn=35 moe=404(sh=33 rt=3) head=1 ms
+  envab-ON-r4.log:PEAK RSS: 31.61 GB
+  envab-ON-r5.log:TTFT: 0.69 s (time to first token)
+  envab-ON-r5.log:[timers] prefill: 25 tokens  dn=204 attn=32 moe=412(sh=33 rt=3) head=16 ms
+  envab-ON-r5.log:PEAK RSS: 31.60 GB
+  envab-ON-r6.log:TTFT: 0.66 s (time to first token)
+  envab-ON-r6.log:[timers] prefill: 25 tokens  dn=205 attn=32 moe=398(sh=33 rt=3) head=1 ms
+  envab-ON-r6.log:PEAK RSS: 31.61 GB
+
+(The paste shows the same command and output twice; the two copies are
+identical.)
+
+Computed here from those lines, paired by repetition as the A/B is (the
+script itself does not compute them):
+
+  TTFT      OFF 0.44 s  ON 0.65 s  (means)
+            deltas +0.16 +0.14 +0.16 +0.26 +0.29 +0.25 s
+            mean +0.21, sd 0.064, se 0.026, df 5, 95 % [+0.14 ; +0.28], 6/6 positive
+  prefill   moe  236.3 -> 388.3 ms (+152)   dn  151.3 -> 202.3 ms (+51)
+            attn 32.3 -> 33.0   (shared) 31.7 -> 32.7   head 1.5 -> 3.7 (one 16 ms reading, ON r5)
+  PEAK RSS  31.59 GB in all six OFF runs; 31.60, 31.62, 31.62, 31.61, 31.60, 31.61 ON
+
+Reading:
+  - The TTFT measures from just before generate() to the first token, so
+    it holds the prefill step and nothing of the decode: +0.21 s is the
+    prefill-side price of the 147 swaps. The moe and dn prefill timers
+    account for about +0.20 s of it. qt_replan runs inside the moe
+    timer, so the plan and the staging copies under the tier's lock are
+    in it; how much of the +152 ms they are (147 copies of ~1.6 MB, tens
+    of ms of memcpy), against GPU expert groups delayed by the
+    uploader's device-synchronising cudaFree / cudaMalloc, is not
+    separated. Nothing here attributes the dn rise either; one candidate
+    is the same synchronisation, while the DeltaNet's per-row
+    projections run on the GPU (in the prefill the rest of the DeltaNet
+    runs on the CPU). attention, which in the prefill runs on the CPU
+    (c/qwen36.c: its projections use the GPU only for a single row),
+    moves only +0.7 ms, as a device stall would leave it; that fits the
+    candidate but does not show it.
+  - The deltas of repetitions 4-6 (+0.25..+0.29) are larger than those
+    of 1-3 (+0.14..+0.16), on both orders of the pair: the OFF arm got
+    faster and the ON arm slower over the session. Not explained.
+  - The run's peak RSS rises by at most 0.03 GB, against ~31.6 GB. That
+    bounds how far the maximum rose; the steady RAM after the swaps is
+    not shown by this line (a rebuild below an earlier peak, such as the
+    warmstart's, would not show). On Windows the figure is the process's
+    peak working set.
+  - End to end at 128 tokens, paired per repetition (TTFT delta + 127 x
+    step() delta): +0.033 +0.064 -0.005 +0.146 +0.163 +0.098 s, mean
+    +0.083, 95 % [+0.015, +0.151], 5 of 6 positive. Each log also prints
+    the generation's own time on its `Speed:` line, not read here.
+  - Break-even: +0.21 s against -1.00 ms per decode token is about 210
+    generated tokens; taking the ends of the two intervals, anywhere
+    from ~110 (0.14 / 1.26 ms) to ~380 (0.28 / 0.74 ms). That holds only
+    if the per-token gain measured over 127 decode steps held beyond
+    them, which is not measured: the LFRU tick keeps moving the OFF
+    arm's residents towards what is routed, and the routing can drift
+    from the prompt's experts as the text goes on, while the one-off
+    decode-side costs inside the -1.00 (the rebuild at the first decode
+    step, uploads still in flight) would amortise, which pushes the
+    other way. On a longer prompt the plan has more evidence and up to
+    960 swaps, and neither side is measured.
+
+--- what this run did NOT measure ---------------------------------------------------
+
+  - Perplexity with the re-plan.
+  - The re-plan without CACHE_ROUTE, other prompts, longer prompts (more
+    evidence per layer, and more swaps), runs longer than 128 tokens.
