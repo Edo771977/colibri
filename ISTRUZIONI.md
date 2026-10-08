@@ -143,7 +143,7 @@ qwen36.exe 256 4 prompt.txt
     prima parola passa da 0,44 a 0,65 s (+0,21 s, intervallo 95 % [+0,14 ; +0,28], 6 coppie su
     6), letto dagli stessi log; la RAM di picco resta praticamente la stessa (+0,01-0,03 GB su
     31,6). Con i 128 token della prova la generazione intera (prima parola più 127 passi) dura
-    circa 0,08 s in più, calcolato dalle due misure (intervallo 95 % [+0,02 ; +0,15], 5 coppie
+    circa 0,08 s in più, calcolato dalle due misure (intervallo 95 % [+0,01 ; +0,15], 5 coppie
     su 6). Se il guadagno per token restasse lo stesso oltre i 128 token (non misurato),
     converrebbe da circa 210 token generati in su (fra ~110 e ~380 secondo gli intervalli). Non misurati: la qualità
     (nessuna perplexity con il re-plan; il testo cambia), prompt più lunghi e generazioni lunghe.
