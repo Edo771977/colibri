@@ -139,11 +139,13 @@ qwen36.exe 256 4 prompt.txt
     misura 15,87 contro il 15,55 del 4 ottobre: altra sessione e build, i tempi assoluti delle due
     misure non si confrontano. La tabella heat era costruita su un altro prompt. Il
     guadagno non è misurato con `HEAT_FILE=heat.bin` riscritta a ogni uscita (come nel blocco
-    sopra), né senza keep-alive. Il prezzo è prima della prima parola: 0,44 → 0,65 s
-    (+0,21 s, intervallo 95 % [+0,14 ; +0,28], 6 su 6), letto dagli stessi log; la RAM di picco
-    resta la stessa (31,59 → 31,60-31,62 GB). Quindi conviene solo se si generano più di circa
-    200 token (fra ~110 e ~370 secondo gli intervalli): con i 128 token della prova il totale è
-    circa 0,08 s più lento. Non misurati: la qualità
+    sopra), né senza keep-alive. Il prezzo si paga prima della prima parola: il tempo fino alla
+    prima parola passa da 0,44 a 0,65 s (+0,21 s, intervallo 95 % [+0,14 ; +0,28], 6 coppie su
+    6), letto dagli stessi log; la RAM di picco resta praticamente la stessa (+0,01-0,03 GB su
+    31,6). Con i 128 token della prova la generazione intera (prima parola più 127 passi) dura
+    circa 0,08 s in più, calcolato dalle due misure (intervallo 95 % [+0,02 ; +0,15], 5 coppie
+    su 6). Se il guadagno per token restasse lo stesso oltre i 128 token (non misurato),
+    converrebbe da circa 210 token generati in su (fra ~110 e ~380 secondo gli intervalli). Non misurati: la qualità
     (nessuna perplexity con il re-plan; il testo cambia), prompt più lunghi e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 

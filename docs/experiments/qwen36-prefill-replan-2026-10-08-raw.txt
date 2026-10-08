@@ -32,10 +32,13 @@ Summary:
 
 Reading: on this prompt, the re-plan is measured faster per decode token
 on top of the setting ISTRUZIONI.md recommends (-1.00 ms/token) and
-slower to the first token (+0.21 s). It breaks even at about 210
-generated tokens (0.21 s / 1.00 ms; the two intervals put it anywhere
-from ~110 to ~370). At this run's 128 tokens it is about 0.08 s slower
-end to end (+0.21 s - 127 x 1.00 ms). Not measured: the quality with the re-plan (no perplexity was
+slower to the first token (+0.21 s). At this run's 128 tokens the whole
+generation (the prefill plus 127 decode steps) takes about 0.08 s longer:
+per repetition, TTFT delta + 127 x step() delta gives +0.083 s, 95 %
+[+0.015, +0.151], 5 pairs of 6 positive. It would break
+even at about 210 generated tokens (0.21 s / 1.00 ms; ~110 to ~380
+across the two intervals) if the -1.00 ms/token held beyond 128 tokens,
+which is not measured. Not measured: the quality with the re-plan (no perplexity was
 taken), other prompts, longer runs, and the re-plan without CACHE_ROUTE.
 
 Everything below is from output the operator pasted in the session. The
@@ -188,8 +191,9 @@ misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
 
 --- 4. TTFT, prefill and peak RSS, read from the logs afterwards -----------------
 
-The operator ran, in the same folder, before any other misure-envab.ps1
-run (which deletes envab-*.log):
+The operator ran, in the same folder (the operator states it was before
+any other misure-envab.ps1 run, which deletes and rewrites envab-*.log;
+the lines carry no stamp linking them to the A/B):
 
   findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" envab-*.log
 
@@ -247,21 +251,35 @@ Reading:
   - The TTFT measures from just before generate() to the first token, so
     it holds the prefill step and nothing of the decode: +0.21 s is the
     prefill-side price of the 147 swaps. The moe and dn prefill timers
-    account for about +0.20 s of it. The moe rise is where qt_replan
-    runs (the plan and the staging copies under the tier's lock).
-    Nothing here attributes the dn rise; one candidate is the uploader's
-    cudaFree / cudaMalloc, which synchronise the device while the
-    DeltaNet runs on it.
+    account for about +0.20 s of it. qt_replan runs inside the moe
+    timer, so the plan and the staging copies under the tier's lock are
+    in it; how much of the +152 ms they are (147 copies of ~1.6 MB, tens
+    of ms of memcpy), against GPU expert groups delayed by the
+    uploader's device-synchronising cudaFree / cudaMalloc, is not
+    separated. Nothing here attributes the dn rise either; one candidate
+    is the same synchronisation, while the DeltaNet's per-row
+    projections run on the GPU (in the prefill the rest of the DeltaNet
+    runs on the CPU). attention moves only +0.7 ms, which a device-wide
+    stall would also be expected to touch; that weakens the candidate.
   - The deltas of repetitions 4-6 (+0.25..+0.29) are larger than those
     of 1-3 (+0.14..+0.16), on both orders of the pair: the OFF arm got
     faster and the ON arm slower over the session. Not explained.
-  - Peak RSS rises by 0.01-0.03 GB, against ~31.6 GB: the rebuild and
-    drop keep the RAM where it was, to within that. On Windows the
-    figure is the process's peak working set.
+  - The run's peak RSS rises by at most 0.03 GB, against ~31.6 GB. That
+    bounds how far the maximum rose; the steady RAM after the swaps is
+    not shown by this line (a rebuild below an earlier peak, such as the
+    warmstart's, would not show). On Windows the figure is the process's
+    peak working set.
+  - End to end at 128 tokens, paired per repetition (TTFT delta + 127 x
+    step() delta): +0.033 +0.064 -0.005 +0.146 +0.163 +0.098 s, mean
+    +0.083, 95 % [+0.015, +0.151], 5 of 6 positive. Each log also prints
+    the generation's own time on its `Speed:` line, not read here.
   - Break-even: +0.21 s against -1.00 ms per decode token is about 210
     generated tokens; taking the ends of the two intervals, anywhere
-    from ~110 (0.14 / 1.26 ms) to ~370 (0.28 / 0.74 ms). Below it the
-    re-plan costs more than it saves. On a longer prompt the plan has
+    from ~110 (0.14 / 1.26 ms) to ~380 (0.28 / 0.74 ms). That holds only
+    if the per-token gain measured over 127 decode steps held beyond
+    them, which is not measured: the LFRU tick keeps moving the OFF
+    arm's residents towards what is routed, and the routing can drift
+    from the prompt's experts as the text goes on. On a longer prompt the plan has
     more evidence and up to 960 swaps, and neither side is measured.
 
 --- what this run did NOT measure ---------------------------------------------------
