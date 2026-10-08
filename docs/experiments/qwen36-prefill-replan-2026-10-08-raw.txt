@@ -25,12 +25,17 @@ Summary:
      slots (2186 of 48640) in every ON run; today's OFF logs were not
      searched for the same meter.
 
-Reading: on this prompt and 128 tokens, the re-plan is measured faster on
-top of the setting ISTRUZIONI.md recommends, with a tight interval. Not
-read: the TTFT, the prefill time and the peak RSS, which every log
-records but the script does not parse (the prefill-side cost of the swaps
-is in them; what the swaps cost inside decode is in the -1.00, net).
-Not measured: the quality with the re-plan (no perplexity was
+  4. The price, read from the same logs afterwards (section 4): TTFT
+     0.44 -> 0.65 s, paired delta +0.21 s, 95 % [+0.14, +0.28], 6 of 6
+     positive; the prefill's moe timer +152 ms and dn +51 ms; peak RSS
+     31.59 -> 31.60..31.62 GB.
+
+Reading: on this prompt, the re-plan is measured faster per decode token
+on top of the setting ISTRUZIONI.md recommends (-1.00 ms/token) and
+slower to the first token (+0.21 s). It breaks even at about 210
+generated tokens (0.21 s / 1.00 ms; the two intervals put it anywhere
+from ~110 to ~370). At this run's 128 tokens it is about 0.08 s slower
+end to end (+0.21 s - 127 x 1.00 ms). Not measured: the quality with the re-plan (no perplexity was
 taken), other prompts, longer runs, and the re-plan without CACHE_ROUTE.
 
 Everything below is from output the operator pasted in the session. The
@@ -169,13 +174,10 @@ misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
   - What the swaps cost: 147 swaps, each a cudaFree and a cudaMalloc per
     tensor in the uploader thread, plus the staging copies under the
     tier's lock on the prefill thread. The script does not time the
-    prefill or the TTFT, so the prefill-side part is not in these
-    numbers. Each log prints them (`TTFT:`, `[timers] prefill`, and
-    `PEAK RSS` for the memory), readable with
-      findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" envab-*.log
-    These logs last only until the next misure-envab.ps1 run, which
-    deletes envab-*.log. The TTFT stops before the first decode step(),
-    so it excludes the int8 rebuilds. The decode-side part is in these
+    prefill or the TTFT, so the prefill-side part is not in the A/B's
+    numbers; section 4 reads it from the logs (+0.21 s TTFT). The TTFT
+    stops before the first decode step(), so it excludes the int8
+    rebuilds. The decode-side part is in the A/B's
     numbers: the int8 rebuilds run at the top of the decode step() after
     each swap is queued (the prefill-queued victims at the first one),
     inside its timer, and any upload still running when decode began, or
@@ -184,10 +186,86 @@ misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
   - The OFF arm reads 15.87 ms/token; on 4 October the same configuration
     read 15.55 (another session and build).
 
+--- 4. TTFT, prefill and peak RSS, read from the logs afterwards -----------------
+
+The operator ran, in the same folder, before any other misure-envab.ps1
+run (which deletes envab-*.log):
+
+  findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" envab-*.log
+
+  envab-OFF-r1.log:TTFT: 0.46 s (time to first token)
+  envab-OFF-r1.log:[timers] prefill: 25 tokens  dn=169 attn=33 moe=238(sh=33 rt=3) head=2 ms
+  envab-OFF-r1.log:PEAK RSS: 31.59 GB
+  envab-OFF-r2.log:TTFT: 0.48 s (time to first token)
+  envab-OFF-r2.log:[timers] prefill: 25 tokens  dn=161 attn=33 moe=259(sh=35 rt=3) head=2 ms
+  envab-OFF-r2.log:PEAK RSS: 31.59 GB
+  envab-OFF-r3.log:TTFT: 0.47 s (time to first token)
+  envab-OFF-r3.log:[timers] prefill: 25 tokens  dn=152 attn=32 moe=260(sh=31 rt=2) head=1 ms
+  envab-OFF-r3.log:PEAK RSS: 31.59 GB
+  envab-OFF-r4.log:TTFT: 0.43 s (time to first token)
+  envab-OFF-r4.log:[timers] prefill: 25 tokens  dn=149 attn=33 moe=231(sh=30 rt=3) head=2 ms
+  envab-OFF-r4.log:PEAK RSS: 31.59 GB
+  envab-OFF-r5.log:TTFT: 0.40 s (time to first token)
+  envab-OFF-r5.log:[timers] prefill: 25 tokens  dn=138 attn=31 moe=213(sh=30 rt=3) head=1 ms
+  envab-OFF-r5.log:PEAK RSS: 31.59 GB
+  envab-OFF-r6.log:TTFT: 0.41 s (time to first token)
+  envab-OFF-r6.log:[timers] prefill: 25 tokens  dn=139 attn=32 moe=217(sh=31 rt=3) head=1 ms
+  envab-OFF-r6.log:PEAK RSS: 31.59 GB
+  envab-ON-r1.log:TTFT: 0.62 s (time to first token)
+  envab-ON-r1.log:[timers] prefill: 25 tokens  dn=192 attn=32 moe=376(sh=29 rt=3) head=1 ms
+  envab-ON-r1.log:PEAK RSS: 31.60 GB
+  envab-ON-r2.log:TTFT: 0.62 s (time to first token)
+  envab-ON-r2.log:[timers] prefill: 25 tokens  dn=194 attn=34 moe=366(sh=34 rt=3) head=2 ms
+  envab-ON-r2.log:PEAK RSS: 31.62 GB
+  envab-ON-r3.log:TTFT: 0.63 s (time to first token)
+  envab-ON-r3.log:[timers] prefill: 25 tokens  dn=199 attn=33 moe=374(sh=34 rt=3) head=1 ms
+  envab-ON-r3.log:PEAK RSS: 31.62 GB
+  envab-ON-r4.log:TTFT: 0.69 s (time to first token)
+  envab-ON-r4.log:[timers] prefill: 25 tokens  dn=220 attn=35 moe=404(sh=33 rt=3) head=1 ms
+  envab-ON-r4.log:PEAK RSS: 31.61 GB
+  envab-ON-r5.log:TTFT: 0.69 s (time to first token)
+  envab-ON-r5.log:[timers] prefill: 25 tokens  dn=204 attn=32 moe=412(sh=33 rt=3) head=16 ms
+  envab-ON-r5.log:PEAK RSS: 31.60 GB
+  envab-ON-r6.log:TTFT: 0.66 s (time to first token)
+  envab-ON-r6.log:[timers] prefill: 25 tokens  dn=205 attn=32 moe=398(sh=33 rt=3) head=1 ms
+  envab-ON-r6.log:PEAK RSS: 31.61 GB
+
+(The paste shows the same command and output twice; the two copies are
+identical.)
+
+Computed here from those lines, paired by repetition as the A/B is (the
+script itself does not compute them):
+
+  TTFT      OFF 0.44 s  ON 0.65 s  (means)
+            deltas +0.16 +0.14 +0.16 +0.26 +0.29 +0.25 s
+            mean +0.21, sd 0.064, se 0.026, df 5, 95 % [+0.14 ; +0.28], 6/6 positive
+  prefill   moe  236.3 -> 388.3 ms (+152)   dn  151.3 -> 202.3 ms (+51)
+            attn 32.3 -> 33.0   (shared) 31.7 -> 32.7   head 1.5 -> 3.7 (one 16 ms reading, ON r5)
+  PEAK RSS  31.59 GB in all six OFF runs; 31.60, 31.62, 31.62, 31.61, 31.60, 31.61 ON
+
+Reading:
+  - The TTFT measures from just before generate() to the first token, so
+    it holds the prefill step and nothing of the decode: +0.21 s is the
+    prefill-side price of the 147 swaps. The moe and dn prefill timers
+    account for about +0.20 s of it. The moe rise is where qt_replan
+    runs (the plan and the staging copies under the tier's lock).
+    Nothing here attributes the dn rise; one candidate is the uploader's
+    cudaFree / cudaMalloc, which synchronise the device while the
+    DeltaNet runs on it.
+  - The deltas of repetitions 4-6 (+0.25..+0.29) are larger than those
+    of 1-3 (+0.14..+0.16), on both orders of the pair: the OFF arm got
+    faster and the ON arm slower over the session. Not explained.
+  - Peak RSS rises by 0.01-0.03 GB, against ~31.6 GB: the rebuild and
+    drop keep the RAM where it was, to within that. On Windows the
+    figure is the process's peak working set.
+  - Break-even: +0.21 s against -1.00 ms per decode token is about 210
+    generated tokens; taking the ends of the two intervals, anywhere
+    from ~110 (0.14 / 1.26 ms) to ~370 (0.28 / 0.74 ms). Below it the
+    re-plan costs more than it saves. On a longer prompt the plan has
+    more evidence and up to 960 swaps, and neither side is measured.
+
 --- what this run did NOT measure ---------------------------------------------------
 
-  - The TTFT and the prefill-side cost of the re-plan, and the peak RSS
-    (in the logs, not read).
   - Perplexity with the re-plan.
   - The re-plan without CACHE_ROUTE, other prompts, longer prompts (more
     evidence per layer, and more swaps), runs longer than 128 tokens.

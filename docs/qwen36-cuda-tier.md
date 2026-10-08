@@ -772,10 +772,14 @@ in both arms; no sync; prompt25.txt; 128 tokens; six ABBA pairs):
   ms/token; decode-only hit 98.2 %;
 - CACHE_ROUTE's substitutions 4.5 % (6.4 % on 4 October without the
   re-plan, another session and build; today's OFF logs not searched);
-- each arm repeated its text, and the two texts differ.
+- each arm repeated its text, and the two texts differ;
+- the price, read from the same logs: TTFT 0.44 -> 0.65 s, +0.21 s, 95 %
+  [+0.14, +0.28], 6 of 6 (the prefill's moe +152 ms, dn +51 ms); peak RSS
+  31.59 -> 31.60..31.62 GB. It breaks even at about 210 generated tokens
+  (~110 to ~370 across the two intervals); at 128 tokens the run is about
+  0.08 s slower end to end.
 
-Not read: the TTFT, prefill time and peak RSS the logs print. Not
-measured: perplexity, other prompts and lengths, a heat table rewritten
+Not measured: perplexity, other prompts and lengths, a heat table rewritten
 at each exit, and the re-plan without `CACHE_ROUTE` or keep-alive
 (docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt).
 
@@ -784,7 +788,10 @@ The A/B:
     tools/misure-envab.ps1 -Var QT_PREFILL_REPLAN -Marker "[qwen36] QT_PREFILL_REPLAN=1" -AllowTextDrift ON
 
 The script times decode `step()` only: the prefill and TTFT cost is not in
-its numbers.
+its numbers. Every log prints them, and they can be read before the next
+run deletes the logs:
+
+    findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" envab-*.log
 
 ## The per-row int8 dense GEMV: R output rows per block (`COLI_CUDA_I8_ROWS`)
 
