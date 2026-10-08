@@ -643,6 +643,84 @@ overwrote the group's input and output mid-flight -- no CUDA error, only
 wrong numbers. qwen36 never called the dense path inside that window, so its
 outputs were unaffected.
 
+## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
+
+Opt-in, off by default. Ported from upstream (JustVugg/colibri 0fc8834b,
+e4a2e3c3, 7555e847, b842448a), with two parts left out (below).
+
+**Why.** The warmstart fills VRAM from the heat file, i.e. from what earlier
+prompts routed to. A new prompt routes elsewhere, and the LFRU tick corrects
+that by one expert per sixteen tokens per device.
+
+**What it does.** With `QT_PREFILL_REPLAN=1`, after each prefill layer the
+engine hands the tier that layer's routing counts over the prompt rows
+(`qt_replan`, `c/qwen36_tier.c`). The tier swaps residents the prompt routed
+to least for the non-residents it routed to most, under these rules:
+
+- **Order.** Victims go by count, then heat, then slot index; newcomers by
+  count, then slot index. Both orders are total, so Linux and Windows pick
+  the same victims (qsort is not stable).
+- **Only while it pays.** A swap happens only while the newcomer's count is
+  strictly higher than its victim's.
+- **Cap.** At most `QT_PREFILL_REPLAN_MAX` swaps per layer (default 24).
+- **Budget-neutral.** Each swap is the victim-first swap the LFRU tick uses,
+  so VRAM use does not change.
+
+The swaps of layer L upload while layers L+1.. still compute. What the
+upload queue (48 entries) cannot take stays pending and starts at the next
+`qt_replan` call or on the layer-0 ticks, four per token.
+
+The routing itself never moves: the counts are taken after the experts are
+chosen. Without `CACHE_ROUTE`, placement never changes which experts run,
+only where they run, so the text is the same. Under `CACHE_ROUTE=1` it does
+change them (the lever prefers residents), so the text can change.
+
+**What this port leaves out.**
+- **The in-place overwrite.** Upstream writes the newcomer into the victim's
+  device buffers (`coli_cuda_tensor_overwrite`, a new `coli_cuda.dll` entry
+  point). Here a re-plan swap is the LFRU swap as it was: the uploader frees
+  the victim's three tensors and uploads the newcomer's, a cudaFree and a
+  cudaMalloc each, which synchronise the device. Upstream measured that cost
+  at 1.3 s of prefill for 1,500 swaps; here the cap bounds it at 24 × 40 =
+  960 swaps per prompt. The port needs no DLL rebuild.
+- **The evicted-expert ring and the eager rebuild of the victims' int8 RAM
+  copies** at the start of each step. Here an evicted int4 expert gets its
+  int8 copy back on its first CPU miss (`slot_ensure_int8`, about 0.5 ms), as
+  after an LFRU swap. That costs nothing for victims never routed again (the
+  victims are the prompt's least-routed experts), and costs no RAM for them:
+  the eager rebuild keeps an int8 copy of every victim (~3 MB each on the
+  35B).
+
+**Counters.**
+- `[qtier] replan: N swaps planned, M started, K still pending` in the
+  `qt_stats` block.
+- `[qtier] after the prefill: hit X %`, the hit rate from the end of the
+  prefill on, which is the number a re-plan moves. It is worded so that it
+  is not read as the `VRAM hit rate:` line the measuring scripts parse.
+- `LFRU swaps` still counts only the tick's swaps.
+- The startup line `[qwen36] QT_PREFILL_REPLAN=1: ...` shows that the
+  switch took effect (the tier must be on).
+
+**Determinism.** Under `QT_UPLOAD_SYNC=1`, every queued upload (re-plan
+swaps included) lands before the next group, so a `CACHE_ROUTE` run stays
+reproducible (`tests/test_qwen36_tier_replan.c`, part 3). Without it, the
+newcomers land when the uploader gets to them.
+
+**Measured upstream, not here** (RTX 3070 8 GB, 35B per-row int4, heat file
+from six other prompts, four held-out prompts, 300 tokens):
+- decode VRAM hit rate 55-63 -> 73-75 % with the trunk on the CPU, and
+  42-50 -> 60-67 % with the trunk in VRAM;
+- MoE phase -2 to -5 ms/token, whole token -8..-10 % with the trunk in VRAM
+  on three prompts of four;
+- TTFT +0.1..1.1 s.
+
+On the operator's 16 GB card the hit rate is already 86.7 % (93.4 % under
+`CACHE_ROUTE=1 ROUTE_J=4`), so the room is smaller. Nothing is measured here
+yet. The A/B is `tools/misure-envab.ps1 -Var QT_PREFILL_REPLAN -Marker
+"[qwen36] QT_PREFILL_REPLAN=1"`; under `CACHE_ROUTE` without the sync, add
+`-AllowTextDrift ON`. The script times decode `step()` only; the TTFT cost
+is not in its numbers.
+
 ## The per-row int8 dense GEMV: R output rows per block (`COLI_CUDA_I8_ROWS`)
 
 The generic `quant_matmul` branch gives one block to one output row, so every

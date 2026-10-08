@@ -66,6 +66,12 @@ static struct {
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
+    /* qt_replan: pending (newcomer, victim) slot-index pairs, started on later
+     * calls and on the layer-0 ticks; its swaps are not counted in `swaps`,
+     * which stays the LFRU tick's count */
+    int *rp_c, *rp_v; int rp_n, rp_i; uint64_t rp_planned, rp_done;
+    /* qt_stats_mark: the counters at the prefill/decode boundary */
+    uint64_t mk_hits, mk_miss; int mk_on;
 } G;
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
@@ -1098,6 +1104,97 @@ void qt_fill_wait(void){
     pthread_mutex_unlock(&G.mx);
 }
 
+/* ---- re-plan from the prompt's routing (qt_replan) ------------------------
+ * Port of upstream 0fc8834b (with e4a2e3c3's total orders), without its
+ * in-place overwrite: this backend has no coli_cuda_tensor_overwrite, so a
+ * re-plan swap is the LFRU swap as it is, the uploader freeing the victim's
+ * tensors and uploading the newcomer's. Nor its evicted-expert ring: an
+ * evicted int4 expert gets its int8 RAM copy back on its first CPU miss
+ * (slot_ensure_int8 in the engine), as after an LFRU swap. */
+
+/* G.mx held: start up to `max` pending re-plan swaps, as many as the queue
+ * takes. Flags are re-checked: the LFRU tick or an earlier drain may have
+ * moved a slot since the plan was made. */
+static void replan_drain_locked(int max){
+    while(max-- > 0 && G.rp_i<G.rp_n && G.qn<QT_QCAP && !G.th_stop){
+        int ci=G.rp_c[G.rp_i], vi=G.rp_v[G.rp_i]; G.rp_i++;
+        QSlot *cs=&G.slot[ci], *vs=&G.slot[vi];
+        if(cs->resident||cs->queued||!cs->g4) continue;
+        if(!vs->resident||vs->queued) continue;
+        vs->resident=0;                                   /* CPU fallback from now on */
+        if(enqueue_locked(ci/G.ne,ci%G.ne,vi/G.ne,vi%G.ne,0)) G.rp_done++;
+        else { vs->resident=1; G.rp_i--; break; }         /* no staging memory: retry later */
+    }
+    if(G.rp_i==G.rp_n){ free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0; }
+}
+#define QT_REPLAN_PER_TICK 4   /* pending swaps a layer-0 tick may start: each one is a cudaFree + cudaMalloc */
+
+static const uint32_t *g_rp_cnt; static int g_rp_base;   /* counts indexed by slot - base; set under G.mx */
+/* Both orders are total (the slot index breaks the last tie): qsort is not
+ * stable, and glibc's and msvcrt's disagree on ties, so without it the same
+ * counts would pick different victims on Linux and Windows (upstream
+ * e4a2e3c3). */
+static int cmp_rp_cand(const void *a,const void *b){          /* count desc, index asc */
+    int ia=*(const int*)a, ib=*(const int*)b;
+    uint32_t fa=g_rp_cnt[ia-g_rp_base], fb=g_rp_cnt[ib-g_rp_base];
+    if(fa!=fb) return fa<fb ? 1 : -1;
+    return ia<ib ? -1 : ia>ib ? 1 : 0;
+}
+static int cmp_rp_vict(const void *a,const void *b){          /* count asc, heat asc, index asc */
+    int ia=*(const int*)a, ib=*(const int*)b;
+    uint32_t fa=g_rp_cnt[ia-g_rp_base], fb=g_rp_cnt[ib-g_rp_base];
+    if(fa!=fb) return fa<fb ? -1 : 1;
+    uint32_t ha=G.slot[ia].heat, hb=G.slot[ib].heat;
+    if(ha!=hb) return ha<hb ? -1 : 1;
+    return ia<ib ? -1 : ia>ib ? 1 : 0;
+}
+int qt_replan(int layer,const uint32_t *counts,int max_swaps){
+    if(!G.on||!counts||G_fp8_stream||max_swaps<=0||layer>=G.nl) return 0;
+    size_t lo = layer>=0 ? (size_t)layer*G.ne : 0, hi = layer>=0 ? lo+G.ne : (size_t)G.nl*G.ne;
+    size_t n=hi-lo;
+    int *cand=malloc(n*sizeof(int)), *vict=malloc(n*sizeof(int));
+    if(!cand||!vict){ free(cand); free(vict); return 0; }
+    pthread_mutex_lock(&G.mx);
+    if(G.th_stop){ pthread_mutex_unlock(&G.mx); free(cand); free(vict); return 0; }
+    g_rp_cnt=counts; g_rp_base=(int)lo;
+    int np=0, seen=0;
+    int *pc=realloc(G.rp_c,(size_t)(G.rp_n+(int)n)*sizeof(int));
+    if(pc) G.rp_c=pc;
+    int *pv=pc ? realloc(G.rp_v,(size_t)(G.rp_n+(int)n)*sizeof(int)) : NULL;
+    if(pv) G.rp_v=pv;
+    if(!pc||!pv){ pthread_mutex_unlock(&G.mx); free(cand); free(vict); return 0; }   /* pending pairs kept */
+    for(int di=0;di<G.ndev && np<max_swaps;di++){
+        int nc=0, nv=0;
+        for(size_t i=lo;i<hi;i++){
+            QSlot *s=&G.slot[i];
+            if(home((int)(i%G.ne))!=di || s->queued) continue;
+            if(s->resident) vict[nv++]=(int)i;
+            else if(s->g4 && counts[i-lo]>0) cand[nc++]=(int)i;
+        }
+        seen+=nc;
+        qsort(cand,nc,sizeof(int),cmp_rp_cand);
+        qsort(vict,nv,sizeof(int),cmp_rp_vict);
+        for(int k=0;k<nc && k<nv && np<max_swaps;k++){
+            if(counts[cand[k]-lo]<=counts[vict[k]-lo]) break;    /* the rest is not worth a swap */
+            G.rp_c[G.rp_n+np]=cand[k]; G.rp_v[G.rp_n+np]=vict[k]; np++;
+        }
+    }
+    G.rp_n+=np; G.rp_planned+=(uint64_t)np;
+    replan_drain_locked(QT_QCAP);                         /* start what the queue takes */
+    pthread_mutex_unlock(&G.mx);
+    free(cand); free(vict);
+    if(layer<0) fprintf(stderr,"[qtier] replan: %d swaps planned from %d routed non-residents\n",np,seen);
+    return np;
+}
+
+void qt_stats_mark(void){
+    if(!G.on) return;
+    pthread_mutex_lock(&G.mx);
+    G.mk_hits=0; for(int i=0;i<G.ndev;i++) G.mk_hits+=G.hits[i];
+    G.mk_miss=G.miss; G.mk_on=1;
+    pthread_mutex_unlock(&G.mx);
+}
+
 /* Adaptive swap check (every 16 ticks = tokens): per device, coldest resident
  * vs hottest non-resident. Decay every 1024 ticks so an old workload cannot
  * permanently own the tier; admission uses the shared tier.h contract. */
@@ -1106,6 +1203,7 @@ static void qt_lfru_tick_locked(void){
     G.tick++;
     if(!(G.tick%1024))
         for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
+    replan_drain_locked(QT_REPLAN_PER_TICK);              /* pending re-plan pairs, a few per token */
     if(G.tick%16) return;
     for(int di=0;di<G.ndev;di++){
         int cold=-1, hot=-1; uint32_t ch=0, hh=0;
@@ -1366,6 +1464,16 @@ void qt_stats(void){
     double tot=(double)(hits+G.miss);
     fprintf(stderr,"[qtier] VRAM hit rate: %.1f %% | LFRU swaps %llu\n",
             tot>0? 100.0*hits/tot : 0.0, (unsigned long long)G.swaps);
+    /* Not "VRAM hit rate:" -- the measuring scripts read the first line by
+     * that text, and this one must not be mistaken for it. */
+    if(G.mk_on){
+        uint64_t dh=hits-G.mk_hits, dm=G.miss-G.mk_miss;
+        fprintf(stderr,"[qtier] after the prefill: hit %.1f %% (%llu hits, %llu misses)\n",
+                dh+dm? 100.0*dh/(dh+dm) : 0.0, (unsigned long long)dh, (unsigned long long)dm);
+    }
+    if(G.rp_planned)
+        fprintf(stderr,"[qtier] replan: %llu swaps planned, %llu started, %d still pending\n",
+                (unsigned long long)G.rp_planned, (unsigned long long)G.rp_done, G.rp_n-G.rp_i);
     { uint64_t calls=0,ex=0,rows=0; double h2d=0,kms=0,d2h=0;
       coli_cuda_group_stats(&calls,&ex,&rows,&h2d,&kms,&d2h);
       /* Three zeros used to print as if they were measurements. They are not:
@@ -1396,6 +1504,10 @@ static void dense_free_all(void){
 void qt_shutdown(void){
     dense_free_all();
     if(!G.on) return;
+    pthread_mutex_lock(&G.mx);
+    free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0;
+    G.rp_planned=G.rp_done=0; G.mk_on=0;
+    pthread_mutex_unlock(&G.mx);
     const char *hf=getenv("HEAT_FILE");
     if(hf){
         FILE *f=fopen(hf,"wb");

@@ -2468,6 +2468,25 @@ static void slot_ensure_int8(Model *m, Slot *s) {
     s->g = w; s->u = w + ng; s->d = w + ng + ng;
 }
 
+/* QT_PREFILL_REPLAN=1 (port of upstream 7555e847): after each prefill layer's
+ * routing, hand the CUDA tier that layer's counts over the prompt rows
+ * (qt_replan), so residents this prompt never routed to make way for the ones
+ * it routed to most, while the rest of the prefill still computes. Without
+ * CACHE_ROUTE placement never changes routing; under CACHE_ROUTE=1 it does
+ * (the lever prefers residents), so the text can change. Opt-in: on the
+ * operator's box it is not measured yet. QT_PREFILL_REPLAN_MAX caps the swaps
+ * per layer (24, upstream's choice). */
+static int prefill_replan_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *p = getenv("QT_PREFILL_REPLAN"); on = p && p[0] == '1' && p[1] == 0; }
+    return on;
+}
+static int prefill_replan_cap(void) {
+    static int cap = -1;
+    if (cap < 0) { const char *p = getenv("QT_PREFILL_REPLAN_MAX"); cap = p && *p ? atoi(p) : 24; if (cap < 0) cap = 0; }
+    return cap;
+}
+
 /* Segna l'esperto instradato per la bitmap HITS della dashboard. Vive qui,
  * fuori dalla regione QWEN36_NO_MAIN: expert_get la chiama anche nel build
  * del segment adapter, dove il resto della telemetria serve non esiste. */
@@ -3041,6 +3060,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *shd = msc;
     int use_qt = qt_ready();
     int use_xf = !use_qt && xf_mode(m);
+    /* QT_PREFILL_REPLAN: this layer's routing counts over the prompt rows */
+    uint32_t *rp_cnt = (use_qt && S > 1 && prefill_replan_on()) ? calloc((size_t)E, sizeof(uint32_t)) : NULL;
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
@@ -3101,6 +3122,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             uint32_t *freq_l = m->freq + (int64_t)layer * E;
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
+        if (rp_cnt) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) rp_cnt[idx[kk]]++;
         const float *xs = x + (int64_t)s*D;
         if (use_xf) {
             for (int kk = 0; kk < K; kk++) { xidx[s*K+kk] = idx[kk]; xval[s*K+kk] = val[kk]; }
@@ -3202,6 +3224,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
     }
+    /* every row of this layer is done: its swaps upload while the next layers compute */
+    if (rp_cnt) { qt_replan(layer, rp_cnt, prefill_replan_cap()); free(rp_cnt); }
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
@@ -3992,6 +4016,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
+    qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
@@ -4487,6 +4512,7 @@ static void serve_one(Model *m, ServeReq *q){
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV rows are position-indexed, so this has to be the real offset. */
     float *lo = step(m, ids + reuse, np - reuse, reuse);
+    qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
     const double s_disk=m->t_disk, s_attn=tm_sum(0)+tm_sum(1), s_moe=tm_sum(2), s_head=tm_sum(5);
@@ -4936,6 +4962,10 @@ int main(int argc, char **argv) {
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
+        if (prefill_replan_on())
+            fprintf(stderr, "[qwen36] QT_PREFILL_REPLAN=1: the VRAM residents follow each prompt's routing, up to %d swaps per layer%s\n",
+                    prefill_replan_cap(),
+                    g_cache_route ? " (under CACHE_ROUTE the text can change)" : "");
         /* Arm the take split only when the timers are on; qt_take reads no
          * clock otherwise, so the inference build is byte-for-byte the same
          * work it was. */

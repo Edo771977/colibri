@@ -175,6 +175,23 @@ void qt_note_block(int layer, int eid,
              const float *gs, const float *us, const float *ds);
 void qt_fill_wait(void);   /* blocks until every enqueued upload is resident (not merely dequeued) */
 
+/* Re-plan the resident set from the prompt's own routing (port of upstream
+ * 0fc8834b/e4a2e3c3; the engine calls it under QT_PREFILL_REPLAN=1). counts[]
+ * are this prompt's routing counts per expert: for layer >= 0 one layer's ne
+ * counts (the engine calls this after each prefill layer, so the swaps of
+ * layer L upload while layers L+1.. still compute), for layer < 0 the whole
+ * nl*ne table, planned per device. Residents with the lowest counts (heat,
+ * then slot index, breaking ties) are swapped, budget-neutral, for the most-
+ * routed non-residents, through the victim-first swap the LFRU tick uses,
+ * while the newcomer's count strictly exceeds the victim's, at most max_swaps
+ * pairs. As many as the upload queue takes start at once; the rest are
+ * pending and start on later calls and, QT_REPLAN_PER_TICK at a time, on the
+ * layer-0 ticks. Nothing blocks. Returns the pairs planned by this call. */
+int  qt_replan(int layer, const uint32_t *counts, int max_swaps);
+/* Snapshot the hit/miss counters: qt_stats then also prints the hit rate from
+ * this point on (the engine marks the prefill/decode boundary). */
+void qt_stats_mark(void);
+
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
 
@@ -213,6 +230,8 @@ static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,c
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}
 static inline void qt_note_block(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline void qt_fill_wait(void){}
+static inline int  qt_replan(int l,const uint32_t*a,int b){(void)l;(void)a;(void)b;return 0;}
+static inline void qt_stats_mark(void){}
 static inline void qt_stats(void){}
 
 #endif /* COLI_CUDA */
