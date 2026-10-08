@@ -766,16 +766,17 @@ ROUTE_J=4`), so the room is smaller.
 `CACHE_ROUTE=1 ROUTE_J=4 COLI_DN_GPU=1`, keep-alive and a fixed heat table
 in both arms; no sync; prompt25.txt; 128 tokens; six ABBA pairs):
 - step() 15.87 -> 14.87 ms/token, delta -1.00, 95 % [-1.26, -0.74], 6 of 6;
-- the re-plan planned and started 147 swaps during the 25-token prefill,
-  layer by layer;
+- the re-plan planned 147 swaps during the 25-token prefill, layer by
+  layer (all started by exit; when is not shown);
 - whole-run hit 93.4 -> 97.7 %, misses 3203 -> 1133, cpu-miss 2.01 -> 0.56
   ms/token; decode-only hit 98.2 %;
-- the lever's substitutions 4.5 % (6.4 % on 4 October without the
-  re-plan);
+- CACHE_ROUTE's substitutions 4.5 % (6.4 % on 4 October without the
+  re-plan, another session and build; today's OFF logs not searched);
 - each arm repeated its text, and the two texts differ.
 
-Not measured: the TTFT cost, perplexity, other prompts and lengths, and
-the re-plan without `CACHE_ROUTE`
+Not read: the TTFT, prefill time and peak RSS the logs print. Not
+measured: perplexity, other prompts and lengths, a heat table rewritten
+at each exit, and the re-plan without `CACHE_ROUTE` or keep-alive
 (docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt).
 
 The A/B:

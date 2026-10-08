@@ -11,21 +11,25 @@ Summary:
      COLI_CUDA_KEEPALIVE=1 in both arms, -AllowTextDrift ON: step() 15.87
      -> 14.87 ms/token, paired delta -1.00, 95 % [-1.26, -0.74], 6 of 6
      pairs negative.
-  2. Where it comes from: the re-plan planned and started 147 swaps
-     during the 25-token prefill, layer by layer; whole-run VRAM hit 93.4 % -> 97.7 %, misses 3203 -> 1133,
+  2. Where it comes from: the re-plan planned 147 swaps during the
+     25-token prefill, layer by layer, all started by exit (when is not
+     shown: the 48-entry queue takes what it can, the rest start four per
+     decode token); whole-run VRAM hit 93.4 % -> 97.7 %, misses 3203 -> 1133,
      cpu-miss 2.01 -> 0.56 ms/token, moe 8.40 -> 7.14. From the end of the
      prefill on, the ON arm hit 98.2 %.
   3. The waiver was not needed: each arm wrote one text in six runs. The
      OFF text is the CACHE_ROUTE=1 ROUTE_J=4 text of the 4 October records
      (b967e6bd24da75bb); the ON text (87ce3f1b34ce2d6b) differs from it
-     from UTF-16 position 121. The lever substituted fewer slots with the
-     re-plan: 4.5 % (2186 of 48640) in every ON run.
+     from UTF-16 position 121. CACHE_ROUTE substituted 4.5 % of the
+     slots (2186 of 48640) in every ON run; today's OFF logs were not
+     searched for the same meter.
 
 Reading: on this prompt and 128 tokens, the re-plan is measured faster on
 top of the setting ISTRUZIONI.md recommends, with a tight interval. Not
-measured: the prefill-side cost of the 147 swaps and the TTFT (the script
-times decode step() only; what the swaps cost inside decode is in the
--1.00, net), the quality with the re-plan (no perplexity was
+read: the TTFT, the prefill time and the peak RSS, which every log
+records but the script does not parse (the prefill-side cost of the swaps
+is in them; what the swaps cost inside decode is in the -1.00, net).
+Not measured: the quality with the re-plan (no perplexity was
 taken), other prompts, longer runs, and the re-plan without CACHE_ROUTE.
 
 Everything below is from output the operator pasted in the session. The
@@ -137,26 +141,39 @@ misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
 
 --- reading -----------------------------------------------------------------------
 
-  - The gain is the lever's target. cpu-miss falls by 1.45 ms per decode
-    token (2.01 -> 0.56), and the misses over the whole run (prompt and
-    decode rows) by 2070. moe falls by 1.26 and step() by 1.00. take
-    rises 0.73 -> 0.87, and wait, which is part of take, 0.64 -> 0.78:
-    more experts run on the GPU, and the CPU side finishes sooner. The
-    meters do not separate the two, and the rise is not attributed.
+  - The gain is where the re-plan aims: cpu-miss falls by 1.45 ms per
+    decode token (2.01 -> 0.56), and the misses over the whole run
+    (prompt and decode rows) by 2070. moe falls by 1.26 and step() by
+    1.00. The 0.26 between them is outside the per-phase timers: step()
+    minus moe, attn, dn and head reads 0.90 (OFF) and 1.16 (ON), which is
+    consistent with the int8 rebuild at the top of the first decode step
+    (not isolated). take rises 0.73 -> 0.87, and wait, which is part of
+    take, 0.64 -> 0.78. Candidates: more experts run on the GPU while
+    the CPU side finishes sooner, and swaps whose cudaFree / cudaMalloc
+    synchronise the device during decode. The meters do not separate
+    them, and the rise is not attributed.
   - The hit rates: 97.7 % covers the whole run, including the 25 prefill
     rows routed before the re-plan; 98.2 % covers the decode only. The
     OFF arm prints no decode-only line (it is printed under the re-plan
     only).
-  - Fewer substitutions (4.5 % against 6.4 % on 4 October): with more of
-    each token's own top experts resident, CACHE_ROUTE has fewer slots
-    to substitute. Whether that brings the text closer to the plain
-    router's is not shown: at position 121 the two agree, and the hashes
-    differ. No perplexity was taken, so the quality is not measured.
+  - Fewer substitutions (4.5 % against 6.4 % on 4 October, another
+    session and build; today's OFF logs were not searched). That is
+    consistent with more of each token's own top experts being resident,
+    leaving CACHE_ROUTE fewer slots to substitute. The 48640 rows include
+    the 25 prefill rows, which each layer routes before its own re-plan,
+    and the decode rows of a text that differs from position 121.
+    Whether the re-plan brings the text closer to the plain router's is
+    not shown: at position 121 the two agree, and the hashes differ. No
+    perplexity was taken, so the quality is not measured.
   - What the swaps cost: 147 swaps, each a cudaFree and a cudaMalloc per
     tensor in the uploader thread, plus the staging copies under the
     tier's lock on the prefill thread. The script does not time the
     prefill or the TTFT, so the prefill-side part is not in these
-    numbers. The rest is: the rebuild of the 153 int8 copies runs at the
+    numbers. Each log prints them (`TTFT:`, `[timers] prefill`, and
+    `PEAK RSS` for the memory), readable with
+      findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" envab-*.log
+    The TTFT stops before the first decode step(), so it excludes the
+    int8 rebuild. The rest is: the rebuild of the 153 int8 copies runs at the
     top of the first decode step(), inside its timer, and any upload
     still running when decode began, or a pending pair a tick started,
     costs inside decode too. The -1.00 is net of those.
@@ -165,7 +182,8 @@ misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
 
 --- what this run did NOT measure ---------------------------------------------------
 
-  - The TTFT and the prefill-side cost of the re-plan.
+  - The TTFT and the prefill-side cost of the re-plan, and the peak RSS
+    (in the logs, not read).
   - Perplexity with the re-plan.
   - The re-plan without CACHE_ROUTE, other prompts, longer prompts (more
     evidence per layer, and more swaps), runs longer than 128 tokens.

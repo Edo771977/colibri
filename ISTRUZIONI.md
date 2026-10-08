@@ -131,11 +131,16 @@ qwen36.exe 256 4 prompt.txt
   - `set QT_PREFILL_REPLAN=1`, insieme ai tre sopra: mentre legge il prompt rimette in VRAM gli
     esperti che il prompt usa davvero. Misurato l'8 ottobre sopra `CACHE_ROUTE=1 ROUTE_J=4`:
     -1,00 ms/token sullo step, 15,87 → 14,87 (l'equivalente di ~63 → ~67 tok/s, ricavato dallo
-    step), intervallo 95 % [-1,26 ; -0,74], 6 coppie su 6, con `COLI_CUDA_KEEPALIVE=1` e la
-    tabella heat fissa in entrambi i bracci, su un solo prompt di 25 token e 128 token generati
-    (`docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt`). Non misurati: il tempo in più
-    prima della prima parola (147 scambi durante quel prompt, strato per strato), la qualità (nessuna perplexity con
-    il re-plan; il testo cambia), prompt più lunghi e generazioni lunghe.
+    step e non misurato direttamente), intervallo 95 % [-1,26 ; -0,74], 6 coppie su 6, con
+    `COLI_CUDA_KEEPALIVE=1` e la tabella heat fissa in entrambi i bracci, su un solo prompt di
+    25 token e 128 token generati
+    (`docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt`). Il braccio senza re-plan qui
+    legge 15,87 contro il 15,55 del 4 ottobre: altra sessione e build, i tempi assoluti delle due
+    misure non si confrontano. La tabella heat era costruita su un altro prompt; con
+    `HEAT_FILE=heat.bin` riscritta a ogni uscita, come nel blocco sopra, e senza keep-alive il
+    guadagno non è misurato. Non letti: il tempo prima della prima parola e la RAM di picco, che
+    ogni log stampa (147 scambi pianificati durante quel prompt). Non misurati: la qualità
+    (nessuna perplexity con il re-plan; il testo cambia), prompt più lunghi e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)
