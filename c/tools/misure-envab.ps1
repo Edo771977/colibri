@@ -572,6 +572,9 @@ function Read-Run([string]$Text, [string]$Log) {
         if ([double]::IsNaN($g[$k])) { throw "$Log : il timer '$k' non e' leggibile. Entrerebbe come NaN nelle medie." }
     }
     $vram  = if ($Text -match 'VRAM hit rate:[ \t]*([0-9.]+)[ \t]*%')             { [double]$Matches[1] } else { [double]::NaN }
+    # Facoltativa: la stampa un motore con QT_PREFILL_REPLAN=1 (il hit rate
+    # dalla fine del prefill in poi, quello che il re-plan sposta).
+    $vdec  = if ($Text -match '\[qtier\] after the prefill: hit[ \t]*([0-9.]+)[ \t]*%') { [double]$Matches[1] } else { [double]::NaN }
     # miss(CPU) serve all'indice per miss in coda, LFRU swaps alle medie per
     # braccio: nessuno dei due ripiega su un valore di comodo.
     if ($Text -notmatch 'miss\(CPU\)[ \t]+([0-9]+)') { throw "$Log : riga 'miss(CPU) N' non trovata. L'indice per miss passerebbe a vuoto." }
@@ -632,7 +635,7 @@ function Read-Run([string]$Text, [string]$Log) {
         Step=$step; Dn=$g["deltanet"]; Attn=$g["attention"]; Moe=$g["moe_total"]; Head=$g["lm_head"]
         Shared=$g["shared"]; Router=$g["router"]; Wait=$g["wait"]
         Issue=$g["issue"]; CpuMiss=$g["cpu-miss"]; Take=$g["take"]; ShOvl=$g["shared-ovl"]
-        Vram=$vram; Swaps=$swaps; Miss=$miss; Resident=$res; Toks=$toks; Place=$place; Banner=$banner
+        Vram=$vram; VramDec=$vdec; Swaps=$swaps; Miss=$miss; Resident=$res; Toks=$toks; Place=$place; Banner=$banner
     }
 }
 
@@ -882,6 +885,10 @@ foreach ($grp in ($rows | Group-Object Arm | Sort-Object Name)) {
         (($q | ForEach-Object { $_.Swaps }   | Measure-Object -Average).Average),
         $(if (@($q | ForEach-Object { $_.Miss } | Sort-Object -Unique).Count -eq 1) { "$($q[0].Miss)" }
           else { "per rip: " + (($q | Sort-Object Rep | ForEach-Object { "$($_.Miss)" }) -join " ") })
+    # Hit rate dopo il prefill: solo se TUTTI i run del braccio lo stampano.
+    if (-not @($q | Where-Object { [double]::IsNaN($_.VramDec) }).Count) {
+        "       dopo il prefill: hit {0,5:N1} %" -f (($q | ForEach-Object { $_.VramDec } | Measure-Object -Average).Average)
+    }
     # Sotto-parti di deltanet: solo se TUTTI i run del braccio le hanno.
     $sub = @(0..3 | ForEach-Object { $i = $_; ($q | ForEach-Object { $_.DnSub[$i] } | Measure-Object -Average).Average })
     if (-not @($q | Where-Object { [double]::IsNaN($_.DnSub[0]) }).Count) {

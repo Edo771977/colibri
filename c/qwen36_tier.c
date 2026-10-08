@@ -69,10 +69,17 @@ static struct {
     /* qt_replan: pending (newcomer, victim) slot-index pairs, started on later
      * calls and on the layer-0 ticks; its swaps are not counted in `swaps`,
      * which stays the LFRU tick's count */
-    int *rp_c, *rp_v; int rp_n, rp_i; uint64_t rp_planned, rp_done;
+    int *rp_c, *rp_v; int rp_n, rp_i; uint64_t rp_planned, rp_done, rp_skipped, rp_dropped;
+    /* Once qt_replan has run (rp_live): every swap (re-plan or LFRU) notes
+     * its victim when queued and its newcomer when resident, as slot
+     * indices, for qt_swapped_take. Bounded ring; what overflows is not
+     * reported and the engine's lazy paths cover it. */
+    int rp_live; int *sw; int sw_h, sw_n;
     /* qt_stats_mark: the counters at the prefill/decode boundary */
     uint64_t mk_hits, mk_miss; int mk_on;
 } G;
+
+static void swap_note_locked(int gi);   /* the swapped ring (qt_swapped_take), below */
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
 static void wait_take_locked(void){
@@ -225,7 +232,8 @@ static void *uploader(void *arg){
         }
         pthread_mutex_lock(&G.mx);
         QSlot *s=qs(layer,eid);
-        if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; }
+        if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++;
+                if(ve>=0) swap_note_locked(layer*G.ne+eid); }   /* a swap's newcomer (rp_live only) */
         else  { int hd=home(eid); G.used[hd]-=G.exp_bytes;
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
         s->queued=0;
@@ -1108,9 +1116,30 @@ void qt_fill_wait(void){
  * Port of upstream 0fc8834b (with e4a2e3c3's total orders), without its
  * in-place overwrite: this backend has no coli_cuda_tensor_overwrite, so a
  * re-plan swap is the LFRU swap as it is, the uploader freeing the victim's
- * tensors and uploading the newcomer's. Nor its evicted-expert ring: an
- * evicted int4 expert gets its int8 RAM copy back on its first CPU miss
- * (slot_ensure_int8 in the engine), as after an LFRU swap. */
+ * tensors and uploading the newcomer's. Upstream's evicted-expert ring is
+ * here as the swapped ring (qt_swapped_take): it carries the newcomers too,
+ * so the engine can drop their int8 RAM copies as it rebuilds the victims',
+ * and the swaps leave RSS where the warmstart put it. */
+
+#define QT_SW_CAP 8192
+/* G.mx held: note a slot whose residency a swap changed (see rp_live). */
+static void swap_note_locked(int gi){
+    if(!G.rp_live) return;
+    if(!G.sw){ G.sw=malloc(QT_SW_CAP*sizeof(int)); if(!G.sw) return; G.sw_h=0; G.sw_n=0; }
+    if(G.sw_n==QT_SW_CAP) return;                     /* full: the engine's lazy paths cover it */
+    G.sw[(G.sw_h+G.sw_n)%QT_SW_CAP]=gi; G.sw_n++;
+}
+int qt_swapped_take(int *layers,int *eids,int max){
+    if(!G.on||max<=0) return 0;
+    pthread_mutex_lock(&G.mx);
+    int n=0;
+    while(n<max && G.sw_n>0){
+        int gi=G.sw[G.sw_h]; G.sw_h=(G.sw_h+1)%QT_SW_CAP; G.sw_n--;
+        layers[n]=gi/G.ne; eids[n]=gi%G.ne; n++;
+    }
+    pthread_mutex_unlock(&G.mx);
+    return n;
+}
 
 /* G.mx held: start up to `max` pending re-plan swaps, as many as the queue
  * takes. Flags are re-checked: the LFRU tick or an earlier drain may have
@@ -1119,10 +1148,9 @@ static void replan_drain_locked(int max){
     while(max-- > 0 && G.rp_i<G.rp_n && G.qn<QT_QCAP && !G.th_stop){
         int ci=G.rp_c[G.rp_i], vi=G.rp_v[G.rp_i]; G.rp_i++;
         QSlot *cs=&G.slot[ci], *vs=&G.slot[vi];
-        if(cs->resident||cs->queued||!cs->g4) continue;
-        if(!vs->resident||vs->queued) continue;
+        if(cs->resident||cs->queued||!cs->g4||!vs->resident||vs->queued){ G.rp_skipped++; continue; }
         vs->resident=0;                                   /* CPU fallback from now on */
-        if(enqueue_locked(ci/G.ne,ci%G.ne,vi/G.ne,vi%G.ne,0)) G.rp_done++;
+        if(enqueue_locked(ci/G.ne,ci%G.ne,vi/G.ne,vi%G.ne,0)){ G.rp_done++; swap_note_locked(vi); }
         else { vs->resident=1; G.rp_i--; break; }         /* no staging memory: retry later */
     }
     if(G.rp_i==G.rp_n){ free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0; }
@@ -1156,6 +1184,7 @@ int qt_replan(int layer,const uint32_t *counts,int max_swaps){
     if(!cand||!vict){ free(cand); free(vict); return 0; }
     pthread_mutex_lock(&G.mx);
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); free(cand); free(vict); return 0; }
+    G.rp_live=1;
     g_rp_cnt=counts; g_rp_base=(int)lo;
     int np=0, seen=0;
     int *pc=realloc(G.rp_c,(size_t)(G.rp_n+(int)n)*sizeof(int));
@@ -1185,6 +1214,14 @@ int qt_replan(int layer,const uint32_t *counts,int max_swaps){
     free(cand); free(vict);
     if(layer<0) fprintf(stderr,"[qtier] replan: %d swaps planned from %d routed non-residents\n",np,seen);
     return np;
+}
+
+void qt_replan_reset(void){
+    if(!G.on) return;
+    pthread_mutex_lock(&G.mx);
+    G.rp_dropped+=(uint64_t)(G.rp_n-G.rp_i);
+    free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0;
+    pthread_mutex_unlock(&G.mx);
 }
 
 void qt_stats_mark(void){
@@ -1218,7 +1255,7 @@ static void qt_lfru_tick_locked(void){
         if(!tier_should_promote(hh,ch)) continue;
         QSlot *v=&G.slot[cold];
         v->resident=0;                                    /* CPU fallback from now on */
-        if(enqueue_locked(hot/G.ne,hot%G.ne,cold/G.ne,cold%G.ne,0)) G.swaps++;
+        if(enqueue_locked(hot/G.ne,hot%G.ne,cold/G.ne,cold%G.ne,0)){ G.swaps++; swap_note_locked(cold); }
         else v->resident=1;                               /* queue full: revert */
     }
 }
@@ -1472,8 +1509,9 @@ void qt_stats(void){
                 dh+dm? 100.0*dh/(dh+dm) : 0.0, (unsigned long long)dh, (unsigned long long)dm);
     }
     if(G.rp_planned)
-        fprintf(stderr,"[qtier] replan: %llu swaps planned, %llu started, %d still pending\n",
-                (unsigned long long)G.rp_planned, (unsigned long long)G.rp_done, G.rp_n-G.rp_i);
+        fprintf(stderr,"[qtier] replan: %llu swaps planned, %llu started, %llu skipped (slot moved since the plan), %llu dropped (next prompt), %d still pending\n",
+                (unsigned long long)G.rp_planned, (unsigned long long)G.rp_done, (unsigned long long)G.rp_skipped,
+                (unsigned long long)G.rp_dropped, G.rp_n-G.rp_i);
     { uint64_t calls=0,ex=0,rows=0; double h2d=0,kms=0,d2h=0;
       coli_cuda_group_stats(&calls,&ex,&rows,&h2d,&kms,&d2h);
       /* Three zeros used to print as if they were measurements. They are not:
@@ -1506,7 +1544,8 @@ void qt_shutdown(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
     free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0;
-    G.rp_planned=G.rp_done=0; G.mk_on=0;
+    G.rp_planned=G.rp_done=G.rp_skipped=G.rp_dropped=0; G.mk_on=0;
+    free(G.sw); G.sw=NULL; G.sw_h=G.sw_n=0; G.rp_live=0;
     pthread_mutex_unlock(&G.mx);
     const char *hf=getenv("HEAT_FILE");
     if(hf){
