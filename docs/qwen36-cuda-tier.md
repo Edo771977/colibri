@@ -766,7 +766,8 @@ ROUTE_J=4`), so the room is smaller.
 `CACHE_ROUTE=1 ROUTE_J=4 COLI_DN_GPU=1`, keep-alive and a fixed heat table
 in both arms; no sync; prompt25.txt; 128 tokens; six ABBA pairs):
 - step() 15.87 -> 14.87 ms/token, delta -1.00, 95 % [-1.26, -0.74], 6 of 6;
-- the re-plan made 147 swaps after the 25-token prefill;
+- the re-plan planned and started 147 swaps during the 25-token prefill,
+  layer by layer;
 - whole-run hit 93.4 -> 97.7 %, misses 3203 -> 1133, cpu-miss 2.01 -> 0.56
   ms/token; decode-only hit 98.2 %;
 - the lever's substitutions 4.5 % (6.4 % on 4 October without the

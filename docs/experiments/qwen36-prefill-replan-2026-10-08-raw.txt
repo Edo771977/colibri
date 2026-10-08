@@ -11,8 +11,8 @@ Summary:
      COLI_CUDA_KEEPALIVE=1 in both arms, -AllowTextDrift ON: step() 15.87
      -> 14.87 ms/token, paired delta -1.00, 95 % [-1.26, -0.74], 6 of 6
      pairs negative.
-  2. Where it comes from: the re-plan made 147 swaps after the 25-token
-     prefill; whole-run VRAM hit 93.4 % -> 97.7 %, misses 3203 -> 1133,
+  2. Where it comes from: the re-plan planned and started 147 swaps
+     during the 25-token prefill, layer by layer; whole-run VRAM hit 93.4 % -> 97.7 %, misses 3203 -> 1133,
      cpu-miss 2.01 -> 0.56 ms/token, moe 8.40 -> 7.14. From the end of the
      prefill on, the ON arm hit 98.2 %.
   3. The waiver was not needed: each arm wrote one text in six runs. The
@@ -23,8 +23,9 @@ Summary:
 
 Reading: on this prompt and 128 tokens, the re-plan is measured faster on
 top of the setting ISTRUZIONI.md recommends, with a tight interval. Not
-measured: the prefill and TTFT cost of the 147 swaps (the script times
-decode step() only), the quality with the re-plan (no perplexity was
+measured: the prefill-side cost of the 147 swaps and the TTFT (the script
+times decode step() only; what the swaps cost inside decode is in the
+-1.00, net), the quality with the re-plan (no perplexity was
 taken), other prompts, longer runs, and the re-plan without CACHE_ROUTE.
 
 Everything below is from output the operator pasted in the session. The
@@ -107,8 +108,9 @@ prints a single value only when they are).
   (the paste shows "é" as "├®", the console code page)
 
 At position 121 the ON arm reads "SO)", as the plain router's text did
-in the 4 October records (there "SO), poiché" against CACHE_ROUTE's "OS),
-poiché" at the same position). Its hash is not the plain router's
+in the two 4 October ROUTE_J=4 records (there "SO), poiché" against
+CACHE_ROUTE's "OS), poiché" at the same position; the ROUTE_J=2 record's
+texts part at position 83). Its hash is not the plain router's
 (4a000cc01f310b64), so it differs from that text somewhere else; where is
 not in the paste.
 
@@ -123,12 +125,15 @@ not in the paste.
   CACHE_ROUTE J=4 M=12 P=0.00 alpha=1.00 | swap 4.5% (2186/48640, 2186 to VRAM)
 
 The replan line ends at "0 still" in the paste, i.e. "0 still pending";
-the rest of that line (the lost-notes count) is not in the paste. 153 =
-147 re-plan swaps + 6 LFRU swaps (the ON arm's "swaps 6.0"), each with one
-victim rebuilt and one newcomer dropped: the RAM side balanced. The OFF
-logs were not searched; on 4 October the same OFF configuration, with
-the same text and the same 3203 misses, substituted 6.4 % (3119 of
-48640).
+the rest of that line (the lost-notes count) is not in the paste. 153
+rebuilt and 153 dropped is consistent with 147 re-plan swaps plus 6 LFRU
+swaps ("swaps 6.0" is the six-run mean; the script prints no per-run
+count), one victim rebuilt and one newcomer dropped each: the RAM side
+balanced, as far as these two counters show (they count the slots whose
+int8 copy changed when a step synced, and nothing syncs after the last
+step). The OFF logs were not searched; on 4 October the same OFF
+configuration (the nosync record's ON arm), with the same text and 3203
+misses (3204 in one run of six), substituted 6.4 % (3119 of 48640).
 
 --- reading -----------------------------------------------------------------------
 
@@ -147,16 +152,20 @@ the same text and the same 3203 misses, substituted 6.4 % (3119 of
     to substitute. Whether that brings the text closer to the plain
     router's is not shown: at position 121 the two agree, and the hashes
     differ. No perplexity was taken, so the quality is not measured.
-  - The swaps cost the prefill: 147 swaps, each a cudaFree and a
-    cudaMalloc per tensor in the uploader thread, plus the staging copies
-    under the tier's lock. The script does not time the prefill or the
-    TTFT, so that cost is not in these numbers.
+  - What the swaps cost: 147 swaps, each a cudaFree and a cudaMalloc per
+    tensor in the uploader thread, plus the staging copies under the
+    tier's lock on the prefill thread. The script does not time the
+    prefill or the TTFT, so the prefill-side part is not in these
+    numbers. The rest is: the rebuild of the 153 int8 copies runs at the
+    top of the first decode step(), inside its timer, and any upload
+    still running when decode began, or a pending pair a tick started,
+    costs inside decode too. The -1.00 is net of those.
   - The OFF arm reads 15.87 ms/token; on 4 October the same configuration
     read 15.55 (another session and build).
 
 --- what this run did NOT measure ---------------------------------------------------
 
-  - The TTFT / prefill cost of the re-plan.
+  - The TTFT and the prefill-side cost of the re-plan.
   - Perplexity with the re-plan.
   - The re-plan without CACHE_ROUTE, other prompts, longer prompts (more
     evidence per layer, and more swaps), runs longer than 128 tokens.

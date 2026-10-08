@@ -128,13 +128,13 @@ qwen36.exe 256 4 prompt.txt
     il testo generato (nella prova, dal carattere 121): è una scelta, non un'ottimizzazione
     esatta. `ROUTE_J=2` ha dato -2,2 ms/token (in un'altra sessione e build) e +1,6% di
     perplexity (su un solo testo): non è stabilito che sia più veloce né che costi di più.
-  - `set QT_PREFILL_REPLAN=1`, insieme ai tre sopra: dopo il prompt rimette in VRAM gli
+  - `set QT_PREFILL_REPLAN=1`, insieme ai tre sopra: mentre legge il prompt rimette in VRAM gli
     esperti che il prompt usa davvero. Misurato l'8 ottobre sopra `CACHE_ROUTE=1 ROUTE_J=4`:
     -1,00 ms/token sullo step, 15,87 → 14,87 (l'equivalente di ~63 → ~67 tok/s, ricavato dallo
     step), intervallo 95 % [-1,26 ; -0,74], 6 coppie su 6, con `COLI_CUDA_KEEPALIVE=1` e la
     tabella heat fissa in entrambi i bracci, su un solo prompt di 25 token e 128 token generati
     (`docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt`). Non misurati: il tempo in più
-    prima della prima parola (147 scambi dopo quel prompt), la qualità (nessuna perplexity con
+    prima della prima parola (147 scambi durante quel prompt, strato per strato), la qualità (nessuna perplexity con
     il re-plan; il testo cambia), prompt più lunghi e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
