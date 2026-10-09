@@ -392,7 +392,7 @@ int main(void){
                 if(group_flush_mode()){ printf("FAIL flush must be off unless exactly \"1\"\n"); fl_bad++; }
                 setenv("COLI_CUDA_FLUSH","1",1);
                 if(!group_flush_mode()){ printf("FAIL \"1\" must turn the flush on\n"); fl_bad++; }
-                uint64_t f0=g_group_flushes;
+                uint64_t f0=g_group_flushes, nr0=g_group_flush_notready, rc0=g_group_flush_recorded;
                 DeviceContext *fctx=find_ctx(0);
                 for(int graph=1; graph>=0; graph--){
                     setenv("COLI_CUDA_GRAPH", graph?"1":"0", 1);
@@ -416,6 +416,16 @@ int main(void){
                 if(g_group_flushes!=f0+4){
                     printf("FAIL %llu flushes for 4 flushed issues\n",
                            (unsigned long long)(g_group_flushes-f0)); fl_bad++; }
+                /* The spin is there so the NotReady branch runs: prove it did,
+                 * or "no error left behind" proves nothing. And say whether
+                 * this runtime records NotReady as the last error -- that is
+                 * the fact the clearing exists for, and nobody has seen it. */
+                unsigned long long nr=g_group_flush_notready-nr0, rc=g_group_flush_recorded-rc0;
+#if COLI_HAS_KEEPALIVE
+                if(nr<1){ printf("FAIL no flush found its group unfinished: the NotReady branch never ran\n"); fl_bad++; }
+#endif
+                printf("grouped-g4 flush: %llu of 4 queries found the group unfinished; "
+                       "the runtime left NotReady as the last error in %llu of them\n",nr,rc);
                 setenv("COLI_CUDA_FLUSH","",1);
                 setenv("COLI_CUDA_GRAPH","1",1);
                 printf("grouped-g4 flush: graph and per-call, 4 issues, %s\n",

@@ -3261,8 +3261,8 @@ extern "C" int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
 static uint64_t g_graph_captures, g_graph_replays;
 
 /* COLI_CUDA_FLUSH=1 (exactly): one cudaStreamQuery on the group's stream
- * right after the group is enqueued, so the driver hands the work to the GPU
- * now rather than when its command batch next goes out.
+ * right after the group is enqueued, meant to make the driver hand the work
+ * to the GPU now rather than when its command batch next goes out.
  *
  * Why: in an Nsight trace of qwen36 decode on Windows (RTX 4070 Ti SUPER,
  * WDDM, 9 October 2026, c/tools/nsys-moe.ps1), the group's first copy starts
@@ -3276,14 +3276,19 @@ static uint64_t g_graph_captures, g_graph_replays;
  * from waiting inside that phase.
  *
  * cudaStreamQuery returns cudaErrorNotReady while the group runs. That is not
- * an error, and it must not be left behind as one: the next call's
- * cudaGetLastError() check would read it and refuse a perfectly good group,
- * sending the layer to the CPU. It is cleared only when it is the last error,
- * so a real error recorded earlier is not swallowed.
+ * an error, and it must not be left behind as one: the next launch check that
+ * reads cudaGetLastError() -- the per-call group, coli_cuda_matmul, the
+ * DeltaNet chain -- would refuse perfectly good work. If the runtime records
+ * it in the last-error slot (PyTorch clears it the same way after a query;
+ * HIP has been known to record it), it is cleared; anything else in the slot
+ * is left, and any other return is reported through cuda_ok. Whether CUDA
+ * 13.4 records it is not known here: the test counts both outcomes.
  *
  * Read on every call, like graph_mode(): tests/test_grouped_g4_cuda.cu flips
  * it mid-process, and one getenv is small next to the driver call it adds. */
-static uint64_t g_group_flushes;            /* read by tests/test_grouped_g4_cuda.cu */
+/* Read by tests/test_grouped_g4_cuda.cu: flushes made, queries that found the
+ * group unfinished, and how many of those left NotReady in the last-error slot. */
+static uint64_t g_group_flushes, g_group_flush_notready, g_group_flush_recorded;
 static int group_flush_mode(void){
     const char *e=getenv("COLI_CUDA_FLUSH");
     return e&&!strcmp(e,"1");
@@ -3295,7 +3300,8 @@ static void group_flush(DeviceContext *ctx){
         fprintf(stderr,"[cuda] group flush active: COLI_CUDA_FLUSH=1, cudaStreamQuery after each expert group launch\n"); }
     cudaError_t e=cudaStreamQuery(ctx->stream);
     if(e==cudaErrorNotReady){
-        if(cudaPeekAtLastError()==cudaErrorNotReady) cudaGetLastError();
+        g_group_flush_notready++;
+        if(cudaPeekAtLastError()==cudaErrorNotReady){ g_group_flush_recorded++; cudaGetLastError(); }
     } else if(e!=cudaSuccess) cuda_ok(e,"expert group flush");
     g_group_flushes++;
 }
