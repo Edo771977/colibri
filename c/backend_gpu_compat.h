@@ -62,6 +62,9 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaSuccess              hipSuccess
 #define cudaGetErrorString       hipGetErrorString
 #define cudaGetLastError         hipGetLastError
+#define cudaPeekAtLastError      hipPeekAtLastError   /* group_flush (COLI_CUDA_FLUSH) */
+#define cudaStreamQuery          hipStreamQuery
+#define cudaErrorNotReady        hipErrorNotReady
 #define cudaSetDevice            hipSetDevice
 #define cudaGetDeviceCount       hipGetDeviceCount
 #define cudaDeviceProp           hipDeviceProp_t

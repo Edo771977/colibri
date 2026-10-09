@@ -373,6 +373,66 @@ int main(void){
                 else printf("grouped-g4 graph after a real buffer grow: re-captured, bitwise\n");
             }
 
+            /* COLI_CUDA_FLUSH: one cudaStreamQuery after the group is
+             * enqueued. Off unless exactly "1". On, it must change no bit on
+             * either launch path (graph replay and per-call), it must
+             * actually run (counted: an "it changes nothing" test passes just
+             * as well when the flush never happens), and it must not leave
+             * cudaErrorNotReady behind as the last error: the next call's
+             * cudaGetLastError() check would read it and refuse a good group.
+             * A ~2 ms spin is put on the group's stream first, so the query
+             * really finds the work unfinished -- with these tiny shapes it
+             * could otherwise always answer cudaSuccess and the NotReady
+             * branch would go unexercised. */
+            {
+                int fl_bad=0;
+                setenv("COLI_CUDA_FLUSH","",1);
+                if(group_flush_mode()){ printf("FAIL flush must be off when unset\n"); fl_bad++; }
+                setenv("COLI_CUDA_FLUSH","2",1);
+                if(group_flush_mode()){ printf("FAIL flush must be off unless exactly \"1\"\n"); fl_bad++; }
+                setenv("COLI_CUDA_FLUSH","1",1);
+                if(!group_flush_mode()){ printf("FAIL \"1\" must turn the flush on\n"); fl_bad++; }
+                uint64_t f0=g_group_flushes, nr0=g_group_flush_notready, rc0=g_group_flush_recorded;
+                DeviceContext *fctx=find_ctx(0);
+                for(int graph=1; graph>=0; graph--){
+                    setenv("COLI_CUDA_GRAPH", graph?"1":"0", 1);
+                    for(int rep=0; rep<2; rep++){
+#if COLI_HAS_KEEPALIVE
+                        if(fctx && rep==0) keepalive_spin<<<1,32,0,fctx->stream>>>(2000000ull);
+#endif
+                        if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,1)){
+                            printf("FAIL flush issue (graph %d, rep %d)\n",graph,rep); return 1; }
+                        cudaError_t le=cudaPeekAtLastError();
+                        if(le!=cudaSuccess){
+                            printf("FAIL the flush left \"%s\" as the last error (graph %d, rep %d)\n",
+                                   cudaGetErrorString(le),graph,rep);
+                            fl_bad++; cudaGetLastError(); }
+                        const float *yf=coli_cuda_expert_group_take(0);
+                        if(!yf){ printf("FAIL flush take (graph %d, rep %d)\n",graph,rep); return 1; }
+                        if(memcmp(ydup,yf,(size_t)COUNT*D*4)!=0){
+                            printf("FAIL flush changed the result (graph %d, rep %d)\n",graph,rep); fl_bad++; }
+                    }
+                }
+                if(g_group_flushes!=f0+4){
+                    printf("FAIL %llu flushes for 4 flushed issues\n",
+                           (unsigned long long)(g_group_flushes-f0)); fl_bad++; }
+                /* The spin is there so the NotReady branch runs: prove it did,
+                 * or "no error left behind" proves nothing. And say whether
+                 * this runtime records NotReady as the last error -- that is
+                 * the fact the clearing exists for, and nobody has seen it. */
+                unsigned long long nr=g_group_flush_notready-nr0, rc=g_group_flush_recorded-rc0;
+#if COLI_HAS_KEEPALIVE
+                if(nr<1){ printf("FAIL no flush found its group unfinished: the NotReady branch never ran\n"); fl_bad++; }
+#endif
+                printf("grouped-g4 flush: %llu of 4 queries found the group unfinished; "
+                       "the runtime left NotReady as the last error in %llu of them\n",nr,rc);
+                setenv("COLI_CUDA_FLUSH","",1);
+                setenv("COLI_CUDA_GRAPH","1",1);
+                printf("grouped-g4 flush: graph and per-call, 4 issues, %s\n",
+                       fl_bad?"FAILED":"bitwise, counted, no error left behind");
+                api_bad+=fl_bad;
+            }
+
             /* And back off cleanly: a graph left armed would follow this
              * process into the next block. */
             setenv("COLI_CUDA_GRAPH", "0", 1);
