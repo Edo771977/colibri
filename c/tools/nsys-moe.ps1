@@ -70,7 +70,9 @@
 #
 # COSA STAMPA, in microsecondi, per i gruppi di decode: la durata della
 # chiamata di lancio, il ritardo fra la chiamata e la prima operazione sulla
-# GPU, le copie su, il kernel hidden, la pausa fra i kernel, il kernel down,
+# GPU, le copie su (e dentro: dalla prima copia all'inizio della copia x, la
+# copia x, l'attesa fra la copia x e il kernel), dalla fine della chiamata al
+# kernel hidden, il kernel hidden, la pausa fra i kernel, il kernel down,
 # la copia giu, lo span sulla GPU; poi i kernel per numero di expert, con
 # la banda di pesi e scale che ne risulta (-ExpertMatBytes byte per matrice:
 # gate e up nel kernel hidden, down nell'altro); poi i gruppi con e senza
@@ -225,7 +227,7 @@ foreach ($key in @($byStream.Keys)) {
         $dFirst = $ops[$k]; $dLast = $ops[$k]; $db = $ops[$k].B
         while ($k + 1 -lt $ops.Count -and $ops[$k + 1].Kind -eq "D") { $k++; $dLast = $ops[$k]; $db += $ops[$k].B }
         $groups.Add([pscustomobject]@{
-            Key = $key; Dev = $h.Dev; FS = $ups[0].S; HS = $h.S; HE = $h.E; KS = $downs[0].S; KE = $downs[-1].E
+            Key = $key; Dev = $h.Dev; FS = $ups[0].S; XS = $ups[-1].S; XE = $ups[-1].E; HS = $h.S; HE = $h.E; KS = $downs[0].S; KE = $downs[-1].E
             DS = $dFirst.S; DE = $dLast.E; Count = $h.GZ; Rows = $h.GY; DBytes = $db; NUp = $ups.Count
             CorrH = $h.Corr; CorrUp = $ups[0].Corr; DownName = (@($downs | ForEach-Object { $_.Name }) -join '+'); NDown = $downs.Count
             ApiS = [double]::NaN; ApiE = [double]::NaN; Foreign = $false
@@ -421,6 +423,10 @@ Row "chiamata cudaGraphLaunch (durata)"            ($dec | ForEach-Object { $_.A
 Row "inizio chiamata -> prima operazione GPU"      ($dec | ForEach-Object { $_.FS - $_.ApiS })
 Row "fine chiamata -> prima operazione GPU"        ($dec | ForEach-Object { $_.FS - $_.ApiE })
 Row "copie su (prima copia -> kernel hidden)"      ($dec | ForEach-Object { $_.HS - $_.FS })
+Row "  prima copia -> inizio copia x"            ($dec | ForEach-Object { $_.XS - $_.FS })
+Row "  copia x (durata)"                         ($dec | ForEach-Object { $_.XE - $_.XS })
+Row "  fine copia x -> kernel hidden"            ($dec | ForEach-Object { $_.HS - $_.XE })
+Row "fine chiamata -> kernel hidden"               ($dec | ForEach-Object { $_.HS - $_.ApiE })
 Row "kernel hidden (gate+up)"                      ($dec | ForEach-Object { $_.HE - $_.HS })
 Row "pausa hidden -> down"                         ($dec | ForEach-Object { $_.KS - $_.HE })
 Row "kernel down"                                  ($dec | ForEach-Object { $_.KE - $_.KS })

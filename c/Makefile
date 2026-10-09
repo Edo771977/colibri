@@ -1076,8 +1076,9 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# graph is switched off, all bitwise against a reference produced with
 	# COLI_CUDA_GRAPH pinned to 0. It was compile-only until its managed
 	# allocations were removed, which meant the graph -- now on by default --
-	# had shipped with its assertions never run. Also COLI_CUDA_FLUSH: bitwise
-	# on both launch paths, flushes counted, no cudaErrorNotReady left behind.
+	# had shipped with its assertions never run. Also checks COLI_CUDA_FLUSH:
+	# bitwise on both launch paths, flushes counted, the NotReady branch
+	# reached, no cudaErrorNotReady left behind.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_grouped_g4_cuda.cu -o grouped_g4_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./grouped_g4_test$(EXE)
 	# The broadcast contract on EVERY dispatcher arm, not just g4's. Two

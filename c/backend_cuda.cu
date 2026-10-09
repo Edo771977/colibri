@@ -3267,13 +3267,24 @@ static uint64_t g_graph_captures, g_graph_replays;
  * Why: in an Nsight trace of qwen36 decode on Windows (RTX 4070 Ti SUPER,
  * WDDM, 9 October 2026, c/tools/nsys-moe.ps1), the group's first copy starts
  * 15.9 us into the 33.5 us cudaGraphLaunch call (medians), but the hidden
- * kernel starts 39.2 us after that copy -- about 21 us AFTER the call has
- * returned -- for two copies of 704 bytes and 8 KiB. The copies go, the
+ * kernel starts 39.2 us after that copy -- about 21 us after the call has
+ * returned, by a sum of medians (15.9 + 39.2 - 33.5), not a per-group
+ * median -- for two copies of 704 bytes and 8 KiB. The copies go, the
  * kernels wait. That is the shape of WDDM command batching, and a query on
  * the stream is the commonly reported way to make the driver submit what it
  * has batched (reported, not verified here). It is a hypothesis this switch
- * exists to test, not a measured cause: the trace cannot separate copy time
- * from waiting inside that phase.
+ * exists to test, not a measured cause: nsys-moe.ps1 did not separate copy
+ * time from waiting inside that phase (it now does, on the same trace), and
+ * a null result would not tell batching apart from other submission or
+ * engine-wake latencies.
+ *
+ * The most it can give on the token is about the `take` wait (0.84 ms/token
+ * in that run) -- after it the CPU side of the MoE window is the longer one
+ * -- MINUS its own cost: the query runs inside qt_issue, on the CPU critical
+ * path, once per group per device, and shows up in `issue`. 0.84 is a loose
+ * ceiling (part of the wait is the synchronize's floor and layer-to-layer
+ * variance), so the net can be zero or negative: read the paired issue and
+ * wait, not only step().
  *
  * cudaStreamQuery returns cudaErrorNotReady while the group runs. That is not
  * an error, and it must not be left behind as one: the next launch check that
