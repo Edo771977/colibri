@@ -23,49 +23,67 @@
 # coli_cuda_expert_group_issue_x), e' in quest'ordine: una o due copie
 # Host-to-Device (i descrittori, poi l'input x), il kernel grouped_hidden*
 # (gate e up), il kernel o i kernel della proiezione down, una copia
-# Device-to-Host (le righe di uscita). Lo script parte dal kernel
+# Device-to-Host (le righe di uscita). In qwen36 su quello stream (creato
+# cudaStreamNonBlocking) passano solo i gruppi: i caricamenti degli expert
+# (coli_cuda_tensor_upload), le chiamate dense e la catena dn_head della
+# DeltaNet stanno sullo stream di default. Lo script parte dal kernel
 # grouped_hidden*: la copia su subito prima e' l'input x (8 KiB in decode,
 # contati quelli che non lo sono), quella prima ancora sono i descrittori
-# solo se e' di 4 KiB al massimo -- una copia piu' grande li' e' un
-# caricamento di expert sullo stesso stream e resta fuori. Dopo il kernel
-# hidden, i kernel fino alla prima copia giu. Il numero di expert e' la
-# GrdZ del kernel hidden (la griglia e' I x righe x expert), controllato
+# se e' di 4 KiB al massimo (al massimo 8 expert x 88 byte = 704 byte: il
+# limite e' solo una protezione, non serve con il motore di oggi). Dopo il
+# kernel hidden, i kernel fino alla prima copia giu. Il numero di expert e'
+# la GrdZ del kernel hidden (la griglia e' I x righe x expert), controllato
 # con i byte della copia giu (un expert, una riga di 2048 float).
+#
+# UNA SCHEDA SOLA. qt_issue manda un gruppo per scheda che ha expert del
+# layer in VRAM: con piu' schede i gruppi per layer sono piu' di uno e il
+# conteggio qui sotto non vale. Lo script si ferma se trova gruppi su piu'
+# di uno stream.
 #
 # PREFILL E DECODE. Il motore manda un gruppo per layer anche per ogni
 # posizione del prompt, con le stesse forme del decode: dalla traccia non si
 # distinguono. Lo script legge dal -BaseLog i token del prompt e quelli
 # generati, ricava i layer come gruppi / (prompt + generati) -- deve venire
-# intero -- e prende come decode gli ultimi generati x layer gruppi. Se nella
-# traccia ci sono kernel dn_head (la DeltaNet sulla GPU, COLI_DN_GPU=1, che
-# gira solo in decode), controlla che il primo gruppo di decode venga dopo il
-# primo dn_head e l'ultimo di prefill prima.
+# intero -- e prende come decode gli ultimi generati x layer gruppi. Un layer
+# con tutti gli expert sulla CPU non manda il gruppo: allora il conto non
+# torna e lo script si ferma. Se nella traccia ci sono kernel dn_head (la
+# DeltaNet sulla GPU, COLI_DN_GPU=1, che gira solo in decode), controlla che
+# il primo gruppo di decode venga dopo il primo dn_head e l'ultimo di prefill
+# prima.
 #
-# IL LANCIO. Il tempo che la CPU passa in qt_issue e' quasi tutto la chiamata
-# cudaGraphLaunch (1,24 ms/token di issue contro una mediana di 33,7 us per
-# chiamata x 40 layer nella traccia del 9 ottobre). Lo script collega ogni
+# IL LANCIO. Nella traccia del 9 ottobre cudaGraphLaunch ha una mediana di
+# 33,7 us, cioe' 1,35 ms/token su 40 layer, contro 1,24 ms/token di tutto
+# l'issue della corsa senza profiler: probabilmente la chiamata e' la parte
+# maggiore di qt_issue, ma la traccia non lo dimostra, perche' sotto
+# profiler la chiamata si allunga (qt_issue contiene anche il lock del tier,
+# il tick LFRU al layer 0, due memcpy sull'host). Lo script collega ogni
 # gruppo alla sua chiamata in -ApiCsv con la colonna CorrId, provando il
 # kernel hidden e poi la prima copia su. Se cosi' se ne collegano meno del
 # 90 %, e le chiamate cudaGraphLaunch sono tante quanti i gruppi, le abbina
 # in ordine di tempo (la k-esima chiamata al k-esimo gruppo, purche' ogni
 # chiamata cominci prima del suo gruppo) e lo dice. Altrimenti le righe del
-# lancio non vengono stampate.
+# lancio non vengono stampate. I totali per token del lancio si stampano
+# solo se tutti i gruppi di decode sono collegati.
 #
 # COSA STAMPA, in microsecondi, per i gruppi di decode: la durata della
 # chiamata di lancio, il ritardo fra la chiamata e la prima operazione sulla
 # GPU, le copie su, il kernel hidden, la pausa fra i kernel, il kernel down,
 # la copia giu, lo span sulla GPU; poi i kernel per numero di expert, con
-# la banda che ne risulta (-ExpertMatBytes byte per matrice: gate e up nel
-# kernel hidden, down nell'altro); poi i gruppi con e senza attivita' di
-# altri stream dentro il loro span (caricamenti di expert, kernel di
-# conversione; lo spin del keep-alive escluso); infine i totali per token
-# accanto ai timer del -BaseLog.
+# la banda di pesi e scale che ne risulta (-ExpertMatBytes byte per matrice:
+# gate e up nel kernel hidden, down nell'altro); poi i gruppi con e senza
+# attivita' di altri stream dentro il loro span (per esempio i caricamenti
+# di expert; lo spin del keep-alive escluso); infine i totali per token
+# accanto ai timer del -BaseLog. Fra i timer, cpu-miss + shared + wait e' la
+# finestra fra la fine di issue e il ritorno dell'attesa: per ogni layer vale
+# max(lavoro CPU, coda della GPU) piu' il risveglio dall'attesa, quindi la
+# coda della GPU dopo issue sta fra wait e quella somma, non e' quella somma.
 #
 # LIMITI. Il profiler allunga le chiamate API e, con il tracciamento dei
 # nodi, forse anche il graph: le durate API valgono come ordine di grandezza,
 # accanto all'issue della corsa senza profiler. La banda presuppone le forme
-# di Qwen3.6-35B-A3B int4 gs64 (512 KiB di pesi e 64 KiB di scale per
-# matrice) e che il kernel legga ogni byte una volta. Le due corse non sono
+# di Qwen3.6-35B-A3B int4 gs64 (512 KiB di pesi e 64 KiB di scale f32 per
+# matrice) e conta pesi e scale letti una volta: non l'input x, che il
+# kernel hidden rilegge dalla cache L2 in ogni blocco. Le due corse non sono
 # la stessa: con CACHE_ROUTE=1 senza QT_UPLOAD_SYNC=1 la scelta degli expert
 # dipende dai tempi, quindi anche gli expert per gruppo possono differire.
 
@@ -185,9 +203,9 @@ foreach ($key in @($byStream.Keys)) {
         $h = $ops[$i]
         if ($h.Kind -ne "K" -or $h.Name -notlike "grouped_hidden*") { continue }
         # copie su immediatamente prima: l'input x subito prima del kernel, e
-        # prima ancora i descrittori (64 expert al massimo, meno di 4 KiB). Una
-        # copia piu' grande li' davanti non e' del gruppo (un caricamento di
-        # expert sullo stesso stream) e resta fuori.
+        # prima ancora i descrittori (8 expert al massimo, 704 byte). Una copia
+        # piu' grande di 4 KiB li' davanti non sarebbe dei descrittori e resta
+        # fuori (con il motore di oggi non succede: vedi COSA CERCA).
         if ($i -lt 1 -or $ops[$i - 1].Kind -ne "H") { $nNoUp++; continue }
         $ups = @($ops[$i - 1])
         if (-not (Near $ops[$i - 1].B $RowBytes)) { $nXOdd++ }
@@ -211,9 +229,14 @@ if ($groups.Count -eq 0) {
     throw "nessun gruppo di expert nella traccia (kernel grouped_hidden* con copie su prima e una copia giu dopo): il tier non ha mandato gruppi alla GPU, oppure la traccia e' stata presa senza --cuda-graph-trace=node e i gruppi sono blocchi di graph senza kernel."
 }
 $groups = [System.Collections.Generic.List[object]]@($groups | Sort-Object FS)
+$groupStreams = @($groups | ForEach-Object { $_.Key } | Sort-Object -Unique)
+if ($groupStreams.Count -gt 1) {
+    throw ("gruppi di expert su {0} stream ({1}): con piu' schede qt_issue manda un gruppo per scheda e per layer, e il conto prefill/decode di questo script non vale. Lo script e' per una scheda sola (COLI_GPUS=0)." -f $groupStreams.Count, ($groupStreams -join ", "))
+}
 
 # ---- log senza profiler -----------------------------------------------------------
 $t = Get-Content -LiteralPath $BaseLog -Raw
+if ($null -eq $t) { $t = "" }
 $bl = [ordered]@{ Dec = $null; Pre = $null; Step = $null; Issue = $null; Miss = $null; Take = $null; Shared = $null; Wait = $null; Accum = $null; Moe = $null
                   KeepAlive = $t.Contains("[cuda] keep-alive active:"); Heat = $t.Contains("[qtier] HEAT_FILE loaded:") }
 if ($t -match '\[timers\] decode: (\d+) tokens')  { $bl.Dec = [int]$Matches[1] }
@@ -325,8 +348,9 @@ function Overlaps($list, [double]$s, [double]$e) {
 foreach ($g in $dec) { $g.Foreign = Overlaps $other[$g.Key] $g.FS $g.DE }
 $decS = $dec[0].FS; $decE = $dec[-1].DE
 $inWin = @($allOps | Where-Object { $_.S -lt $decE -and $_.E -gt $decS -and $decStreams -notcontains $_.Key })
-$winH = @($inWin | Where-Object { $_.Kind -eq "H" })
-$winK = @($inWin | Where-Object { $_.Kind -eq "K" })
+$winUp  = @($inWin | Where-Object { $_.Kind -eq "H" -and $_.B -gt 16384 })
+$winSm  = @($inWin | Where-Object { $_.Kind -eq "H" -and $_.B -le 16384 })
+$winK   = @($inWin | Where-Object { $_.Kind -eq "K" -and $_.Name -notlike "keepalive*" })
 $winKNames = @($winK | Group-Object Name | Sort-Object Count -Descending | Select-Object -First 4 | ForEach-Object { "{0} x{1}" -f $_.Name, $_.Count })
 
 # ---- statistiche ------------------------------------------------------------------------
@@ -358,9 +382,9 @@ if ($nBytesOff) { $warn.Add("$nBytesOff gruppi di decode hanno una copia giu che
 "  non riconosciuti: senza copie su $nNoUp, senza kernel down $nNoDown, senza copia giu $nNoD2H"
 "  $dnCheck"
 "lancio: $linkHow"
-"altri stream durante il decode: {0} copie su ({1} MB), {2} kernel ({3}); gruppi di decode con attivita' di altri stream nello span: {4} su {5}" -f $winH.Count,
-    (($winH | Measure-Object -Property B -Sum).Sum / 1e6).ToString("0.0", $inv), $winK.Count, $(if ($winKNames.Count) { $winKNames -join ", " } else { "nessuno" }),
-    @($dec | Where-Object { $_.Foreign }).Count, $dec.Count
+"altri stream durante il decode (lo stream di default porta anche le chiamate dense e la DeltaNet): {0} copie su oltre 16 KiB ({1} MB, caricamenti di expert), {2} fino a 16 KiB, {3} kernel senza il keep-alive ({4})" -f $winUp.Count,
+    (($winUp | Measure-Object -Property B -Sum).Sum / 1e6).ToString("0.0", $inv), $winSm.Count, $winK.Count, $(if ($winKNames.Count) { $winKNames -join ", " } else { "nessuno" })
+"gruppi di decode con attivita' di altri stream nello span (keep-alive escluso): {0} su {1}" -f @($dec | Where-Object { $_.Foreign }).Count, $dec.Count
 foreach ($w in $warn) { "ATTENZIONE: $w" }
 ""
 "decode, microsecondi per gruppo                    n    media  mediana      p10      p90      min"
@@ -376,7 +400,7 @@ Row "span GPU (prima copia -> fine copia giu)"     ($dec | ForEach-Object { $_.D
 Row "inizio chiamata -> fine copia giu"            ($dec | ForEach-Object { $_.DE - $_.ApiS })
 Row "fine chiamata -> fine copia giu"              ($dec | ForEach-Object { $_.DE - $_.ApiE })
 ""
-"kernel per numero di expert (decode), microsecondi; banda = byte letti / mediana"
+"kernel per numero di expert (decode), microsecondi; banda = byte di pesi e scale / mediana"
 "  expert  gruppi   hidden med   down med   hidden+down med   p10    GB/s hidden   GB/s down"
 foreach ($grp in @($dec | Group-Object Count | Sort-Object { [int]$_.Name })) {
     $c = [int]$grp.Name
@@ -402,13 +426,17 @@ foreach ($fg in @($true, $false)) {
 }
 ""
 # ---- per token ------------------------------------------------------------------------
-$T = $bl.Dec
-function PerTok([double[]]$v) { $st = Get-Stats $v; if (-not $st) { return [double]::NaN }; $st.Sum / 1000.0 / $T }
+$nTok = $bl.Dec
+function PerTok([double[]]$v) { $st = Get-Stats $v; if (-not $st) { return [double]::NaN }; $st.Sum / 1000.0 / $nTok }
+# Il lancio per token solo se ogni gruppo di decode ha la sua chiamata: una
+# somma su una parte dei gruppi divisa per tutti i token sarebbe sottostimata.
+$allLinked = (@($dec | Where-Object { [double]::IsNaN($_.ApiS) }).Count -eq 0)
 $ptApi   = PerTok ($dec | ForEach-Object { $_.ApiE - $_.ApiS })
 $ptKern  = PerTok ($dec | ForEach-Object { ($_.HE - $_.HS) + ($_.KE - $_.KS) })
 $ptSpan  = PerTok ($dec | ForEach-Object { $_.DE - $_.FS })
 $ptAfter = PerTok ($dec | ForEach-Object { $_.DE - $_.ApiE })
-"per token di decode (somma dei gruppi / $T token), ms/token:"
+if (-not $allLinked) { $ptApi = [double]::NaN; $ptAfter = [double]::NaN }
+"per token di decode (somma dei gruppi / $nTok token), ms/token:"
 "  traccia (corsa profilata): lancio {0} | kernel {1} | span GPU {2} | da fine chiamata a fine copia giu {3}" -f (Fmt2 $ptApi), (Fmt2 $ptKern), (Fmt2 $ptSpan), (Fmt2 $ptAfter)
 "  $BaseLog (senza profiler): step {0} | moe {1} | issue {2} | cpu-miss {3} | shared {4} | take {5} (wait {6}, accum {7})" -f `
     $(if ($null -ne $bl.Step) { Fmt2 $bl.Step } else { "?" }), $(if ($null -ne $bl.Moe) { Fmt2 $bl.Moe } else { "?" }),
@@ -416,5 +444,6 @@ $ptAfter = PerTok ($dec | ForEach-Object { $_.DE - $_.ApiE })
     $(if ($null -ne $bl.Shared) { Fmt2 $bl.Shared } else { "?" }), $(if ($null -ne $bl.Take) { Fmt2 $bl.Take } else { "?" }),
     $(if ($null -ne $bl.Wait) { Fmt2 $bl.Wait } else { "?" }), $(if ($null -ne $bl.Accum) { Fmt2 $bl.Accum } else { "?" })
 if ($null -ne $bl.Miss -and $null -ne $bl.Shared -and $null -ne $bl.Wait) {
-    "  senza profiler la GPU finisce {0} ms/token dopo la fine di issue (cpu-miss + shared + wait), da confrontare con 'da fine chiamata a fine copia giu' della traccia" -f (Fmt2 ($bl.Miss + $bl.Shared + $bl.Wait))
+    "  senza profiler, dalla fine di issue: lavoro CPU (cpu-miss + shared) {0}, poi attesa della GPU (wait) {1}. Per ogni layer la finestra e' max(lavoro CPU, coda della GPU) piu' il risveglio dall'attesa: la coda della GPU dopo issue sta fra {1} e {2} ms/token, non e' {2}. Da confrontare con 'da fine chiamata a fine copia giu' della traccia (profilata)." -f `
+        (Fmt2 ($bl.Miss + $bl.Shared)), (Fmt2 $bl.Wait), (Fmt2 ($bl.Miss + $bl.Shared + $bl.Wait))
 }
