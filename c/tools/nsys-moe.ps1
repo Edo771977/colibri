@@ -44,7 +44,8 @@
 # posizione del prompt, con le stesse forme del decode: dalla traccia non si
 # distinguono. Lo script legge dal -BaseLog i token del prompt e quelli
 # generati, ricava i layer come gruppi / (prompt + generati) -- deve venire
-# intero -- e prende come decode gli ultimi generati x layer gruppi. Un layer
+# intero e uguale a -Layers (40 per Qwen3.6-35B-A3B) -- e prende come
+# decode gli ultimi generati x layer gruppi. Un layer
 # con tutti gli expert sulla CPU non manda il gruppo: allora il conto non
 # torna e lo script si ferma. Se nella traccia ci sono kernel dn_head (la
 # DeltaNet sulla GPU, COLI_DN_GPU=1, che gira solo in decode), controlla che
@@ -61,7 +62,9 @@
 # kernel hidden e poi la prima copia su. Se cosi' se ne collegano meno del
 # 90 %, e le chiamate cudaGraphLaunch sono tante quanti i gruppi, le abbina
 # in ordine di tempo (la k-esima chiamata al k-esimo gruppo, purche' ogni
-# chiamata cominci prima del suo gruppo) e lo dice. Altrimenti le righe del
+# chiamata cominci dopo la fine del gruppo precedente -- qt_take sincronizza
+# prima della issue successiva -- e prima dell'inizio del suo; le chiamate
+# con Result diverso da 0 non contano) e lo dice. Altrimenti le righe del
 # lancio non vengono stampate. I totali per token del lancio si stampano
 # solo se tutti i gruppi di decode sono collegati.
 #
@@ -95,7 +98,9 @@ param(
     # int4 gs64, 2048 x 512 pesi a 4 bit (512 KiB) + 2048 x 512 / 64 scale f32 (64 KiB).
     [long]   $ExpertMatBytes = 589824,
     # Byte della copia giu per expert in decode: una riga di hidden float.
-    [long]   $RowBytes = 8192
+    [long]   $RowBytes = 8192,
+    # Layer MoE del modello: i gruppi per posizione devono essere questi.
+    [int]    $Layers = 40
 )
 
 $ErrorActionPreference = "Stop"
@@ -261,6 +266,9 @@ if ($groups.Count % $pos -ne 0) {
     throw ("la traccia ha {0} gruppi, che non sono (prompt {1} + generati {2}) x un numero intero di layer. O la corsa profilata non e' uguale a {3} (altro prompt, altro N_NEW), o in qualche posizione un layer non ha mandato il gruppo (tutti gli expert sulla CPU), o lo script non ha riconosciuto qualche gruppo (senza copie su {4}, senza kernel down {5}, senza copia giu {6})." -f $groups.Count, $bl.Pre, $bl.Dec, $BaseLog, $nNoUp, $nNoDown, $nNoD2H)
 }
 $L = [int]($groups.Count / $pos)
+if ($L -ne $Layers) {
+    throw ("la traccia ha {0} gruppi = (prompt {1} + generati {2}) x {3}, non x {4} layer (-Layers): la corsa profilata non e' uguale a {5}, oppure il modello non ha {4} layer MoE." -f $groups.Count, $bl.Pre, $bl.Dec, $L, $Layers, $BaseLog)
+}
 $nPre = [int]($bl.Pre * $L)
 $pre = @($groups | Select-Object -First $nPre)
 $dec = @($groups | Select-Object -Skip $nPre)
@@ -273,7 +281,7 @@ if ($dnHeads.Count -gt 0) {
     if ($okDec -and $okPre) { $dnCheck = "il primo kernel dn_head cade fra l'ultimo gruppo di prefill e il primo di decode: ok" }
     else {
         $dnCheck = "il primo kernel dn_head NON cade fra l'ultimo gruppo di prefill e il primo di decode"
-        $warn.Add("la divisione prefill/decode presa dal conteggio non coincide con il primo dn_head: le statistiche di decode potrebbero contenere gruppi di prefill o viceversa.")
+        $warn.Add("la divisione prefill/decode presa dal conteggio non coincide con il primo dn_head: le statistiche di decode potrebbero contenere gruppi di prefill o viceversa. Puo' anche essere un falso allarme, se COLI_DN_GPU=1 non ha messo sulla GPU il layer 0 (la riga '[qwen36] DeltaNet decode on the GPU: N/30 layers' del log).")
     }
 }
 
@@ -285,6 +293,8 @@ $aStart = Find-Col $acols "Start*" $ApiCsv
 $aDur   = Find-Col $acols "Duration*" $ApiCsv
 $aCorr  = Find-Col $acols "Corr*" $ApiCsv
 $aName  = Find-Col $acols "Name*" $ApiCsv
+$aRes   = @($acols | Where-Object { $_ -like "Result*" })[0]
+$nFailed = 0
 $atUs = Get-Unit $aStart $TimeUnits $ApiCsv
 if ((Get-Unit $aDur $TimeUnits $ApiCsv) -ne $atUs) { throw "Start e Duration hanno unita' diverse in $ApiCsv." }
 if ($atUs -ne $tUs) { throw "$Csv e $ApiCsv hanno unita' di tempo diverse." }
@@ -293,6 +303,9 @@ $graphLaunches = New-Object System.Collections.Generic.List[object]
 foreach ($r in $apiRows) {
     $n = [string]$r.$aName
     if ($n -notlike "cudaGraphLaunch*") { continue }
+    # Una chiamata fallita non ha lavoro sulla GPU: fuori, o l'abbinamento in
+    # ordine slitterebbe di uno da li' in poi.
+    if ($aRes -and ([string]$r.$aRes).Trim() -notin @("", "0")) { $nFailed++; continue }
     $s = (To-Num $r.$aStart $aStart $ApiCsv -Int:$nsInt) * $tUs
     $e = $s + (To-Num $r.$aDur $aDur $ApiCsv -Int:$nsInt) * $tUs
     $o = [pscustomobject]@{ S = $s; E = $e }
@@ -312,12 +325,18 @@ if ($linked -lt 0.9 * $groups.Count) {
     foreach ($g in $groups) { $g.ApiS = [double]::NaN; $g.ApiE = [double]::NaN }
     $gl = @($graphLaunches | Sort-Object S)
     $ordOk = ($gl.Count -eq $groups.Count)
-    if ($ordOk) { for ($q = 0; $q -lt $gl.Count; $q++) { if ($gl[$q].S -ge $groups[$q].FS) { $ordOk = $false; break } } }
+    # qt_take sincronizza prima della issue successiva: la chiamata giusta
+    # comincia dopo la fine del gruppo precedente e prima dell'inizio del suo.
+    if ($ordOk) {
+        for ($q = 0; $q -lt $gl.Count; $q++) {
+            if ($gl[$q].S -ge $groups[$q].FS -or ($q -gt 0 -and $gl[$q].S -le $groups[$q - 1].DE)) { $ordOk = $false; break }
+        }
+    }
     if ($ordOk) {
         for ($q = 0; $q -lt $gl.Count; $q++) { $groups[$q].ApiS = $gl[$q].S; $groups[$q].ApiE = $gl[$q].E }
-        $linkHow = "per CorrId solo $linked su $($groups.Count); abbinati in ordine di tempo: $($gl.Count) chiamate cudaGraphLaunch per $($groups.Count) gruppi, ognuna prima del suo gruppo"
+        $linkHow = "per CorrId solo $linked su $($groups.Count); abbinati in ordine di tempo: $($gl.Count) chiamate cudaGraphLaunch per $($groups.Count) gruppi, ognuna fra la fine del gruppo precedente e l'inizio del suo"
     } else {
-        $linkHow = "per CorrId solo $linked su $($groups.Count), e $($gl.Count) chiamate cudaGraphLaunch per $($groups.Count) gruppi (o una comincia dopo il suo gruppo): le righe del lancio non vengono stampate"
+        $linkHow = "per CorrId solo $linked su $($groups.Count), e $($gl.Count) chiamate cudaGraphLaunch per $($groups.Count) gruppi (o una non cade fra la fine del gruppo precedente e l'inizio del suo): le righe del lancio non vengono stampate"
     }
 }
 
@@ -374,6 +393,10 @@ function Row([string]$label, [double[]]$v) {
 $nNon1 = @($dec | Where-Object { $_.Rows -ne 1 }).Count
 $nBytesOff = @($dec | Where-Object { -not (Near $_.DBytes ($_.Count * $RowBytes)) }).Count
 if ($nXOdd)     { $warn.Add("$nXOdd gruppi hanno una copia subito prima del kernel hidden che non e' l'input di $RowBytes byte del decode: la loro fase 'copie su' puo' contenere altro.") }
+$downNames = @($dec | ForEach-Object { $_.DownName } | Sort-Object -Unique)
+$nMultiDown = @($dec | Where-Object { $_.NDown -ne 1 }).Count
+if ($nMultiDown -or $downNames.Count -gt 1) { $warn.Add("kernel dopo il hidden: $nMultiDown gruppi di decode ne hanno piu' di uno, nomi $($downNames -join ', '). 'kernel down' e la sua banda li sommano tutti: con il motore int4 gs64 di oggi e' uno solo, grouped_down_g4r.") }
+if ($nFailed)   { $warn.Add("$nFailed chiamate cudaGraphLaunch con Result diverso da 0, lasciate fuori dal collegamento.") }
 if ($nNon1)     { $warn.Add("$nNon1 gruppi di decode hanno piu' di una riga per expert (GrdY > 1): non e' la forma di decode, i tempi per expert non valgono per loro.") }
 if ($nBytesOff) { $warn.Add("$nBytesOff gruppi di decode hanno una copia giu che non e' expert x $RowBytes byte: il numero di expert dalla griglia non torna con i byte. -RowBytes e' giusto per questo modello?") }
 
@@ -438,6 +461,7 @@ $ptAfter = PerTok ($dec | ForEach-Object { $_.DE - $_.ApiE })
 if (-not $allLinked) { $ptApi = [double]::NaN; $ptAfter = [double]::NaN }
 "per token di decode (somma dei gruppi / $nTok token), ms/token:"
 "  traccia (corsa profilata): lancio {0} | kernel {1} | span GPU {2} | da fine chiamata a fine copia giu {3}" -f (Fmt2 $ptApi), (Fmt2 $ptKern), (Fmt2 $ptSpan), (Fmt2 $ptAfter)
+if (-not $allLinked) { "  (lancio e 'da fine chiamata' per token non stampati: {0} gruppi di decode su {1} senza la loro chiamata cudaGraphLaunch)" -f @($dec | Where-Object { [double]::IsNaN($_.ApiS) }).Count, $dec.Count }
 "  $BaseLog (senza profiler): step {0} | moe {1} | issue {2} | cpu-miss {3} | shared {4} | take {5} (wait {6}, accum {7})" -f `
     $(if ($null -ne $bl.Step) { Fmt2 $bl.Step } else { "?" }), $(if ($null -ne $bl.Moe) { Fmt2 $bl.Moe } else { "?" }),
     $(if ($null -ne $bl.Issue) { Fmt2 $bl.Issue } else { "?" }), $(if ($null -ne $bl.Miss) { Fmt2 $bl.Miss } else { "?" }),
