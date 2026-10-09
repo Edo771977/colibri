@@ -3260,6 +3260,46 @@ extern "C" int coli_cuda_expert_group_pinned(ColiCudaTensor *const *gates,
  * returns the right answer too. */
 static uint64_t g_graph_captures, g_graph_replays;
 
+/* COLI_CUDA_FLUSH=1 (exactly): one cudaStreamQuery on the group's stream
+ * right after the group is enqueued, so the driver hands the work to the GPU
+ * now rather than when its command batch next goes out.
+ *
+ * Why: in an Nsight trace of qwen36 decode on Windows (RTX 4070 Ti SUPER,
+ * WDDM, 9 October 2026, c/tools/nsys-moe.ps1), the group's first copy starts
+ * 15.9 us into the 33.5 us cudaGraphLaunch call (medians), but the hidden
+ * kernel starts 39.2 us after that copy -- about 21 us AFTER the call has
+ * returned -- for two copies of 704 bytes and 8 KiB. The copies go, the
+ * kernels wait. That is the shape of WDDM command batching, and a query on
+ * the stream is the commonly reported way to make the driver submit what it
+ * has batched (reported, not verified here). It is a hypothesis this switch
+ * exists to test, not a measured cause: the trace cannot separate copy time
+ * from waiting inside that phase.
+ *
+ * cudaStreamQuery returns cudaErrorNotReady while the group runs. That is not
+ * an error, and it must not be left behind as one: the next call's
+ * cudaGetLastError() check would read it and refuse a perfectly good group,
+ * sending the layer to the CPU. It is cleared only when it is the last error,
+ * so a real error recorded earlier is not swallowed.
+ *
+ * Read on every call, like graph_mode(): tests/test_grouped_g4_cuda.cu flips
+ * it mid-process, and one getenv is small next to the driver call it adds. */
+static uint64_t g_group_flushes;            /* read by tests/test_grouped_g4_cuda.cu */
+static int group_flush_mode(void){
+    const char *e=getenv("COLI_CUDA_FLUSH");
+    return e&&!strcmp(e,"1");
+}
+static void group_flush(DeviceContext *ctx){
+    if(!group_flush_mode()) return;
+    static int said=0;
+    if(!said){ said=1;
+        fprintf(stderr,"[cuda] group flush active: COLI_CUDA_FLUSH=1, cudaStreamQuery after each expert group launch\n"); }
+    cudaError_t e=cudaStreamQuery(ctx->stream);
+    if(e==cudaErrorNotReady){
+        if(cudaPeekAtLastError()==cudaErrorNotReady) cudaGetLastError();
+    } else if(e!=cudaSuccess) cuda_ok(e,"expert group flush");
+    g_group_flushes++;
+}
+
 /* One call's worth of group accounting. Exists because the graph replay path
  * returns early and silently stopped counting when it was added. */
 static void group_account(DeviceContext *ctx,int count,int total){
@@ -3386,6 +3426,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
                     "expert group graph launch")) return 0;
         ctx->group_pending=1; ctx->group_pending_bytes=yb;
         g_graph_replays++;
+        group_flush(ctx);
         /* The replay is a call, an expert count and a row count like any
          * other. This early return used to skip the accounting, so with the
          * graph on by default `qt_stats` reported only the CAPTURES -- tens
@@ -3560,6 +3601,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
     }
 #endif
     ctx->group_pending=1; ctx->group_pending_bytes=yb;   /* the readback, not the upload */
+    group_flush(ctx);
     group_account(ctx,count,total);
     return 1;
 }
