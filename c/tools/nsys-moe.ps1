@@ -79,7 +79,8 @@
 # accanto ai timer del -BaseLog. Fra i timer, cpu-miss + shared + wait e' la
 # finestra fra la fine di issue e il ritorno dell'attesa: per ogni layer vale
 # max(lavoro CPU, coda della GPU) piu' il risveglio dall'attesa, quindi la
-# coda della GPU dopo issue sta fra wait e quella somma, non e' quella somma.
+# coda della GPU dopo issue sta fra wait e quella somma, e vale la somma
+# solo se in ogni layer la GPU finisce dopo la CPU.
 #
 # LIMITI. Il profiler allunga le chiamate API e, con il tracciamento dei
 # nodi, forse anche il graph: le durate API valgono come ordine di grandezza,
@@ -187,10 +188,11 @@ foreach ($r in $rows) {
         $short = Short-Name $name
     }
     $corr = ([string]$r.$cCorr).Trim()
-    $key = [string]$r.$cStrm
-    if ($cDev) { $key = [string]$r.$cDev + "/" + $key }
-    if ($cCtx) { $key = [string]$r.$cCtx + "/" + $key }
-    $op = [pscustomobject]@{ S = $s; E = $s + $d; B = $b; Kind = $kind; Name = $short; GY = $gy; GZ = $gz; Corr = $corr; Key = $key }
+    $dev = ""
+    if ($cDev) { $dev = [string]$r.$cDev }
+    if ($cCtx) { $dev = [string]$r.$cCtx + "/" + $dev }
+    $key = $dev + "/" + [string]$r.$cStrm
+    $op = [pscustomobject]@{ S = $s; E = $s + $d; B = $b; Kind = $kind; Name = $short; GY = $gy; GZ = $gz; Corr = $corr; Key = $key; Dev = $dev }
     if (-not $byStream.ContainsKey($key)) { $byStream[$key] = New-Object System.Collections.Generic.List[object] }
     $byStream[$key].Add($op)
     $allOps.Add($op)
@@ -223,9 +225,9 @@ foreach ($key in @($byStream.Keys)) {
         $dFirst = $ops[$k]; $dLast = $ops[$k]; $db = $ops[$k].B
         while ($k + 1 -lt $ops.Count -and $ops[$k + 1].Kind -eq "D") { $k++; $dLast = $ops[$k]; $db += $ops[$k].B }
         $groups.Add([pscustomobject]@{
-            Key = $key; FS = $ups[0].S; HS = $h.S; HE = $h.E; KS = $downs[0].S; KE = $downs[-1].E
+            Key = $key; Dev = $h.Dev; FS = $ups[0].S; HS = $h.S; HE = $h.E; KS = $downs[0].S; KE = $downs[-1].E
             DS = $dFirst.S; DE = $dLast.E; Count = $h.GZ; Rows = $h.GY; DBytes = $db; NUp = $ups.Count
-            CorrH = $h.Corr; CorrUp = $ups[0].Corr; DownName = $downs[0].Name; NDown = $downs.Count
+            CorrH = $h.Corr; CorrUp = $ups[0].Corr; DownName = (@($downs | ForEach-Object { $_.Name }) -join '+'); NDown = $downs.Count
             ApiS = [double]::NaN; ApiE = [double]::NaN; Foreign = $false
         })
     }
@@ -236,7 +238,11 @@ if ($groups.Count -eq 0) {
 $groups = [System.Collections.Generic.List[object]]@($groups | Sort-Object FS)
 $groupStreams = @($groups | ForEach-Object { $_.Key } | Sort-Object -Unique)
 if ($groupStreams.Count -gt 1) {
-    throw ("gruppi di expert su {0} stream ({1}): con piu' schede qt_issue manda un gruppo per scheda e per layer, e il conto prefill/decode di questo script non vale. Lo script e' per una scheda sola (COLI_GPUS=0)." -f $groupStreams.Count, ($groupStreams -join ", "))
+    $groupDevs = @($groups | ForEach-Object { $_.Dev } | Sort-Object -Unique)
+    if ($groupDevs.Count -gt 1) {
+        throw ("gruppi di expert su {0} schede ({1}): con piu' schede qt_issue manda un gruppo per scheda e per layer, e il conto prefill/decode di questo script non vale. Lo script e' per una scheda sola (COLI_GPUS=0)." -f $groupDevs.Count, ($groupDevs -join ", "))
+    }
+    throw ("gruppi di expert su {0} stream della stessa scheda ({1}): il motore li manda tutti su uno stream solo, e lo script cerca le copie e i kernel di un gruppo sul suo stream. Una traccia cosi' non e' quella che lo script sa leggere." -f $groupStreams.Count, ($groupStreams -join ", "))
 }
 
 # ---- log senza profiler -----------------------------------------------------------
@@ -395,7 +401,7 @@ $nBytesOff = @($dec | Where-Object { -not (Near $_.DBytes ($_.Count * $RowBytes)
 if ($nXOdd)     { $warn.Add("$nXOdd gruppi hanno una copia subito prima del kernel hidden che non e' l'input di $RowBytes byte del decode: la loro fase 'copie su' puo' contenere altro.") }
 $downNames = @($dec | ForEach-Object { $_.DownName } | Sort-Object -Unique)
 $nMultiDown = @($dec | Where-Object { $_.NDown -ne 1 }).Count
-if ($nMultiDown -or $downNames.Count -gt 1) { $warn.Add("kernel dopo il hidden: $nMultiDown gruppi di decode ne hanno piu' di uno, nomi $($downNames -join ', '). 'kernel down' e la sua banda li sommano tutti: con il motore int4 gs64 di oggi e' uno solo, grouped_down_g4r.") }
+if ($nMultiDown -or $downNames.Count -gt 1) { $warn.Add("kernel dopo il hidden: $nMultiDown gruppi di decode ne hanno piu' di uno, sequenze $($downNames -join ', '). 'kernel down' e la sua banda li sommano tutti: con il motore int4 gs64 di oggi e' uno solo, grouped_down_g4r.") }
 if ($nFailed)   { $warn.Add("$nFailed chiamate cudaGraphLaunch con Result diverso da 0, lasciate fuori dal collegamento.") }
 if ($nNon1)     { $warn.Add("$nNon1 gruppi di decode hanno piu' di una riga per expert (GrdY > 1): non e' la forma di decode, i tempi per expert non valgono per loro.") }
 if ($nBytesOff) { $warn.Add("$nBytesOff gruppi di decode hanno una copia giu che non e' expert x $RowBytes byte: il numero di expert dalla griglia non torna con i byte. -RowBytes e' giusto per questo modello?") }
@@ -405,7 +411,7 @@ if ($nBytesOff) { $warn.Add("$nBytesOff gruppi di decode hanno una copia giu che
 "  non riconosciuti: senza copie su $nNoUp, senza kernel down $nNoDown, senza copia giu $nNoD2H"
 "  $dnCheck"
 "lancio: $linkHow"
-"altri stream durante il decode (lo stream di default porta anche le chiamate dense e la DeltaNet): {0} copie su oltre 16 KiB ({1} MB, caricamenti di expert), {2} fino a 16 KiB, {3} kernel senza il keep-alive ({4})" -f $winUp.Count,
+"altri stream durante il decode (lo stream di default porta anche le chiamate dense e la DeltaNet): {0} copie su oltre 16 KiB ({1} MB: caricamenti di expert e, al primo token, lo stato DeltaNet), {2} fino a 16 KiB, {3} kernel senza il keep-alive ({4})" -f $winUp.Count,
     (($winUp | Measure-Object -Property B -Sum).Sum / 1e6).ToString("0.0", $inv), $winSm.Count, $winK.Count, $(if ($winKNames.Count) { $winKNames -join ", " } else { "nessuno" })
 "gruppi di decode con attivita' di altri stream nello span (keep-alive escluso): {0} su {1}" -f @($dec | Where-Object { $_.Foreign }).Count, $dec.Count
 foreach ($w in $warn) { "ATTENZIONE: $w" }
@@ -468,6 +474,6 @@ if (-not $allLinked) { "  (lancio e 'da fine chiamata' per token non stampati: {
     $(if ($null -ne $bl.Shared) { Fmt2 $bl.Shared } else { "?" }), $(if ($null -ne $bl.Take) { Fmt2 $bl.Take } else { "?" }),
     $(if ($null -ne $bl.Wait) { Fmt2 $bl.Wait } else { "?" }), $(if ($null -ne $bl.Accum) { Fmt2 $bl.Accum } else { "?" })
 if ($null -ne $bl.Miss -and $null -ne $bl.Shared -and $null -ne $bl.Wait) {
-    "  senza profiler, dalla fine di issue: lavoro CPU (cpu-miss + shared) {0}, poi attesa della GPU (wait) {1}. Per ogni layer la finestra e' max(lavoro CPU, coda della GPU) piu' il risveglio dall'attesa: la coda della GPU dopo issue sta fra {1} e {2} ms/token, non e' {2}. Da confrontare con 'da fine chiamata a fine copia giu' della traccia (profilata)." -f `
+    "  senza profiler, dalla fine di issue: lavoro CPU (cpu-miss + shared) {0}, poi attesa della GPU (wait) {1}. Per ogni layer la finestra e' max(lavoro CPU, coda della GPU) piu' il risveglio dall'attesa: la coda della GPU dopo issue sta fra {1} e {2} ms/token, e vale {2} solo se in ogni layer la GPU finisce dopo la CPU. Da confrontare con 'da fine chiamata a fine copia giu' della traccia (profilata)." -f `
         (Fmt2 ($bl.Miss + $bl.Shared)), (Fmt2 $bl.Wait), (Fmt2 ($bl.Miss + $bl.Shared + $bl.Wait))
 }
