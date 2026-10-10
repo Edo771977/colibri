@@ -299,7 +299,8 @@ Reading:
 The same binaries and environment as above, later on 8 October: a first
 attempt at 512 tokens had stopped on an out-of-memory error (the Windows
 commit limit, with physical RAM free), the PC was rebooted, and the run
-below followed. Quoted from the operator's paste:
+below followed. None of that attempt's runs is used here; whether the
+measured run paged was not checked. Quoted from the operator's paste:
 
   powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var QT_PREFILL_REPLAN -Value 1 -Marker "[qwen36] QT_PREFILL_REPLAN=1" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J -AllowTextDrift ON -NNew 512
   eseguibile: .\qwen36_clang.exe | 404480 byte | 2026-10-08 21:19:17 | sha256 CED1C97A27121D71
@@ -324,7 +325,9 @@ below followed. Quoted from the operator's paste:
     OFF rip 6: sha256 fb07758568f1e6f6
 
 The script stopped there, after all twelve runs, on its text guard: only
-the ON arm had the waiver. That is consistent with CACHE_ROUTE depending
+the ON arm had the waiver. The guard checks OFF first, so the ON arm's
+texts were not examined by the script. The banner, placement, residency
+and heat-table checks ran before it and passed. That is consistent with CACHE_ROUTE depending
 on upload timing without QT_UPLOAD_SYNC (the QT_UPLOAD_SYNC row of
 docs/ENVIRONMENT.md); at 128 tokens it had not happened. So the script
 printed the pairs but not its statistics or per-arm means. Then, from

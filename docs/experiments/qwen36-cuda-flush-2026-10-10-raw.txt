@@ -33,9 +33,14 @@ means (not paired) put it in issue (2.06 -> 1.77), the DeltaNet (4.42 ->
 which the prediction expected to shrink, went 0.51 -> 0.59. Why issue
 falls when it now contains one more driver call is not measured; one
 candidate is that a launch costs less when the previous group was already
-submitted. The OFF arm's 16.78 against the 15.0 of the 9 October run (and
-issue 2.06 against 1.24) is another session: absolute times of the two
-days are not compared, the paired delta is.
+submitted. A rise in wait is also what a CPU-side saving in a partly
+GPU-bound window turns into (the COLI_CUDA_GRAPH row of
+docs/ENVIRONMENT.md documents exactly that), so the wait rising is not by
+itself evidence that the delay before the kernel was untouched. The OFF
+arm's 16.78 against the 15.0 of the 9 October run (and issue 2.06 against
+1.24) is another session: absolute times of the two days are not
+compared, the paired delta is; but the gain was measured in a session
+whose issue was ~0.8 ms higher, which limits how far it generalises.
 
 Not measured: a trace with the flush on (whether the ~22 us between the
 call's return and the kernel -- 33 us after the x copy -- fell), whether Windows' hardware-accelerated GPU scheduling was on
@@ -181,8 +186,10 @@ Same window, after the build:
 
   - The prediction in #80 was, in substance, at most about the take wait
     (0.84 in the 9 October run) minus the query's own cost, which would
-    land in issue. The A/B gives -0.60 on step(), inside that ceiling,
-    but with issue SMALLER (-0.29) and the wait slightly LARGER (+0.08),
+    land in issue. The 0.84 is another day's; in this session the OFF
+    arm's wait was 0.51, smaller than the -0.60 the A/B gives on step(),
+    so even removing the whole wait could not account for the gain. And
+    issue came out SMALLER (-0.29) and the wait slightly LARGER (+0.08),
     and the rest of the gain in the DeltaNet, lm_head and attention
     timers, which contain no expert group. These are differences of
     per-arm means over six runs each, not paired, and their noise is

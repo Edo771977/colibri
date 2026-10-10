@@ -149,16 +149,17 @@ qwen36.exe 256 4 prompt.txt
     intervalli). Con **512 token generati** (stessi binari, più tardi la stessa sera, dopo un
     riavvio): -1,30 ms/token sullo step, 16,02 → 14,72, intervallo 95 % [-1,59 ; -1,01], 6 coppie
     su 6; il tempo fino alla prima parola sale di 0,19 s (0,43 → 0,63 s); **generazione intera
-    -0,47 s**, intervallo 95 % [-0,61 ; -0,33], più breve in 6 coppie su 6: con 512 token, su
+    -0,47 s** (calcolata: prima parola più 511 passi), intervallo 95 % [-0,61 ; -0,33], più breve in 6 coppie su 6: con 512 token, su
     questo prompt, conviene. In quella corsa anche il braccio senza
-    re-plan ha scritto un testo diverso in 1 run su 6 (sezione 5 dello stesso record). Non
+    re-plan ha scritto un testo diverso in 1 run su 6; quelli del braccio con il re-plan lo
+    script non li ha controllati, perché si è fermato prima (sezione 5 dello stesso record). Non
     misurati: la qualità (nessuna perplexity con il re-plan; il testo cambia), prompt più lunghi
     e generazioni oltre i 512 token.
   - `set COLI_CUDA_FLUSH=1`, insieme a tutti quelli sopra: dopo ogni gruppo di esperti mandato
     alla GPU chiede subito lo stato dello stream (`cudaStreamQuery`), per spingere il driver di
     Windows a inviare il lavoro invece di tenerlo in coda. Nella traccia del 9 ottobre il kernel
-    del gruppo partiva ~22 µs dopo che la chiamata di lancio era già tornata, con i dati già
-    copiati. Misurato il 10 ottobre sopra `CACHE_ROUTE=1 ROUTE_J=4`, `QT_PREFILL_REPLAN=1`,
+    del gruppo partiva ~22 µs (mediana per gruppo, traccia presa con il profiler) dopo che la
+    chiamata di lancio era già tornata, con i dati già copiati. Misurato il 10 ottobre sopra `CACHE_ROUTE=1 ROUTE_J=4`, `QT_PREFILL_REPLAN=1`,
     `COLI_DN_GPU=1` e `COLI_CUDA_KEEPALIVE=1`, con la tabella heat fissa in entrambi i bracci:
     -0,60 ms/token sullo step, 16,78 → 16,18 (l'equivalente di ~59,6 → ~61,8 tok/s, ricavato
     dallo step e non misurato direttamente), intervallo 95 % [-1,09 ; -0,11], 6 coppie su 6,
@@ -170,7 +171,8 @@ qwen36.exe 256 4 prompt.txt
     leggermente) e nessuna traccia con il flush acceso mostra se l'attesa prima del kernel è
     scesa. Non misurato con `HEAT_FILE=heat.bin` riscritta a ogni uscita. Vive nella
     DLL: dopo `git pull` serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il
-    motore; nel log deve comparire `[cuda] group flush active`. Non annotato: se la
+    motore; nell'uscita del motore (stderr), già durante la lettura del prompt, deve comparire
+    `[cuda] group flush active`: se manca, la DLL è quella vecchia. Non annotato: se la
     "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non misurati: altri
     prompt e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
