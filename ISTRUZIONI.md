@@ -178,6 +178,20 @@ qwen36.exe 256 4 prompt.txt
     esattamente `1` (attenzione agli spazi dopo l'`1` in cmd). Non annotato: se la
     "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non misurati: altri
     prompt e generazioni lunghe.
+  - `set COLI_CUDA_GROUP_ZC=1`, insieme a tutti quelli sopra compreso il flush: il gruppo di
+    esperti mandato alla GPU diventa di soli kernel (niente copie del copy engine; il risultato
+    va direttamente nella memoria del PC). Misurato il 10 ottobre, con `COLI_CUDA_FLUSH=1`,
+    `QT_ASYNC_ISSUE=1` e la tabella heat fissa in entrambi i bracci: -1,38 ms/token sullo step,
+    16,47 → 15,08 (l'equivalente di ~60,7 → ~66,3 tok/s, ricavato dallo step e non misurato
+    direttamente), intervallo 95 % [-2,20 ; -0,57], 6 coppie su 6, testo identico in tutti i 12
+    run, su un solo prompt di 25 token e 128 token generati
+    (`docs/experiments/qwen36-group-zc-2026-10-10-raw.txt`). Nella traccia la chiamata di lancio
+    del gruppo scende da 52,8 a 32,7 µs (mediana), ma il kernel down si allunga da 23,5 a 38,2
+    µs. `QT_ASYNC_ISSUE=1` (il lancio da un thread di appoggio), misurato con lo zero-copy
+    acceso: -0,13 ms/token, intervallo [-1,14 ; +0,87], nessun effetto distinguibile dal rumore;
+    il guadagno qui sopra però è misurato con quello acceso. Vive nella DLL: dopo `git pull`
+    serve `make cuda-dll CC=clang CUDA_ARCH=sm_89`; nell'uscita del motore deve comparire
+    `[cuda] group zero-copy active`.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <cerrno>
 #include <chrono>
 #include <mutex>
@@ -3371,6 +3372,35 @@ static void *zc_dev(DeviceContext *ctx,int slot,void *host){
     (void)ctx; (void)slot; (void)host; return nullptr;
 #endif
 }
+/* COLI_CUDA_GROUP_ZC_OUT=1, only together with COLI_CUDA_GROUP_ZC=1: the
+ * down kernel writes ctx->y in VRAM as on the copy path, and group_zc_out
+ * then copies the rows into host_y -- still a kernel, still no copy engine.
+ *
+ * Why: in the 10 October trace with COLI_CUDA_GROUP_ZC=1 (moe3,
+ * docs/experiments/qwen36-group-zc-2026-10-10-raw.txt, profiled, medians per
+ * decode group) the launch call fell from 52.8 to 32.7 us and the kernel now
+ * starts at its end, but the down kernel went from 23.5 to 38.2 us. Writing
+ * host_y it sends its rows over PCIe as each block finishes, 16 bytes per
+ * block at R=4 (8 experts x 512 blocks); the copy path paid 6.5 us for the
+ * readback instead. Hypothesis: the same 64 KiB written in whole 16-byte
+ * float4 stores by consecutive threads, after the down, cost less than those
+ * 4,096 scattered writes. Not measured.
+ *
+ * One float4 per thread; the last thread takes the tail scalar. Both
+ * addresses come from cudaMalloc / cudaMallocHost, aligned far beyond 16
+ * bytes; the caller checks anyway and leaves the variant off otherwise. A
+ * copy changes no value: the rows are bitwise the copy path's
+ * (tests/test_grouped_g4_cuda.cu). */
+__global__ static void group_zc_out(float *hy,const float *dy,int n){
+    int i=(int)(blockIdx.x*blockDim.x+threadIdx.x)*4;
+    if(i+3<n) *(float4*)(hy+i)=*(const float4*)(dy+i);
+    else for(;i<n;i++) hy[i]=dy[i];
+}
+static uint64_t g_group_zc_out;             /* groups that took it; read by the test */
+static int group_zc_out_mode(void){
+    const char *e=getenv("COLI_CUDA_GROUP_ZC_OUT");
+    return e&&!strcmp(e,"1");
+}
 static int group_flush_mode(void){
     const char *e=getenv("COLI_CUDA_FLUSH");
     return e&&!strcmp(e,"1");
@@ -3501,11 +3531,12 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
      * stream captured. */
     int w4p_=!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED"));
     int branch_= all_e8?1 : all_f8?2 : (all_s4&&w4p_)?3 : (all_q4&&any_g4)?4 : 5;
-    unsigned gsig_=(ctx->buf_gen<<8)|((unsigned)branch_<<4)|(unsigned)count;
+    unsigned gsig_=(ctx->buf_gen<<9)|((unsigned)branch_<<4)|(unsigned)count;
     int graphable_= graph_mode() && !ctx->group_timed && x_rows==1 &&
                     count>=1 && count<=8 && (branch_==3||branch_==4);
     /* COLI_CUDA_GROUP_ZC: decided before the replay check, because the graph
-     * signature carries it (bit 7: count takes bits 0-3, branch 4-6). */
+     * signature carries it (bit 7, and bit 8 for COLI_CUDA_GROUP_ZC_OUT:
+     * count takes bits 0-3, branch 4-6, buf_gen from bit 9 up). */
     float *zc_x=nullptr,*zc_y=nullptr; uint32_t *zc_d=nullptr;
     int zc_=0;
     if(graphable_ && group_zc_mode()){
@@ -3519,6 +3550,17 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
             else    fprintf(stderr,"[cuda] COLI_CUDA_GROUP_ZC=1: no device address for the pinned staging buffers, the copy path stays\n"); }
     }
     if(zc_) gsig_|=1u<<7;
+    int zo_=0;
+    if(graphable_ && group_zc_out_mode()){
+        zo_ = zc_ && !(((uintptr_t)zc_y|(uintptr_t)ctx->y)&15u);
+        static int said_zo=0;
+        if(!said_zo){ said_zo=1;
+            if(zo_) fprintf(stderr,"[cuda] group zero-copy output active: COLI_CUDA_GROUP_ZC_OUT=1, the down kernel writes VRAM and group_zc_out copies the rows to the host\n");
+            else    fprintf(stderr,"[cuda] COLI_CUDA_GROUP_ZC_OUT=1 ignored: it needs COLI_CUDA_GROUP_ZC=1 active and 16-byte aligned buffers\n"); }
+    }
+    if(zo_) gsig_|=1u<<8;
+    /* where the down kernel writes: host_y under plain ZC, VRAM otherwise */
+    float *ydst_ = (zc_&&!zo_) ? zc_y : ctx->y;
 #if COLI_GPU_HAS_GRAPH
     if(graphable_ && ctx->graph_exec[count] && ctx->graph_gen[count]==gsig_){
         /* Everything the launch depends on is already in the graph except the
@@ -3530,6 +3572,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         ctx->group_pending=1; ctx->group_pending_bytes=yb;
         g_graph_replays++;
         if(zc_) g_group_zc++;
+        if(zo_) g_group_zc_out++;
         group_flush(ctx);
         /* The replay is a call, an expert count and a row count like any
          * other. This early return used to skip the accounting, so with the
@@ -3612,8 +3655,9 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
             silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(
                 ctx->gate,ctx->up,(size_t)total*I);
         }
-        /* COLI_CUDA_GROUP_ZC: the rows go straight to the pinned host_y */
-        grouped_down_w4<<<og,256,0,ctx->stream>>>(zc_?zc_y:ctx->y,ctx->gate,dev,D,I);
+        /* COLI_CUDA_GROUP_ZC: the rows go straight to the pinned host_y
+         * (to VRAM again under COLI_CUDA_GROUP_ZC_OUT) */
+        grouped_down_w4<<<og,256,0,ctx->stream>>>(ydst_,ctx->gate,dev,D,I);
     } else if(all_q4&&any_g4){
         /* grouped int4 (fmt=4) present in the async decode path: per-group
          * scales via the #334 kernels (fmt=2 members ride along as ng=1). The
@@ -3625,7 +3669,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
          * an extra silu_mul here would re-apply it against the never-written
          * ctx->up buffer. */
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        down_g4_launch(zc_?zc_y:ctx->y,ctx->gate,dev,D,I,max_rows,count,ctx->stream);
+        down_g4_launch(ydst_,ctx->gate,dev,D,I,max_rows,count,ctx->stream);
     } else {
         /* Fallback runs quant_matmul with gs=0,ng=1 — per-row-scale semantics.
          * That is only correct for fmt 0/1/2/3: refuse group/block-scaled
@@ -3650,6 +3694,11 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
             host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),0,1);
     }}
+    if(zo_){
+        /* COLI_CUDA_GROUP_ZC_OUT: the readback as a kernel */
+        int ny=(int)(yb/sizeof(float));
+        group_zc_out<<<(unsigned)(((ny+3)/4+255)/256),256,0,ctx->stream>>>(zc_y,ctx->y,ny);
+    }
     if(ctx->group_timed) cudaEventRecord(ctx->ev_grp[2],ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
        /* yb, not xb. The two were the same number until x_rows existed, and
@@ -3658,7 +3707,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         * of host_y holding whatever the previous call had put there. qt_take
         * summed stale memory into the token -- wrong logits, a generation
         * that diverges, and a profile that reads as a 14 % slowdown. */
-       (!zc_ &&                    /* ZC: the down kernel already wrote host_y */
+       (!zc_ &&                    /* ZC: the down kernel (or group_zc_out) already wrote host_y */
         !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,yb,cudaMemcpyDeviceToHost,ctx->stream),
                  "expert group issue download"))){
 #if COLI_GPU_HAS_GRAPH
@@ -3716,6 +3765,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
 #endif
     ctx->group_pending=1; ctx->group_pending_bytes=yb;   /* the readback, not the upload */
     if(zc_) g_group_zc++;
+    if(zo_) g_group_zc_out++;
     group_flush(ctx);
     group_account(ctx,count,total);
     return 1;
