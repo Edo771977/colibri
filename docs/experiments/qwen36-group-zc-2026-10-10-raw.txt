@@ -303,6 +303,6 @@ The same window, right after section 3:
          dopo il prefill: hit  98.2 %
 
 Windows "hardware-accelerated GPU scheduling" (HAGS): not recorded at the
-time of the runs; the operator reported it on at the end of the session on
-10 October (changing it takes a restart, and none was reported in between;
-the operator was not asked).
+time of the runs; asked in the evening of 10 October, after the zero-copy
+runs, the operator answered that it is on (changing it takes a restart;
+none was reported in between, and the operator was not asked).

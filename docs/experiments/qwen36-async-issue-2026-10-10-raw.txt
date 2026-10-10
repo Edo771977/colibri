@@ -50,6 +50,11 @@ Everything below is from output the operator pasted in the session. The
 logs, the trace and its CSVs stay on the operator's machine; none is
 committed and no evidence.sha256 exists for them.
 
+Windows "hardware-accelerated GPU scheduling" (HAGS): not recorded here;
+asked in the evening of 10 October, hours after these runs, the operator
+answered that it is on (changing it takes a restart; none was reported in
+between, and the operator was not asked).
+
 --- 1. build -------------------------------------------------------------------
 
 A Visual Studio 2022 Developer Command Prompt, C:\colibri-fork\c:
