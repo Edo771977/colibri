@@ -79,10 +79,11 @@ variant against the copy path in one A/B (the -1.38 of COLI_CUDA_GROUP_ZC
 and this -0.52 come from different runs and baselines and are not to be
 added).
 
-Everything below is from output the operator pasted in the session;
-where lines are left out it says so. The logs, the trace and its CSVs stay on the operator's machine; none is
-committed and no evidence.sha256 exists for them. Not annotated: whether
-Windows "hardware-accelerated GPU scheduling" (HAGS) was on.
+Everything below is from output the operator pasted in the session; where
+lines are left out it says so. The logs, the trace and its CSVs stay on the
+operator's machine; none is committed and no evidence.sha256 exists for
+them. Not annotated: whether Windows "hardware-accelerated GPU scheduling"
+(HAGS) was on.
 
 --- 1. build and test --------------------------------------------------------------
 
