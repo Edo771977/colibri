@@ -146,8 +146,30 @@ qwen36.exe 256 4 prompt.txt
     dura circa 0,08 s in più, calcolato dalle due misure (intervallo 95 % [+0,01 ; +0,15], più
     lunga in 5 coppie su 6). Se il guadagno per token restasse lo stesso oltre i 128 token (non
     misurato), converrebbe da circa 210 token generati in su (fra ~110 e ~380 secondo gli
-    intervalli). Non misurati: la qualità (nessuna perplexity con il re-plan; il testo cambia),
-    prompt più lunghi e generazioni lunghe.
+    intervalli). Con **512 token generati** (stessi binari, in una sessione successiva): -1,30
+    ms/token sullo step, 16,02 → 14,72, intervallo 95 % [-1,59 ; -1,01], 6 coppie su 6; prima
+    parola +0,19 s; **generazione intera -0,47 s**, intervallo 95 % [-0,61 ; -0,33], più breve
+    in 6 coppie su 6: con risposte lunghe conviene. In quella corsa anche il braccio senza
+    re-plan ha scritto un testo diverso in 1 run su 6 (sezione 5 dello stesso record). Non
+    misurati: la qualità (nessuna perplexity con il re-plan; il testo cambia), prompt più lunghi
+    e generazioni oltre i 512 token.
+  - `set COLI_CUDA_FLUSH=1`, insieme a tutti quelli sopra: dopo ogni gruppo di esperti mandato
+    alla GPU chiede subito lo stato dello stream (`cudaStreamQuery`), per spingere il driver di
+    Windows a inviare il lavoro invece di tenerlo in coda. Nella traccia del 9 ottobre il kernel
+    del gruppo partiva ~22 µs dopo che la chiamata di lancio era già tornata, con i dati già
+    copiati. Misurato il 10 ottobre sopra `CACHE_ROUTE=1 ROUTE_J=4`, `QT_PREFILL_REPLAN=1`,
+    `COLI_DN_GPU=1` e `COLI_CUDA_KEEPALIVE=1`, con la tabella heat fissa in entrambi i bracci:
+    -0,60 ms/token sullo step, 16,78 → 16,18 (l'equivalente di ~59,6 → ~61,8 tok/s, ricavato
+    dallo step e non misurato direttamente), intervallo 95 % [-1,09 ; -0,11], 6 coppie su 6,
+    testo identico in tutti i 12 run, su un solo prompt di 25 token e 128 token generati
+    (`docs/experiments/qwen36-cuda-flush-2026-10-10-raw.txt`). Quel giorno il braccio senza
+    flush misurava 16,78 contro i ~15 del 9 ottobre: altra sessione, i tempi assoluti non si
+    confrontano. Il guadagno non è dove era previsto (è sceso `issue`, non l'attesa della GPU) e
+    nessuna traccia con il flush acceso mostra se l'attesa prima del kernel è scesa. Vive nella
+    DLL: dopo `git pull` serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il
+    motore; nel log deve comparire `[cuda] group flush active`. Non annotato: se la
+    "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non misurati: altri
+    prompt e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)

@@ -287,8 +287,54 @@ Reading:
     other way. On a longer prompt the plan has more evidence and up to
     960 swaps, and neither side is measured.
 
+--- 5. 512 generated tokens, a later session -------------------------------------
+
+Same binaries as above (qwen36_clang.exe sha256 CED1C97A27121D71,
+coli_cuda.dll 230CA632A2CEA752), same environment and command with
+-NNew 512, in a later session after a reboot (an earlier attempt had stopped on a
+Windows commit-limit OOM, not recorded here). The script stopped at the
+end, after all twelve runs, on its text guard: OFF repetition 3 wrote a
+different text (a09e2b3b9649461d) from the other five OFF runs
+(fb07758568f1e6f6) -- CACHE_ROUTE without QT_UPLOAD_SYNC makes the OFF
+arm timing-dependent too over 512 tokens; it had not happened at 128.
+Only the ON arm had the waiver. So the script printed the pairs but not
+its statistics or per-arm means; the numbers below are computed here
+from the printed pairs and from the operator's findstr of the logs.
+
+  rip 1 (OFF prima)  OFF  16.50  ON  14.80  delta  -1.70 ms/token
+  rip 2 (ON prima )  OFF  16.00  ON  14.70  delta  -1.30 ms/token
+  rip 3 (OFF prima)  OFF  15.90  ON  14.40  delta  -1.50 ms/token
+  rip 4 (ON prima )  OFF  15.80  ON  14.60  delta  -1.20 ms/token
+  rip 5 (OFF prima)  OFF  16.00  ON  15.10  delta  -0.90 ms/token
+  rip 6 (ON prima )  OFF  15.90  ON  14.70  delta  -1.20 ms/token
+
+  step(): OFF 16.02, ON 14.72; paired delta mean -1.30, sd 0.28,
+  95 % [-1.59, -1.01] (t(5) = 2.571), 6 of 6 negative.
+
+  TTFT (s), OFF r1-r6: 0.47 0.45 0.41 0.41 0.41 0.45 (mean 0.43)
+             ON r1-r6: 0.66 0.64 0.67 0.53 0.60 0.65 (mean 0.63)
+  paired +0.19 +0.19 +0.26 +0.12 +0.19 +0.20, mean +0.19 s,
+  95 % about [+0.15, +0.24], 6 of 6 positive.
+
+  End to end (TTFT delta + 511 x step() delta), per pair:
+  -0.68 -0.47 -0.51 -0.49 -0.27 -0.41 s, mean -0.47 s,
+  95 % about [-0.61, -0.33], 6 of 6 negative.
+
+  Peak RSS 31.60-31.62 GB in both arms. Every ON log: "replan: 147 swaps
+  planned, 147 started", "replan RAM: 177 int8 copies rebuilt for
+  swapped-out experts, 177 dropped for swapped-in ones" (177 > 147: the
+  LFRU tick's own swaps over the extra tokens are rebuilt too).
+
+Reading: on this prompt, at 512 generated tokens, the re-plan saves
+about 0.47 s end to end, and its per-token gain (-1.30) is larger than
+at 128 (-1.00, an earlier session). Why it grew is not
+measured; the one-off decode-side costs amortising over more tokens is
+one candidate. The OFF arm's text drift means the six OFF repetitions
+are not one fixed sequence: OFF repetition 3 differs from the others.
+
 --- what this run did NOT measure ---------------------------------------------------
 
   - Perplexity with the re-plan.
   - The re-plan without CACHE_ROUTE, other prompts, longer prompts (more
-    evidence per layer, and more swaps), runs longer than 128 tokens.
+    evidence per layer, and more swaps), runs longer than 512 tokens
+    (512 in section 5, 128 in sections 1-4).

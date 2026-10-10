@@ -1,0 +1,188 @@
+Qwen3.6-35B-A3B: COLI_CUDA_FLUSH=1 (#80), one cudaStreamQuery on the expert
+group's stream right after each group is enqueued, under the CUDA tier with
+CACHE_ROUTE=1 ROUTE_J=4, QT_PREFILL_REPLAN=1, the DeltaNet on the GPU and
+the keep-alive, no QT_UPLOAD_SYNC.
+9 October 2026 (the trace) and 10 October 2026, morning (the A/B), on the
+operator's machine (RTX 4070 Ti SUPER, Ryzen 9 7950X, Windows 11,
+qwen36_i4_gs64 read from D:, cap 256, 4 bits).
+
+Summary:
+
+  1. The 9 October Nsight trace (moe1, the setting of ISTRUZIONI.md,
+     unflushed), read again with c/tools/nsys-moe.ps1 after #80 split its
+     copy phase. Medians over 5080 decode groups: descriptor copy start
+     -> x copy start 5.0 us, x copy 1.4 us, x copy end -> hidden kernel
+     33.3 us, call end -> hidden kernel 21.7 us. The bytes arrive in a
+     few microseconds and the kernel starts about 22 us after the
+     cudaGraphLaunch call has returned.
+  2. tests/test_grouped_g4_cuda.cu on the 4070 Ti SUPER (CUDA 13.4,
+     MSVC): OK. 4 of 4 flushed queries found the group unfinished; the
+     runtime left cudaErrorNotReady as the last error in 0 of them.
+  3. misure-envab.ps1, COLI_CUDA_FLUSH absent vs =1, six ABBA pairs, the
+     heat table, the rest of ISTRUZIONI.md's setting in both arms:
+     step() 16.78 -> 16.18 ms/token, paired delta -0.60, 95 % [-1.09,
+     -0.11], 6 of 6 negative. One text in all twelve runs (87ce3f1b34ce2d6b),
+     the same in both arms, although both had the drift waiver.
+
+Reading: on this prompt the flush is measured faster (-0.60 ms/token,
+about 59.6 -> 61.8 tok/s derived from step(), not measured as such) and
+changes no text. The gain is not where it was predicted. The per-arm
+means (not paired) put it in issue (2.06 -> 1.77), the DeltaNet (4.42 ->
+4.19), lm_head (1.15 -> 1.05) and attention (2.24 -> 2.17); the take wait,
+which the prediction expected to shrink, went 0.51 -> 0.59. Why issue
+falls when it now contains one more driver call is not measured; one
+candidate is that a launch costs less when the previous group was already
+submitted. The OFF arm's 16.78 against the 15.0 of the 9 October run (and
+issue 2.06 against 1.24) is another session: absolute times of the two
+days are not compared, the paired delta is.
+
+Not measured: a trace with the flush on (whether the 33 us wait before the
+kernel fell), whether Windows' hardware-accelerated GPU scheduling was on
+(not recorded), other prompts, longer runs, other engines that share the
+DLL (GLM, qwen38 and the rest: the switch stays off by default there).
+
+Everything below is from output the operator pasted in the session. The
+logs, the trace and its CSVs stay on the operator's machine; none is
+committed and no evidence.sha256 exists for them.
+
+--- 1. the 9 October trace, copy phase split -------------------------------
+
+From C:\colibri-ab, after `git pull` to f28b72cd (main at the merge of
+#80):
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File C:\colibri-fork\c\tools\nsys-moe.ps1 -Csv moe1_cuda_gpu_trace.csv -ApiCsv moe1_cuda_api_trace.csv -BaseLog moe-base.log
+
+  gruppi di expert: 6080 = (prompt 25 + generati 127) x 40 layer | prefill 1000, decode 5080
+  lancio: per CorrId: 6080 gruppi su 6080
+
+  decode, microsecondi per gruppo                    n    media  mediana      p10      p90      min
+    chiamata cudaGraphLaunch (durata)              5080     37.6     33.5     29.2     51.2     25.6
+    inizio chiamata -> prima operazione GPU        5080     17.2     15.9     14.1     21.0     11.9
+    fine chiamata -> prima operazione GPU          5080    -20.5    -17.5    -30.8    -14.6   -547.8
+    copie su (prima copia -> kernel hidden)        5080     41.1     39.2     28.4     52.3     13.9
+      prima copia -> inizio copia x                5080      4.7      5.0      2.3      5.2      1.9
+      copia x (durata)                             5080      1.5      1.4      1.4      1.7      1.3
+      fine copia x -> kernel hidden                5080     34.9     33.3     21.8     45.6      8.0
+    fine chiamata -> kernel hidden                 5080     20.6     21.7     -3.1     33.0   -518.6
+    kernel hidden (gate+up)                        5080     52.0     44.4     39.7     44.8     13.8
+    pausa hidden -> down                           5080      0.1      0.1      0.1      0.2     -0.5
+    kernel down                                    5080     27.1     23.5     20.9     23.6      7.2
+    fine kernel -> fine copia giu                  5080      6.9      6.5      5.5      7.2      4.7
+    span GPU (prima copia -> fine copia giu)       5080    127.2    113.2    101.7    129.6     64.5
+    inizio chiamata -> fine copia giu              5080    144.4    129.1    118.7    148.2     84.1
+    fine chiamata -> fine copia giu                5080    106.7     95.8     71.6    110.9      6.2
+
+  kernel per numero di expert: 8 expert, 4466 gruppi, hidden 44.4 us
+  (212.5 GB/s of weights and scales), down 23.5 us (200.6 GB/s).
+
+  The trace was taken with nsys 2026.3.2 (`-t cuda --sample=none
+  --cpuctxsw=none --cuda-graph-trace=node`), so its API durations are
+  profiled ones. The rest of its output was pasted in the session the
+  day before; not repeated here.
+
+--- 2. build and test ----------------------------------------------------------
+
+A Visual Studio 2022 Developer Command Prompt, C:\colibri-fork\c, PATH with
+C:\msys64\clang64\bin first and C:\msys64\usr\bin last:
+
+  make cuda-dll CC=clang CUDA_ARCH=sm_89
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+  nvcc -O3 -std=c++17 -ftz=false -arch=sm_89 tests\test_grouped_g4_cuda.cu -o grouped_g4_test.exe
+  grouped_g4_test.exe
+
+  grouped-g4 oracle: 50 trials x 3 experts (gs=64 + tail + per-row member), 0 mismatches
+  [CUDA] device 0: NVIDIA GeForce RTX 4070 Ti SUPER, 17.2 GB VRAM, sm_89
+  [cuda] WARNING: expert down-rows is on with COLI_CUDA_GRAPH off. Measured +1.15 ms/token in that combination; set COLI_CUDA_DOWN_ROWS=0 too, or leave the graph on.
+  grouped-g4 API: sync vs oracle + async(issue/take) vs sync, 0 mismatches
+  grouped-g4 broadcast: x_rows=1 vs 3 duplicated rows: bitwise
+  [cuda] expert group graph active (count=3)
+  grouped-g4 graph: rep 0 (capture) vs per-call launches: bitwise
+  grouped-g4 graph: rep 1 (replay) vs per-call launches: bitwise
+  grouped-g4 graph: rep 2 (replay) vs per-call launches: bitwise
+  grouped-g4 graph: 1 captures + 2 replays, all counted
+  grouped-g4 graph after a real buffer grow: re-captured, bitwise
+  [cuda] group flush active: COLI_CUDA_FLUSH=1, cudaStreamQuery after each expert group launch
+  grouped-g4 flush: 4 of 4 queries found the group unfinished; the runtime left NotReady as the last error in 0 of them
+  grouped-g4 flush: graph and per-call, 4 issues, bitwise, counted, no error left behind
+  OK
+
+The WARNING comes from the test's own reference arm, which sets
+COLI_CUDA_GRAPH=0 with the down-rows default on. "0 of them": on CUDA
+13.4 the NotReady of cudaStreamQuery is not recorded as the last error,
+so the clearing in group_flush does not fire here; it stays for runtimes
+that do record it.
+
+--- 3. the A/B -----------------------------------------------------------------
+
+Same window, after the build:
+
+  set QT_UPLOAD_SYNC=
+  set Q36_DN_GPU=
+  set COLI_PLACE=
+  set COLI_CUDA_FLUSH=
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set CACHE_ROUTE=1
+  set ROUTE_J=4
+  set QT_PREFILL_REPLAN=1
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var COLI_CUDA_FLUSH -Value 1 -Marker "[cuda] group flush active:" -MarkerFile coli_cuda.dll -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -AllowTextDrift ON,OFF
+
+  eseguibile: .\qwen36_clang.exe | 404480 byte | 2026-10-10 07:50:54 | sha256 44BBCE1140EF8C1D
+  coli_cuda.dll: 820736 byte | 2026-10-10 07:50:51 | sha256 D99AEF0D030A42F6
+  parametri: cap=256 bits=4 N_NEW=128 rip=6 | OFF: COLI_CUDA_FLUSH assente | ON: COLI_CUDA_FLUSH=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -- DEROGA  | testo-variabile=ON,OFF -- DEROGA: i run di un braccio nominato possono scrivere testi diversi
+  marker: [cuda] group flush active:  (testo trovato in C:\colibri-fork\c\coli_cuda.dll)
+  heat: C:\colibri-fork\c\heat.caldo.bin | 40972 byte | 40 layer x 256 esperti | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F | costruita su un prompt sha256 6A4F0BCF64192EA3, diverso dal prompt misurato (come CROSS) | heat.caldo.bin.sha256: tabella= verificata
+
+  rip 1 (OFF prima)  OFF  17.60  ON  16.20  delta  -1.40 ms/token
+  rip 2 (ON prima )  OFF  16.50  ON  15.70  delta  -0.80 ms/token
+  rip 3 (OFF prima)  OFF  16.70  ON  16.50  delta  -0.20 ms/token
+  rip 4 (ON prima )  OFF  16.70  ON  16.10  delta  -0.60 ms/token
+  rip 5 (OFF prima)  OFF  16.60  ON  16.10  delta  -0.50 ms/token
+  rip 6 (ON prima )  OFF  16.60  ON  16.50  delta  -0.10 ms/token
+
+  tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 12 run
+  [place] auto: identica in tutti i 12 run
+  residenza identica in tutti i run: 6812/10240
+  braccio OFF: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  braccio ON: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  testo generato IDENTICO fra i due bracci (sullo stdout letto) -- solo ripetizione 1
+
+  --- delta appaiati (ON - OFF), ms/token ---
+  -1.40   -0.80   -0.20   -0.60   -0.50   -0.10
+  media    -0.60   sd  0.47   se  0.19   df 5
+  intervallo 95 %:  [-1.09 ; -0.11]   ampiezza +-0.49
+  negativi 6/6
+
+  --- controllo POSIZIONE (ABBA) ---
+  OFF prima:  -1.40  -0.20  -0.50
+  ON prima:   -0.80  -0.60  -0.10
+  differenza fra le medie dei due gruppi: -0.20 ms/token
+
+  --- medie per braccio ---
+  OFF    step  16.78  moe   7.74  attn  2.24  dn  4.42  head  1.15
+         (shared)  3.37  (router)  0.83  wait  0.51
+         issue  2.06  cpu-miss  0.57  take  0.62  sh-ovl  3.38  hit  97.7 %  swaps  6.0  miss 1133
+         dopo il prefill: hit  98.2 %
+  ON     step  16.18  moe   7.58  attn  2.17  dn  4.19  head  1.05
+         (shared)  3.40  (router)  0.86  wait  0.59
+         issue  1.77  cpu-miss  0.59  take  0.69  sh-ovl  3.40  hit  97.7 %  swaps  6.0  miss 1133
+         dopo il prefill: hit  98.2 %
+
+--- reading ---------------------------------------------------------------------
+
+  - The prediction in #80 was "at most about the take wait (0.84 in the
+    9 October run) minus the query's cost, landing as a smaller wait and
+    a larger issue". The A/B gives -0.60 on step(), inside that ceiling,
+    but with issue SMALLER (-0.29) and the wait slightly LARGER (+0.08),
+    and the rest of the gain in the DeltaNet, lm_head and attention
+    timers, which contain no expert group. These are differences of
+    per-arm means over six runs each, not paired, and their noise is
+    not estimated; the paired figure is step() alone.
+  - So the trace's 22 us between the call's return and the kernel is
+    real, and the flush is worth -0.60 ms/token on this prompt, but this
+    run does not show that the flush removed that wait: a trace with the
+    flush on would. Everything the flush could touch outside the group
+    (the next dense call on the default stream, the next launch) shares
+    the same driver, and nothing here separates those.
+  - Same hit rate, swaps, misses and residency in both arms: the flush
+    moves no expert.
