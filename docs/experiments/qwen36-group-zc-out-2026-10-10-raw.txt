@@ -25,13 +25,20 @@ Summary:
                  +0.13], 5 of 6 negative;
        10 pairs: step() 14.50 -> 13.98, paired delta -0.52, 95 % [-1.02,
                  -0.02], 8 of 10 negative; position check 0.80 ms/token
-                 (OFF first -0.12, ON first -0.92 on average): the arm run
-                 second was slower by about 0.4, which the ABBA order
-                 cancels in the mean if it stayed constant.
-     One text in all 32 runs (87ce3f1b34ce2d6b). The 6-pair mean is larger
-     than the mechanism can give (below, at most ~0.6 ms/token); the
-     10-pair run is the one to quote. Per-arm means of the 10-pair run (not
-     paired): wait 1.57 -> 1.20, take 1.69 -> 1.31, moe 6.34 -> 5.93.
+                 (OFF first -0.12, ON first -0.92 on average), the largest
+                 of the 10 October records: consistent with the arm run
+                 second being slower by ~0.4 under an additive order
+                 effect, which the ABBA order cancels in the mean if it
+                 stayed constant;
+       the 16 pairs pooled: -0.70, 95 % [-1.16, -0.24], 13 of 16
+                 negative (computed here from the printed deltas).
+     The two runs agree within their intervals; the 10-pair figure, the
+     smaller, is the one quoted elsewhere. The 10-pair run was taken
+     because the 6-pair interval straddled zero. One text in all 32 runs
+     (87ce3f1b34ce2d6b). In the same window, same binaries, the OFF arm
+     moved 15.63 -> 14.50 between the two runs. Per-arm means of the
+     10-pair run (not paired): wait 1.57 -> 1.20, take 1.69 -> 1.31, moe
+     6.34 -> 5.93.
   3. Nsight trace with all four switches on (moe4), read with
      c/tools/nsys-moe.ps1, medians over 5080 decode groups, all 6080 groups
      zero-copy with group_zc_out, linked by CorrId. Against moe3 (the same
@@ -54,14 +61,17 @@ Summary:
      moe3 the 7-expert groups were slower than the 8-expert ones).
 
 Reading: on this prompt COLI_CUDA_GROUP_ZC_OUT is a gain on top of the
-zero-copy group, ~0.5 ms/token (10 pairs), the same order as the bound the
-trace gives (the 14.7 - 4.3 = ~10 us per group, x 40 layers = ~0.4
-ms/token from the end of the call to the results; with the launch on the
-helper it reaches the decode thread through wait, which fell 0.37 in the
-per-arm means). The ON arm's step, 13.98 ms/token (~71.5 tok/s, derived
-from the step), is the lowest arm mean of the 10 October A/Bs; across
-sessions absolute times do not compare. Not measured: other prompts, longer generations, without
-QT_ASYNC_ISSUE or COLI_CUDA_FLUSH.
+zero-copy group, at the edge of the noise: -0.52 ms/token over 10 pairs,
+with an upper end of -0.02. The trace bounds what the mechanism can save:
+(14.7 - 4.3) us per group x 40 layers = ~0.4 ms/token from the end of the
+call to the results (medians; 0.26 from the traces' per-token sums, ~0.55
+from call start to results), and with the launch on the helper it reaches
+the decode thread only through wait, which fell 0.37 in the per-arm means.
+Both point estimates are above that bound; both intervals contain it. Not
+measured: other prompts, longer generations, without QT_ASYNC_ISSUE or
+COLI_CUDA_FLUSH, and zero-copy plus this variant against the copy path in
+one A/B (the -1.38 of COLI_CUDA_GROUP_ZC and this -0.52 come from different
+runs and baselines and are not to be added).
 
 Everything below is from output the operator pasted in the session. The
 logs, the trace and its CSVs stay on the operator's machine; none is
@@ -78,6 +88,7 @@ A Visual Studio 2022 Developer Command Prompt, C:\colibri-fork\c:
   nvcc -O3 -std=c++17 -ftz=false -arch=sm_89 tests\test_grouped_g4_cuda.cu -o grouped_g4_test.exe
   grouped_g4_test.exe                        (window with COLI_CUDA_GROUP_ZC=1, COLI_CUDA_FLUSH=1 set)
 
+  (excerpt: the oracle and device lines and some block lines omitted)
   [cuda] group flush active: COLI_CUDA_FLUSH=1, cudaStreamQuery after each expert group launch
   grouped-g4 API: sync vs oracle + async(issue/take) vs sync, 0 mismatches
   grouped-g4 broadcast: x_rows=1 vs 3 duplicated rows: bitwise
@@ -117,7 +128,7 @@ A Visual Studio 2022 Developer Command Prompt, C:\colibri-fork\c:
   grouped-g4 zero-copy: 4 graph issues on two inputs + branch 3, bitwise against the copy path, captured once and replayed, off again
   OK
 
-The first run's "..." lines were as in the second. After sections 2 and 3:
+The first run is an excerpt. After sections 2 and 3:
 
   git pull                                   (a599a00..b96321e, main at the merge of #85)
   nvcc -O3 -std=c++17 -ftz=false -arch=sm_89 tests\test_grouped_g4_cuda.cu -o grouped_g4_test.exe
@@ -136,7 +147,7 @@ The first run's "..." lines were as in the second. After sections 2 and 3:
   grouped-g4 zero-copy: 4 graph issues on two inputs + branch 3, bitwise against the copy path, captured once and replayed, off again
   OK
 
-(the "..." lines as in the run above.)
+(excerpt: "..." stands for lines omitted here.)
 
 --- 2. the A/Bs -------------------------------------------------------------------
 
@@ -172,15 +183,26 @@ rewritten it); the engine was rebuilt, unchanged in source:
   rip 5 (OFF prima)  OFF  15.10  ON  14.50  delta  -0.60 ms/token
   rip 6 (ON prima )  OFF  15.90  ON  14.50  delta  -1.40 ms/token
 
+  (excerpt of the summary that followed:)
   tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 12 run
+  [place] auto: identica in tutti i 12 run
   residenza identica in tutti i run: 6812/10240
-  braccio OFF: 1 testo in 6 run ... sha256 87ce3f1b34ce2d6b
-  braccio ON: 1 testo in 6 run ... sha256 87ce3f1b34ce2d6b
+  braccio OFF: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  braccio ON: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
   testo generato IDENTICO fra i due bracci (sullo stdout letto) -- solo ripetizione 1
+
+  --- delta appaiati (ON - OFF), ms/token ---
+  -2.60   -1.20   0.70   -0.90   -0.60   -1.40
   media    -1.00   sd  1.08   se  0.44   df 5
   intervallo 95 %:  [-2.13 ; 0.13]   ampiezza +-1.13
   negativi 5/6
-  differenza fra le medie dei due gruppi (ABBA): 0.33 ms/token
+
+  --- controllo POSIZIONE (ABBA) ---
+  OFF prima:  -2.60  0.70  -0.60
+  ON prima:   -1.20  -0.90  -1.40
+  differenza fra le medie dei due gruppi: 0.33 ms/token
+
+  --- medie per braccio ---
   OFF    step  15.63  moe   7.16  attn  2.08  dn  4.09  head  1.06
          (shared)  3.21  (router)  0.91  wait  2.00
          issue  0.05  cpu-miss  0.55  take  2.14
