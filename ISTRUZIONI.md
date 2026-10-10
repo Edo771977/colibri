@@ -130,24 +130,54 @@ qwen36.exe 256 4 prompt.txt
     perplexity (su un solo testo): non è stabilito che sia più veloce né che costi di più.
   - `set QT_PREFILL_REPLAN=1`, insieme ai tre sopra: mentre legge il prompt sceglie gli esperti
     che il prompt usa di più e li porta in VRAM al posto di quelli che usa meno (gli scambi
-    partono durante il prompt o nei primi token generati). Misurato l'8 ottobre sopra `CACHE_ROUTE=1 ROUTE_J=4`:
-    -1,00 ms/token sullo step, 15,87 → 14,87 (l'equivalente di ~63 → ~67 tok/s, ricavato dallo
-    step e non misurato direttamente), intervallo 95 % [-1,26 ; -0,74], 6 coppie su 6, con
-    `COLI_CUDA_KEEPALIVE=1` e la tabella heat fissa in entrambi i bracci, su un solo prompt di
-    25 token e 128 token generati
+    partono durante il prompt o nei primi token generati). Misurato l'8 ottobre sopra
+    `CACHE_ROUTE=1 ROUTE_J=4`: -1,00 ms/token sullo step, 15,87 → 14,87 (l'equivalente di ~63 →
+    ~67 tok/s, ricavato dallo step e non misurato direttamente), intervallo 95 % [-1,26 ;
+    -0,74], 6 coppie su 6, con `COLI_CUDA_KEEPALIVE=1` e la tabella heat fissa in entrambi i
+    bracci, su un solo prompt di 25 token e 128 token generati
     (`docs/experiments/qwen36-prefill-replan-2026-10-08-raw.txt`). Il braccio senza re-plan qui
-    misura 15,87 contro il 15,55 del 4 ottobre: altra sessione e build, i tempi assoluti delle due
-    misure non si confrontano. La tabella heat era costruita su un altro prompt. Il
-    guadagno non è misurato con `HEAT_FILE=heat.bin` riscritta a ogni uscita (come nel blocco
-    sopra), né senza keep-alive. Il prezzo si paga prima della prima parola: il tempo fino alla
-    prima parola passa da 0,44 a 0,65 s (+0,21 s, intervallo 95 % [+0,14 ; +0,28], 6 coppie su
-    6), letto dagli stessi log; la RAM di picco resta praticamente la stessa (+0,01-0,03 GB su
-    31,6 GB). Con i 128 token della prova la generazione intera (prima parola più 127 passi)
-    dura circa 0,08 s in più, calcolato dalle due misure (intervallo 95 % [+0,01 ; +0,15], più
-    lunga in 5 coppie su 6). Se il guadagno per token restasse lo stesso oltre i 128 token (non
-    misurato), converrebbe da circa 210 token generati in su (fra ~110 e ~380 secondo gli
-    intervalli). Non misurati: la qualità (nessuna perplexity con il re-plan; il testo cambia),
-    prompt più lunghi e generazioni lunghe.
+    misura 15,87 contro il 15,55 del 4 ottobre: altra sessione e build, i tempi assoluti delle
+    due misure non si confrontano. La tabella heat era costruita su un altro prompt. Il guadagno
+    non è misurato con `HEAT_FILE=heat.bin` riscritta a ogni uscita (come nel blocco sopra), né
+    senza keep-alive. Il prezzo si paga prima della prima parola: il tempo fino alla prima
+    parola passa da 0,44 a 0,65 s (+0,21 s, intervallo 95 % [+0,14 ; +0,28], 6 coppie su 6),
+    letto dagli stessi log; la RAM di picco resta praticamente la stessa (+0,01-0,03 GB su 31,6
+    GB). Con i 128 token della prova la generazione intera (prima parola più 127 passi) dura
+    circa 0,08 s in più, calcolato dalle due misure (intervallo 95 % [+0,01 ; +0,15], più lunga
+    in 5 coppie su 6). Se il guadagno per token restasse lo stesso oltre i 128 token (non
+    misurato in quella prova; vedi sotto la misura a 512 token), converrebbe da circa 210 token
+    generati in su (fra ~110 e ~380 secondo gli intervalli). Con **512 token generati** (stessi
+    binari, più tardi la stessa sera, dopo un riavvio): -1,30 ms/token sullo step, 16,02 →
+    14,72, intervallo 95 % [-1,59 ; -1,01], 6 coppie su 6; il tempo fino alla prima parola sale
+    di 0,19 s (0,43 → 0,63 s); **generazione intera -0,47 s** (calcolata: prima parola più 511
+    passi), intervallo 95 % [-0,61 ; -0,33], più breve in 6 coppie su 6: con 512 token, su
+    questo prompt, conviene. In quella corsa anche il braccio senza re-plan ha scritto un testo
+    diverso in 1 run su 6; quelli del braccio con il re-plan lo script non li ha controllati,
+    perché si è fermato prima (sezione 5 dello stesso record). Non misurati: la qualità (nessuna
+    perplexity con il re-plan; il testo cambia), prompt più lunghi e generazioni oltre i 512
+    token.
+  - `set COLI_CUDA_FLUSH=1`, insieme a tutti quelli sopra: dopo ogni gruppo di esperti mandato
+    alla GPU chiede subito lo stato dello stream (`cudaStreamQuery`), per spingere il driver di
+    Windows a inviare il lavoro invece di tenerlo in coda. Nella traccia del 9 ottobre il kernel
+    del gruppo partiva ~22 µs (mediana per gruppo, traccia presa con il profiler) dopo che la
+    chiamata di lancio era già tornata, con i dati già copiati. Misurato il 10 ottobre sopra
+    `CACHE_ROUTE=1 ROUTE_J=4`, `QT_PREFILL_REPLAN=1`, `COLI_DN_GPU=1` e `COLI_CUDA_KEEPALIVE=1`,
+    con la tabella heat fissa in entrambi i bracci: -0,60 ms/token sullo step, 16,78 → 16,18
+    (l'equivalente di ~59,6 → ~61,8 tok/s, ricavato dallo step e non misurato direttamente),
+    intervallo 95 % [-1,09 ; -0,11], 6 coppie su 6, testo identico in tutti i 12 run, su un solo
+    prompt di 25 token e 128 token generati
+    (`docs/experiments/qwen36-cuda-flush-2026-10-10-raw.txt`). Quel giorno il braccio senza
+    flush misurava 16,78 contro i 15,0 del 9 ottobre: altra sessione, i tempi assoluti non si
+    confrontano. Il guadagno non è dove era previsto (dalle medie per braccio, non appaiate: è
+    sceso `issue`, e anche i tempi `dn`, `head` e `attn`, mentre l'attesa della GPU è salita
+    leggermente) e nessuna traccia con il flush acceso mostra se l'attesa prima del kernel è
+    scesa. Non misurato con `HEAT_FILE=heat.bin` riscritta a ogni uscita. Vive nella DLL: dopo
+    `git pull` serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il motore;
+    nell'uscita del motore (stderr), già durante la lettura del prompt, deve comparire `[cuda]
+    group flush active`: se manca, la DLL è quella vecchia oppure la variabile non vale
+    esattamente `1` (attenzione agli spazi dopo l'`1` in cmd). Non annotato: se la
+    "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non misurati: altri
+    prompt e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)
