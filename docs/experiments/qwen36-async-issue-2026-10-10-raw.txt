@@ -1,0 +1,166 @@
+Qwen3.6-35B-A3B: QT_ASYNC_ISSUE=1 (#82), the expert group launched from a
+helper thread, under the CUDA tier with COLI_CUDA_FLUSH=1, CACHE_ROUTE=1
+ROUTE_J=4, QT_PREFILL_REPLAN=1, the DeltaNet on the GPU and the keep-alive,
+no QT_UPLOAD_SYNC. Then an Nsight trace with both switches on.
+10 October 2026, morning, on the operator's machine (RTX 4070 Ti SUPER,
+Ryzen 9 7950X, Windows 11, qwen36_i4_gs64 read from D:, cap 256, 4 bits).
+
+Summary:
+
+  1. misure-envab.ps1, QT_ASYNC_ISSUE absent vs =1, six ABBA pairs, the
+     heat table and COLI_CUDA_FLUSH=1 in both arms: step() 16.48 -> 16.73
+     ms/token, paired delta +0.25, 95 % [-0.87, +1.37], 3 of 6 negative.
+     No effect distinguishable from the noise. One text in all twelve runs
+     (87ce3f1b34ce2d6b); 6080 groups launched by the helper and 0 experts
+     refused in the ON repetition 1 log.
+  2. Where the time went (per-arm means, not paired): issue 1.86 -> 0.05,
+     wait 0.78 -> 2.69 (take 0.89 -> 2.79). What the launch no longer costs
+     the decode thread it waits for afterwards: the GPU side of the MoE
+     window is the longer one. That is the case the model in #82 predicted
+     ("about nothing where P >= C").
+  3. An Nsight trace with COLI_CUDA_FLUSH=1 and QT_ASYNC_ISSUE=1 (moe2), read
+     with c/tools/nsys-moe.ps1, medians over 5080 decode groups: the
+     cudaGraphLaunch call (now on the helper) 52.8 us; the first GPU
+     operation 25.3 us into it; x copy end -> hidden kernel 26.7 us; call
+     end -> hidden kernel 6.8 us; hidden + down 67.9 us; call start ->
+     results 136.0 us. Against the 9 October trace (no flush, no helper,
+     docs/experiments/qwen36-cuda-flush-2026-10-10-raw.txt section 1):
+     call 33.5 us, call end -> hidden 21.7 us, call start -> results
+     129.1 us. With both switches the kernel starts close to the end of the
+     launch call, but the call itself is longer on the helper thread, and
+     the group as a whole is not shorter.
+
+Reading: on this prompt the helper thread buys nothing by itself, and the
+run shows why: the decode thread finishes its CPU work (cpu-miss + shared,
+~4 ms/token) and then waits ~2-2.7 ms/token for the GPU. The kernels start
+only at about the end of the launch call (6.8 us after it, median), while
+the copies that open the graph (704 bytes and 8 KiB) start in the middle
+of it: about 60 us of the 136 us group are before the first kernel. Why
+the call is longer on the helper (52.8 against 33.5 us) is not measured;
+the helper sharing a core with the OpenMP team is one candidate. Not
+measured: the two switches separately under Nsight, other prompts.
+
+What this leaves: with the helper on, the decode thread waits ~2 ms/token
+(unprofiled) for the helper's launch plus the GPU group, so time removed
+from that would count, up to about that wait and layer by layer. The next step (COLI_CUDA_GROUP_ZC, a graph of
+kernels only) tests whether the copy-engine nodes are what makes the
+launch long; that is a hypothesis.
+
+Everything below is from output the operator pasted in the session. The
+logs, the trace and its CSVs stay on the operator's machine; none is
+committed and no evidence.sha256 exists for them.
+
+--- 1. build -------------------------------------------------------------------
+
+A Visual Studio 2022 Developer Command Prompt, C:\colibri-fork\c:
+
+  set PATH=C:\msys64\clang64\bin;%PATH%;C:\msys64\usr\bin
+  git pull                                   (f28b72c..231df32, main at the merge of #82)
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+
+The DLL was not rebuilt (#82 changes no DLL code): the one built for #80.
+
+--- 2. the A/B -------------------------------------------------------------------
+
+  set QT_UPLOAD_SYNC=
+  set Q36_DN_GPU=
+  set COLI_PLACE=
+  set QT_ASYNC_ISSUE=
+  set QT_ASYNC_SPIN_US=
+  set COLI_CUDA_FLUSH=1
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set CACHE_ROUTE=1
+  set ROUTE_J=4
+  set QT_PREFILL_REPLAN=1
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var QT_ASYNC_ISSUE -Value 1 -Marker "[qtier] QT_ASYNC_ISSUE=1: expert groups launched from a helper thread" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_FLUSH,COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -AllowTextDrift ON,OFF
+
+  eseguibile: .\qwen36_clang.exe | 412672 byte | 2026-10-10 08:55:06 | sha256 00FCBEEAB5F588C7
+  coli_cuda.dll: 820736 byte | 2026-10-10 07:50:51 | sha256 D99AEF0D030A42F6
+  parametri: cap=256 bits=4 N_NEW=128 rip=6 | OFF: QT_ASYNC_ISSUE assente | ON: QT_ASYNC_ISSUE=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_FLUSH,COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -- DEROGA  | testo-variabile=ON,OFF -- DEROGA: i run di un braccio nominato possono scrivere testi diversi
+  marker: [qtier] QT_ASYNC_ISSUE=1: expert groups launched from a helper thread  (testo trovato in C:\colibri-fork\c\qwen36_clang.exe)
+
+  rip 1 (OFF prima)  OFF  16.50  ON  16.10  delta  -0.40 ms/token
+  rip 2 (ON prima )  OFF  16.10  ON  16.90  delta   0.80 ms/token
+  rip 3 (OFF prima)  OFF  15.90  ON  17.80  delta   1.90 ms/token
+  rip 4 (ON prima )  OFF  16.80  ON  16.20  delta  -0.60 ms/token
+  rip 5 (OFF prima)  OFF  17.40  ON  16.50  delta  -0.90 ms/token
+  rip 6 (ON prima )  OFF  16.20  ON  16.90  delta   0.70 ms/token
+
+  tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 12 run
+  [place] auto: identica in tutti i 12 run
+  residenza identica in tutti i run: 6812/10240
+  braccio OFF: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  braccio ON: 1 testo in 6 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+
+  --- delta appaiati (ON - OFF), ms/token ---
+  -0.40   0.80   1.90   -0.60   -0.90   0.70
+  media     0.25   sd  1.07   se  0.44   df 5
+  intervallo 95 %:  [-0.87 ; 1.37]   ampiezza +-1.12
+  negativi 3/6
+
+  --- medie per braccio ---
+  OFF    step  16.48  moe   7.54  attn  2.26  dn  4.32  head  1.09
+         (shared)  3.23  (router)  0.72  wait  0.78
+         issue  1.86  cpu-miss  0.54  take  0.89  sh-ovl  3.24  hit  97.7 %  swaps  6.0  miss 1133
+  ON     step  16.73  moe   7.72  attn  2.28  dn  4.41  head  1.15
+         (shared)  3.31  (router)  0.74  wait  2.69
+         issue  0.05  cpu-miss  0.54  take  2.79  sh-ovl  3.31  hit  97.7 %  swaps  6.0  miss 1133
+
+  findstr /C:"async issue" /C:"QT_ASYNC" envab-ON-r1.log envab-OFF-r1.log
+  envab-ON-r1.log:[qtier] QT_ASYNC_ISSUE=1: expert groups launched from a helper thread (spins 2000 us after each job, then sleeps)
+  envab-ON-r1.log:[qtier] async issue: 6080 groups launched by the helper thread, 0 experts refused and recomputed on the CPU
+
+  In the ON arm `wait` contains the decode thread's wait for the helper
+  (#82 charges it there), and `issue` only the hand-off.
+
+--- 3. the trace with both switches on -----------------------------------------
+
+From C:\colibri-ab, a cmd window with Nsight Systems 2026.3.2 and
+C:\msys64\clang64\bin on PATH, SNAP=D:\modelli\qwen36_i4_gs64 COLI_CUDA=1
+COLI_GPUS=0 COLI_TIMERS=1 N_NEW=128 HEAT_FILE=heat.bin CACHE_ROUTE=1
+ROUTE_J=4 QT_PREFILL_REPLAN=1 COLI_DN_GPU=1 COLI_CUDA_KEEPALIVE=1
+COLI_CUDA_FLUSH=1 QT_ASYNC_ISSUE=1, COLI_PLACE QT_UPLOAD_SYNC Q36_DN_GPU
+QT_ASYNC_SPIN_US cleared:
+
+  copy /Y heat.caldo.bin heat.bin >nul & C:\colibri-fork\c\qwen36_clang.exe 256 4 prompt25.txt > moe2-base.log 2>&1
+  copy /Y heat.caldo.bin heat.bin >nul & nsys profile -t cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node --force-overwrite=true -o moe2 C:\colibri-fork\c\qwen36_clang.exe 256 4 prompt25.txt > moe2-nsys.log 2>&1
+  nsys stats --report cuda_gpu_trace,cuda_api_trace --format csv --force-export=true --output moe2 moe2.nsys-rep
+  powershell -NoProfile -ExecutionPolicy Bypass -File C:\colibri-fork\c\tools\nsys-moe.ps1 -Csv moe2_cuda_gpu_trace.csv -ApiCsv moe2_cuda_api_trace.csv -BaseLog moe2-base.log
+
+  gruppi di expert: 6080 = (prompt 25 + generati 127) x 40 layer | prefill 1000, decode 5080
+  lancio: per CorrId: 6080 gruppi su 6080
+  gruppi di decode con attivita' di altri stream nello span (keep-alive escluso): 9 su 5080
+
+  decode, microsecondi per gruppo                    n    media  mediana      p10      p90      min
+    chiamata cudaGraphLaunch (durata)              5080     59.4     52.8     36.3     90.1     24.0
+    inizio chiamata -> prima operazione GPU        5080     27.0     25.3     14.1     41.4     11.6
+    fine chiamata -> prima operazione GPU          5080    -32.4    -26.8    -52.2    -19.2   -361.9
+    copie su (prima copia -> kernel hidden)        5080     39.8     35.0     23.4     54.5     15.7
+      prima copia -> inizio copia x                5080      8.1      5.1      4.9     13.6      1.9
+      copia x (durata)                             5080      1.5      1.5      1.4      1.7      1.3
+      fine copia x -> kernel hidden                5080     30.1     26.7     15.8     42.2      7.7
+    fine chiamata -> kernel hidden                 5080      7.4      6.8     -9.7     22.6   -189.9
+    kernel hidden (gate+up)                        5080     45.7     44.4     39.7     45.1     13.7
+    pausa hidden -> down                           5080      0.1      0.1      0.1      0.2     -0.4
+    kernel down                                    5080     24.2     23.5     20.9     23.8      7.3
+    fine kernel -> fine copia giu                  5080      6.7      6.5      5.6      7.1      4.3
+    span GPU (prima copia -> fine copia giu)       5080    116.5    109.3     97.3    129.8     63.4
+    inizio chiamata -> fine copia giu              5080    143.5    136.0    117.5    165.1     87.4
+    fine chiamata -> fine copia giu                5080     84.1     80.7     64.2     97.6   -132.0
+
+  8 expert, 4466 gruppi: hidden 44.4 us, down 23.5 us (212.5 / 200.6 GB/s of weights and scales)
+
+  per token di decode (somma dei gruppi / 127 token), ms/token:
+    traccia (corsa profilata): lancio 2.38 | kernel 2.79 | span GPU 4.66 | da fine chiamata a fine copia giu 3.36
+    moe2-base.log (senza profiler): step 15.30 | moe 7.26 | issue 0.06 | cpu-miss 0.57 | shared 3.47 | take 2.12 (wait 2.03, accum 0.08)
+
+  findstr /L /C:"group flush active" /C:"QT_ASYNC_ISSUE=1" moe2-base.log
+  [qtier] QT_ASYNC_ISSUE=1: expert groups launched from a helper thread (spins 2000 us after each job, then sleeps)
+  [cuda] group flush active: COLI_CUDA_FLUSH=1, cudaStreamQuery after each expert group launch
+
+  The trace is profiled: its API durations, and possibly the graph under
+  node tracing, are longer than in an unprofiled run (the base log's step
+  15.30 is the unprofiled run made just before it, a single run, not an
+  A/B arm). The 9 October figures compared above come from a trace taken
+  the same way, without the two switches.

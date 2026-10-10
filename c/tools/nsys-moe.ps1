@@ -33,7 +33,11 @@
 # limite e' solo una protezione, non serve con il motore di oggi). Dopo il
 # kernel hidden, i kernel fino alla prima copia giu. Il numero di expert e'
 # la GrdZ del kernel hidden (la griglia e' I x righe x expert), controllato
-# con i byte della copia giu (un expert, una riga di 2048 float).
+# con i byte della copia giu (un expert, una riga di 2048 float). Con
+# COLI_CUDA_GROUP_ZC=1 il gruppo non ha copie: al posto di quelle su c'e' il
+# kernel group_zc_stage, dopo il hidden un solo kernel grouped_down* e
+# nessuna copia giu (le righe vanno direttamente nella memoria dell'host);
+# lo script riconosce questa forma e la conta a parte.
 #
 # UNA SCHEDA SOLA. qt_issue manda un gruppo per scheda che ha expert del
 # layer in VRAM: con piu' schede i gruppi per layer sono piu' di uno e il
@@ -205,7 +209,7 @@ function Near([double]$got, [double]$want) { [Math]::Abs($got - $want) -le [Math
 
 # ---- gruppi ----------------------------------------------------------------------
 $groups = New-Object System.Collections.Generic.List[object]
-$nNoUp = 0; $nNoDown = 0; $nNoD2H = 0; $nXOdd = 0
+$nNoUp = 0; $nNoDown = 0; $nNoD2H = 0; $nXOdd = 0; $nZc = 0
 foreach ($key in @($byStream.Keys)) {
     $ops = @($byStream[$key] | Sort-Object S)
     for ($i = 0; $i -lt $ops.Count; $i++) {
@@ -215,22 +219,42 @@ foreach ($key in @($byStream.Keys)) {
         # prima ancora i descrittori (8 expert al massimo, 704 byte). Una copia
         # piu' grande di 4 KiB li' davanti non sarebbe dei descrittori e resta
         # fuori (con il motore di oggi non succede: vedi COSA CERCA).
-        if ($i -lt 1 -or $ops[$i - 1].Kind -ne "H") { $nNoUp++; continue }
-        $ups = @($ops[$i - 1])
-        if (-not (Near $ops[$i - 1].B $RowBytes)) { $nXOdd++ }
-        if ($i -ge 2 -and $ops[$i - 2].Kind -eq "H" -and $ops[$i - 2].B -le 4096) { $ups = @($ops[$i - 2]) + $ups }
-        # kernel fino alla prima copia giu
+        # COLI_CUDA_GROUP_ZC: al posto delle due copie su, il kernel
+        # group_zc_stage (legge x e i descrittori dalla memoria pinned), e
+        # nessuna copia giu (il kernel down scrive le righe nella memoria
+        # dell'host). Le sue righe "copia x" sono il kernel di staging, e la
+        # fase "fine kernel -> fine copia giu" vale 0.
+        $zc = ($i -ge 1 -and $ops[$i - 1].Kind -eq "K" -and $ops[$i - 1].Name -like "group_zc_stage*")
+        if ($zc) {
+            $ups = @($ops[$i - 1])
+        } else {
+            if ($i -lt 1 -or $ops[$i - 1].Kind -ne "H") { $nNoUp++; continue }
+            $ups = @($ops[$i - 1])
+            if (-not (Near $ops[$i - 1].B $RowBytes)) { $nXOdd++ }
+            if ($i -ge 2 -and $ops[$i - 2].Kind -eq "H" -and $ops[$i - 2].B -le 4096) { $ups = @($ops[$i - 2]) + $ups }
+        }
+        # kernel fino alla prima copia giu (o, a zero-copy, fino al gruppo dopo)
         $downs = @(); $k = $i + 1
-        while ($k -lt $ops.Count -and $ops[$k].Kind -eq "K" -and $ops[$k].Name -notlike "grouped_hidden*") { $downs += $ops[$k]; $k++ }
+        # Senza la copia giu a chiudere il gruppo, a zero-copy il gruppo finisce
+        # al primo kernel che non e' un grouped_down* (la variante esiste solo
+        # nei rami del graph, dove dopo il hidden c'e' un solo kernel down).
+        while ($k -lt $ops.Count -and $ops[$k].Kind -eq "K" -and $ops[$k].Name -notlike "grouped_hidden*" -and
+               $ops[$k].Name -notlike "group_zc_stage*" -and (-not $zc -or $ops[$k].Name -like "grouped_down*")) { $downs += $ops[$k]; $k++ }
         if ($downs.Count -eq 0) { $nNoDown++; continue }
-        if ($k -ge $ops.Count -or $ops[$k].Kind -ne "D") { $nNoD2H++; continue }
-        $dFirst = $ops[$k]; $dLast = $ops[$k]; $db = $ops[$k].B
-        while ($k + 1 -lt $ops.Count -and $ops[$k + 1].Kind -eq "D") { $k++; $dLast = $ops[$k]; $db += $ops[$k].B }
+        if ($zc) {
+            $nZc++
+            $db = [double]::NaN
+            $dFirst = [pscustomobject]@{ S = $downs[-1].E; E = $downs[-1].E }; $dLast = $dFirst
+        } else {
+            if ($k -ge $ops.Count -or $ops[$k].Kind -ne "D") { $nNoD2H++; continue }
+            $dFirst = $ops[$k]; $dLast = $ops[$k]; $db = $ops[$k].B
+            while ($k + 1 -lt $ops.Count -and $ops[$k + 1].Kind -eq "D") { $k++; $dLast = $ops[$k]; $db += $ops[$k].B }
+        }
         $groups.Add([pscustomobject]@{
             Key = $key; Dev = $h.Dev; FS = $ups[0].S; XS = $ups[-1].S; XE = $ups[-1].E; HS = $h.S; HE = $h.E; KS = $downs[0].S; KE = $downs[-1].E
             DS = $dFirst.S; DE = $dLast.E; Count = $h.GZ; Rows = $h.GY; DBytes = $db; NUp = $ups.Count
             CorrH = $h.Corr; CorrUp = $ups[0].Corr; DownName = (@($downs | ForEach-Object { $_.Name }) -join '+'); NDown = $downs.Count
-            ApiS = [double]::NaN; ApiE = [double]::NaN; Foreign = $false
+            ApiS = [double]::NaN; ApiE = [double]::NaN; Foreign = $false; Zc = $zc
         })
     }
 }
@@ -399,7 +423,7 @@ function Row([string]$label, [double[]]$v) {
 
 # ---- stampa ------------------------------------------------------------------------------
 $nNon1 = @($dec | Where-Object { $_.Rows -ne 1 }).Count
-$nBytesOff = @($dec | Where-Object { -not (Near $_.DBytes ($_.Count * $RowBytes)) }).Count
+$nBytesOff = @($dec | Where-Object { -not $_.Zc -and -not (Near $_.DBytes ($_.Count * $RowBytes)) }).Count
 if ($nXOdd)     { $warn.Add("$nXOdd gruppi hanno una copia subito prima del kernel hidden che non e' l'input di $RowBytes byte del decode: la loro fase 'copie su' puo' contenere altro.") }
 $downNames = @($dec | ForEach-Object { $_.DownName } | Sort-Object -Unique)
 $nMultiDown = @($dec | Where-Object { $_.NDown -ne 1 }).Count
@@ -411,6 +435,7 @@ if ($nBytesOff) { $warn.Add("$nBytesOff gruppi di decode hanno una copia giu che
 "traccia: $Csv | $($allOps.Count) operazioni GPU su $($byStream.Count) stream"
 "gruppi di expert: $($groups.Count) = (prompt $($bl.Pre) + generati $($bl.Dec)) x $L layer | prefill $($pre.Count), decode $($dec.Count)"
 "  non riconosciuti: senza copie su $nNoUp, senza kernel down $nNoDown, senza copia giu $nNoD2H"
+"  riconosciuti a zero-copy (COLI_CUDA_GROUP_ZC: kernel di staging al posto delle copie, nessuna copia giu; per loro 'copia giu' finisce con il kernel down): $nZc"
 "  $dnCheck"
 "lancio: $linkHow"
 "altri stream durante il decode (lo stream di default porta anche le chiamate dense e la DeltaNet): {0} copie su oltre 16 KiB ({1} MB: caricamenti di expert e, al primo token, lo stato DeltaNet), {2} fino a 16 KiB, {3} kernel senza il keep-alive ({4})" -f $winUp.Count,
@@ -424,7 +449,7 @@ Row "inizio chiamata -> prima operazione GPU"      ($dec | ForEach-Object { $_.F
 Row "fine chiamata -> prima operazione GPU"        ($dec | ForEach-Object { $_.FS - $_.ApiE })
 Row "copie su (prima copia -> kernel hidden)"      ($dec | ForEach-Object { $_.HS - $_.FS })
 Row "  prima copia -> inizio copia x"            ($dec | ForEach-Object { $_.XS - $_.FS })
-Row "  copia x (durata)"                         ($dec | ForEach-Object { $_.XE - $_.XS })
+Row "  copia x o kernel di staging (durata)"     ($dec | ForEach-Object { $_.XE - $_.XS })
 Row "  fine copia x -> kernel hidden"            ($dec | ForEach-Object { $_.HS - $_.XE })
 Row "fine chiamata -> kernel hidden"               ($dec | ForEach-Object { $_.HS - $_.ApiE })
 Row "kernel hidden (gate+up)"                      ($dec | ForEach-Object { $_.HE - $_.HS })
