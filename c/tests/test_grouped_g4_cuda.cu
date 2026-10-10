@@ -90,6 +90,31 @@ static int check_graph_default(void){
 }
 
 int main(void){
+    /* Opt-in switches that change the expert group's path. Every block below
+     * sets the ones it tests and expects the others off; a variable left in
+     * the shell (COLI_CUDA_GROUP_ZC=1, set in the window as ISTRUZIONI.md
+     * recommends) made the graph blocks capture the zero-copy graph and the
+     * zero-copy block count 0 captures and 4 replays; COLI_CUDA_GROUP_ZC_OUT=1
+     * would do the same one block later. Cleared here, and said, so the
+     * test means the same thing in any window.
+     * COLI_CUDA_PROFILE would also keep every group off the graph (read
+     * once, at the first issue). */
+    {
+        const char *sw[]={"COLI_CUDA_FLUSH","COLI_CUDA_GROUP_ZC","COLI_CUDA_GROUP_ZC_OUT","COLI_CUDA_PROFILE"};
+        for(int i=0;i<4;i++){
+            const char *e=getenv(sw[i]);
+            if(e&&*e){ printf("note: %s=%s was set in the environment; cleared for this test\n",sw[i],e);
+                       setenv(sw[i],"",1); }
+        }
+        /* COLI_CUDA_W4_PACKED is on by default and read as !getenv||atoi:
+         * "=0" (or, on Linux, set and empty) sends the branch-3 groups to
+         * branch 5, off the graph, and the zero-copy branch-3 counters fail.
+         * Set to "1", not cleared: an empty value reads as off on Linux and
+         * as unset (on) on Windows. */
+        const char *wp=getenv("COLI_CUDA_W4_PACKED");
+        if(wp&&strcmp(wp,"1")) printf("note: COLI_CUDA_W4_PACKED=%s was set in the environment; set to 1 for this test\n",wp);
+        setenv("COLI_CUDA_W4_PACKED","1",1);
+    }
     srand(7);
     const int D=200, I=96, gs=64;            /* tail group: 200 % 64 = 8 */
     const int COUNT=3;                       /* expert 0,1: fmt4 gs=64; expert 2: per-row (gs=0) */
