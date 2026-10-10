@@ -3289,6 +3289,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
              * qwen36 promised this with qt_async_allow(). Always 0 without the
              * switch, where a refusal is folded into qmask before the miss
              * loop runs. */
+            double _qr0 = tm_now(), _qr = 0;
             {
                 uint32_t redo = qt_take_redo();
                 for (int kk = 0; redo && kk < K; kk++) {
@@ -3302,11 +3303,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                     float w = val[kk]; float *os = out + (int64_t)s*D;
                     for (int d = 0; d < D; d++) os[d] += w * hh[d];
                 }
+                if (redo) _qr = tm_now() - _qr0;   /* CPU expert work: cpu-miss, not take */
             }
             if (tm_on() && S==1) {
                 extern double g_qt_iss, g_qt_cpu, g_qt_shr, g_qt_tak;
-                g_qt_iss += _q1-_q0; g_qt_cpu += _qm-_q1;
-                g_qt_shr += _q2-_qm; g_qt_tak += tm_now()-_q2;
+                g_qt_iss += _q1-_q0; g_qt_cpu += (_qm-_q1) + _qr;
+                g_qt_shr += _q2-_qm; g_qt_tak += (tm_now()-_q2) - _qr;
             }
         } else {
             for (int kk = 0; kk < K; kk++) {

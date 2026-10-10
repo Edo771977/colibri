@@ -134,7 +134,8 @@ int main(void) {
     check(qt_take_redo() == 0xFFu, "every refused k must come back from qt_take_redo()");
     int untouched = 1; for (int d = 0; d < D; d++) if (out[d] != 0.f) untouched = 0;
     check(untouched, "nothing of a refused launch may reach out");
-    check(G.miss == miss0 + K && G.hits[0] == hits0, "a refused launch counts as K misses, not hits");
+    check(G.miss == miss0 && G.hits[0] == hits0 + K,
+          "a refused launch is counted as the synchronous path counts it: hits");
     check(A.refused == K, "the refusal is counted for qt_stats");
     issue_answer = 1;
     check(one_round(out, NULL) && out[0] == want && qt_take_redo() == 0, "an accepted launch after a refusal");

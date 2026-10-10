@@ -1333,7 +1333,8 @@ static uint32_t G_redo;                     /* k refused by the backend, from th
 static struct {
     int on, spin_us;
     pthread_t th; pthread_mutex_t m; pthread_cond_t cv;
-    int posted, done, sleeping, stop;       /* __atomic, SEQ_CST */
+    unsigned posted, done;                  /* __atomic, SEQ_CST; wrap is fine: compared for equality */
+    int sleeping, stop;                     /* __atomic, SEQ_CST */
     int pending;                            /* decode thread only: a job is out */
     const float *x;
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS], *tu[QT_MAX_DEV][QT_MAX_ROWS], *td[QT_MAX_DEV][QT_MAX_ROWS];
@@ -1353,9 +1354,9 @@ static int issue_dev(int di, ColiCudaTensor *const *tg, ColiCudaTensor *const *t
 
 static void *async_launcher(void *arg){
     (void)arg;
-    int last=0;
+    unsigned last=0;
     for(;;){
-        int p, it=0;
+        unsigned p; int it=0;
         double t0=qt_ms();
         while((p=__atomic_load_n(&A.posted,__ATOMIC_SEQ_CST))==last){
             if(__atomic_load_n(&A.stop,__ATOMIC_SEQ_CST)) return NULL;
@@ -1392,7 +1393,12 @@ static void async_start(void){
         return;
     }
     const char *s=getenv("QT_ASYNC_SPIN_US");
-    A.spin_us = (s && atoi(s)>=0) ? atoi(s) : 2000;
+    A.spin_us=2000;
+    if(s && *s){
+        char *end=NULL; long v=strtol(s,&end,10);
+        if(end && !*end && v>=0 && v<=1000000) A.spin_us=(int)v;
+        else fprintf(stderr,"[qtier] QT_ASYNC_SPIN_US=%s ignored: microseconds 0..1000000; using 2000\n",s);
+    }
     A.posted=A.done=A.sleeping=A.stop=0; A.pending=0; A.jobs=A.refused=0;
     if(pthread_mutex_init(&A.m,NULL)) return;
     if(pthread_cond_init(&A.cv,NULL)){ pthread_mutex_destroy(&A.m); return; }
@@ -1494,7 +1500,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
                    memcpy(A.td[di],td[di],(size_t)c*sizeof *td[di]); }
         }
         A.x=x; A.pending=1; A.jobs++;
-        __atomic_store_n(&A.posted, A.posted+1, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&A.posted, A.posted+1u, __ATOMIC_SEQ_CST);
         if(__atomic_load_n(&A.sleeping,__ATOMIC_SEQ_CST)){
             pthread_mutex_lock(&A.m); pthread_cond_signal(&A.cv); pthread_mutex_unlock(&A.m);
         }
@@ -1572,8 +1578,11 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
      * of microseconds, the CPU work in between about a hundred). A refused
      * launch becomes redo bits: those k were promised to the GPU and not
      * computed, and the engine computes them on the CPU after this call. */
+    /* The wait for the helper is charged to `wait` with the drain below:
+     * both are the decode thread standing still for the GPU side. */
+    double _wh = (g_qt_time_take && A.pending) ? qt_ms() : 0.0;
     if(A.pending){
-        int seq=__atomic_load_n(&A.posted,__ATOMIC_SEQ_CST);
+        unsigned seq=__atomic_load_n(&A.posted,__ATOMIC_SEQ_CST);
         for(int it=0; __atomic_load_n(&A.done,__ATOMIC_SEQ_CST)!=seq; it++){
             if(it<4096) QT_PAUSE(); else sched_yield();
         }
@@ -1585,11 +1594,12 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
             refused+=G.is_cnt[di]; G.is_cnt[di]=0;
         }
         if(refused){
+            /* Counted as the synchronous path counts a refusal -- still hits
+             * (tests/test_qwen36_tier_fp8.c and _invariants pin that), so the
+             * two arms of an A/B report the same hit rate; the refusals show
+             * on their own in qt_stats' "async issue" line. */
             mask &= ~G_redo;
-            pthread_mutex_lock(&G.mx);
-            for(int di=0;di<G.ndev;di++) if(!A.ok[di]) G.hits[di]-=(uint64_t)A.cnt[di];
-            G.miss+=(uint64_t)refused; A.refused+=(uint64_t)refused;
-            pthread_mutex_unlock(&G.mx);
+            A.refused+=(uint64_t)refused;
         }
     }
     const float *result[QT_MAX_DEV]={0};
@@ -1603,6 +1613,7 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
      * OGNI layer senza esperti in VRAM. */
     const int _tm = g_qt_time_take && mask;
     double _w0 = _tm ? qt_ms() : 0.0;
+    if(_wh > 0.0) g_qt_wait += _w0 > 0.0 ? _w0-_wh : qt_ms()-_wh;
     if(mask) for(int di=0;di<G.ndev;di++){
         if(!G.is_cnt[di]) continue;
         result[di]=coli_cuda_expert_group_take(G.dev[di]);
