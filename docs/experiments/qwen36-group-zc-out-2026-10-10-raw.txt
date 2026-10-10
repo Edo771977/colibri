@@ -1,0 +1,302 @@
+Qwen3.6-35B-A3B: COLI_CUDA_GROUP_ZC_OUT=1 (#84) on top of
+COLI_CUDA_GROUP_ZC=1: the down kernel writes VRAM again and group_zc_out
+copies the rows to the pinned host_y. Under the CUDA tier with
+COLI_CUDA_FLUSH=1, QT_ASYNC_ISSUE=1, CACHE_ROUTE=1 ROUTE_J=4,
+QT_PREFILL_REPLAN=1, the DeltaNet on the GPU and the keep-alive, no
+QT_UPLOAD_SYNC. The CUDA test, two A/Bs (6 and 10 pairs), an Nsight trace
+(moe4). 10 October 2026, evening, on the operator's machine (RTX 4070 Ti
+SUPER, Ryzen 9 7950X, Windows 11, qwen36_i4_gs64 read from D:, cap 256, 4
+bits), after docs/experiments/qwen36-group-zc-2026-10-10-raw.txt (moe3,
+the trace this one is compared with).
+
+Summary:
+
+  1. tests/test_grouped_g4_cuda.cu on the card (CUDA 13.4). The #84 version
+     first failed one capture count ("0 captures, 4 replays (want 1 and
+     3)") because COLI_CUDA_GROUP_ZC=1 was set in the window, every value
+     comparison bitwise; with the switches cleared by hand it gave OK,
+     including "grouped-g4 zero-copy output: ... bitwise against the copy
+     path, host_y poisoned before each, captured once and replayed, tail
+     lengths". The #85 version, which clears the switches itself, gave OK
+     in the same window with the three notes.
+  2. misure-envab.ps1, COLI_CUDA_GROUP_ZC_OUT absent vs =1, COLI_CUDA_GROUP_ZC=1,
+     COLI_CUDA_FLUSH=1, QT_ASYNC_ISSUE=1 and the heat table in both arms:
+       6 pairs:  step() 15.63 -> 14.63, paired delta -1.00, 95 % [-2.13,
+                 +0.13], 5 of 6 negative;
+       10 pairs: step() 14.50 -> 13.98, paired delta -0.52, 95 % [-1.02,
+                 -0.02], 8 of 10 negative; position check 0.80 ms/token
+                 (OFF first -0.12, ON first -0.92 on average): the arm run
+                 second was slower by about 0.4, which the ABBA order
+                 cancels in the mean if it stayed constant.
+     One text in all 32 runs (87ce3f1b34ce2d6b). The 6-pair mean is larger
+     than the mechanism can give (below, at most ~0.6 ms/token); the
+     10-pair run is the one to quote. Per-arm means of the 10-pair run (not
+     paired): wait 1.57 -> 1.20, take 1.69 -> 1.31, moe 6.34 -> 5.93.
+  3. Nsight trace with all four switches on (moe4), read with
+     c/tools/nsys-moe.ps1, medians over 5080 decode groups, all 6080 groups
+     zero-copy with group_zc_out, linked by CorrId. Against moe3 (the same
+     without COLI_CUDA_GROUP_ZC_OUT; one profiled trace each, not paired):
+         down kernel                  38.2 -> 23.5 us (moe2, copy path: 23.5)
+         end of down -> rows on host   0.0 ->  4.3 us (group_zc_out; the
+                                                     moe2 readback: 6.5)
+         span GPU                     83.8 -> 73.4 us
+         call end -> results          84.9 -> 74.5 us (moe2: 80.7)
+         call start -> results       118.1 -> 104.4 us (moe2: 136.0)
+         cudaGraphLaunch call         32.7 -> 29.5 us
+         per token (trace): kernels 3.36 -> 2.97, call end -> results
+           3.57 -> 3.31 ms
+         per token (unprofiled base logs, one run each, not paired):
+           step 15.00 -> 14.30, wait 1.47 -> 1.27 ms
+     The down kernel is back at its copy-path time, and the copy kernel
+     costs 4.3 us against the 14.7 us the direct writes added -- the
+     hypothesis of #84 holds in this trace. The down kernel per expert
+     count is monotonic again (7 experts 20.9 us, 8 experts 23.6 us; in
+     moe3 the 7-expert groups were slower than the 8-expert ones).
+
+Reading: on this prompt COLI_CUDA_GROUP_ZC_OUT is a gain on top of the
+zero-copy group, ~0.5 ms/token (10 pairs), the same order as the bound the
+trace gives (the 14.7 - 4.3 = ~10 us per group, x 40 layers = ~0.4
+ms/token from the end of the call to the results; with the launch on the
+helper it reaches the decode thread through wait, which fell 0.37 in the
+per-arm means). The ON arm's step, 13.98 ms/token (~71.5 tok/s, derived
+from the step), is the lowest arm mean of the 10 October A/Bs; across
+sessions absolute times do not compare. Not measured: other prompts, longer generations, without
+QT_ASYNC_ISSUE or COLI_CUDA_FLUSH.
+
+Everything below is from output the operator pasted in the session. The
+logs, the trace and its CSVs stay on the operator's machine; none is
+committed and no evidence.sha256 exists for them. Not annotated: whether
+Windows "hardware-accelerated GPU scheduling" (HAGS) was on.
+
+--- 1. build and test --------------------------------------------------------------
+
+A Visual Studio 2022 Developer Command Prompt, C:\colibri-fork\c:
+
+  set PATH=C:\msys64\clang64\bin;%PATH%;C:\msys64\usr\bin
+  git pull                                   (main at the merge of #84, a599a00)
+  make cuda-dll CC=clang CUDA_ARCH=sm_89
+  nvcc -O3 -std=c++17 -ftz=false -arch=sm_89 tests\test_grouped_g4_cuda.cu -o grouped_g4_test.exe
+  grouped_g4_test.exe                        (window with COLI_CUDA_GROUP_ZC=1, COLI_CUDA_FLUSH=1 set)
+
+  [cuda] group flush active: COLI_CUDA_FLUSH=1, cudaStreamQuery after each expert group launch
+  grouped-g4 API: sync vs oracle + async(issue/take) vs sync, 0 mismatches
+  grouped-g4 broadcast: x_rows=1 vs 3 duplicated rows: bitwise
+  [cuda] group zero-copy active: COLI_CUDA_GROUP_ZC=1, the expert group runs as kernels only
+  [cuda] expert group graph active (count=3)
+  grouped-g4 graph: rep 0 (capture) vs per-call launches: bitwise
+  ...
+  grouped-g4 flush: graph and per-call, 4 issues, bitwise, counted, no error left behind
+  FAIL zero-copy graph: 0 captures, 4 replays (want 1 and 3)
+  [cuda] group zero-copy output active: COLI_CUDA_GROUP_ZC_OUT=1, the down kernel writes VRAM and group_zc_out copies the rows to the host
+  grouped-g4 zero-copy output: 4 graph issues on two inputs + branch 3, bitwise against the copy path, host_y poisoned before each, captured once and replayed, tail lengths
+  grouped-g4 zero-copy: 4 graph issues on two inputs + branch 3, FAILED
+  FAIL
+
+  set COLI_CUDA_GROUP_ZC=
+  set COLI_CUDA_GROUP_ZC_OUT=
+  set COLI_CUDA_FLUSH=
+  grouped_g4_test.exe
+
+  grouped-g4 oracle: 50 trials x 3 experts (gs=64 + tail + per-row member), 0 mismatches
+  [CUDA] device 0: NVIDIA GeForce RTX 4070 Ti SUPER, 17.2 GB VRAM, sm_89
+  [cuda] WARNING: expert down-rows is on with COLI_CUDA_GRAPH off. Measured +1.15 ms/token in that combination; set COLI_CUDA_DOWN_ROWS=0 too, or leave the graph on.
+  grouped-g4 API: sync vs oracle + async(issue/take) vs sync, 0 mismatches
+  grouped-g4 broadcast: x_rows=1 vs 3 duplicated rows: bitwise
+  [cuda] expert group graph active (count=3)
+  grouped-g4 graph: rep 0 (capture) vs per-call launches: bitwise
+  grouped-g4 graph: rep 1 (replay) vs per-call launches: bitwise
+  grouped-g4 graph: rep 2 (replay) vs per-call launches: bitwise
+  grouped-g4 graph: 1 captures + 2 replays, all counted
+  grouped-g4 graph after a real buffer grow: re-captured, bitwise
+  [cuda] group flush active: COLI_CUDA_FLUSH=1, cudaStreamQuery after each expert group launch
+  grouped-g4 flush: 3 of 4 queries found the group unfinished; the runtime left NotReady as the last error in 0 of them
+  grouped-g4 flush: graph and per-call, 4 issues, bitwise, counted, no error left behind
+  [cuda] group zero-copy active: COLI_CUDA_GROUP_ZC=1, the expert group runs as kernels only
+  [cuda] group zero-copy output active: COLI_CUDA_GROUP_ZC_OUT=1, the down kernel writes VRAM and group_zc_out copies the rows to the host
+  grouped-g4 zero-copy output: 4 graph issues on two inputs + branch 3, bitwise against the copy path, host_y poisoned before each, captured once and replayed, tail lengths
+  grouped-g4 zero-copy: 4 graph issues on two inputs + branch 3, bitwise against the copy path, captured once and replayed, off again
+  OK
+
+The first run's "..." lines were as in the second. After sections 2 and 3:
+
+  git pull                                   (a599a00..b96321e, main at the merge of #85)
+  nvcc -O3 -std=c++17 -ftz=false -arch=sm_89 tests\test_grouped_g4_cuda.cu -o grouped_g4_test.exe
+  grouped_g4_test.exe                        (the measurement window: the switches set)
+
+  note: COLI_CUDA_FLUSH=1 was set in the environment; cleared for this test
+  note: COLI_CUDA_GROUP_ZC=1 was set in the environment; cleared for this test
+  note: COLI_CUDA_GROUP_ZC_OUT=1 was set in the environment; cleared for this test
+  grouped-g4 oracle: 50 trials x 3 experts (gs=64 + tail + per-row member), 0 mismatches
+  ...
+  grouped-g4 flush: 4 of 4 queries found the group unfinished; the runtime left NotReady as the last error in 0 of them
+  grouped-g4 flush: graph and per-call, 4 issues, bitwise, counted, no error left behind
+  [cuda] group zero-copy active: COLI_CUDA_GROUP_ZC=1, the expert group runs as kernels only
+  [cuda] group zero-copy output active: COLI_CUDA_GROUP_ZC_OUT=1, the down kernel writes VRAM and group_zc_out copies the rows to the host
+  grouped-g4 zero-copy output: 4 graph issues on two inputs + branch 3, bitwise against the copy path, host_y poisoned before each, captured once and replayed, tail lengths
+  grouped-g4 zero-copy: 4 graph issues on two inputs + branch 3, bitwise against the copy path, captured once and replayed, off again
+  OK
+
+(the "..." lines as in the run above.)
+
+--- 2. the A/Bs -------------------------------------------------------------------
+
+The same window. The first attempt stopped on the staleness check
+(".build-config e' piu' recente di .\qwen36_clang.exe": make cuda-dll had
+rewritten it); the engine was rebuilt, unchanged in source:
+
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+  set COLI_CUDA_GROUP_ZC_OUT=
+  set COLI_CUDA_GROUP_ZC=1
+  set COLI_CUDA_FLUSH=1
+  set QT_ASYNC_ISSUE=1
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set CACHE_ROUTE=1
+  set ROUTE_J=4
+  set QT_PREFILL_REPLAN=1
+  set QT_UPLOAD_SYNC=
+  set Q36_DN_GPU=
+  set COLI_PLACE=
+  set QT_ASYNC_SPIN_US=
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var COLI_CUDA_GROUP_ZC_OUT -Value 1 -Marker "[cuda] group zero-copy output active:" -MarkerFile coli_cuda.dll -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_FLUSH,COLI_CUDA_GROUP_ZC,QT_ASYNC_ISSUE,COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -AllowTextDrift ON,OFF
+
+  eseguibile: .\qwen36_clang.exe | 412672 byte | 2026-10-10 19:30:48 | sha256 4A33094D267E84FE
+  coli_cuda.dll: 829952 byte | 2026-10-10 19:27:58 | sha256 B32D6C4AFF53E83C
+  marker: [cuda] group zero-copy output active:  (testo trovato in C:\colibri-fork\c\coli_cuda.dll)
+  heat: C:\colibri-fork\c\heat.caldo.bin | 40972 byte | 40 layer x 256 esperti | 2026-09-27 07:49:11 | sha256 2682CA6E4CD9744F
+
+  rip 1 (OFF prima)  OFF  17.20  ON  14.60  delta  -2.60 ms/token
+  rip 2 (ON prima )  OFF  15.10  ON  13.90  delta  -1.20 ms/token
+  rip 3 (OFF prima)  OFF  15.40  ON  16.10  delta   0.70 ms/token
+  rip 4 (ON prima )  OFF  15.10  ON  14.20  delta  -0.90 ms/token
+  rip 5 (OFF prima)  OFF  15.10  ON  14.50  delta  -0.60 ms/token
+  rip 6 (ON prima )  OFF  15.90  ON  14.50  delta  -1.40 ms/token
+
+  tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 12 run
+  residenza identica in tutti i run: 6812/10240
+  braccio OFF: 1 testo in 6 run ... sha256 87ce3f1b34ce2d6b
+  braccio ON: 1 testo in 6 run ... sha256 87ce3f1b34ce2d6b
+  testo generato IDENTICO fra i due bracci (sullo stdout letto) -- solo ripetizione 1
+  media    -1.00   sd  1.08   se  0.44   df 5
+  intervallo 95 %:  [-2.13 ; 0.13]   ampiezza +-1.13
+  negativi 5/6
+  differenza fra le medie dei due gruppi (ABBA): 0.33 ms/token
+  OFF    step  15.63  moe   7.16  attn  2.08  dn  4.09  head  1.06
+         (shared)  3.21  (router)  0.91  wait  2.00
+         issue  0.05  cpu-miss  0.55  take  2.14
+  ON     step  14.63  moe   6.32  attn  2.01  dn  4.04  head  1.07
+         (shared)  3.06  (router)  0.85  wait  1.43
+         issue  0.05  cpu-miss  0.52  take  1.56
+
+Then, same window, same executable and DLL, with -Reps 10:
+
+  rip 1 (OFF prima)  OFF  14.70  ON  15.00  delta   0.30 ms/token
+  rip 2 (ON prima )  OFF  14.90  ON  13.90  delta  -1.00 ms/token
+  rip 3 (OFF prima)  OFF  13.50  ON  13.20  delta  -0.30 ms/token
+  rip 4 (ON prima )  OFF  15.10  ON  13.50  delta  -1.60 ms/token
+  rip 5 (OFF prima)  OFF  15.20  ON  14.30  delta  -0.90 ms/token
+  rip 6 (ON prima )  OFF  14.30  ON  12.80  delta  -1.50 ms/token
+  rip 7 (OFF prima)  OFF  13.80  ON  14.20  delta   0.40 ms/token
+  rip 8 (ON prima )  OFF  14.40  ON  14.10  delta  -0.30 ms/token
+  rip 9 (OFF prima)  OFF  14.60  ON  14.50  delta  -0.10 ms/token
+  rip 10 (ON prima )  OFF  14.50  ON  14.30  delta  -0.20 ms/token
+
+  tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 20 run
+  [place] auto: identica in tutti i 20 run
+  residenza identica in tutti i run: 6812/10240
+  braccio OFF: 1 testo in 10 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  braccio ON: 1 testo in 10 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  testo generato IDENTICO fra i due bracci (sullo stdout letto) -- solo ripetizione 1
+
+  --- delta appaiati (ON - OFF), ms/token ---
+  0.30   -1.00   -0.30   -1.60   -0.90   -1.50   0.40   -0.30   -0.10   -0.20
+  media    -0.52   sd  0.70   se  0.22   df 9
+  intervallo 95 %:  [-1.02 ; -0.02]   ampiezza +-0.50
+  negativi 8/10
+
+  --- controllo POSIZIONE (ABBA) ---
+  OFF prima:  0.30  -0.30  -0.90  0.40  -0.10
+  ON prima:   -1.00  -1.60  -1.50  -0.30  -0.20
+  differenza fra le medie dei due gruppi: 0.80 ms/token
+
+  --- medie per braccio ---
+  OFF    step  14.50  moe   6.34  attn  1.89  dn  4.09  head  1.12
+         (shared)  3.06  (router)  0.76  wait  1.57
+         issue  0.05  cpu-miss  0.56  take  1.69  sh-ovl  3.06  hit  97.7 %  swaps  6.0  miss 1133
+         dopo il prefill: hit  98.2 %
+  ON     step  13.98  moe   5.93  attn  1.89  dn  4.04  head  1.08
+         (shared)  3.01  (router)  0.80  wait  1.20
+         issue  0.04  cpu-miss  0.53  take  1.31  sh-ovl  3.02  hit  97.7 %  swaps  6.0  miss 1133
+         dopo il prefill: hit  98.2 %
+
+--- 3. the trace (moe4) ---------------------------------------------------------
+
+Right after the 10-pair A/B, C:\colibri-ab, the A/B's variables still set:
+
+  set PATH=C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.3.2\target-windows-x64;%PATH%
+  set SNAP=D:\modelli\qwen36_i4_gs64
+  set COLI_CUDA=1
+  set COLI_GPUS=0
+  set COLI_TIMERS=1
+  set N_NEW=128
+  set HEAT_FILE=heat.bin
+  set COLI_CUDA_GROUP_ZC_OUT=1
+  copy /Y heat.caldo.bin heat.bin >nul & C:\colibri-fork\c\qwen36_clang.exe 256 4 prompt25.txt > moe4-base.log 2>&1
+  copy /Y heat.caldo.bin heat.bin >nul & nsys profile -t cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node --force-overwrite=true -o moe4 C:\colibri-fork\c\qwen36_clang.exe 256 4 prompt25.txt > moe4-nsys.log 2>&1
+  nsys stats --report cuda_gpu_trace,cuda_api_trace --format csv --force-export=true --output moe4 moe4.nsys-rep
+  powershell -NoProfile -ExecutionPolicy Bypass -File C:\colibri-fork\c\tools\nsys-moe.ps1 -Csv moe4_cuda_gpu_trace.csv -ApiCsv moe4_cuda_api_trace.csv -BaseLog moe4-base.log
+
+  traccia: moe4_cuda_gpu_trace.csv | 121859 operazioni GPU su 3 stream
+  gruppi di expert: 6080 = (prompt 25 + generati 127) x 40 layer | prefill 1000, decode 5080
+    non riconosciuti: senza copie su 0, senza kernel down 0, senza copia giu 0
+    riconosciuti a zero-copy (COLI_CUDA_GROUP_ZC: kernel di staging al posto delle copie, nessuna copia giu; per quelli senza group_zc_out 'copia giu' finisce con il kernel down): 6080, di cui con il kernel group_zc_out (COLI_CUDA_GROUP_ZC_OUT, fa da 'copia giu'): 6080
+    il primo kernel dn_head cade fra l'ultimo gruppo di prefill e il primo di decode: ok
+  lancio: per CorrId: 6080 gruppi su 6080
+  altri stream durante il decode (lo stream di default porta anche le chiamate dense e la DeltaNet): 94 copie su oltre 16 KiB (74.3 MB: caricamenti di expert e, al primo token, lo stato DeltaNet), 6475 fino a 16 KiB, 17920 kernel senza il keep-alive (quant_matmul_i8r x10284, dn_head x3809, dn_conv_silu x3809, offset_to_signed_s4 x18)
+  gruppi di decode con attivita' di altri stream nello span (keep-alive escluso): 11 su 5080
+
+  decode, microsecondi per gruppo                    n    media  mediana      p10      p90      min
+    chiamata cudaGraphLaunch (durata)              5080     32.0     29.5     16.2     49.4     12.5
+    inizio chiamata -> prima operazione GPU        5080     34.6     31.5     17.6     50.7     13.8
+    fine chiamata -> prima operazione GPU          5080      2.6      1.1     -1.0      6.8    -30.7
+    copie su (prima copia -> kernel hidden)        5080      1.7      1.6      1.5      2.2      1.5
+      prima copia -> inizio copia x                5080      0.0      0.0      0.0      0.0      0.0
+      copia x o kernel di staging (durata)         5080      1.7      1.5      1.5      2.1      1.4
+      fine copia x -> kernel hidden                5080      0.0      0.0      0.0      0.1     -0.7
+    fine chiamata -> kernel hidden                 5080      4.3      2.8      0.7      8.4    -29.1
+    kernel hidden (gate+up)                        5080     48.5     43.9     39.3     44.4     13.2
+    pausa hidden -> down                           5080      0.0      0.0      0.0      0.1     -0.3
+    kernel down                                    5080     25.7     23.5     20.9     23.7      7.3
+    fine kernel -> fine copia giu                  5080      4.3      4.3      3.8      4.4      2.5
+    span GPU (prima copia -> fine copia giu)       5080     80.3     73.4     66.0     74.3     24.5
+    inizio chiamata -> fine copia giu              5080    114.8    104.4     90.6    125.1     59.8
+    fine chiamata -> fine copia giu                5080     82.8     74.5     67.3     79.8     23.7
+
+  kernel per numero di expert (decode), microsecondi; banda = byte di pesi e scale / mediana
+    expert  gruppi   hidden med   down med   hidden+down med   p10    GB/s hidden   GB/s down
+         2       1         13.2        7.3              20.4   20.4         179.4       161.7
+         4       1         23.6       12.6              36.2   36.2         200.1       186.6
+         5       9         28.8       15.4              44.1   43.9         204.8       191.6
+         6      81         33.9       18.2              52.1   51.8         208.9       194.7
+         7     522         38.9       20.9              59.8   59.5         212.0       197.9
+         8    4466         44.0       23.6              67.5   67.2         214.5       200.3
+    prefill, tutti i gruppi: 1000, hidden+down mediana 198.3, media 223.6
+
+  gruppi di decode con 8 expert (il caso piu' frequente), con e senza attivita' di altri stream nello span:
+                                      gruppi   hidden+down med   media   span med   media
+    con                                   11              67.7    67.7       73.3    73.7
+    senza                               4455              67.5    75.9       73.4    82.0
+
+  per token di decode (somma dei gruppi / 127 token), ms/token:
+    traccia (corsa profilata): lancio 1.28 | kernel 2.97 | span GPU 3.21 | da fine chiamata a fine copia giu 3.31
+    moe4-base.log (senza profiler): step 14.30 | moe 5.92 | issue 0.04 | cpu-miss 0.54 | shared 2.96 | take 1.41 (wait 1.27, accum 0.13)
+
+  findstr /L /C:"zero-copy" /C:"group flush active" /C:"QT_ASYNC_ISSUE=1" moe4-base.log
+  [qtier] QT_ASYNC_ISSUE=1: expert groups launched from a helper thread (spins 2000 us after each job, then sleeps)
+  [cuda] group zero-copy active: COLI_CUDA_GROUP_ZC=1, the expert group runs as kernels only
+  [cuda] group zero-copy output active: COLI_CUDA_GROUP_ZC_OUT=1, the down kernel writes VRAM and group_zc_out copies the rows to the host
+  [cuda] group flush active: COLI_CUDA_FLUSH=1, cudaStreamQuery after each expert group launch
+
+The moe3 figures are from docs/experiments/qwen36-group-zc-2026-10-10-raw.txt,
+section 2; moe2's from docs/experiments/qwen36-async-issue-2026-10-10-raw.txt,
+section 3.
