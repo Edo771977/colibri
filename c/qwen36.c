@@ -3280,6 +3280,26 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
                 exit(1);
             }
+            /* QT_ASYNC_ISSUE=1: qt_issue returned before the backend had
+             * accepted the group, so a refused launch only shows up here.
+             * Those k were neither computed on the GPU nor in the miss loop
+             * above; compute them now, the same way. Always 0 without the
+             * switch, where a refusal is folded into qmask before the miss
+             * loop runs. */
+            {
+                uint32_t redo = qt_take_redo();
+                for (int kk = 0; redo && kk < K; kk++) {
+                    if (!(redo & (1u<<kk))) continue;
+                    Slot *e; expert_get(m, layer, idx[kk], &e);
+                    slot_ensure_int8(m, e);
+                    matmul_qe(g, xs, e->g, e->gs, D, I);
+                    matmul_qe(u, xs, e->u, e->us, D, I);
+                    for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+                    matmul_qe(hh, g, e->d, e->ds, I, D);
+                    float w = val[kk]; float *os = out + (int64_t)s*D;
+                    for (int d = 0; d < D; d++) os[d] += w * hh[d];
+                }
+            }
             if (tm_on() && S==1) {
                 extern double g_qt_iss, g_qt_cpu, g_qt_shr, g_qt_tak;
                 g_qt_iss += _q1-_q0; g_qt_cpu += _qm-_q1;
