@@ -506,13 +506,103 @@ int main(void){
                     if(g_group_zc!=zb+2){ printf("FAIL branch 3 did not take the zero-copy path\n"); zc_bad++; }
                     free(yref3);
                 }
+                /* COLI_CUDA_GROUP_ZC_OUT: the down kernel writes VRAM again
+                 * and group_zc_out copies the rows to host_y. host_y is
+                 * poisoned before every issue (it holds the right rows from
+                 * the call before), so an out kernel that never ran fails
+                 * here; the two inputs alternate, so VRAM y holds the other
+                 * input's rows before each issue and a down that wrote
+                 * elsewhere, or an out kernel that ran before it, fails too.
+                 * Its own graph: one capture (bit 8 of the signature), then
+                 * replays. */
+                {
+                    int zo_bad=0;
+                    setenv("COLI_CUDA_GROUP_ZC_OUT","",1);
+                    if(group_zc_out_mode()){ printf("FAIL zero-copy output must be off when unset\n"); zo_bad++; }
+                    setenv("COLI_CUDA_GROUP_ZC_OUT","2",1);
+                    if(group_zc_out_mode()){ printf("FAIL zero-copy output must be off unless exactly \"1\"\n"); zo_bad++; }
+                    setenv("COLI_CUDA_GROUP_ZC_OUT","1",1);
+                    uint64_t o0=g_group_zc_out, zo0=g_group_zc, capo=g_graph_captures, repo=g_graph_replays;
+                    for(int rep=0; rep<4; rep++){
+                        const float *xin = (rep&1) ? x2 : x;
+                        const float *want = (rep&1) ? yref2 : ydup;
+                        { DeviceContext *pc=find_ctx(0); if(pc&&pc->host_y) memset(pc->host_y,0xFF,(size_t)COUNT*D*4); }
+                        if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,xin,1)){
+                            printf("FAIL zc-out issue (rep %d)\n",rep); return 1; }
+                        const float *yo=coli_cuda_expert_group_take(0);
+                        if(!yo||memcmp(want,yo,(size_t)COUNT*D*4)!=0){
+                            printf("FAIL zero-copy output rows differ from the copy path (rep %d)\n",rep); zo_bad++; }
+                    }
+                    if(g_group_zc_out!=o0+4||g_group_zc!=zo0+4){
+                        printf("FAIL zero-copy output: %llu out groups, %llu zero-copy groups for 4 issues\n",
+                               (unsigned long long)(g_group_zc_out-o0),(unsigned long long)(g_group_zc-zo0)); zo_bad++; }
+                    if(g_graph_captures!=capo+1 || g_graph_replays!=repo+3){
+                        printf("FAIL zero-copy output graph: %llu captures, %llu replays (want 1 and 3)\n",
+                               (unsigned long long)(g_graph_captures-capo),
+                               (unsigned long long)(g_graph_replays-repo)); zo_bad++; }
+                    /* branch 3 (grouped_down_w4), expert 2 alone. One input
+                     * here, so VRAM y is poisoned too before each issue: the
+                     * reference call leaves exactly the right rows in it. */
+                    {
+                        float *yref3=(float*)malloc((size_t)D*4);
+                        setenv("COLI_CUDA_GROUP_ZC","",1); setenv("COLI_CUDA_GRAPH","0",1);
+                        if(!coli_cuda_expert_group_issue_x(tg+2,tu+2,td+2,rows1,1,x,1)){ printf("FAIL branch-3 reference issue\n"); return 1; }
+                        { const float *yr=coli_cuda_expert_group_take(0);
+                          if(!yr){ printf("FAIL branch-3 reference take\n"); return 1; }
+                          memcpy(yref3,yr,(size_t)D*4); }
+                        setenv("COLI_CUDA_GRAPH","1",1); setenv("COLI_CUDA_GROUP_ZC","1",1);
+                        uint64_t ob=g_group_zc_out;
+                        for(int rep=0; rep<2; rep++){
+                            { DeviceContext *pc=find_ctx(0);
+                              if(pc&&pc->host_y) memset(pc->host_y,0xFF,(size_t)D*4);
+                              if(pc&&pc->y){ cudaMemsetAsync(pc->y,0xFF,(size_t)D*4,pc->stream); cudaStreamSynchronize(pc->stream); } }
+                            if(!coli_cuda_expert_group_issue_x(tg+2,tu+2,td+2,rows1,1,x,1)){ printf("FAIL branch-3 zc-out issue\n"); return 1; }
+                            const float *y3=coli_cuda_expert_group_take(0);
+                            if(!y3||memcmp(yref3,y3,(size_t)D*4)!=0){
+                                printf("FAIL zero-copy output branch 3 differs from the copy path (rep %d)\n",rep); zo_bad++; }
+                        }
+                        if(g_group_zc_out!=ob+2){ printf("FAIL branch 3 did not take the zero-copy output path\n"); zo_bad++; }
+                        free(yref3);
+                    }
+                    /* the kernel alone, on lengths that are not a multiple of
+                     * 4 (the engine's never are): every element once, none
+                     * past n */
+                    {
+                        const int ns[]={1,3,4,5,7,1021};
+                        float *dsrc=nullptr,*ddst=nullptr; float hs[1032],hd[1032];
+                        for(int i=0;i<1032;i++) hs[i]=(float)i+0.5f;
+                        if(cudaMalloc(&dsrc,sizeof hs)!=cudaSuccess||cudaMalloc(&ddst,sizeof hd)!=cudaSuccess){
+                            printf("FAIL group_zc_out test buffers\n"); return 1; }
+                        cudaMemcpy(dsrc,hs,sizeof hs,cudaMemcpyHostToDevice);
+                        for(int t=0;t<6;t++){
+                            int n=ns[t];
+                            cudaMemset(ddst,0xFF,sizeof hd);
+                            group_zc_out<<<(unsigned)(((n+3)/4+255)/256),256>>>(ddst,dsrc,n);
+                            if(cudaGetLastError()!=cudaSuccess){ printf("FAIL group_zc_out launch n=%d\n",n); zo_bad++; }
+                            cudaMemcpy(hd,ddst,sizeof hd,cudaMemcpyDeviceToHost);
+                            int ok=1;
+                            for(int i=0;i<1032;i++){
+                                uint32_t b; memcpy(&b,&hd[i],4);
+                                if(i<n ? hd[i]!=hs[i] : b!=0xFFFFFFFFu) ok=0; }
+                            if(!ok){ printf("FAIL group_zc_out on n=%d\n",n); zo_bad++; }
+                        }
+                        cudaFree(dsrc); cudaFree(ddst);
+                    }
+                    printf("grouped-g4 zero-copy output: 4 graph issues on two inputs + branch 3, %s\n",
+                           zo_bad?"FAILED":"bitwise against the copy path, host_y poisoned before each, captured once and replayed, tail lengths");
+                    api_bad+=zo_bad;
+                    /* left at "1" on purpose: the copy-path issue below must
+                     * ignore it without COLI_CUDA_GROUP_ZC */
+                }
                 /* back to the copy path: a re-capture, and the same bits */
                 setenv("COLI_CUDA_GROUP_ZC","",1);
-                uint64_t z1=g_group_zc, cap1=g_graph_captures;
+                uint64_t z1=g_group_zc, cap1=g_graph_captures, o1=g_group_zc_out;
                 if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x2,1)){ printf("FAIL post-zc issue\n"); return 1; }
                 { const float *yc=coli_cuda_expert_group_take(0);
                   if(!yc||memcmp(yref2,yc,(size_t)COUNT*D*4)!=0){ printf("FAIL copy path after zero-copy\n"); zc_bad++; } }
                 if(g_group_zc!=z1){ printf("FAIL zero-copy ran with the variable unset\n"); zc_bad++; }
+                if(g_group_zc_out!=o1){ printf("FAIL COLI_CUDA_GROUP_ZC_OUT=1 acted without COLI_CUDA_GROUP_ZC\n"); zc_bad++; }
+                setenv("COLI_CUDA_GROUP_ZC_OUT","",1);
                 if(g_graph_captures!=cap1+1){ printf("FAIL switching zero-copy off must re-capture the copy graph\n"); zc_bad++; }
                 free(x2); free(yref2);
                 printf("grouped-g4 zero-copy: 4 graph issues on two inputs + branch 3, %s\n",
