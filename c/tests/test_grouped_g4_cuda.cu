@@ -494,6 +494,10 @@ int main(void){
                     setenv("COLI_CUDA_GRAPH","1",1); setenv("COLI_CUDA_GROUP_ZC","1",1);
                     uint64_t zb=g_group_zc;
                     for(int rep=0; rep<2; rep++){
+                        /* host_y already holds yref3 from the reference call:
+                         * poison it, or a down kernel that wrote somewhere else
+                         * would pass on the stale rows */
+                        { DeviceContext *pc=find_ctx(0); if(pc&&pc->host_y) memset(pc->host_y,0xFF,(size_t)D*4); }
                         if(!coli_cuda_expert_group_issue_x(tg+2,tu+2,td+2,rows1,1,x,1)){ printf("FAIL branch-3 zc issue\n"); return 1; }
                         const float *y3=coli_cuda_expert_group_take(0);
                         if(!y3||memcmp(yref3,y3,(size_t)D*4)!=0){
