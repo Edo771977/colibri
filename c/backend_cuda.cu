@@ -149,7 +149,7 @@ typedef struct {
      * host_y (pinned, so mapped under unified addressing), cached against the
      * host pointer they were asked for -- a reserve that moves a buffer
      * changes the host pointer, and the next call asks again. */
-    void *zc_hp[3], *zc_dp[3];
+    void *zc_hp[3], *zc_dp[3]; int zc_bad[3];   /* zc_bad: no address for zc_hp[i]; not asked again */
     unsigned buf_gen;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
@@ -3312,8 +3312,9 @@ static uint64_t g_group_flushes, g_group_flush_notready, g_group_flush_recorded;
  * -raw.txt, section 3; COLI_CUDA_FLUSH=1 and QT_ASYNC_ISSUE=1 on) the group's
  * kernels start only when its cudaGraphLaunch call has ended -- 6.8 us after
  * it, median per group -- while the call lasts 52.8 us and the two copies
- * that open the graph (704 bytes of descriptors, 8 KiB of x) have long
- * finished: the GPU sits ~27 us between the x copy and the kernel. The graph
+ * that open the graph (704 bytes of descriptors, 8 KiB of x) have
+ * finished about 20 us before the call returns: the GPU sits ~27 us between
+ * the x copy and the kernel (sums and medians of a profiled trace). The graph
  * mixes two engines, copies on the copy engine and kernels on the compute
  * engine, and every hand-over between them is a synchronisation the driver
  * has to build and submit. Hypothesis: a graph of kernels only is cheaper to
@@ -3329,8 +3330,10 @@ static uint64_t g_group_flushes, g_group_flush_notready, g_group_flush_recorded;
  * inputs: the rows must be bitwise those of the copy path
  * (tests/test_grouped_g4_cuda.cu checks it).
  *
- * Only where the graph is used (graph mode, broadcast x, branches 3 and 4,
- * 1..8 experts); anywhere else, or if a device address is not available
+ * Only where the graph is eligible (graph mode, COLI_CUDA_PROFILE off,
+ * broadcast x, branches 3 and 4, 1..8 experts) -- if a capture fails the
+ * same kernels run as ordinary launches, still correct and counted; anywhere
+ * else, or if a device address is not available
  * (cudaHostGetDevicePointer fails: no unified addressing), the copy path
  * runs and says so once. Read on every call, like graph_mode(): the test
  * flips it mid-process, and the graph signature carries it, so turning it
@@ -3349,12 +3352,24 @@ static int group_zc_mode(void){
 /* The device address of a pinned host buffer, cached per slot. 0 if the
  * runtime cannot give one. */
 static void *zc_dev(DeviceContext *ctx,int slot,void *host){
+#if COLI_GPU_HAS_GRAPH
     if(!host) return nullptr;
-    if(ctx->zc_hp[slot]==host && ctx->zc_dp[slot]) return ctx->zc_dp[slot];
+    if(ctx->zc_hp[slot]==host) return ctx->zc_bad[slot] ? nullptr : ctx->zc_dp[slot];
     void *d=nullptr;
-    if(cudaHostGetDevicePointer(&d,host,0)!=cudaSuccess){ cudaGetLastError(); return nullptr; }
-    ctx->zc_hp[slot]=host; ctx->zc_dp[slot]=d;
+    ctx->zc_hp[slot]=host;
+    if(cudaHostGetDevicePointer(&d,host,0)!=cudaSuccess){
+        /* Remembered for this buffer: 40 calls a token must not repeat a
+         * failing runtime call. Clear only our own error from the slot. */
+        if(cudaPeekAtLastError()!=cudaSuccess) cudaGetLastError();
+        ctx->zc_bad[slot]=1; ctx->zc_dp[slot]=nullptr; return nullptr;
+    }
+    ctx->zc_bad[slot]=0; ctx->zc_dp[slot]=d;
     return d;
+#else
+    /* No graph on this target (HIP): the variant cannot run, and
+     * cudaHostGetDevicePointer has no mapping in backend_gpu_compat.h. */
+    (void)ctx; (void)slot; (void)host; return nullptr;
+#endif
 }
 static int group_flush_mode(void){
     const char *e=getenv("COLI_CUDA_FLUSH");

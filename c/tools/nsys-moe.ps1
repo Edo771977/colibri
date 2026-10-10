@@ -434,7 +434,8 @@ if ($nBytesOff) { $warn.Add("$nBytesOff gruppi di decode hanno una copia giu che
 
 "traccia: $Csv | $($allOps.Count) operazioni GPU su $($byStream.Count) stream"
 "gruppi di expert: $($groups.Count) = (prompt $($bl.Pre) + generati $($bl.Dec)) x $L layer | prefill $($pre.Count), decode $($dec.Count)"
-"  non riconosciuti: senza copie su $nNoUp, senza kernel down $nNoDown, senza copia giu $nNoD2H | a zero-copy (COLI_CUDA_GROUP_ZC, kernel di staging al posto delle copie): $nZc"
+"  non riconosciuti: senza copie su $nNoUp, senza kernel down $nNoDown, senza copia giu $nNoD2H"
+"  riconosciuti a zero-copy (COLI_CUDA_GROUP_ZC: kernel di staging al posto delle copie, nessuna copia giu; per loro 'copia giu' finisce con il kernel down): $nZc"
 "  $dnCheck"
 "lancio: $linkHow"
 "altri stream durante il decode (lo stream di default porta anche le chiamate dense e la DeltaNet): {0} copie su oltre 16 KiB ({1} MB: caricamenti di expert e, al primo token, lo stato DeltaNet), {2} fino a 16 KiB, {3} kernel senza il keep-alive ({4})" -f $winUp.Count,

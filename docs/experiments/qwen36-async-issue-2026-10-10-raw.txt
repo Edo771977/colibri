@@ -40,9 +40,9 @@ the call is longer on the helper (52.8 against 33.5 us) is not measured;
 the helper sharing a core with the OpenMP team is one candidate. Not
 measured: the two switches separately under Nsight, other prompts.
 
-What this leaves: with the helper on, the GPU side is the critical path by
-~2 ms/token, so time removed before the group's first kernel would count,
-up to about that wait. The next step (COLI_CUDA_GROUP_ZC, a graph of
+What this leaves: with the helper on, the decode thread waits ~2 ms/token
+(unprofiled) for the helper's launch plus the GPU group, so time removed
+from that would count, up to about that wait and layer by layer. The next step (COLI_CUDA_GROUP_ZC, a graph of
 kernels only) tests whether the copy-engine nodes are what makes the
 launch long; that is a hypothesis.
 
