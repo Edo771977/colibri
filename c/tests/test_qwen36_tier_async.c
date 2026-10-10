@@ -1,8 +1,8 @@
 /* QT_ASYNC_ISSUE=1: the expert group launch on a helper thread.
  *
  * What has to hold, on the fake backend (tests/qwen36_fake_cuda.h):
- *   1. off unless exactly "1"; refused, with a message, on more than one
- *      card or on a card that is not device 0;
+ *   1. off unless exactly "1"; refused, with a message, when the engine
+ *      did not call qt_async_allow() or on more than one card;
  *   2. on: qt_issue returns the resident mask, the launch happens on ANOTHER
  *      thread, and qt_take accumulates exactly what the synchronous path
  *      accumulates;
@@ -88,6 +88,12 @@ static int one_round(float *out, uint32_t *mask_out) {
 }
 
 int main(void) {
+    /* An engine that never calls qt_async_allow() (qwen38) must not get the
+     * helper: it would drop every refused expert. */
+    check(up("1", NULL), "tier init without qt_async_allow");
+    check(!A.on, "QT_ASYNC_ISSUE=1 must be refused unless the engine called qt_async_allow()");
+    qt_shutdown();
+    qt_async_allow();
 #ifndef _WIN32
     signal(SIGALRM, on_alarm); alarm(60);
 #endif
@@ -149,10 +155,12 @@ int main(void) {
     check(bad == 0, "2000 rounds with a helper that sleeps between jobs");
     qt_shutdown();
 
-    /* ---- 1b. refused on a card that is not device 0, and on two cards ---- */
+    /* ---- 1b. one card that is not device 0: allowed (the DLL's device
+     * cache is thread_local); two cards: refused ---- */
     setenv("COLI_GPUS", "1", 1); fake_ndev = 2;
     check(up("1", NULL), "tier init on device 1");
-    check(!A.on, "QT_ASYNC_ISSUE=1 must be refused on a card other than device 0");
+    check(A.on, "QT_ASYNC_ISSUE=1 must start on a single card that is device 1");
+    check(one_round(out, NULL) && qt_take_redo() == 0, "a round on device 1");
     qt_shutdown();
     setenv("COLI_GPUS", "0,1", 1);
     check(up("1", NULL), "tier init on two cards");

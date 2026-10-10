@@ -3283,7 +3283,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             /* QT_ASYNC_ISSUE=1: qt_issue returned before the backend had
              * accepted the group, so a refused launch only shows up here.
              * Those k were neither computed on the GPU nor in the miss loop
-             * above; compute them now, the same way. Always 0 without the
+             * above; compute them now, with the miss loop's per-expert
+             * arithmetic (added after the GPU rows and the shared expert,
+             * so the sum's order differs from a synchronous refusal's).
+             * qwen36 promised this with qt_async_allow(). Always 0 without the
              * switch, where a refusal is folded into qmask before the miss
              * loop runs. */
             {
@@ -5053,6 +5056,7 @@ int main(int argc, char **argv) {
     trunk_offer_out(&m);
     trunk_offer_attnproj(&m);
     dn_offer_state(&m);
+    qt_async_allow();   /* QT_ASYNC_ISSUE: moe() computes qt_take_redo()'s experts */
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");

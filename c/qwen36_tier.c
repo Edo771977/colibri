@@ -1273,11 +1273,19 @@ static void qt_lfru_tick_locked(void){
  * the decode thread BEFORE the CPU side of the window (the misses and the
  * shared expert, ~96 us a layer) can start, and the GPU group cannot start
  * before it either. Launched from another thread, the decode thread starts
- * its CPU work at once and the launch overlaps it: the window becomes about
- * max(CPU work, launch + GPU group) instead of launch + max(CPU work, GPU
- * tail). That is an estimate from a profiled and an unprofiled run, not a
- * measurement; the hand-off costs something, and a spinning helper takes a
- * hardware thread from the OpenMP team.
+ * its CPU work at once and the launch overlaps it. Per layer, with L the
+ * launch, C the CPU work, P the time from the launch's return to the
+ * results (the ~22 us before the kernel included) and h the hand-off:
+ * synchronous L + max(C, P), asynchronous max(C, h + L + P). The GPU still
+ * cannot start before the launch, whichever thread makes it, so where
+ * P >= C the saving is about nothing; it is at most min(L, C - P) on the
+ * layers where the CPU is the longer side. The 9 October run had the two
+ * sides about even (call end -> results 106.7 us mean, profiled; CPU work
+ * ~96 us, unprofiled; take wait 0.84 ms/token), so the expected gain may be
+ * close to zero, and it can be negative: the hand-off costs something, and
+ * a spinning helper shares a core with the 16-thread OpenMP team (no
+ * pinning on Windows, libomp workers spin between regions), which can slow
+ * the shared expert and the launch itself. Not measured.
  *
  * HOW. qt_issue decides the residents under G.mx as before, sets issue_open
  * (so no resident's tensors can be freed before qt_take), copies the tensor
@@ -1291,18 +1299,23 @@ static void qt_lfru_tick_locked(void){
  *
  * The helper spins (with a pause instruction) for QT_ASYNC_SPIN_US after
  * each job, default 2000 us, then sleeps on a condition variable. Decode
- * posts a job every layer, ~100-150 us apart, so it spins through a token
- * and sleeps across idle time. Publishing and the sleeping flag are both
+ * posts a job every MoE layer, about step/40 apart (~400 us at 16 ms a
+ * token), so it spins through a token and sleeps across idle time. Publishing and the sleeping flag are both
  * sequentially consistent atomics, so either the poster sees the helper
  * asleep and signals it under the mutex, or the helper sees the new job
  * before it waits: no lost wake-up.
  *
- * ONE CARD, DEVICE 0. coli_cuda.dll caches the current device in a process
- * global (select_ctx, g_current_device), while CUDA keeps it per host thread
- * and a new thread starts on device 0. With COLI_GPUS naming one card that is
- * device 0 the helper's launches go to the right context; with any other
- * device, or more than one, the cache would make the helper launch on the
- * wrong one, so the switch refuses and says so. The decode thread makes no
+ * ONE CARD. Only the one-card shape is tested (on the fake backend), so
+ * with more than one card the switch refuses and says so. (The device itself
+ * is not a problem: coli_cuda.dll's current-device cache, g_current_device
+ * in select_ctx, is thread_local, so the helper's first launch sets it.)
+ *
+ * qwen36 ONLY. The engine has to ask for it with qt_async_allow() before
+ * qt_init, because it has to compute qt_take_redo()'s experts: qwen38 links
+ * this tier too, does not, and would drop every refused expert -- with 10
+ * routed experts and the backend refusing more than 8 rows, a layer with 9
+ * or 10 residents would lose all of them. qwen38's shared expert can also
+ * run on the GPU inside the window. The decode thread makes no
  * CUDA call between qt_issue and qt_take (the shared expert and the misses run
  * on the CPU in qwen36), so the helper's launch is the only CUDA traffic it
  * overlaps besides the uploader and the keep-alive, which already run on
@@ -1313,6 +1326,8 @@ static void qt_lfru_tick_locked(void){
 #define QT_PAUSE() ((void)0)
 #endif
 static int G_rows1[QT_MAX_ROWS];            /* one row per expert, decode shape */
+static int G_async_allowed;                 /* set by qt_async_allow(): the engine handles redo */
+void qt_async_allow(void){ G_async_allowed = 1; }
 static int G_bcast = -1;                    /* broadcast entry available (and not disabled) */
 static uint32_t G_redo;                     /* k refused by the backend, from the last qt_take */
 static struct {
@@ -1367,9 +1382,13 @@ static void *async_launcher(void *arg){
 static void async_start(void){
     const char *e=getenv("QT_ASYNC_ISSUE");
     if(!e || strcmp(e,"1")) return;
-    if(G.ndev!=1 || G.dev[0]!=0){
-        fprintf(stderr,"[qtier] QT_ASYNC_ISSUE=1 ignored: it needs exactly one card, device 0 "
-                       "(coli_cuda.dll caches the current device per process, a new thread starts on 0)\n");
+    if(!G_async_allowed){
+        fprintf(stderr,"[qtier] QT_ASYNC_ISSUE=1 ignored: this engine does not recompute "
+                       "refused launches (qt_take_redo), only qwen36 does\n");
+        return;
+    }
+    if(G.ndev!=1){
+        fprintf(stderr,"[qtier] QT_ASYNC_ISSUE=1 ignored: only one card is supported (tested)\n");
         return;
     }
     const char *s=getenv("QT_ASYNC_SPIN_US");
@@ -1716,9 +1735,12 @@ static void dense_free_all(void){
     memset(G_dnp,0,sizeof G_dnp);
 }
 void qt_shutdown(void){
+    /* The helper first: a process leaving from inside the issue..take window
+     * (exit on an allocation failure, at exit through atexit) must not free
+     * anything while it may still be launching. */
+    if(G.on) async_stop();
     dense_free_all();
     if(!G.on) return;
-    async_stop();
     pthread_mutex_lock(&G.mx);
     free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0;
     G.rp_planned=G.rp_done=G.rp_skipped=G.rp_dropped=0; G.mk_on=0;
