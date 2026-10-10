@@ -105,6 +105,14 @@ int main(void){
             if(e&&*e){ printf("note: %s=%s was set in the environment; cleared for this test\n",sw[i],e);
                        setenv(sw[i],"",1); }
         }
+        /* COLI_CUDA_W4_PACKED is on by default and read as !getenv||atoi:
+         * "=0" (or, on Linux, set and empty) sends the branch-3 groups to
+         * branch 5, off the graph, and the zero-copy branch-3 counters fail.
+         * Set to "1", not cleared: an empty value reads as off on Linux and
+         * as unset (on) on Windows. */
+        const char *wp=getenv("COLI_CUDA_W4_PACKED");
+        if(wp&&strcmp(wp,"1")) printf("note: COLI_CUDA_W4_PACKED=%s was set in the environment; set to 1 for this test\n",wp);
+        setenv("COLI_CUDA_W4_PACKED","1",1);
     }
     srand(7);
     const int D=200, I=96, gs=64;            /* tail group: 200 % 64 = 8 */
