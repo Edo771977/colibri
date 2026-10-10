@@ -302,5 +302,7 @@ The same window, right after section 3:
          issue  0.04  cpu-miss  0.58  take  1.63  sh-ovl  3.27  hit  97.7 %  swaps  6.0  miss 1133
          dopo il prefill: hit  98.2 %
 
-Not annotated: whether Windows "hardware-accelerated GPU scheduling" (HAGS)
-was on.
+Windows "hardware-accelerated GPU scheduling" (HAGS): on, as the operator
+reported at the end of the session on 10 October; not checked at the time
+of each run (changing it takes a restart, and none was reported in
+between).
