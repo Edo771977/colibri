@@ -433,6 +433,59 @@ int main(void){
                 api_bad+=fl_bad;
             }
 
+            /* COLI_CUDA_GROUP_ZC: the graph as kernels only -- a staging
+             * kernel reads x and the descriptors from the pinned buffers, the
+             * down kernel writes host_y directly. Same kernels on the same
+             * data, so the rows must be BITWISE the copy path's. Two inputs
+             * alternate, each checked against its own per-call reference: a
+             * stage that read a stale x, or a down that wrote somewhere the
+             * take does not read, returns the previous call's rows and fails
+             * here instead of passing on identical inputs. The counter proves
+             * the path actually ran (it falls back silently-but-once when the
+             * runtime has no device address for pinned memory). */
+            {
+                int zc_bad=0;
+                setenv("COLI_CUDA_GROUP_ZC","",1);
+                if(group_zc_mode()){ printf("FAIL zero-copy must be off when unset\n"); zc_bad++; }
+                setenv("COLI_CUDA_GROUP_ZC","2",1);
+                if(group_zc_mode()){ printf("FAIL zero-copy must be off unless exactly \"1\"\n"); zc_bad++; }
+                float *x2=(float*)malloc((size_t)D*4), *yref2=(float*)malloc((size_t)COUNT*D*4);
+                for(int i=0;i<D;i++) x2[i]=0.5f*x[i]+0.25f;
+                setenv("COLI_CUDA_GROUP_ZC","",1);
+                setenv("COLI_CUDA_GRAPH","0",1);
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x2,1)){ printf("FAIL zc reference issue\n"); return 1; }
+                { const float *yr=coli_cuda_expert_group_take(0);
+                  if(!yr){ printf("FAIL zc reference take\n"); return 1; }
+                  memcpy(yref2,yr,(size_t)COUNT*D*4); }
+                setenv("COLI_CUDA_GRAPH","1",1);
+                setenv("COLI_CUDA_GROUP_ZC","1",1);
+                uint64_t z0=g_group_zc;
+                for(int rep=0; rep<4; rep++){
+                    const float *xin = (rep&1) ? x2 : x;
+                    const float *want = (rep&1) ? yref2 : ydup;
+                    if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,xin,1)){
+                        printf("FAIL zc issue (rep %d)\n",rep); return 1; }
+                    const float *yz=coli_cuda_expert_group_take(0);
+                    if(!yz){ printf("FAIL zc take (rep %d)\n",rep); return 1; }
+                    if(memcmp(want,yz,(size_t)COUNT*D*4)!=0){
+                        printf("FAIL zero-copy rows differ from the copy path (rep %d)\n",rep); zc_bad++; }
+                }
+                if(g_group_zc!=z0+4){
+                    printf("FAIL %llu zero-copy groups for 4 issues (no device address for pinned memory?)\n",
+                           (unsigned long long)(g_group_zc-z0)); zc_bad++; }
+                /* back to the copy path: a re-capture, and the same bits */
+                setenv("COLI_CUDA_GROUP_ZC","",1);
+                uint64_t z1=g_group_zc;
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x2,1)){ printf("FAIL post-zc issue\n"); return 1; }
+                { const float *yc=coli_cuda_expert_group_take(0);
+                  if(!yc||memcmp(yref2,yc,(size_t)COUNT*D*4)!=0){ printf("FAIL copy path after zero-copy\n"); zc_bad++; } }
+                if(g_group_zc!=z1){ printf("FAIL zero-copy ran with the variable unset\n"); zc_bad++; }
+                free(x2); free(yref2);
+                printf("grouped-g4 zero-copy: 4 graph issues on two inputs, %s\n",
+                       zc_bad?"FAILED":"bitwise against the copy path, counted, off again");
+                api_bad+=zc_bad;
+            }
+
             /* And back off cleanly: a graph left armed would follow this
              * process into the next block. */
             setenv("COLI_CUDA_GRAPH", "0", 1);
