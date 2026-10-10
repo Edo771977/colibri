@@ -48,7 +48,7 @@ prompts, longer runs, other engines that share the DLL (GLM, qwen38 and the
 rest: the switch stays off by default there). Windows "hardware-accelerated
 GPU scheduling" (HAGS): not recorded here; the operator reported it on at
 the end of the session on 10 October, after these runs (changing it takes a
-restart, and none was reported in between).
+restart, and none was reported in between; the operator was not asked).
 
 Everything below is from output the operator pasted in the session. The
 logs, the trace and its CSVs stay on the operator's machine; none is

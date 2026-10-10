@@ -82,10 +82,10 @@ added).
 Everything below is from output the operator pasted in the session; where
 lines are left out it says so. The logs, the trace and its CSVs stay on the
 operator's machine; none is committed and no evidence.sha256 exists for
-them. Windows "hardware-accelerated GPU scheduling" (HAGS): on, as the
-operator reported at the end of the session on 10 October; not checked at
-the time of each run (changing it takes a restart, and none was reported in
-between).
+them. Windows "hardware-accelerated GPU scheduling" (HAGS): not recorded at
+the time of the runs; the operator reported it on at the end of the session
+on 10 October (changing it takes a restart, and none was reported in
+between; the operator was not asked).
 
 --- 1. build and test --------------------------------------------------------------
 
