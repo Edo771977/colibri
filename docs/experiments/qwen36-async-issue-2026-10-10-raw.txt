@@ -46,14 +46,16 @@ from that would count, up to about that wait and layer by layer. The next step (
 kernels only) tests whether the copy-engine nodes are what makes the
 launch long; that is a hypothesis.
 
+Windows "hardware-accelerated GPU scheduling" (HAGS): not recorded at the
+time of the runs; the operator, asked during the day, answered in the
+evening of 10 October, hours after these runs, that it is on (changing it
+takes a restart; none was reported in between, and the operator was not
+asked about one).
+
 Everything below is from output the operator pasted in the session. The
 logs, the trace and its CSVs stay on the operator's machine; none is
 committed and no evidence.sha256 exists for them.
 
-Windows "hardware-accelerated GPU scheduling" (HAGS): not recorded here;
-asked in the evening of 10 October, hours after these runs, the operator
-answered that it is on (changing it takes a restart; none was reported in
-between, and the operator was not asked).
 
 --- 1. build -------------------------------------------------------------------
 
