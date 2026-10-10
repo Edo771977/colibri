@@ -571,12 +571,14 @@ int main(void){
                         const int ns[]={1,3,4,5,7,1021};
                         float *dsrc=nullptr,*ddst=nullptr; float hs[1032],hd[1032];
                         for(int i=0;i<1032;i++) hs[i]=(float)i+0.5f;
-                        cudaMalloc(&dsrc,sizeof hs); cudaMalloc(&ddst,sizeof hd);
+                        if(cudaMalloc(&dsrc,sizeof hs)!=cudaSuccess||cudaMalloc(&ddst,sizeof hd)!=cudaSuccess){
+                            printf("FAIL group_zc_out test buffers\n"); return 1; }
                         cudaMemcpy(dsrc,hs,sizeof hs,cudaMemcpyHostToDevice);
                         for(int t=0;t<6;t++){
                             int n=ns[t];
                             cudaMemset(ddst,0xFF,sizeof hd);
                             group_zc_out<<<(unsigned)(((n+3)/4+255)/256),256>>>(ddst,dsrc,n);
+                            if(cudaGetLastError()!=cudaSuccess){ printf("FAIL group_zc_out launch n=%d\n",n); zo_bad++; }
                             cudaMemcpy(hd,ddst,sizeof hd,cudaMemcpyDeviceToHost);
                             int ok=1;
                             for(int i=0;i<1032;i++){

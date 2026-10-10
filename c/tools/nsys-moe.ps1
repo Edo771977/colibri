@@ -226,7 +226,8 @@ foreach ($key in @($byStream.Keys)) {
         # nessuna copia giu (il kernel down scrive le righe nella memoria
         # dell'host). Le sue righe "copia x" sono il kernel di staging, e la
         # fase "fine kernel -> fine copia giu" vale 0 (con
-        # COLI_CUDA_GROUP_ZC_OUT e' la durata del kernel group_zc_out).
+        # COLI_CUDA_GROUP_ZC_OUT va dalla fine del down alla fine del kernel
+        # group_zc_out).
         $zc = ($i -ge 1 -and $ops[$i - 1].Kind -eq "K" -and $ops[$i - 1].Name -like "group_zc_stage*")
         if ($zc) {
             $ups = @($ops[$i - 1])
