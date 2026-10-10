@@ -163,6 +163,18 @@ uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
  * stop inference: experts selected by qt_issue were not computed on CPU. */
 int qt_take(uint32_t mask, const float *val, int K, float *out);
 
+/* QT_ASYNC_ISSUE=1: qt_issue hands the launch to a helper thread and returns
+ * the resident mask before the backend has accepted the group, so a refusal
+ * (which the synchronous path turns into CPU misses before it returns) is
+ * only known in qt_take. The k it covers come back here, set by the last
+ * qt_take and not accumulated into `out`: the caller computes them on the
+ * CPU after qt_take, exactly as it computes misses. Always 0 without the
+ * switch. */
+uint32_t qt_take_redo(void);
+/* The engine's promise that it computes qt_take_redo()'s experts: without it
+ * QT_ASYNC_ISSUE=1 is refused. Call before qt_init. */
+void qt_async_allow(void);
+
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
 int  qt_plan_fill(int *layers, int *eids, int max);
@@ -237,6 +249,8 @@ static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
+static inline uint32_t qt_take_redo(void){return 0;}
+static inline void qt_async_allow(void){}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}

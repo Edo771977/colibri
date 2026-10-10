@@ -3280,10 +3280,35 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
                 exit(1);
             }
+            /* QT_ASYNC_ISSUE=1: qt_issue returned before the backend had
+             * accepted the group, so a refused launch only shows up here.
+             * Those k were neither computed on the GPU nor in the miss loop
+             * above; compute them now, with the miss loop's per-expert
+             * arithmetic (added after the GPU rows and the shared expert,
+             * so the sum's order differs from a synchronous refusal's).
+             * qwen36 promised this with qt_async_allow(). Always 0 without the
+             * switch, where a refusal is folded into qmask before the miss
+             * loop runs. */
+            double _qr0 = tm_now(), _qr = 0;
+            {
+                uint32_t redo = qt_take_redo();
+                for (int kk = 0; redo && kk < K; kk++) {
+                    if (!(redo & (1u<<kk))) continue;
+                    Slot *e; expert_get(m, layer, idx[kk], &e);
+                    slot_ensure_int8(m, e);
+                    matmul_qe(g, xs, e->g, e->gs, D, I);
+                    matmul_qe(u, xs, e->u, e->us, D, I);
+                    for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+                    matmul_qe(hh, g, e->d, e->ds, I, D);
+                    float w = val[kk]; float *os = out + (int64_t)s*D;
+                    for (int d = 0; d < D; d++) os[d] += w * hh[d];
+                }
+                if (redo) _qr = tm_now() - _qr0;   /* CPU expert work: cpu-miss, not take */
+            }
             if (tm_on() && S==1) {
                 extern double g_qt_iss, g_qt_cpu, g_qt_shr, g_qt_tak;
-                g_qt_iss += _q1-_q0; g_qt_cpu += _qm-_q1;
-                g_qt_shr += _q2-_qm; g_qt_tak += tm_now()-_q2;
+                g_qt_iss += _q1-_q0; g_qt_cpu += (_qm-_q1) + _qr;
+                g_qt_shr += _q2-_qm; g_qt_tak += (tm_now()-_q2) - _qr;
             }
         } else {
             for (int kk = 0; kk < K; kk++) {
@@ -5033,6 +5058,7 @@ int main(int argc, char **argv) {
     trunk_offer_out(&m);
     trunk_offer_attnproj(&m);
     dn_offer_state(&m);
+    qt_async_allow();   /* QT_ASYNC_ISSUE: moe() computes qt_take_redo()'s experts */
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");

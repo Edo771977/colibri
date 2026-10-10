@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>     /* sched_yield: QT_ASYNC_ISSUE's wait in qt_take */
 #ifdef __linux__
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -519,6 +520,9 @@ static size_t dev_alloc_footprint(size_t bytes){
     return (b + 8*KiB - 1) / (8*KiB) * (8*KiB);
 }
 
+static void async_start(void);   /* QT_ASYNC_ISSUE, defined next to qt_issue */
+static void async_stop(void);
+static double qt_ms(void);
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
     if(G.on) return 0;
@@ -751,6 +755,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     G.on=1;
     fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
             G.ndev, G.exp_bytes/1048576.0);
+    async_start();
     /* The launcher and coli doctor recognise a Windows CUDA_DLL build by this
      * literal in the binary (they cannot read an import table for a DLL
      * loaded at run time); without it a working GPU build of this engine read
@@ -1260,12 +1265,169 @@ static void qt_lfru_tick_locked(void){
     }
 }
 
+/* ---- QT_ASYNC_ISSUE=1: the group launch on a helper thread --------------
+ *
+ * WHY. In the 9 October trace (docs/experiments/qwen36-cuda-flush-2026-10-10
+ * -raw.txt) one cudaGraphLaunch takes a median 33.5 us, and with the timers
+ * the whole qt_issue costs 1.24-2.06 ms/token over 40 layers. All of it is on
+ * the decode thread BEFORE the CPU side of the window (the misses and the
+ * shared expert, ~96 us a layer) can start, and the GPU group cannot start
+ * before it either. Launched from another thread, the decode thread starts
+ * its CPU work at once and the launch overlaps it. Per layer, with L the
+ * launch, C the CPU work, P the time from the launch's return to the
+ * results (the ~22 us before the kernel included) and h the hand-off:
+ * synchronous L + max(C, P), asynchronous max(C, h + L + P). The GPU still
+ * cannot start before the launch, whichever thread makes it, so where
+ * P >= C the saving is about nothing; it is at most min(L, C - P) on the
+ * layers where the CPU is the longer side. The 9 October run had the two
+ * sides about even (call end -> results 106.7 us mean, profiled; CPU work
+ * ~96 us, unprofiled; take wait 0.84 ms/token), so the expected gain may be
+ * close to zero, and it can be negative: the hand-off costs something, and
+ * a spinning helper shares a core with the 16-thread OpenMP team (no
+ * pinning on Windows, libomp workers spin between regions), which can slow
+ * the shared expert and the launch itself. Not measured.
+ *
+ * HOW. qt_issue decides the residents under G.mx as before, sets issue_open
+ * (so no resident's tensors can be freed before qt_take), copies the tensor
+ * lists into the job below and publishes it; the helper runs the same
+ * per-device launch the synchronous path runs. qt_issue returns the resident
+ * mask at once, optimistically. qt_take first waits for the helper to finish
+ * the job, then turns every device whose launch was refused into k bits for
+ * qt_take_redo(), which the engine computes on the CPU after qt_take. The
+ * synchronous path instead knows the refusal before it returns and hands
+ * those k to the miss loop; the arithmetic is the same either way.
+ *
+ * The helper spins (with a pause instruction) for QT_ASYNC_SPIN_US after
+ * each job, default 2000 us, then sleeps on a condition variable. Decode
+ * posts a job every MoE layer, about step/40 apart (~400 us at 16 ms a
+ * token), so it spins through a token and sleeps across idle time. Publishing and the sleeping flag are both
+ * sequentially consistent atomics, so either the poster sees the helper
+ * asleep and signals it under the mutex, or the helper sees the new job
+ * before it waits: no lost wake-up.
+ *
+ * ONE CARD. Only the one-card shape is tested (on the fake backend), so
+ * with more than one card the switch refuses and says so. (The device itself
+ * is not a problem: coli_cuda.dll's current-device cache, g_current_device
+ * in select_ctx, is thread_local, so the helper's first launch sets it.)
+ *
+ * qwen36 ONLY. The engine has to ask for it with qt_async_allow() before
+ * qt_init, because it has to compute qt_take_redo()'s experts: qwen38 links
+ * this tier too, does not, and would drop every refused expert -- with 10
+ * routed experts and the backend refusing more than 8 rows, a layer with 9
+ * or 10 residents would lose all of them. qwen38's shared expert can also
+ * run on the GPU inside the window. The decode thread makes no
+ * CUDA call between qt_issue and qt_take (the shared expert and the misses run
+ * on the CPU in qwen36), so the helper's launch is the only CUDA traffic it
+ * overlaps besides the uploader and the keep-alive, which already run on
+ * their own threads. */
+#if defined(__x86_64__) || defined(__i386__)
+#define QT_PAUSE() __builtin_ia32_pause()
+#else
+#define QT_PAUSE() ((void)0)
+#endif
+static int G_rows1[QT_MAX_ROWS];            /* one row per expert, decode shape */
+static int G_async_allowed;                 /* set by qt_async_allow(): the engine handles redo */
+void qt_async_allow(void){ G_async_allowed = 1; }
+static int G_bcast = -1;                    /* broadcast entry available (and not disabled) */
+static uint32_t G_redo;                     /* k refused by the backend, from the last qt_take */
+static struct {
+    int on, spin_us;
+    pthread_t th; pthread_mutex_t m; pthread_cond_t cv;
+    unsigned posted, done;                  /* __atomic, SEQ_CST; wrap is fine: compared for equality */
+    int sleeping, stop;                     /* __atomic, SEQ_CST */
+    int pending;                            /* decode thread only: a job is out */
+    const float *x;
+    ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS], *tu[QT_MAX_DEV][QT_MAX_ROWS], *td[QT_MAX_DEV][QT_MAX_ROWS];
+    int cnt[QT_MAX_DEV], ok[QT_MAX_DEV];
+    uint64_t jobs, refused;                 /* for qt_stats */
+} A;
+
+/* One device's launch: the body qt_issue always ran, now shared with the
+ * helper. Returns the backend's answer. */
+static int issue_dev(int di, ColiCudaTensor *const *tg, ColiCudaTensor *const *tu,
+                     ColiCudaTensor *const *td, int c, const float *x){
+    if(G_bcast) return coli_cuda_expert_group_issue_x(tg,tu,td,G_rows1,c,x,1);
+    float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D; /* per-device input block */
+    for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
+    return coli_cuda_expert_group_issue(tg,tu,td,G_rows1,c,xr);
+}
+
+static void *async_launcher(void *arg){
+    (void)arg;
+    unsigned last=0;
+    for(;;){
+        unsigned p; int it=0;
+        double t0=qt_ms();
+        while((p=__atomic_load_n(&A.posted,__ATOMIC_SEQ_CST))==last){
+            if(__atomic_load_n(&A.stop,__ATOMIC_SEQ_CST)) return NULL;
+            QT_PAUSE();
+            if(((++it)&63)==0 && qt_ms()-t0 > A.spin_us/1000.0){
+                pthread_mutex_lock(&A.m);
+                __atomic_store_n(&A.sleeping,1,__ATOMIC_SEQ_CST);
+                while(__atomic_load_n(&A.posted,__ATOMIC_SEQ_CST)==last &&
+                      !__atomic_load_n(&A.stop,__ATOMIC_SEQ_CST))
+                    pthread_cond_wait(&A.cv,&A.m);
+                __atomic_store_n(&A.sleeping,0,__ATOMIC_SEQ_CST);
+                pthread_mutex_unlock(&A.m);
+                t0=qt_ms(); it=0;
+            }
+        }
+        last=p;
+        for(int di=0;di<G.ndev;di++)
+            A.ok[di] = A.cnt[di] ? issue_dev(di,A.tg[di],A.tu[di],A.td[di],A.cnt[di],A.x) : 1;
+        __atomic_store_n(&A.done,last,__ATOMIC_SEQ_CST);
+    }
+}
+
+/* Called once from qt_init, after the tier is up. Off unless exactly "1". */
+static void async_start(void){
+    const char *e=getenv("QT_ASYNC_ISSUE");
+    if(!e || strcmp(e,"1")) return;
+    if(!G_async_allowed){
+        fprintf(stderr,"[qtier] QT_ASYNC_ISSUE=1 ignored: this engine does not recompute "
+                       "refused launches (qt_take_redo), only qwen36 does\n");
+        return;
+    }
+    if(G.ndev!=1){
+        fprintf(stderr,"[qtier] QT_ASYNC_ISSUE=1 ignored: only one card is supported (tested)\n");
+        return;
+    }
+    const char *s=getenv("QT_ASYNC_SPIN_US");
+    A.spin_us=2000;
+    if(s && *s){
+        char *end=NULL; long v=strtol(s,&end,10);
+        if(end && !*end && v>=0 && v<=1000000) A.spin_us=(int)v;
+        else fprintf(stderr,"[qtier] QT_ASYNC_SPIN_US=%s ignored: microseconds 0..1000000; using 2000\n",s);
+    }
+    A.posted=A.done=A.sleeping=A.stop=0; A.pending=0; A.jobs=A.refused=0;
+    if(pthread_mutex_init(&A.m,NULL)) return;
+    if(pthread_cond_init(&A.cv,NULL)){ pthread_mutex_destroy(&A.m); return; }
+    if(pthread_create(&A.th,NULL,async_launcher,NULL)){
+        pthread_cond_destroy(&A.cv); pthread_mutex_destroy(&A.m);
+        fprintf(stderr,"[qtier] QT_ASYNC_ISSUE=1: helper thread not started, launches stay on the decode thread\n");
+        return;
+    }
+    A.on=1;
+    fprintf(stderr,"[qtier] QT_ASYNC_ISSUE=1: expert groups launched from a helper thread "
+                   "(spins %d us after each job, then sleeps)\n", A.spin_us);
+}
+
+static void async_stop(void){
+    if(!A.on) return;
+    __atomic_store_n(&A.stop,1,__ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&A.m); pthread_cond_signal(&A.cv); pthread_mutex_unlock(&A.m);
+    pthread_join(A.th,NULL);
+    pthread_cond_destroy(&A.cv); pthread_mutex_destroy(&A.m);
+    A.on=0; A.pending=0;
+}
+
+uint32_t qt_take_redo(void){ return G_redo; }
+
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     if(!G.on||K>QT_MAX_ROWS) return 0;
     uint32_t mask=0;
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
-    static int rows[QT_MAX_ROWS]={0};
-    if(!rows[0]) for(int i=0;i<QT_MAX_ROWS;i++) rows[i]=1;
+    if(!G_rows1[0]) for(int i=0;i<QT_MAX_ROWS;i++) G_rows1[i]=1;
     for(int i=0;i<G.ndev;i++) G.is_cnt[i]=0;
 
     pthread_mutex_lock(&G.mx);
@@ -1313,8 +1475,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * The duplicating path stays for a DLL built before that entry existed:
      * calling the legacy symbol with a one-row buffer would have it read
      * c*D floats off the end. Asked once -- this runs 40 times a token. */
-    static int bcast = -1;
-    if(bcast < 0){
+    if(G_bcast < 0){
         /* COLI_CUDA_X_BCAST=0 forces the duplicating path even on a DLL that
          * has the broadcast entry. Without it this change has no B arm: the
          * fast path is taken whenever the symbol resolves, and "measure it"
@@ -1322,23 +1483,33 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
          * kernel measurements were lost this week. It doubles as the escape
          * hatch if the broadcast form is ever suspected. */
         const char *e = getenv("COLI_CUDA_X_BCAST");
-        bcast = (e && *e=='0') ? 0 : coli_cuda_has_group_x_broadcast();
+        G_bcast = (e && *e=='0') ? 0 : coli_cuda_has_group_x_broadcast();
         if(getenv("COLI_TIMERS"))
             fprintf(stderr,"[qtier] expert input: %s\n",
-                    bcast ? "one row broadcast to every chunk"
-                          : "duplicated once per chunk");
+                    G_bcast ? "one row broadcast to every chunk"
+                            : "duplicated once per chunk");
+    }
+    if(A.on && mask){
+        /* Hand the launch over: the tensor lists by value, x by pointer (the
+         * caller keeps it untouched until qt_take, which waits for the job). */
+        for(int di=0;di<G.ndev;di++){
+            int c=G.is_cnt[di];
+            A.cnt[di]=c;
+            if(c){ memcpy(A.tg[di],tg[di],(size_t)c*sizeof *tg[di]);
+                   memcpy(A.tu[di],tu[di],(size_t)c*sizeof *tu[di]);
+                   memcpy(A.td[di],td[di],(size_t)c*sizeof *td[di]); }
+        }
+        A.x=x; A.pending=1; A.jobs++;
+        __atomic_store_n(&A.posted, A.posted+1u, __ATOMIC_SEQ_CST);
+        if(__atomic_load_n(&A.sleeping,__ATOMIC_SEQ_CST)){
+            pthread_mutex_lock(&A.m); pthread_cond_signal(&A.cv); pthread_mutex_unlock(&A.m);
+        }
+        return mask;
     }
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
-        int ok;
-        if(bcast){
-            ok = coli_cuda_expert_group_issue_x(tg[di],tu[di],td[di],rows,c,x,1);
-        } else {
-            float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D; /* per-device input block */
-            for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
-            ok = coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr);
-        }
+        int ok = issue_dev(di,tg[di],tu[di],td[di],c,x);
         if(!ok){
             /* issue failed -> hand these k back to the CPU */
             for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[di][j]);
@@ -1399,7 +1570,38 @@ static double qt_ms(void){
 
 int qt_take(uint32_t mask,const float *val,int K,float *out){
     (void)K;
+    G_redo=0;
     if(!G.on) return mask==0;
+    /* QT_ASYNC_ISSUE: the helper must be done with the job before the
+     * results are collected -- and before issue_open is cleared below, since
+     * it reads the tensors. Normally it finished long ago (a launch is tens
+     * of microseconds, the CPU work in between about a hundred). A refused
+     * launch becomes redo bits: those k were promised to the GPU and not
+     * computed, and the engine computes them on the CPU after this call. */
+    /* The wait for the helper is charged to `wait` with the drain below:
+     * both are the decode thread standing still for the GPU side. */
+    double _wh = (g_qt_time_take && A.pending) ? qt_ms() : 0.0;
+    if(A.pending){
+        unsigned seq=__atomic_load_n(&A.posted,__ATOMIC_SEQ_CST);
+        for(int it=0; __atomic_load_n(&A.done,__ATOMIC_SEQ_CST)!=seq; it++){
+            if(it<4096) QT_PAUSE(); else sched_yield();
+        }
+        A.pending=0;
+        int refused=0;
+        for(int di=0;di<G.ndev;di++){
+            if(!G.is_cnt[di] || A.ok[di]) continue;
+            for(int j=0;j<G.is_cnt[di];j++) G_redo |= 1u<<G.is_k[di][j];
+            refused+=G.is_cnt[di]; G.is_cnt[di]=0;
+        }
+        if(refused){
+            /* Counted as the synchronous path counts a refusal -- still hits
+             * (tests/test_qwen36_tier_fp8.c and _invariants pin that), so the
+             * two arms of an A/B report the same hit rate; the refusals show
+             * on their own in qt_stats' "async issue" line. */
+            mask &= ~G_redo;
+            A.refused+=(uint64_t)refused;
+        }
+    }
     const float *result[QT_MAX_DEV]={0};
     int ok=1;
     /* Drain every device before deciding whether this layer is usable.
@@ -1411,6 +1613,7 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
      * OGNI layer senza esperti in VRAM. */
     const int _tm = g_qt_time_take && mask;
     double _w0 = _tm ? qt_ms() : 0.0;
+    if(_wh > 0.0) g_qt_wait += _w0 > 0.0 ? _w0-_wh : qt_ms()-_wh;
     if(mask) for(int di=0;di<G.ndev;di++){
         if(!G.is_cnt[di]) continue;
         result[di]=coli_cuda_expert_group_take(G.dev[di]);
@@ -1489,6 +1692,9 @@ void qt_stats(void){
     fprintf(stderr,"[qtier] resident %zu/%d experts | uploads %llu | miss(CPU) %llu | q_skips %llu\n",
             res, G.nl*G.ne, (unsigned long long)G.uploads,
             (unsigned long long)G.miss, (unsigned long long)G.q_full_skips);
+    if(A.on)
+        fprintf(stderr,"[qtier] async issue: %llu groups launched by the helper thread, %llu experts refused and recomputed on the CPU\n",
+                (unsigned long long)A.jobs, (unsigned long long)A.refused);
     for(int i=0;i<G.ndev;i++){
         size_t tc=0,tb=0; coli_cuda_stats(G.dev[i],&tc,&tb);
         hits+=G.hits[i];
@@ -1540,6 +1746,10 @@ static void dense_free_all(void){
     memset(G_dnp,0,sizeof G_dnp);
 }
 void qt_shutdown(void){
+    /* The helper first: a process leaving from inside the issue..take window
+     * (exit on an allocation failure, at exit through atexit) must not free
+     * anything while it may still be launching. */
+    if(G.on) async_stop();
     dense_free_all();
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
