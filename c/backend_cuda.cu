@@ -3386,14 +3386,19 @@ static void *zc_dev(DeviceContext *ctx,int slot,void *host){
  * for the readback instead. That those writes are the cause is a reading.
  * Hypothesis: the same 64 KiB written in whole 16-byte float4 stores by
  * consecutive threads, after the down, cost less than those 4,096 scattered
- * writes. Not measured.
+ * writes. Measured the same evening on one prompt, with COLI_CUDA_FLUSH=1
+ * and QT_ASYNC_ISSUE=1: ten ABBA pairs on top of COLI_CUDA_GROUP_ZC=1,
+ * -0.52 ms/token, 95 % [-1.02, -0.02], at the edge of the noise (a 6-pair
+ * run before it: -1.00, [-2.13, +0.13]); in the moe4 trace (against moe3,
+ * one trace each, not paired) the down kernel back at 23.5 us, end of down
+ * -> end of group_zc_out 4.3 us.
+ * docs/experiments/qwen36-group-zc-out-2026-10-10-raw.txt.
  *
  * One float4 per thread; the last thread takes the tail scalar. Both
  * addresses come from cudaMalloc / cudaMallocHost, aligned far beyond 16
  * bytes; the caller checks anyway and leaves the variant off otherwise. A
  * copy changes no value: the rows must be bitwise the copy path's
- * (tests/test_grouped_g4_cuda.cu checks it; compiled, not yet run on a
- * GPU when this was written). */
+ * (tests/test_grouped_g4_cuda.cu checks it; OK on the RTX 4070 Ti SUPER). */
 __global__ static void group_zc_out(float *hy,const float *dy,int n){
     int i=(int)(blockIdx.x*blockDim.x+threadIdx.x)*4;
     if(i+3<n) *(float4*)(hy+i)=*(const float4*)(dy+i);

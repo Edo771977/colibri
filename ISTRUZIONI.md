@@ -181,21 +181,43 @@ qwen36.exe 256 4 prompt.txt
   - `set COLI_CUDA_GROUP_ZC=1`, insieme a tutti quelli sopra compreso il flush: il gruppo di
     esperti mandato alla GPU diventa di soli kernel (niente copie del copy engine; il risultato
     va direttamente nella memoria del PC). Misurato il 10 ottobre, con `COLI_CUDA_FLUSH=1`,
-    `QT_ASYNC_ISSUE=1` e la tabella heat fissa in entrambi i bracci: -1,38 ms/token sullo step,
-    16,47 → 15,08 (l'equivalente di ~60,7 → ~66,3 tok/s, ricavato dallo step e non misurato
-    direttamente), intervallo 95 % [-2,20 ; -0,57], 6 coppie su 6, testo identico in tutti i 12
-    run, su un solo prompt di 25 token e 128 token generati
+    `QT_ASYNC_ISSUE=1`, `COLI_CUDA_KEEPALIVE=1` e la tabella heat fissa in entrambi i bracci:
+    -1,38 ms/token sullo step, 16,47 → 15,08 (l'equivalente di ~60,7 → ~66,3 tok/s, ricavato
+    dallo step e non misurato direttamente), intervallo 95 % [-2,20 ; -0,57], 6 coppie su 6,
+    testo identico in tutti i 12 run, su un solo prompt di 25 token e 128 token generati
     (`docs/experiments/qwen36-group-zc-2026-10-10-raw.txt`). Nelle tracce prese con il profiler
     (una per variante, a ore di distanza, non appaiate) la chiamata di lancio del gruppo scende
     da 52,8 a 32,7 µs (mediana), ma il kernel down si allunga da 23,5 a 38,2 µs.
-    `QT_ASYNC_ISSUE=1` (il lancio da un thread di appoggio) si può lasciare spento: misurato
-    con lo zero-copy acceso, -0,13 ms/token, intervallo [-1,14 ; +0,87], nessun effetto
-    distinguibile dal rumore. Il guadagno qui sopra però è misurato con quello acceso, e lo
-    zero-copy senza il thread di appoggio non è stato confrontato con il percorso a copie. Vive
-    nella DLL: dopo `git pull` serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il
-    motore; nell'uscita del motore deve comparire `[cuda] group zero-copy active`. Non
-    annotato: se la "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non
-    misurati: altri prompt e generazioni lunghe.
+    `QT_ASYNC_ISSUE=1` (il lancio da un thread di appoggio), con lo zero-copy da solo, si può
+    lasciare spento (con `COLI_CUDA_GROUP_ZC_OUT` no: vedi sotto): misurato con lo zero-copy
+    acceso, -0,13 ms/token, intervallo [-1,14 ; +0,87], nessun effetto distinguibile dal
+    rumore. Il guadagno qui sopra però è misurato con quello acceso, e lo zero-copy senza il
+    thread di appoggio non è stato confrontato con il percorso a copie. Vive nella DLL: dopo
+    `git pull` serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il motore;
+    nell'uscita del motore deve comparire `[cuda] group zero-copy active`. Non annotato: se la
+    "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non misurati: senza
+    keep-alive, con `HEAT_FILE=heat.bin` riscritta a ogni uscita, altri prompt e generazioni
+    lunghe.
+  - `set COLI_CUDA_GROUP_ZC_OUT=1`, insieme a tutti quelli sopra, a `COLI_CUDA_GROUP_ZC=1`
+    (senza di esso questa variabile non fa nulla) e a `set QT_ASYNC_ISSUE=1`, da tenere acceso
+    con questa variante perché è misurata solo così: il kernel down torna a scrivere nella
+    memoria della scheda e un piccolo kernel copia poi il risultato nella memoria del PC.
+    Misurato il 10 ottobre sopra lo zero-copy, con `COLI_CUDA_FLUSH=1`, `QT_ASYNC_ISSUE=1`,
+    `COLI_CUDA_KEEPALIVE=1` e la tabella heat fissa in entrambi i bracci, 10 coppie: -0,52
+    ms/token sullo step, 14,50 → 13,98 (l'equivalente di ~69,0 → ~71,5 tok/s, ricavato dallo
+    step e non misurato direttamente), intervallo 95 % [-1,02 ; -0,02], 8 coppie su 10, testo
+    identico in tutti i 20 run, stesso prompt
+    (`docs/experiments/qwen36-group-zc-out-2026-10-10-raw.txt`). È al limite del rumore: una
+    prima corsa di 6 coppie, nella stessa finestra, aveva dato -1,00 con intervallo [-2,13 ;
+    +0,13], e la corsa a 10 coppie è stata fatta perché quell'intervallo comprendeva lo zero;
+    in quella a 10 coppie il controllo di posizione (0,80) è compatibile con un effetto
+    dell'ordine di circa 0,4 ms/token, che l'ordine alternato annulla se costante. Nelle tracce
+    prese con il profiler (una per variante, non appaiate) il kernel down torna da 38,2 a 23,5
+    µs e dalla fine del down alla fine della copia passano 4,3 µs. Il guadagno dello zero-copy
+    (sopra) e questo vengono da corse diverse e non si sommano. Vive nella DLL; nell'uscita del
+    motore deve comparire `[cuda] group zero-copy output active`. Non misurati: senza
+    `QT_ASYNC_ISSUE`, senza il flush o senza keep-alive, con `HEAT_FILE=heat.bin` riscritta a
+    ogni uscita, altri prompt e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)
