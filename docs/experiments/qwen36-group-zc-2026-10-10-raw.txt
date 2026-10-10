@@ -68,8 +68,8 @@ gain, and shared by 0.55; another ~0.2 lies in attn, dn and head (2.12 ->
 2.06, 4.17 -> 4.05, 1.06 -> 1.04). Neither the shared nor that part is
 explained by the traces. Also not explained by write volume: in moe3 the
 522 seven-expert groups have a longer down kernel than the 4466
-eight-expert ones (median 44.6 against 38.1 us). COLI_CUDA_GROUP_ZC_OUT (the change this
-record ships with) tests the down kernel's half: the down
+eight-expert ones (median 44.6 against 38.1 us). COLI_CUDA_GROUP_ZC_OUT
+(the change this record ships with) tests the down kernel's half: the down
 writes VRAM again and a copy kernel writes the 64 KiB to host_y in 16-byte
 stores by consecutive threads. With the variant on, QT_ASYNC_ISSUE still
 buys nothing measurable; the synchronous launch now costs the decode thread
