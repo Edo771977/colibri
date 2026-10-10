@@ -30,6 +30,12 @@ Summary:
      positive; the prefill's moe timer +152 ms and dn +51 ms; peak RSS
      31.59 -> 31.60..31.62 GB.
 
+  5. At 512 generated tokens, later the same evening (section 5):
+     step() 16.02 -> 14.72, -1.30, 95 % [-1.59, -1.01], 6 of 6; TTFT
+     +0.19 s; end to end -0.47 s, 95 % about [-0.61, -0.33], 6 of 6.
+     Computed here: the script stopped on its text guard after the
+     twelve runs (one OFF repetition wrote another text).
+
 Reading: on this prompt, the re-plan is measured faster per decode token
 on top of the setting ISTRUZIONI.md recommends (-1.00 ms/token) and
 slower to the first token (+0.21 s). At this run's 128 tokens the whole
@@ -38,8 +44,9 @@ per repetition, TTFT delta + 127 x step() delta gives +0.083 s, 95 %
 [+0.015, +0.151], 5 pairs of 6 positive. It would break
 even at about 210 generated tokens (0.21 s / 1.00 ms; ~110 to ~380
 across the two intervals) if the -1.00 ms/token held beyond 128 tokens,
-which is not measured. Not measured: the quality with the re-plan (no perplexity was
-taken), other prompts, longer runs, and the re-plan without CACHE_ROUTE.
+which is not measured here (section 5 measures 512 tokens). Not measured: the quality
+with the re-plan (no perplexity was taken), other prompts, runs longer than 512 tokens,
+and the re-plan without CACHE_ROUTE.
 
 Everything below is from output the operator pasted in the session. The
 logs stay on the operator's machine; none is committed and no
@@ -287,19 +294,17 @@ Reading:
     other way. On a longer prompt the plan has more evidence and up to
     960 swaps, and neither side is measured.
 
---- 5. 512 generated tokens, a later session -------------------------------------
+--- 5. 512 generated tokens, later the same evening -------------------------------
 
-Same binaries as above (qwen36_clang.exe sha256 CED1C97A27121D71,
-coli_cuda.dll 230CA632A2CEA752), same environment and command with
--NNew 512, in a later session after a reboot (an earlier attempt had stopped on a
-Windows commit-limit OOM, not recorded here). The script stopped at the
-end, after all twelve runs, on its text guard: OFF repetition 3 wrote a
-different text (a09e2b3b9649461d) from the other five OFF runs
-(fb07758568f1e6f6) -- CACHE_ROUTE without QT_UPLOAD_SYNC makes the OFF
-arm timing-dependent too over 512 tokens; it had not happened at 128.
-Only the ON arm had the waiver. So the script printed the pairs but not
-its statistics or per-arm means; the numbers below are computed here
-from the printed pairs and from the operator's findstr of the logs.
+The same binaries and environment as above, later on 8 October: a first
+attempt at 512 tokens had stopped on an out-of-memory error (the Windows
+commit limit, with physical RAM free), the PC was rebooted, and the run
+below followed. Quoted from the operator's paste:
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var QT_PREFILL_REPLAN -Value 1 -Marker "[qwen36] QT_PREFILL_REPLAN=1" -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J -AllowTextDrift ON -NNew 512
+  eseguibile: .\qwen36_clang.exe | 404480 byte | 2026-10-08 21:19:17 | sha256 CED1C97A27121D71
+  coli_cuda.dll: 819712 byte | 2026-09-28 21:42:02 | sha256 230CA632A2CEA752
+  parametri: cap=256 bits=4 N_NEW=512 rip=6 | OFF: QT_PREFILL_REPLAN assente | ON: QT_PREFILL_REPLAN=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J -- DEROGA  | testo-variabile=ON -- DEROGA: i run di un braccio nominato possono scrivere testi diversi
 
   rip 1 (OFF prima)  OFF  16.50  ON  14.80  delta  -1.70 ms/token
   rip 2 (ON prima )  OFF  16.00  ON  14.70  delta  -1.30 ms/token
@@ -308,29 +313,56 @@ from the printed pairs and from the operator's findstr of the logs.
   rip 5 (OFF prima)  OFF  16.00  ON  15.10  delta  -0.90 ms/token
   rip 6 (ON prima )  OFF  15.90  ON  14.70  delta  -1.20 ms/token
 
+  tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 12 run
+  residenza identica in tutti i run: 6812/10240
+  il testo generato NON e' identico fra i run del braccio OFF: le sue ripetizioni hanno scritto testi diversi.
+    OFF rip 1: sha256 fb07758568f1e6f6
+    OFF rip 2: sha256 fb07758568f1e6f6
+    OFF rip 3: sha256 a09e2b3b9649461d
+    OFF rip 4: sha256 fb07758568f1e6f6
+    OFF rip 5: sha256 fb07758568f1e6f6
+    OFF rip 6: sha256 fb07758568f1e6f6
+
+The script stopped there, after all twelve runs, on its text guard: only
+the ON arm had the waiver. That is consistent with CACHE_ROUTE depending
+on upload timing without QT_UPLOAD_SYNC (the QT_UPLOAD_SYNC row of
+docs/ENVIRONMENT.md); at 128 tokens it had not happened. So the script
+printed the pairs but not its statistics or per-arm means. Then, from
+the same logs:
+
+  findstr /C:"TTFT" /C:"[timers] prefill" /C:"PEAK RSS" /C:"replan" envab-*.log
+
+  OFF r1-r6 TTFT: 0.47 0.45 0.41 0.41 0.41 0.45 s; PEAK RSS 31.62 GB in all six
+  ON  r1-r6 TTFT: 0.66 0.64 0.67 0.53 0.60 0.65 s; PEAK RSS 31.61 31.62 31.62 31.62 31.60 31.61 GB
+  every ON log:
+    [qwen36] replan RAM: 177 int8 copies rebuilt for swapped-out experts, 177 dropped for swapped-in ones
+    [qtier] replan: 147 swaps planned, 147 started, 0 skipped (slot moved since the plan), 0 dropped (next prompt), 0 still
+
+(the TTFT and RSS values are the findstr's, one line per log, condensed
+here into rows.) Computed here from the pairs and those values:
+
   step(): OFF 16.02, ON 14.72; paired delta mean -1.30, sd 0.28,
   95 % [-1.59, -1.01] (t(5) = 2.571), 6 of 6 negative.
 
-  TTFT (s), OFF r1-r6: 0.47 0.45 0.41 0.41 0.41 0.45 (mean 0.43)
-             ON r1-r6: 0.66 0.64 0.67 0.53 0.60 0.65 (mean 0.63)
-  paired +0.19 +0.19 +0.26 +0.12 +0.19 +0.20, mean +0.19 s,
-  95 % about [+0.15, +0.24], 6 of 6 positive.
+  TTFT: OFF mean 0.43 s, ON mean 0.63 s; paired +0.19 +0.19 +0.26 +0.12
+  +0.19 +0.20, mean +0.19 s, 95 % about [+0.15, +0.24], 6 of 6 positive.
 
   End to end (TTFT delta + 511 x step() delta), per pair:
   -0.68 -0.47 -0.51 -0.49 -0.27 -0.41 s, mean -0.47 s,
   95 % about [-0.61, -0.33], 6 of 6 negative.
 
-  Peak RSS 31.60-31.62 GB in both arms. Every ON log: "replan: 147 swaps
-  planned, 147 started", "replan RAM: 177 int8 copies rebuilt for
-  swapped-out experts, 177 dropped for swapped-in ones" (177 > 147: the
-  LFRU tick's own swaps over the extra tokens are rebuilt too).
+  177 > 147 is consistent with the LFRU tick's own swaps over the extra
+  tokens being rebuilt as well, as 153 = 147 + 6 is in section 3; not
+  shown separately.
 
 Reading: on this prompt, at 512 generated tokens, the re-plan saves
-about 0.47 s end to end, and its per-token gain (-1.30) is larger than
-at 128 (-1.00, an earlier session). Why it grew is not
-measured; the one-off decode-side costs amortising over more tokens is
-one candidate. The OFF arm's text drift means the six OFF repetitions
-are not one fixed sequence: OFF repetition 3 differs from the others.
+about 0.47 s end to end. Its per-token point estimate (-1.30) is larger
+than at 128 tokens (-1.00, earlier the same evening, before the
+reboot); the two runs are unpaired and their intervals overlap
+([-1.59, -1.01] against [-1.26, -0.74]), so a growth is not shown. The
+one-off decode-side costs amortising over more tokens would push that
+way. The OFF arm's text drift means its six repetitions are not one
+fixed sequence: repetition 3 differs from the others.
 
 --- what this run did NOT measure ---------------------------------------------------
 

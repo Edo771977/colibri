@@ -12,9 +12,10 @@ Summary:
      unflushed), read again with c/tools/nsys-moe.ps1 after #80 split its
      copy phase. Medians over 5080 decode groups: descriptor copy start
      -> x copy start 5.0 us, x copy 1.4 us, x copy end -> hidden kernel
-     33.3 us, call end -> hidden kernel 21.7 us. The bytes arrive in a
-     few microseconds and the kernel starts about 22 us after the
-     cudaGraphLaunch call has returned.
+     33.3 us, call end -> hidden kernel 21.7 us. In that (profiled)
+     trace the bytes arrive in a few microseconds and the kernel starts
+     about 22 us after the cudaGraphLaunch call has returned (33 us after
+     the x copy ends).
   2. tests/test_grouped_g4_cuda.cu on the 4070 Ti SUPER (CUDA 13.4,
      MSVC): OK. 4 of 4 flushed queries found the group unfinished; the
      runtime left cudaErrorNotReady as the last error in 0 of them.
@@ -36,8 +37,8 @@ submitted. The OFF arm's 16.78 against the 15.0 of the 9 October run (and
 issue 2.06 against 1.24) is another session: absolute times of the two
 days are not compared, the paired delta is.
 
-Not measured: a trace with the flush on (whether the 33 us wait before the
-kernel fell), whether Windows' hardware-accelerated GPU scheduling was on
+Not measured: a trace with the flush on (whether the ~22 us between the
+call's return and the kernel -- 33 us after the x copy -- fell), whether Windows' hardware-accelerated GPU scheduling was on
 (not recorded), other prompts, longer runs, other engines that share the
 DLL (GLM, qwen38 and the rest: the switch stays off by default there).
 
@@ -74,6 +75,14 @@ From C:\colibri-ab, after `git pull` to f28b72cd (main at the merge of
 
   kernel per numero di expert: 8 expert, 4466 gruppi, hidden 44.4 us
   (212.5 GB/s of weights and scales), down 23.5 us (200.6 GB/s).
+
+  per token di decode (somma dei gruppi / 127 token), ms/token:
+    traccia (corsa profilata): lancio 1.51 | kernel 3.16 | span GPU 5.09 | da fine chiamata a fine copia giu 4.27
+    moe-base.log (senza profiler): step 15.00 | moe 7.00 | issue 1.24 | cpu-miss 0.58 | shared 3.25 | take 0.92 (wait 0.84, accum 0.08)
+
+  (moe-base.log is the unprofiled run made just before the trace on 9
+  October, same setting; the "15.0" and "issue 1.24" this record and
+  ISTRUZIONI.md quote for that day are its line above.)
 
   The trace was taken with nsys 2026.3.2 (`-t cuda --sample=none
   --cpuctxsw=none --cuda-graph-trace=node`), so its API durations are
@@ -170,16 +179,16 @@ Same window, after the build:
 
 --- reading ---------------------------------------------------------------------
 
-  - The prediction in #80 was "at most about the take wait (0.84 in the
-    9 October run) minus the query's cost, landing as a smaller wait and
-    a larger issue". The A/B gives -0.60 on step(), inside that ceiling,
+  - The prediction in #80 was, in substance, at most about the take wait
+    (0.84 in the 9 October run) minus the query's own cost, which would
+    land in issue. The A/B gives -0.60 on step(), inside that ceiling,
     but with issue SMALLER (-0.29) and the wait slightly LARGER (+0.08),
     and the rest of the gain in the DeltaNet, lm_head and attention
     timers, which contain no expert group. These are differences of
     per-arm means over six runs each, not paired, and their noise is
     not estimated; the paired figure is step() alone.
-  - So the trace's 22 us between the call's return and the kernel is
-    real, and the flush is worth -0.60 ms/token on this prompt, but this
+  - So the ~22 us between the call's return and the kernel is in the
+    (profiled) trace, and the flush is worth -0.60 ms/token on this prompt, but this
     run does not show that the flush removed that wait: a trace with the
     flush on would. Everything the flush could touch outside the group
     (the next dense call on the default stream, the next launch) shares
