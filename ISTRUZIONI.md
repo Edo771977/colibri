@@ -158,14 +158,14 @@ qwen36.exe 256 4 prompt.txt
     token.
   - `set COLI_CUDA_FLUSH=1`, insieme a tutti quelli sopra: dopo ogni gruppo di esperti mandato
     alla GPU chiede subito lo stato dello stream (`cudaStreamQuery`), per spingere il driver di
-    Windows a inviare il lavoro invece di tenerlo in coda. Nella traccia del 9 ottobre il kernel
-    del gruppo partiva ~22 µs (mediana per gruppo, traccia presa con il profiler) dopo che la
-    chiamata di lancio era già tornata, con i dati già copiati. Misurato il 10 ottobre sopra
-    `CACHE_ROUTE=1 ROUTE_J=4`, `QT_PREFILL_REPLAN=1`, `COLI_DN_GPU=1` e `COLI_CUDA_KEEPALIVE=1`,
-    con la tabella heat fissa in entrambi i bracci: -0,60 ms/token sullo step, 16,78 → 16,18
-    (l'equivalente di ~59,6 → ~61,8 tok/s, ricavato dallo step e non misurato direttamente),
-    intervallo 95 % [-1,09 ; -0,11], 6 coppie su 6, testo identico in tutti i 12 run, su un solo
-    prompt di 25 token e 128 token generati
+    Windows a inviare il lavoro invece di tenerlo in coda. Nella traccia del 9 ottobre il
+    kernel del gruppo partiva ~22 µs (mediana per gruppo, traccia presa con il profiler) dopo
+    che la chiamata di lancio era già tornata, con i dati già copiati. Misurato il 10 ottobre
+    sopra `CACHE_ROUTE=1 ROUTE_J=4`, `QT_PREFILL_REPLAN=1`, `COLI_DN_GPU=1` e
+    `COLI_CUDA_KEEPALIVE=1`, con la tabella heat fissa in entrambi i bracci: -0,60 ms/token
+    sullo step, 16,78 → 16,18 (l'equivalente di ~59,6 → ~61,8 tok/s, ricavato dallo step e non
+    misurato direttamente), intervallo 95 % [-1,09 ; -0,11], 6 coppie su 6, testo identico in
+    tutti i 12 run, su un solo prompt di 25 token e 128 token generati
     (`docs/experiments/qwen36-cuda-flush-2026-10-10-raw.txt`). Quel giorno il braccio senza
     flush misurava 16,78 contro i 15,0 del 9 ottobre: altra sessione, i tempi assoluti non si
     confrontano. Il guadagno non è dove era previsto (dalle medie per braccio, non appaiate: è
@@ -173,11 +173,14 @@ qwen36.exe 256 4 prompt.txt
     leggermente) e nessuna traccia con il flush acceso mostra se l'attesa prima del kernel è
     scesa. Non misurato con `HEAT_FILE=heat.bin` riscritta a ogni uscita. Vive nella DLL: dopo
     `git pull` serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il motore;
-    nell'uscita del motore (stderr), già durante la lettura del prompt, deve comparire `[cuda]
-    group flush active`: se manca, la DLL è quella vecchia oppure la variabile non vale
-    esattamente `1` (attenzione agli spazi dopo l'`1` in cmd). Non annotato: se la
-    "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non misurati: altri
-    prompt e generazioni lunghe.
+    nell'uscita del motore (stderr), già durante la lettura del prompt, deve comparire
+    `[cuda] group flush active`: se manca, la DLL è quella vecchia oppure la variabile non vale
+    esattamente `1` (attenzione agli spazi dopo l'`1` in cmd). La "Pianificazione GPU con
+    accelerazione hardware" di Windows risultava attiva secondo la risposta dell'operatore,
+    data la sera del 10 ottobre, dopo le misure; al momento delle misure non era stata annotata
+    (cambiarla richiede un riavvio; nessun riavvio è stato riferito nel frattempo, ma non è
+    stato chiesto se ce ne sia stato uno). Nessun confronto con la pianificazione disattivata.
+    Non misurati: altri prompt e generazioni lunghe.
   - `set COLI_CUDA_GROUP_ZC=1`, insieme a tutti quelli sopra compreso il flush: il gruppo di
     esperti mandato alla GPU diventa di soli kernel (niente copie del copy engine; il risultato
     va direttamente nella memoria del PC). Misurato il 10 ottobre, con `COLI_CUDA_FLUSH=1`,
@@ -194,10 +197,13 @@ qwen36.exe 256 4 prompt.txt
     rumore. Il guadagno qui sopra però è misurato con quello acceso, e lo zero-copy senza il
     thread di appoggio non è stato confrontato con il percorso a copie. Vive nella DLL: dopo
     `git pull` serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il motore;
-    nell'uscita del motore deve comparire `[cuda] group zero-copy active`. Non annotato: se la
-    "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non misurati: senza
-    keep-alive, con `HEAT_FILE=heat.bin` riscritta a ogni uscita, altri prompt e generazioni
-    lunghe.
+    nell'uscita del motore deve comparire `[cuda] group zero-copy active`. La "Pianificazione
+    GPU con accelerazione hardware" di Windows risultava attiva secondo la risposta
+    dell'operatore, data la sera del 10 ottobre, dopo le misure; al momento delle misure non
+    era stata annotata (cambiarla richiede un riavvio; nessun riavvio è stato riferito nel
+    frattempo, ma non è stato chiesto se ce ne sia stato uno). Nessun confronto con la
+    pianificazione disattivata. Non misurati: senza keep-alive, con `HEAT_FILE=heat.bin`
+    riscritta a ogni uscita, altri prompt e generazioni lunghe.
   - `set COLI_CUDA_GROUP_ZC_OUT=1`, insieme a tutti quelli sopra, a `COLI_CUDA_GROUP_ZC=1`
     (senza di esso questa variabile non fa nulla) e a `set QT_ASYNC_ISSUE=1`, da tenere acceso
     con questa variante perché è misurata solo così: il kernel down torna a scrivere nella
@@ -215,9 +221,13 @@ qwen36.exe 256 4 prompt.txt
     prese con il profiler (una per variante, non appaiate) il kernel down torna da 38,2 a 23,5
     µs e dalla fine del down alla fine della copia passano 4,3 µs. Il guadagno dello zero-copy
     (sopra) e questo vengono da corse diverse e non si sommano. Vive nella DLL; nell'uscita del
-    motore deve comparire `[cuda] group zero-copy output active`. Non misurati: senza
-    `QT_ASYNC_ISSUE`, senza il flush o senza keep-alive, con `HEAT_FILE=heat.bin` riscritta a
-    ogni uscita, altri prompt e generazioni lunghe.
+    motore deve comparire `[cuda] group zero-copy output active`. La "Pianificazione GPU con
+    accelerazione hardware" di Windows risultava attiva secondo la risposta dell'operatore,
+    data la sera del 10 ottobre, dopo le misure; al momento delle misure non era stata annotata
+    (cambiarla richiede un riavvio; nessun riavvio è stato riferito nel frattempo, ma non è
+    stato chiesto se ce ne sia stato uno). Nessun confronto con la pianificazione disattivata.
+    Non misurati: senza `QT_ASYNC_ISSUE`, senza il flush o senza keep-alive, con
+    `HEAT_FILE=heat.bin` riscritta a ogni uscita, altri prompt e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)
