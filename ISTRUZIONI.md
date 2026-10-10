@@ -187,14 +187,15 @@ qwen36.exe 256 4 prompt.txt
     run, su un solo prompt di 25 token e 128 token generati
     (`docs/experiments/qwen36-group-zc-2026-10-10-raw.txt`). Nelle tracce prese con il profiler
     (una per variante, a ore di distanza, non appaiate) la chiamata di lancio del gruppo scende
-    da 52,8 a 32,7 µs (mediana), ma il kernel down si allunga da 23,5 a 38,2 µs. `QT_ASYNC_ISSUE=1` (il lancio da un thread di appoggio), misurato con lo zero-copy
-    acceso: -0,13 ms/token, intervallo [-1,14 ; +0,87], nessun effetto distinguibile dal rumore;
-    il guadagno qui sopra però è misurato con quello acceso, e lo zero-copy senza il thread di
-    appoggio non è stato confrontato con il percorso a copie. Vive nella DLL: dopo `git pull`
-    serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il motore; nell'uscita del
-    motore deve comparire `[cuda] group zero-copy active`. Non annotato: se la "Pianificazione
-    GPU con accelerazione hardware" di Windows era attiva. Non misurati: altri prompt e
-    generazioni lunghe.
+    da 52,8 a 32,7 µs (mediana), ma il kernel down si allunga da 23,5 a 38,2 µs.
+    `QT_ASYNC_ISSUE=1` (il lancio da un thread di appoggio) si può lasciare spento: misurato
+    con lo zero-copy acceso, -0,13 ms/token, intervallo [-1,14 ; +0,87], nessun effetto
+    distinguibile dal rumore. Il guadagno qui sopra però è misurato con quello acceso, e lo
+    zero-copy senza il thread di appoggio non è stato confrontato con il percorso a copie. Vive
+    nella DLL: dopo `git pull` serve `make cuda-dll CC=clang CUDA_ARCH=sm_89` e poi di nuovo il
+    motore; nell'uscita del motore deve comparire `[cuda] group zero-copy active`. Non
+    annotato: se la "Pianificazione GPU con accelerazione hardware" di Windows era attiva. Non
+    misurati: altri prompt e generazioni lunghe.
 - Riferimento: `docs/qwen36-cuda-tier.md`.
 
 ### DeepSeek V4 Flash (~167 GB)

@@ -58,10 +58,17 @@ Summary:
 
 Reading: the variant is a gain on this prompt. The traces (one each, not
 paired) show a shorter launch call and a longer down kernel; from call
-start to results they account for about 18 us x 40 layers = 0.7 ms/token,
-about half the step gain. In the per-arm means of the A/B (not paired) the
-moe time falls 7.83 -> 6.67, wait by 0.50 and shared by 0.55; the shared
-part the traces do not explain. COLI_CUDA_GROUP_ZC_OUT (the change this
+start to results they differ by about 18 us x 40 layers = 0.7 ms/token
+(profiled). With QT_ASYNC_ISSUE=1 the launch runs on the helper, so that
+figure reaches the decode thread only through wait, and per layer through
+max(C, h + L + P): it bounds what the group change can save, it is not an
+amount that shows in the step. In the A/B's per-arm means (not paired) the
+moe time falls 7.83 -> 6.67: wait by 0.50, about a third of the 1.38 step
+gain, and shared by 0.55; another ~0.2 lies in attn, dn and head (2.12 ->
+2.06, 4.17 -> 4.05, 1.06 -> 1.04). Neither the shared nor that part is
+explained by the traces. Also not explained by write volume: in moe3 the
+522 seven-expert groups have a longer down kernel than the 4466
+eight-expert ones (median 44.6 against 38.1 us). COLI_CUDA_GROUP_ZC_OUT (the change this
 record ships with) tests the down kernel's half: the down
 writes VRAM again and a copy kernel writes the 64 KiB to host_y in 16-byte
 stores by consecutive threads. With the variant on, QT_ASYNC_ISSUE still
