@@ -316,7 +316,8 @@ measured run paged was not checked. Quoted from the operator's paste:
 
   tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 12 run
   residenza identica in tutti i run: 6812/10240
-  il testo generato NON e' identico fra i run del braccio OFF: le sue ripetizioni hanno scritto testi diversi.
+  il testo generato NON e' identico fra i run del braccio OFF: le sue ripetizioni hanno scritto testi diversi. I testi
+  sono nei log; qui l'impronta di ogni run.
     OFF rip 1: sha256 fb07758568f1e6f6
     OFF rip 2: sha256 fb07758568f1e6f6
     OFF rip 3: sha256 a09e2b3b9649461d

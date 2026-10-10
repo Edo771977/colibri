@@ -187,9 +187,10 @@ Same window, after the build:
   - The prediction in #80 was, in substance, at most about the take wait
     (0.84 in the 9 October run) minus the query's own cost, which would
     land in issue. The 0.84 is another day's; in this session the OFF
-    arm's wait was 0.51, smaller than the -0.60 the A/B gives on step(),
-    so even removing the whole wait could not account for the gain. And
-    issue came out SMALLER (-0.29) and the wait slightly LARGER (+0.08),
+    arm's wait was 0.51 (a per-arm mean, noise not estimated). The
+    point estimate of the gain (-0.60) exceeds it, though the interval
+    [-1.09, -0.11] does not exclude a smaller gain; and the wait did not
+    fall (0.51 -> 0.59). Issue came out SMALLER (-0.29) and the wait slightly LARGER (+0.08),
     and the rest of the gain in the DeltaNet, lm_head and attention
     timers, which contain no expert group. These are differences of
     per-arm means over six runs each, not paired, and their noise is
