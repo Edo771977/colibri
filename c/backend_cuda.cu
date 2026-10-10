@@ -3378,19 +3378,22 @@ static void *zc_dev(DeviceContext *ctx,int slot,void *host){
  *
  * Why: in the 10 October trace with COLI_CUDA_GROUP_ZC=1 (moe3,
  * docs/experiments/qwen36-group-zc-2026-10-10-raw.txt, profiled, medians per
- * decode group) the launch call fell from 52.8 to 32.7 us and the kernel now
- * starts at its end, but the down kernel went from 23.5 to 38.2 us. Writing
- * host_y it sends its rows over PCIe as each block finishes, 16 bytes per
- * block at R=4 (8 experts x 512 blocks); the copy path paid 6.5 us for the
- * readback instead. Hypothesis: the same 64 KiB written in whole 16-byte
- * float4 stores by consecutive threads, after the down, cost less than those
- * 4,096 scattered writes. Not measured.
+ * decode group; one trace each, against moe2 hours earlier, not paired) the
+ * launch call fell from 52.8 to 32.7 us and the kernel now starts at its
+ * end, but the down kernel went from 23.5 to 38.2 us. Writing host_y it
+ * sends its rows over PCIe as each block finishes, one coalesced 16-byte
+ * store per block at R=4 (8 experts x 512 blocks); the copy path paid 6.5 us
+ * for the readback instead. That those writes are the cause is a reading.
+ * Hypothesis: the same 64 KiB written in whole 16-byte float4 stores by
+ * consecutive threads, after the down, cost less than those 4,096 scattered
+ * writes. Not measured.
  *
  * One float4 per thread; the last thread takes the tail scalar. Both
  * addresses come from cudaMalloc / cudaMallocHost, aligned far beyond 16
  * bytes; the caller checks anyway and leaves the variant off otherwise. A
- * copy changes no value: the rows are bitwise the copy path's
- * (tests/test_grouped_g4_cuda.cu). */
+ * copy changes no value: the rows must be bitwise the copy path's
+ * (tests/test_grouped_g4_cuda.cu checks it; compiled, not yet run on a
+ * GPU when this was written). */
 __global__ static void group_zc_out(float *hy,const float *dy,int n){
     int i=(int)(blockIdx.x*blockDim.x+threadIdx.x)*4;
     if(i+3<n) *(float4*)(hy+i)=*(const float4*)(dy+i);

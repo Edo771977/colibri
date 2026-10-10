@@ -225,7 +225,8 @@ foreach ($key in @($byStream.Keys)) {
         # group_zc_stage (legge x e i descrittori dalla memoria pinned), e
         # nessuna copia giu (il kernel down scrive le righe nella memoria
         # dell'host). Le sue righe "copia x" sono il kernel di staging, e la
-        # fase "fine kernel -> fine copia giu" vale 0.
+        # fase "fine kernel -> fine copia giu" vale 0 (con
+        # COLI_CUDA_GROUP_ZC_OUT e' la durata del kernel group_zc_out).
         $zc = ($i -ge 1 -and $ops[$i - 1].Kind -eq "K" -and $ops[$i - 1].Name -like "group_zc_stage*")
         if ($zc) {
             $ups = @($ops[$i - 1])
@@ -443,7 +444,7 @@ if ($nBytesOff) { $warn.Add("$nBytesOff gruppi di decode hanno una copia giu che
 "traccia: $Csv | $($allOps.Count) operazioni GPU su $($byStream.Count) stream"
 "gruppi di expert: $($groups.Count) = (prompt $($bl.Pre) + generati $($bl.Dec)) x $L layer | prefill $($pre.Count), decode $($dec.Count)"
 "  non riconosciuti: senza copie su $nNoUp, senza kernel down $nNoDown, senza copia giu $nNoD2H"
-"  riconosciuti a zero-copy (COLI_CUDA_GROUP_ZC: kernel di staging al posto delle copie, nessuna copia giu; per loro 'copia giu' finisce con il kernel down): $nZc, di cui con il kernel group_zc_out (COLI_CUDA_GROUP_ZC_OUT, fa da 'copia giu'): $nZcOut"
+"  riconosciuti a zero-copy (COLI_CUDA_GROUP_ZC: kernel di staging al posto delle copie, nessuna copia giu; per quelli senza group_zc_out 'copia giu' finisce con il kernel down): $nZc, di cui con il kernel group_zc_out (COLI_CUDA_GROUP_ZC_OUT, fa da 'copia giu'): $nZcOut"
 "  $dnCheck"
 "lancio: $linkHow"
 "altri stream durante il decode (lo stream di default porta anche le chiamate dense e la DeltaNet): {0} copie su oltre 16 KiB ({1} MB: caricamenti di expert e, al primo token, lo stato DeltaNet), {2} fino a 16 KiB, {3} kernel senza il keep-alive ({4})" -f $winUp.Count,

@@ -17,7 +17,10 @@ Summary:
   2. Nsight trace with COLI_CUDA_FLUSH=1, QT_ASYNC_ISSUE=1 and
      COLI_CUDA_GROUP_ZC=1 (moe3), read with c/tools/nsys-moe.ps1, medians
      over 5080 decode groups, all 6080 groups recognised as zero-copy and
-     linked by CorrId. Against moe2 (same switches without the variant):
+     linked by CorrId. Against moe2 (same switches without the variant;
+     one profiled trace each, taken hours apart, not paired -- moe2's
+     52.8 us call was itself longer than the 33.5 us of 9 October, and why
+     is not known):
          cudaGraphLaunch call              52.8 -> 32.7 us
          call end -> first GPU operation  -26.8 ->  0.8 us
          uploads (first op -> hidden)      35.0 ->  1.6 us (staging kernel)
@@ -32,7 +35,8 @@ Summary:
      The hypothesis of #83 holds in part: without the copy-engine nodes the
      launch call is 20 us shorter and the first kernel starts at its end.
      The down kernel, which now writes its rows into the pinned host_y over
-     PCIe (16-byte writes, one per block, 8 experts x 512 blocks at R=4),
+     PCIe (one coalesced 16-byte store per block, 8 experts x 512 blocks
+     at R=4),
      is 14.7 us longer, more than the 6.5 us readback it replaces: from the
      end of the call to the results the group is 4.2 us slower. That the
      writes to host memory are the cause is a reading, not measured.
@@ -52,15 +56,21 @@ Summary:
      3.73 -> 3.18 between the arms of 3, which both had the helper and
      differ in the variant); not explained.
 
-Reading: the variant is a gain on this prompt, and the trace says where it
-comes from -- the launch call -- and where it gives part of it back -- the
-down kernel. COLI_CUDA_GROUP_ZC_OUT (#84) tests the second half: the down
+Reading: the variant is a gain on this prompt. The traces (one each, not
+paired) show a shorter launch call and a longer down kernel; from call
+start to results they account for about 18 us x 40 layers = 0.7 ms/token,
+about half the step gain. In the per-arm means of the A/B (not paired) the
+moe time falls 7.83 -> 6.67, wait by 0.50 and shared by 0.55; the shared
+part the traces do not explain. COLI_CUDA_GROUP_ZC_OUT (the change this
+record ships with) tests the down kernel's half: the down
 writes VRAM again and a copy kernel writes the 64 KiB to host_y in 16-byte
 stores by consecutive threads. With the variant on, QT_ASYNC_ISSUE still
 buys nothing measurable; the synchronous launch now costs the decode thread
 0.82 ms/token (unprofiled issue), against 1.86 in the morning's A/B without
 the variant. Not measured: other prompts, longer generations, the variant
-without COLI_CUDA_FLUSH.
+without COLI_CUDA_FLUSH, and the variant against the copy path without
+QT_ASYNC_ISSUE (section 4's OFF arm runs ZC without the helper, but only
+against ZC with it).
 
 Everything below is from output the operator pasted in the session. The
 logs, the trace and its CSVs stay on the operator's machine; none is
