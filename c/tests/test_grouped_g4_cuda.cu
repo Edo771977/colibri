@@ -509,9 +509,12 @@ int main(void){
                 /* COLI_CUDA_GROUP_ZC_OUT: the down kernel writes VRAM again
                  * and group_zc_out copies the rows to host_y. host_y is
                  * poisoned before every issue (it holds the right rows from
-                 * the call before), so an out kernel that never ran, or ran
-                 * before the down, fails here. Its own graph: one capture (bit
-                 * 8 of the signature), then replays. */
+                 * the call before), so an out kernel that never ran fails
+                 * here; the two inputs alternate, so VRAM y holds the other
+                 * input's rows before each issue and a down that wrote
+                 * elsewhere, or an out kernel that ran before it, fails too.
+                 * Its own graph: one capture (bit 8 of the signature), then
+                 * replays. */
                 {
                     int zo_bad=0;
                     setenv("COLI_CUDA_GROUP_ZC_OUT","",1);
@@ -537,7 +540,9 @@ int main(void){
                         printf("FAIL zero-copy output graph: %llu captures, %llu replays (want 1 and 3)\n",
                                (unsigned long long)(g_graph_captures-capo),
                                (unsigned long long)(g_graph_replays-repo)); zo_bad++; }
-                    /* branch 3 (grouped_down_w4), expert 2 alone */
+                    /* branch 3 (grouped_down_w4), expert 2 alone. One input
+                     * here, so VRAM y is poisoned too before each issue: the
+                     * reference call leaves exactly the right rows in it. */
                     {
                         float *yref3=(float*)malloc((size_t)D*4);
                         setenv("COLI_CUDA_GROUP_ZC","",1); setenv("COLI_CUDA_GRAPH","0",1);
@@ -548,7 +553,9 @@ int main(void){
                         setenv("COLI_CUDA_GRAPH","1",1); setenv("COLI_CUDA_GROUP_ZC","1",1);
                         uint64_t ob=g_group_zc_out;
                         for(int rep=0; rep<2; rep++){
-                            { DeviceContext *pc=find_ctx(0); if(pc&&pc->host_y) memset(pc->host_y,0xFF,(size_t)D*4); }
+                            { DeviceContext *pc=find_ctx(0);
+                              if(pc&&pc->host_y) memset(pc->host_y,0xFF,(size_t)D*4);
+                              if(pc&&pc->y){ cudaMemsetAsync(pc->y,0xFF,(size_t)D*4,pc->stream); cudaStreamSynchronize(pc->stream); } }
                             if(!coli_cuda_expert_group_issue_x(tg+2,tu+2,td+2,rows1,1,x,1)){ printf("FAIL branch-3 zc-out issue\n"); return 1; }
                             const float *y3=coli_cuda_expert_group_take(0);
                             if(!y3||memcmp(yref3,y3,(size_t)D*4)!=0){
@@ -557,9 +564,31 @@ int main(void){
                         if(g_group_zc_out!=ob+2){ printf("FAIL branch 3 did not take the zero-copy output path\n"); zo_bad++; }
                         free(yref3);
                     }
+                    /* the kernel alone, on lengths that are not a multiple of
+                     * 4 (the engine's never are): every element once, none
+                     * past n */
+                    {
+                        const int ns[]={1,3,4,5,7,1021};
+                        float *dsrc=nullptr,*ddst=nullptr; float hs[1032],hd[1032];
+                        for(int i=0;i<1032;i++) hs[i]=(float)i+0.5f;
+                        cudaMalloc(&dsrc,sizeof hs); cudaMalloc(&ddst,sizeof hd);
+                        cudaMemcpy(dsrc,hs,sizeof hs,cudaMemcpyHostToDevice);
+                        for(int t=0;t<6;t++){
+                            int n=ns[t];
+                            cudaMemset(ddst,0xFF,sizeof hd);
+                            group_zc_out<<<(unsigned)(((n+3)/4+255)/256),256>>>(ddst,dsrc,n);
+                            cudaMemcpy(hd,ddst,sizeof hd,cudaMemcpyDeviceToHost);
+                            int ok=1;
+                            for(int i=0;i<1032;i++){
+                                uint32_t b; memcpy(&b,&hd[i],4);
+                                if(i<n ? hd[i]!=hs[i] : b!=0xFFFFFFFFu) ok=0; }
+                            if(!ok){ printf("FAIL group_zc_out on n=%d\n",n); zo_bad++; }
+                        }
+                        cudaFree(dsrc); cudaFree(ddst);
+                    }
                     printf("grouped-g4 zero-copy output: 4 graph issues on two inputs + branch 3, %s\n",
-                           zo_bad?"FAILED":"bitwise against the copy path, host_y poisoned before each, captured once and replayed");
-                    zc_bad+=zo_bad;
+                           zo_bad?"FAILED":"bitwise against the copy path, host_y poisoned before each, captured once and replayed, tail lengths");
+                    api_bad+=zo_bad;
                     /* left at "1" on purpose: the copy-path issue below must
                      * ignore it without COLI_CUDA_GROUP_ZC */
                 }
