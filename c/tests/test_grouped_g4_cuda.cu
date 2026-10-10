@@ -92,10 +92,11 @@ static int check_graph_default(void){
 int main(void){
     /* Opt-in switches that change the expert group's path. Every block below
      * sets the ones it tests and expects the others off; a variable left in
-     * the shell by a measurement (COLI_CUDA_GROUP_ZC=1 in the window where
-     * the A/B ran) made the plain graph block capture the zero-copy graph
-     * and the zero-copy block count 0 captures and 4 replays. Cleared here,
-     * and said, so the test means the same thing in any window.
+     * the shell (COLI_CUDA_GROUP_ZC=1, set in the window as ISTRUZIONI.md
+     * recommends) made the graph blocks capture the zero-copy graph and the
+     * zero-copy block count 0 captures and 4 replays; COLI_CUDA_GROUP_ZC_OUT=1
+     * would do the same one block later. Cleared here, and said, so the
+     * test means the same thing in any window.
      * COLI_CUDA_PROFILE would also keep every group off the graph (read
      * once, at the first issue). */
     {
