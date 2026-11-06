@@ -100,8 +100,9 @@ int main(void){
      * COLI_CUDA_PROFILE would also keep every group off the graph (read
      * once, at the first issue). */
     {
-        const char *sw[]={"COLI_CUDA_FLUSH","COLI_CUDA_GROUP_ZC","COLI_CUDA_GROUP_ZC_OUT","COLI_CUDA_PROFILE"};
-        for(int i=0;i<4;i++){
+        const char *sw[]={"COLI_CUDA_FLUSH","COLI_CUDA_GROUP_ZC","COLI_CUDA_GROUP_ZC_OUT","COLI_CUDA_PROFILE",
+                          "COLI_CUDA_GS64","COLI_CUDA_DOWN_ROWS"};
+        for(int i=0;i<6;i++){
             const char *e=getenv(sw[i]);
             if(e&&*e){ printf("note: %s=%s was set in the environment; cleared for this test\n",sw[i],e);
                        setenv(sw[i],"",1); }
@@ -202,6 +203,89 @@ int main(void){
     printf("grouped-g4 oracle: %d trials x %d experts (gs=64 + tail + per-row member), %d mismatches\n",
            trials,COUNT,bad);
     if(bad){ printf("FAIL\n"); return 1; }
+
+    /* COLI_CUDA_GS64, the kernels alone: grouped_hidden_g4_dual_gs64 and
+     * grouped_down_g4r_gs64<R> against the generic kernels on the same
+     * inputs, BITWISE. Three shapes: qwen36's own (D=2048, I=512: four
+     * loop iterations per thread, 64-wide groups with no tail) and two with
+     * a partial last group (200 % 64 = 8, 130 % 64 = 2) and a tail block in
+     * the down kernel (130 % 4, 130 % 8). 8 experts, some with two rows, and
+     * both input layouts (broadcast xoff=0, and one x row per expert row).
+     * Outputs poisoned before every launch, so a row a kernel fails to write
+     * cannot match by leftover. CUDA only: the variant is off on HIP. */
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))
+    {
+        int k_bad=0, k_cmp=0;
+        const int shapes[3][2]={{2048,512},{200,96},{130,66}};
+        for(int sh=0;sh<3;sh++){
+            const int KD=shapes[sh][0], KI=shapes[sh][1], KC=8, KR=2;
+            const int krbD=KD/2, krbI=KI/2, kngD=(KD+63)/64, kngI=(KI+63)/64;
+            const size_t wg=(size_t)KI*krbD, wd=(size_t)KD*krbI;
+            int krows[KC], koff[KC], ktot=0;
+            for(int c=0;c<KC;c++){ krows[c]=(c%3==0)?2:1; koff[c]=ktot; ktot+=krows[c]; }
+            uint8_t *hq=(uint8_t*)malloc(KC*(2*wg+wd));
+            float *hs=(float*)malloc(sizeof(float)*(size_t)KC*(2*(size_t)KI*kngD+(size_t)KD*kngI));
+            float *hx=(float*)malloc(sizeof(float)*(size_t)ktot*KD);
+            for(size_t i=0;i<KC*(2*wg+wd);i++) hq[i]=rand()&255;
+            for(size_t i=0;i<(size_t)KC*(2*(size_t)KI*kngD+(size_t)KD*kngI);i++) hs[i]=.01f+.05f*(rand()/(float)RAND_MAX);
+            for(size_t i=0;i<(size_t)ktot*KD;i++) hx[i]=(rand()/(float)RAND_MAX-.5f)*2.f;
+            uint8_t *dq; float *dsc_,*dx,*dgA,*dgB,*dup,*dyA,*dyB; GroupDesc *kdesc;
+            cudaMalloc(&dq,KC*(2*wg+wd));
+            cudaMalloc(&dsc_,sizeof(float)*(size_t)KC*(2*(size_t)KI*kngD+(size_t)KD*kngI));
+            cudaMalloc(&dx,sizeof(float)*(size_t)ktot*KD);
+            cudaMalloc(&dgA,sizeof(float)*(size_t)ktot*KI); cudaMalloc(&dgB,sizeof(float)*(size_t)ktot*KI);
+            cudaMalloc(&dup,sizeof(float)*(size_t)ktot*KI);
+            cudaMalloc(&dyA,sizeof(float)*(size_t)ktot*KD); cudaMalloc(&dyB,sizeof(float)*(size_t)ktot*KD);
+            cudaMalloc(&kdesc,sizeof(GroupDesc)*KC);
+            cudaMemcpy(dq,hq,KC*(2*wg+wd),cudaMemcpyHostToDevice);
+            cudaMemcpy(dsc_,hs,sizeof(float)*(size_t)KC*(2*(size_t)KI*kngD+(size_t)KD*kngI),cudaMemcpyHostToDevice);
+            cudaMemcpy(dx,hx,sizeof(float)*(size_t)ktot*KD,cudaMemcpyHostToDevice);
+            float *hA=(float*)malloc(sizeof(float)*(size_t)ktot*KD), *hB=(float*)malloc(sizeof(float)*(size_t)ktot*KD);
+            for(int layout=0;layout<2;layout++){
+                GroupDesc kd[KC];
+                for(int c=0;c<KC;c++){
+                    const uint8_t *g=dq+(size_t)c*wg, *u=dq+(size_t)KC*wg+(size_t)c*wg, *dd=dq+(size_t)2*KC*wg+(size_t)c*wd;
+                    const float *gs_=dsc_+(size_t)c*KI*kngD, *us_=dsc_+(size_t)KC*KI*kngD+(size_t)c*KI*kngD,
+                                *ds_=dsc_+(size_t)2*KC*KI*kngD+(size_t)c*KD*kngI;
+                    kd[c]={g,u,dd,gs_,us_,ds_,4,4,4,krows[c],koff[c],64,64,64,layout?koff[c]:0};
+                }
+                cudaMemcpy(kdesc,kd,sizeof kd,cudaMemcpyHostToDevice);
+                dim3 hgk((unsigned)KI,(unsigned)KR,(unsigned)KC);
+                cudaMemset(dgA,0xFF,sizeof(float)*(size_t)ktot*KI); cudaMemset(dgB,0xFF,sizeof(float)*(size_t)ktot*KI);
+                grouped_hidden_g4_dual<<<hgk,256>>>(dgA,dup,dx,kdesc,KI,KD);
+                grouped_hidden_g4_dual_gs64<<<hgk,256>>>(dgB,dup,dx,kdesc,KI,KD);
+                if(cudaDeviceSynchronize()!=cudaSuccess){ printf("FAIL gs64 hidden launch\n"); return 1; }
+                cudaMemcpy(hA,dgA,sizeof(float)*(size_t)ktot*KI,cudaMemcpyDeviceToHost);
+                cudaMemcpy(hB,dgB,sizeof(float)*(size_t)ktot*KI,cudaMemcpyDeviceToHost);
+                k_cmp++;
+                if(memcmp(hA,hB,sizeof(float)*(size_t)ktot*KI)!=0){
+                    printf("FAIL gs64 hidden differs (D=%d I=%d layout %d)\n",KD,KI,layout); k_bad++; }
+                for(int R=2;R<=8;R*=2){
+                    dim3 ogk((unsigned)((KD+R-1)/R),(unsigned)KR,(unsigned)KC);
+                    cudaMemset(dyA,0xFF,sizeof(float)*(size_t)ktot*KD); cudaMemset(dyB,0xFF,sizeof(float)*(size_t)ktot*KD);
+                    if(R==2){ grouped_down_g4r<2><<<ogk,256>>>(dyA,dgA,kdesc,KD,KI); grouped_down_g4r_gs64<2><<<ogk,256>>>(dyB,dgA,kdesc,KD,KI); }
+                    else if(R==4){ grouped_down_g4r<4><<<ogk,256>>>(dyA,dgA,kdesc,KD,KI); grouped_down_g4r_gs64<4><<<ogk,256>>>(dyB,dgA,kdesc,KD,KI); }
+                    else { grouped_down_g4r<8><<<ogk,256>>>(dyA,dgA,kdesc,KD,KI); grouped_down_g4r_gs64<8><<<ogk,256>>>(dyB,dgA,kdesc,KD,KI); }
+                    if(cudaDeviceSynchronize()!=cudaSuccess){ printf("FAIL gs64 down launch\n"); return 1; }
+                    cudaMemcpy(hA,dyA,sizeof(float)*(size_t)ktot*KD,cudaMemcpyDeviceToHost);
+                    cudaMemcpy(hB,dyB,sizeof(float)*(size_t)ktot*KD,cudaMemcpyDeviceToHost);
+                    k_cmp++;
+                    if(memcmp(hA,hB,sizeof(float)*(size_t)ktot*KD)!=0){
+                        printf("FAIL gs64 down R=%d differs (D=%d I=%d layout %d)\n",R,KD,KI,layout); k_bad++; }
+                    /* and the generic kernel wrote every row: no 0xFF left */
+                    for(size_t i=0;i<(size_t)ktot*KD;i++){ uint32_t b; memcpy(&b,&hA[i],4);
+                        if(b==0xFFFFFFFFu){ printf("FAIL down R=%d left row %zu unwritten\n",R,i); k_bad++; break; } }
+                }
+            }
+            cudaFree(dq);cudaFree(dsc_);cudaFree(dx);cudaFree(dgA);cudaFree(dgB);cudaFree(dup);
+            cudaFree(dyA);cudaFree(dyB);cudaFree(kdesc);
+            free(hq);free(hs);free(hx);free(hA);free(hB);
+        }
+        printf("grouped-g4 gs64 kernels: %d comparisons (3 shapes x 2 input layouts, hidden + down R=2/4/8), %s\n",
+               k_cmp, k_bad?"FAILED":"bitwise against the generic kernels");
+        if(k_bad){ printf("FAIL\n"); return 1; }
+    }
+#endif
 
     /* ---- Phase 2: public API — upload_g + sync group vs async issue/take ----
      * The async path is what MoE decode (and the VRAM expert tiers) actually
@@ -633,6 +717,87 @@ int main(void){
                 printf("grouped-g4 zero-copy: 4 graph issues on two inputs + branch 3, %s\n",
                        zc_bad?"FAILED":"bitwise against the copy path, captured once and replayed, off again");
                 api_bad+=zc_bad;
+            }
+#endif
+
+            /* COLI_CUDA_GS64 through the API: experts 0 and 1 (both group
+             * size 64; D=200 has a tail group) against the same calls with
+             * the variable unset, BITWISE, per call and through the graph
+             * (its own signature bit: captured once, then replayed), with
+             * down-rows R=2, 8 and 0 (R=0 keeps the generic down kernel), and
+             * on the synchronous group path. The 3-expert group carries the
+             * per-row expert 2 and must keep the generic kernels. */
+#if COLI_GPU_HAS_GRAPH
+            {
+                int g_bad=0;
+                setenv("COLI_CUDA_GS64","",1);
+                if(gs64_mode()){ printf("FAIL gs64 must be off when unset\n"); g_bad++; }
+                setenv("COLI_CUDA_GS64","2",1);
+                if(gs64_mode()){ printf("FAIL gs64 must be off unless exactly \"1\"\n"); g_bad++; }
+                const int C2=2;
+                float *xg2=(float*)malloc((size_t)D*4), *r0=(float*)malloc((size_t)C2*D*4), *r1=(float*)malloc((size_t)C2*D*4);
+                for(int i=0;i<D;i++) xg2[i]=0.25f*x[i]-0.5f;
+                setenv("COLI_CUDA_GS64","",1); setenv("COLI_CUDA_GRAPH","0",1);
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,C2,x,1)){ printf("FAIL gs64 reference issue\n"); return 1; }
+                { const float *yr=coli_cuda_expert_group_take(0); if(!yr){ printf("FAIL gs64 reference take\n"); return 1; } memcpy(r0,yr,(size_t)C2*D*4); }
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,C2,xg2,1)){ printf("FAIL gs64 reference issue\n"); return 1; }
+                { const float *yr=coli_cuda_expert_group_take(0); if(!yr){ printf("FAIL gs64 reference take\n"); return 1; } memcpy(r1,yr,(size_t)C2*D*4); }
+                setenv("COLI_CUDA_GS64","1",1);
+                uint64_t q0=g_gs64_groups;
+                for(int rep=0;rep<2;rep++){
+                    if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,C2,rep?xg2:x,1)){ printf("FAIL gs64 issue\n"); return 1; }
+                    const float *yq=coli_cuda_expert_group_take(0);
+                    if(!yq||memcmp(rep?r1:r0,yq,(size_t)C2*D*4)!=0){ printf("FAIL gs64 per-call rows differ (rep %d)\n",rep); g_bad++; }
+                }
+                if(g_gs64_groups!=q0+2){ printf("FAIL gs64 per-call: %llu groups for 2 issues\n",(unsigned long long)(g_gs64_groups-q0)); g_bad++; }
+                setenv("COLI_CUDA_GRAPH","1",1);
+                uint64_t q1=g_gs64_groups, cq=g_graph_captures, rq=g_graph_replays;
+                for(int rep=0;rep<4;rep++){
+                    if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,C2,(rep&1)?xg2:x,1)){ printf("FAIL gs64 graph issue\n"); return 1; }
+                    const float *yq=coli_cuda_expert_group_take(0);
+                    if(!yq||memcmp((rep&1)?r1:r0,yq,(size_t)C2*D*4)!=0){ printf("FAIL gs64 graph rows differ (rep %d)\n",rep); g_bad++; }
+                }
+                if(g_gs64_groups!=q1+4){ printf("FAIL gs64 graph: %llu groups for 4 issues\n",(unsigned long long)(g_gs64_groups-q1)); g_bad++; }
+                if(g_graph_captures!=cq+1||g_graph_replays!=rq+3){
+                    printf("FAIL gs64 graph: %llu captures, %llu replays (want 1 and 3)\n",
+                           (unsigned long long)(g_graph_captures-cq),(unsigned long long)(g_graph_replays-rq)); g_bad++; }
+                /* down-rows widths, per call, each against its own reference */
+                setenv("COLI_CUDA_GRAPH","0",1);
+                const char *rs[3]={"2","8","0"};
+                for(int k=0;k<3;k++){
+                    setenv("COLI_CUDA_DOWN_ROWS",rs[k],1);
+                    setenv("COLI_CUDA_GS64","",1);
+                    if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,C2,x,1)){ printf("FAIL gs64 R reference\n"); return 1; }
+                    { const float *yr=coli_cuda_expert_group_take(0); if(!yr){ printf("FAIL gs64 R take\n"); return 1; } memcpy(r1,yr,(size_t)C2*D*4); }
+                    setenv("COLI_CUDA_GS64","1",1);
+                    if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,C2,x,1)){ printf("FAIL gs64 R issue\n"); return 1; }
+                    const float *yq=coli_cuda_expert_group_take(0);
+                    if(!yq||memcmp(r1,yq,(size_t)C2*D*4)!=0){ printf("FAIL gs64 rows differ with COLI_CUDA_DOWN_ROWS=%s\n",rs[k]); g_bad++; }
+                }
+                setenv("COLI_CUDA_DOWN_ROWS","",1);
+                /* the group with the per-row expert keeps the generic kernels */
+                uint64_t q2=g_gs64_groups;
+                if(!coli_cuda_expert_group_issue_x(tg,tu,td,rows1,COUNT,x,1)){ printf("FAIL gs64 mixed issue\n"); return 1; }
+                { const float *yq=coli_cuda_expert_group_take(0);
+                  if(!yq||memcmp(ydup,yq,(size_t)COUNT*D*4)!=0){ printf("FAIL gs64 mixed group rows differ\n"); g_bad++; } }
+                if(g_gs64_groups!=q2){ printf("FAIL gs64 took a group with a per-row member\n"); g_bad++; }
+                /* the synchronous group path */
+                {
+                    float *ys0=(float*)malloc((size_t)C2*D*4), *ys1=(float*)malloc((size_t)C2*D*4);
+                    setenv("COLI_CUDA_GS64","",1);
+                    if(!coli_cuda_expert_group(tg,tu,td,rows1,C2,ys0,x)){ printf("FAIL gs64 sync reference\n"); return 1; }
+                    setenv("COLI_CUDA_GS64","1",1);
+                    uint64_t q3=g_gs64_groups;
+                    if(!coli_cuda_expert_group(tg,tu,td,rows1,C2,ys1,x)){ printf("FAIL gs64 sync group\n"); return 1; }
+                    if(memcmp(ys0,ys1,(size_t)C2*D*4)!=0){ printf("FAIL gs64 sync rows differ\n"); g_bad++; }
+                    if(g_gs64_groups!=q3+1){ printf("FAIL gs64 sync path did not take the gs64 kernels\n"); g_bad++; }
+                    free(ys0); free(ys1);
+                }
+                setenv("COLI_CUDA_GS64","",1);
+                free(xg2); free(r0); free(r1);
+                printf("grouped-g4 gs64: %s\n", g_bad?"FAILED":
+                       "bitwise against the generic kernels per call, in the graph (captured once, replayed), with down-rows 2/8/0 and on the sync path; a per-row member keeps the generic kernels");
+                api_bad+=g_bad;
             }
 #endif
 
