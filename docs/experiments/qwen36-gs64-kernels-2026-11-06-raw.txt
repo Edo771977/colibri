@@ -1,0 +1,181 @@
+Qwen3.6-35B-A3B: Nsight Compute on the two expert-group kernels of decode,
+grouped_hidden_g4_dual and grouped_down_g4r<4>, and what it led to
+(COLI_CUDA_GS64, this change). 6 November 2026, on the operator's machine
+(RTX 4070 Ti SUPER, Ryzen 9 7950X, Windows 11, qwen36_i4_gs64 read from D:,
+cap 256, 4 bits, Nsight Compute 2026.3.0), main at 95c4e0a (the merge of
+#87), the DLL and engine as built after #86.
+
+Summary:
+
+  1. Two launches of each kernel were profiled in decode (sixth token,
+     --set full, --clock-control none). The first hidden launch ran with
+     the GPU still at idle clocks (SM 270 MHz, DRAM 404 MHz; 647 us) and is
+     discarded; the second hidden launch and both down launches ran at
+     2.74 / 2.52 GHz SM and 10.23 GHz DRAM:
+       hidden (512 x 1 x 8 blocks of 256): 44.0 us, DRAM throughput 33.4 %
+         of peak (218 GB/s), Compute (SM) throughput 69.5 %, LSU the most
+         used pipeline at 69.4 %, issue slots busy 60.5 %, achieved
+         occupancy 93.8 %, 19,261,568 executed warp instructions; L1TEX
+         scoreboard stalls 43.4 % of the 17.9 cycles between issues.
+       down<4> (512 x 1 x 8 blocks of 256): 26.1 us, DRAM 28.3 % (185 GB/s),
+         Compute (SM) 58.5 %, LSU 58.5 %, issue slots 58.5 %, achieved
+         occupancy 76.6 %, 10,129,408 executed warp instructions.
+     Both kernels use 28-33 % of the memory bandwidth while the LSU and the
+     issue slots are well used. Reading, not measured: they issue more
+     instructions than the bytes they read need -- though the L1TEX
+     scoreboard stall (43 % of the hidden kernel's cycles between issues)
+     says load latency limits them too. Against the moe4 trace's 8-expert
+     medians (docs/experiments/qwen36-group-zc-out-2026-10-10-raw.txt) the
+     hidden kernel matches (44.0 against 44.0 us); the down kernel is 10 %
+     longer under the profiler (26.1 against 23.6 us), not explained --
+     Nsight Compute's default cache flush between passes is one candidate,
+     not checked.
+  2. Where the instructions go, read from the SASS of backend_cuda.cu built
+     in the cloud session with nvcc 12.0 for sm_89 (the operator's DLL is
+     built with CUDA 13.4; the code generated there may differ): the inner
+     loop of grouped_hidden_g4_dual is 101 instructions per iteration, about
+     40 of them the two runtime integer divisions i/ggs and i/ugs that pick
+     the scale; x is read with two scalar loads; the reduction is eight
+     shared-memory steps with a barrier each. Four iterations per thread
+     (D = 2048: 1024 bytes per row, 256 threads), plus the reduction and the
+     prologue, make about 590 instructions per warp, which is what the
+     profile counts: 19,261,568 / (4096 blocks x 8 warps) = 588. The down
+     kernel's loop is 133 instructions per iteration at R=4, with one
+     division.
+  3. COLI_CUDA_GS64=1 (this change): versions of both kernels with the
+     group size 64 compiled in (the division becomes a shift), x read as one
+     float2, and the last five reduction steps as warp shuffles; the same
+     arithmetic in the same order, so the rows are bitwise those of the
+     generic kernels. Same compiler, same flags: the hidden loop is 49
+     instructions per iteration (from 101), the down<4> loop 92 (from 133);
+     the floating-point operations of both loops have the same form (the
+     weight times x, then an FMA by the scale into the accumulator).
+     Hypothesis: if the instruction count is what limits them, both kernels
+     get shorter; if it is memory latency, less so. Not measured. The test
+     (tests/test_grouped_g4_cuda.cu) compiles in the cloud session and has
+     not been run on a GPU when this is written; the bitwise argument also
+     rests on the compiler contracting both loops alike, which the SASS
+     shows for nvcc 12.0 and the test checks for the toolkit it is built
+     with.
+
+The profile output below is from what the operator pasted in the session.
+The report file stays on the operator's machine; none is committed and no
+evidence.sha256 exists for it. The SASS was produced in the cloud session
+and is not committed either.
+
+--- 1. how the profile was taken ---------------------------------------------------
+
+A command prompt, C:\colibri-ab. The first attempts failed: libomp.dll not
+found (C:\msys64\clang64\bin missing from PATH in that window), then
+ERR_NVGPUCTRPERM until GPU performance counters were allowed for all users
+in the NVIDIA Control Panel. Nsight Compute 2026.3.0 writes the report as
+.ncu-repz.
+
+  set PATH=C:\msys64\clang64\bin;%PATH%
+  set SNAP=D:\modelli\qwen36_i4_gs64
+  set COLI_CUDA=1
+  set COLI_GPUS=0
+  set N_NEW=16
+  set HEAT_FILE=heat.bin
+  set CACHE_ROUTE=1
+  set ROUTE_J=4
+  set QT_PREFILL_REPLAN=1
+  set COLI_DN_GPU=1
+  set COLI_CUDA_FLUSH=1
+  set COLI_CUDA_KEEPALIVE=
+  set COLI_CUDA_GROUP_ZC=
+  set COLI_CUDA_GROUP_ZC_OUT=
+  set QT_ASYNC_ISSUE=
+  set COLI_TIMERS=
+  set COLI_PLACE=
+  set QT_UPLOAD_SYNC=
+  copy /Y heat.caldo.bin heat.bin >nul
+  ncu --kernel-name regex:"grouped_hidden_g4_dual|grouped_down_g4r" --launch-skip 2400 --launch-count 4 --set full --clock-control none -f -o hidden1 C:\colibri-fork\c\qwen36_clang.exe 256 4 prompt25.txt > hidden1-ncu.log 2>&1
+  ncu --import hidden1.ncu-repz --page details > hidden1-details.txt
+
+  ==PROF== Profiling "grouped_hidden_g4_dual": 0%
+  ==PROF== Profiling "grouped_down_g4r": 0%
+  ==PROF== Profiling "grouped_hidden_g4_dual": 0%....50%....100% - 45 passes
+  ==PROF== Profiling "grouped_down_g4r": 0%....50%....100% - 45 passes
+  ==PROF== Report: C:\colibri-ab\hidden1.ncu-repz
+
+The keep-alive was off (a kernel that spins under a profiler that
+serialises kernels), and the zero-copy variants off (the two kernels are
+the same with or without them). An earlier run of the same command, before
+the counters were allowed, printed "[qtier] group_stats: 1600 calls" (25
+prompt + 15 decode positions x 40 layers): 3200 matching launches, so
+--launch-skip 2400 lands in decode.
+
+--- 2. the profile (excerpts: the second hidden launch, the second down launch) --
+
+  grouped_hidden_g4_dual(float *, float *, const float *, const GroupDesc *, int, int) (512, 1, 8)x(256, 1, 1), Context 1, Stream 13, Device 0, CC 8.9
+    Section: GPU Speed Of Light Throughput
+    DRAM Frequency                  Ghz        10,23
+    SM Frequency                    Ghz         2,74
+    Elapsed Cycles                cycle      120.959
+    Memory Throughput                 %        69,45
+    DRAM Throughput                   %        33,37
+    Duration                         us           44
+    L1/TEX Cache Throughput           %        71,88
+    L2 Cache Throughput               %        12,61
+    SM Active Cycles              cycle   116.558,76
+    Compute (SM) Throughput           %        69,45
+    Section: Compute Workload Analysis
+    Executed Ipc Active   inst/cycle         2,50
+    Issue Slots Busy               %        60,53
+    INF   ALU is the highest-utilized pipeline (60.0%) ... Based on the number of executed instructions, the highest
+          utilized pipeline (69.4%) is LSU.
+    Section: Memory Workload Analysis
+    Memory Throughput                           Gbyte/s       218,49
+    Mem Busy                                          %        41,81
+    L1/TEX Hit Rate                                   %        88,68
+    L2 Hit Rate                                       %        10,31
+    OPT   ... global loads from L1TEX ... only 15.5 of the 32 bytes transmitted per sector are utilized by each thread.
+    Section: Scheduler Statistics
+    One or More Eligible                   %        62,70
+    Active Warps Per Scheduler          warp        11,22
+    Eligible Warps Per Scheduler        warp         1,90
+    Section: Warp State Statistics
+    Warp Cycles Per Issued Instruction             cycle        17,89
+    OPT   ... each warp of this workload spends 7.8 cycles being stalled waiting for a scoreboard dependency on
+          a L1TEX (local, global, surface, texture) operation. ... about 43.4% of the total average of 17.9 cycles
+          between issuing two instructions.
+    Section: Instruction Statistics
+    Executed Instructions                           inst   19.261.568
+    Section: Launch Statistics
+    Grid Size                                                  4.096
+    Registers Per Thread             register/thread              40
+    Section: Occupancy
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        93,76
+
+  void grouped_down_g4r<4>(float *, const float *, const GroupDesc *, int, int) (512, 1, 8)x(256, 1, 1), Context 1, Stream 13, Device 0, CC 8.9
+    Section: GPU Speed Of Light Throughput
+    DRAM Frequency                  Ghz        10,23
+    SM Frequency                    Ghz         2,52
+    Memory Throughput                 %        58,13
+    DRAM Throughput                   %        28,02
+    Duration                         us        26,24
+    Compute (SM) Throughput           %        58,13
+    Section: Compute Workload Analysis
+    Issue Slots Busy               %        58,05
+    INF   ALU is the highest-utilized pipeline (44.2%) ... Based on the number of executed instructions, the highest
+          utilized pipeline (58.1%) is LSU.
+    Section: Memory Workload Analysis
+    Memory Throughput                           Gbyte/s       183,43
+    L1/TEX Hit Rate                                   %        80,42
+    Section: Instruction Statistics
+    Executed Instructions                           inst   10.129.408
+    Section: Occupancy
+    Theoretical Occupancy                     %        83,33
+    Achieved Occupancy                        %        76,46
+
+  (both down launches are valid and agree to within 0.2 us: 26.05 and 26.24
+  us; the numbers in the summary are from the first, 26.05 us, 185.18 GB/s,
+  DRAM 28.29 %, Compute (SM) 58.54 %, issue slots 58.46 %, occupancy
+  76.56 %, and its line "the highest utilized pipeline (58.5%) is LSU")
+
+  The first launch of the hidden kernel, discarded:
+    DRAM Frequency                  Mhz       404,17
+    SM Frequency                    Mhz       269,97
+    Duration                         us       647,33

@@ -1220,6 +1220,148 @@ __global__ static void grouped_down_g4r(float *y,const float *x,const GroupDesc 
     }
 }
 
+/* COLI_CUDA_GS64=1: grouped_hidden_g4_dual and grouped_down_g4r<R> for the
+ * groups whose every member has quant group size 64 (qwen36 i4 gs64), with
+ * the same arithmetic in the same order -- the rows must be BITWISE those of
+ * the generic kernels (tests/test_grouped_g4_cuda.cu checks it).
+ *
+ * Why: Nsight Compute on the RTX 4070 Ti SUPER (6 November 2026, decode, 8
+ * experts, docs/experiments/qwen36-gs64-kernels-2026-11-06-raw.txt) puts
+ * the hidden kernel at 44.0 us with DRAM at 33 % of its peak, the LSU 69 %
+ * busy and the issue slots 61 % busy. Reading, not measured: the kernel
+ * issues more instructions than its 9 MB of weights need -- though the
+ * L1TEX scoreboard stall (43 % of the cycles between issues) says load
+ * latency limits it too. Its inner loop is 101 SASS instructions per
+ * iteration (nvcc 12.0, sm_89), about 40 of them two runtime integer
+ * divisions (i/ggs, i/ugs) for the scale index. The down kernel has one per
+ * iteration.
+ *
+ * What changes, and why each keeps the bits:
+ *   - the group size is the constant 64, so i/64 is a shift: the same index;
+ *   - x is read as one float2 (D and I even, checked by the caller, so
+ *     the pair is 8-byte aligned): the same two floats, and the same
+ *     expressions in the same order (x*w*s accumulated low nibble first);
+ *   - the reduction tail (n = 16..1) uses warp shuffles instead of shared
+ *     memory and barriers: each step still adds lane t+n into lane t, the
+ *     same operands in the same order as p[t] += p[t+n].
+ * That also needs the compiler to contract acc + x*w*s the same way in both
+ * kernels (FMUL then FFMA in nvcc 12.0's SASS for both); the test is the
+ * gate for the toolkit the DLL is actually built with.
+ * Hypothesis: fewer instructions make both kernels shorter. Not measured.
+ * Off on HIP (wave64 untested here): gs64_mode() returns 0 there. */
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define gs64_shfl_bcast(v) __shfl((v),0,32)
+#else
+#define gs64_shfl_bcast(v) __shfl_sync(0xffffffffu,(v),0,32)
+#endif
+__global__ static void grouped_hidden_g4_dual_gs64(float *gate,float *up,const float *x,
+                                                   const GroupDesc *desc,int I,int D){
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
+    const int rb=D/2, ng=(D+63)/64;
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*rb;
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*rb;
+    const float *gsc=d.gs+(size_t)o*(size_t)ng;
+    const float *usc=d.us+(size_t)o*(size_t)ng;
+    const float2 *xs2=(const float2*)(x+(size_t)(d.xoff+s)*D);float ga=0,ua=0;
+    for(int b=threadIdx.x;b<rb;b+=blockDim.x){float g0,g1,u0,u1;unpack_s4(gr[b],&g0,&g1);unpack_s4(ur[b],&u0,&u1);
+        unsigned gi=(unsigned)b>>5;          /* (2b)/64 */
+        float gv=gsc[gi],uv=usc[gi];float2 xv=xs2[b];
+        ga+=xv.x*g0*gv;ua+=xv.x*u0*uv;
+        ga+=xv.y*g1*gv;ua+=xv.y*u1*uv;}
+    __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
+    for(int n=128;n>=32;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
+    if(threadIdx.x<32){
+        float g=gp[threadIdx.x],u=upv[threadIdx.x];
+        for(int n=16;n;n>>=1){g+=f8_shfl_down(g,n);u+=f8_shfl_down(u,n);}
+        if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
+            gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
+    }
+}
+template<int R>
+__global__ static void grouped_down_g4r_gs64(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    int o0=(int)blockIdx.x*R, s=(int)blockIdx.y, c=(int)blockIdx.z;
+    GroupDesc d=desc[c]; if(s>=d.rows)return;
+    int nr = D-o0 < R ? D-o0 : R;
+    const int rb=I/2, ng=(I+63)/64;
+    const uint8_t *rw[R]; const float *dsc[R];
+#pragma unroll
+    for(int r=0;r<R;r++){
+        int o = o0 + (r<nr?r:0);
+        rw[r]=(const uint8_t*)d.d+(size_t)o*(size_t)rb;
+        dsc[r]=d.ds+(size_t)o*(size_t)ng;
+    }
+    const float2 *xs2=(const float2*)(x+(size_t)(d.offset+s)*I);
+    float acc[R];
+#pragma unroll
+    for(int r=0;r<R;r++) acc[r]=0.0f;
+    for(int b=threadIdx.x;b<rb;b+=blockDim.x){
+        float a[R],z[R];
+#pragma unroll
+        for(int r=0;r<R;r++) unpack_s4(rw[r][b],&a[r],&z[r]);
+        float2 xv=xs2[b];
+        unsigned gi=(unsigned)b>>5;          /* (2b)/64 */
+#pragma unroll
+        for(int r=0;r<R;r++){
+            float sv=dsc[r][gi];
+            acc[r]+=xv.x*a[r]*sv;
+            acc[r]+=xv.y*z[r]*sv;
+        }
+    }
+    __shared__ float p[R][256];
+#pragma unroll
+    for(int r=0;r<R;r++) p[r][threadIdx.x]=acc[r];
+    __syncthreads();
+    for(int n=128;n>=32;n>>=1){
+        if(threadIdx.x<(unsigned)n){
+#pragma unroll
+            for(int r=0;r<R;r++) p[r][threadIdx.x]+=p[r][threadIdx.x+n];
+        }
+        __syncthreads();
+    }
+    if(threadIdx.x<32){
+        float v[R];
+#pragma unroll
+        for(int r=0;r<R;r++) v[r]=p[r][threadIdx.x];
+        for(int n=16;n;n>>=1){
+#pragma unroll
+            for(int r=0;r<R;r++) v[r]+=f8_shfl_down(v[r],n);
+        }
+#pragma unroll
+        for(int r=0;r<R;r++){
+            float out=gs64_shfl_bcast(v[r]);
+            if(threadIdx.x==(unsigned)r && r<nr) y[(size_t)(d.offset+s)*D+o0+r]=out;
+        }
+    }
+}
+static uint64_t g_gs64_groups;              /* groups that took the gs64 kernels; read by the test */
+static int gs64_mode(void){
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    return 0;
+#else
+    const char *e=getenv("COLI_CUDA_GS64");
+    return e&&!strcmp(e,"1");
+#endif
+}
+/* Every member group-size 64 on gate, up and down, and both dims even (the
+ * float2 reads). A group with a per-row (fmt=2) member keeps the generic
+ * kernels. Says once that the variant is active (at the first eligible
+ * group) and, separately, once that a group kept the generic kernels, so a
+ * mixed first group does not hide the "active" line. With
+ * COLI_CUDA_DOWN_ROWS=0 only the hidden kernel changes: the down kernel is
+ * the generic grouped_down_g4. */
+static int gs64_use(const GroupDesc *host,int count,int D,int I){
+    if(!gs64_mode()) return 0;
+    int ok=!(D&1)&&!(I&1);
+    for(int c=0;ok&&c<count;c++)
+        if(host[c].ggs!=64||host[c].ugs!=64||host[c].dgs!=64) ok=0;
+    static int said_ok=0, said_no=0;
+    if(ok&&!said_ok){ said_ok=1;
+        fprintf(stderr,"[cuda] gs64 expert kernels active: COLI_CUDA_GS64=1, group size 64 compiled in, x read in pairs, warp-shuffle reduction tail (the down kernel only with COLI_CUDA_DOWN_ROWS 2, 4 or 8)\n"); }
+    if(!ok&&!said_no){ said_no=1;
+        fprintf(stderr,"[cuda] COLI_CUDA_GS64=1: a group that is not all group-size 64 (or has odd dims) keeps the generic kernels\n"); }
+    return ok;
+}
+
 /* ON BY DEFAULT AT R=4, AND ONLY BECAUSE THE GRAPH IS ON TOO.
  *
  * Measured alone, this kernel COSTS 1.15 ms/token (+4 %): it is faster on the
@@ -1281,7 +1423,7 @@ static int down_rows_mode(void){
 static uint64_t g_downr_launches;
 
 static void down_g4_launch(float *y,const float *x,const GroupDesc *dev,
-                           int D,int I,int max_rows,int count,cudaStream_t st){
+                           int D,int I,int max_rows,int count,cudaStream_t st,int gs64=0){
     int R=down_rows_mode();
     if(R){
         /* Say so once, on stderr, the first time the branch actually fires.
@@ -1319,6 +1461,12 @@ static void down_g4_launch(float *y,const float *x,const GroupDesc *dev,
         }
         g_downr_launches++;
         dim3 og((unsigned)((D+R-1)/R),(unsigned)max_rows,(unsigned)count);
+        if(gs64){   /* COLI_CUDA_GS64: same rows, bitwise; see above */
+            if(R==2)      grouped_down_g4r_gs64<2><<<og,256,0,st>>>(y,x,dev,D,I);
+            else if(R==4) grouped_down_g4r_gs64<4><<<og,256,0,st>>>(y,x,dev,D,I);
+            else          grouped_down_g4r_gs64<8><<<og,256,0,st>>>(y,x,dev,D,I);
+            return;
+        }
         if(R==2)      grouped_down_g4r<2><<<og,256,0,st>>>(y,x,dev,D,I);
         else if(R==4) grouped_down_g4r<4><<<og,256,0,st>>>(y,x,dev,D,I);
         else          grouped_down_g4r<8><<<og,256,0,st>>>(y,x,dev,D,I);
@@ -3172,8 +3320,10 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         /* grouped-int4 (fmt=4) present: per-group scales (#334). fmt=2 members
          * ride along as the ng=1 special case. silu fused in the dual epilogue. */
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        down_g4_launch(ctx->y,ctx->gate,dev,D,I,max_rows,count,ctx->stream);
+        int gs64_=gs64_use(host,count,D,I);   /* COLI_CUDA_GS64 */
+        if(gs64_){ grouped_hidden_g4_dual_gs64<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D); g_gs64_groups++; }
+        else grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        down_g4_launch(ctx->y,ctx->gate,dev,D,I,max_rows,count,ctx->stream,gs64_);
     }else{
         /* generic path decodes fmt 0/1/2/3 only — refuse everything else rather
          * than whitelist known offenders: a fmt=4 group that slipped the gates
@@ -3539,12 +3689,17 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
      * stream captured. */
     int w4p_=!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED"));
     int branch_= all_e8?1 : all_f8?2 : (all_s4&&w4p_)?3 : (all_q4&&any_g4)?4 : 5;
-    unsigned gsig_=(ctx->buf_gen<<9)|((unsigned)branch_<<4)|(unsigned)count;
+    unsigned gsig_=(ctx->buf_gen<<10)|((unsigned)branch_<<4)|(unsigned)count;
+    /* COLI_CUDA_GS64: decided here because it changes the kernels the graph
+     * holds, so the signature carries it (bit 9). */
+    int gs64_ = branch_==4 && gs64_use(host,count,D,I);
+    if(gs64_) gsig_|=1u<<9;
     int graphable_= graph_mode() && !ctx->group_timed && x_rows==1 &&
                     count>=1 && count<=8 && (branch_==3||branch_==4);
     /* COLI_CUDA_GROUP_ZC: decided before the replay check, because the graph
      * signature carries it (bit 7, and bit 8 for COLI_CUDA_GROUP_ZC_OUT:
-     * count takes bits 0-3, branch 4-6, buf_gen from bit 9 up). */
+     * count takes bits 0-3, branch 4-6, bit 9 COLI_CUDA_GS64, buf_gen from
+     * bit 10 up). */
     float *zc_x=nullptr,*zc_y=nullptr; uint32_t *zc_d=nullptr;
     int zc_=0;
     if(graphable_ && group_zc_mode()){
@@ -3581,6 +3736,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         g_graph_replays++;
         if(zc_) g_group_zc++;
         if(zo_) g_group_zc_out++;
+        if(gs64_) g_gs64_groups++;
         group_flush(ctx);
         /* The replay is a call, an expert count and a row count like any
          * other. This early return used to skip the accounting, so with the
@@ -3676,8 +3832,9 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
         /* silu is fused in the dual kernel's epilogue (like the sync path):
          * an extra silu_mul here would re-apply it against the never-written
          * ctx->up buffer. */
-        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        down_g4_launch(ydst_,ctx->gate,dev,D,I,max_rows,count,ctx->stream);
+        if(gs64_) grouped_hidden_g4_dual_gs64<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        else grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        down_g4_launch(ydst_,ctx->gate,dev,D,I,max_rows,count,ctx->stream,gs64_);
     } else {
         /* Fallback runs quant_matmul with gs=0,ng=1 — per-row-scale semantics.
          * That is only correct for fmt 0/1/2/3: refuse group/block-scaled
@@ -3774,6 +3931,7 @@ extern "C" int coli_cuda_expert_group_issue_x(ColiCudaTensor *const *gates,
     ctx->group_pending=1; ctx->group_pending_bytes=yb;   /* the readback, not the upload */
     if(zc_) g_group_zc++;
     if(zo_) g_group_zc_out++;
+    if(gs64_) g_gs64_groups++;
     group_flush(ctx);
     group_account(ctx,count,total);
     return 1;
