@@ -1228,10 +1228,13 @@ __global__ static void grouped_down_g4r(float *y,const float *x,const GroupDesc 
  * Why: Nsight Compute on the RTX 4070 Ti SUPER (6 November 2026, decode, 8
  * experts, docs/experiments/qwen36-gs64-kernels-2026-11-06-raw.txt) puts
  * the hidden kernel at 44.0 us with DRAM at 33 % of its peak, the LSU 69 %
- * busy and the issue slots 61 % busy: the kernel issues more instructions
- * than its 9 MB of weights need. Its inner loop is 101 SASS instructions per
- * iteration, about 40 of them two runtime integer divisions (i/ggs, i/ugs)
- * for the scale index. The down kernel has one per iteration.
+ * busy and the issue slots 61 % busy. Reading, not measured: the kernel
+ * issues more instructions than its 9 MB of weights need -- though the
+ * L1TEX scoreboard stall (43 % of the cycles between issues) says load
+ * latency limits it too. Its inner loop is 101 SASS instructions per
+ * iteration (nvcc 12.0, sm_89), about 40 of them two runtime integer
+ * divisions (i/ggs, i/ugs) for the scale index. The down kernel has one per
+ * iteration.
  *
  * What changes, and why each keeps the bits:
  *   - the group size is the constant 64, so i/64 is a shift: the same index;
@@ -1241,6 +1244,9 @@ __global__ static void grouped_down_g4r(float *y,const float *x,const GroupDesc 
  *   - the reduction tail (n = 16..1) uses warp shuffles instead of shared
  *     memory and barriers: each step still adds lane t+n into lane t, the
  *     same operands in the same order as p[t] += p[t+n].
+ * That also needs the compiler to contract acc + x*w*s the same way in both
+ * kernels (FMUL then FFMA in nvcc 12.0's SASS for both); the test is the
+ * gate for the toolkit the DLL is actually built with.
  * Hypothesis: fewer instructions make both kernels shorter. Not measured.
  * Off on HIP (wave64 untested here): gs64_mode() returns 0 there. */
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
@@ -1338,16 +1344,21 @@ static int gs64_mode(void){
 }
 /* Every member group-size 64 on gate, up and down, and both dims even (the
  * float2 reads). A group with a per-row (fmt=2) member keeps the generic
- * kernels. Says once which of the two applied first. */
+ * kernels. Says once that the variant is active (at the first eligible
+ * group) and, separately, once that a group kept the generic kernels, so a
+ * mixed first group does not hide the "active" line. With
+ * COLI_CUDA_DOWN_ROWS=0 only the hidden kernel changes: the down kernel is
+ * the generic grouped_down_g4. */
 static int gs64_use(const GroupDesc *host,int count,int D,int I){
     if(!gs64_mode()) return 0;
     int ok=!(D&1)&&!(I&1);
     for(int c=0;ok&&c<count;c++)
         if(host[c].ggs!=64||host[c].ugs!=64||host[c].dgs!=64) ok=0;
-    static int said=0;
-    if(!said){ said=1;
-        if(ok) fprintf(stderr,"[cuda] gs64 expert kernels active: COLI_CUDA_GS64=1, group size 64 compiled in, x read in pairs, warp-shuffle reduction tail\n");
-        else   fprintf(stderr,"[cuda] COLI_CUDA_GS64=1: a group that is not all group-size 64 (or has odd dims) keeps the generic kernels\n"); }
+    static int said_ok=0, said_no=0;
+    if(ok&&!said_ok){ said_ok=1;
+        fprintf(stderr,"[cuda] gs64 expert kernels active: COLI_CUDA_GS64=1, group size 64 compiled in, x read in pairs, warp-shuffle reduction tail (the down kernel only with COLI_CUDA_DOWN_ROWS 2, 4 or 8)\n"); }
+    if(!ok&&!said_no){ said_no=1;
+        fprintf(stderr,"[cuda] COLI_CUDA_GS64=1: a group that is not all group-size 64 (or has odd dims) keeps the generic kernels\n"); }
     return ok;
 }
 
