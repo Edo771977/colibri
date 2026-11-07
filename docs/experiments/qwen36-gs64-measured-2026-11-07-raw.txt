@@ -33,32 +33,46 @@ Summary:
      Both kernels are shorter: hidden -34 % in time (-39 % in cycles), down
      -17 %. Instructions halved in the hidden kernel; it now waits more on
      loads (L1TEX stall 52 % of the cycles between issues). Together about
-     19 us per 8-expert group, about 0.8 ms/token of GPU time at 40 groups
-     a token (profiled, isolated kernels; not every group has 8 experts).
+     19 us less per 8-expert group in time (the generic hidden kernel at
+     2.74 GHz; in cycles at 2.53 GHz about 23 us), about 0.8 ms/token of
+     GPU time at 40 groups a token (profiled, isolated kernels; not every
+     group has 8 experts). The generic down kernel's elapsed cycles (65,993
+     / 66,422) are from the 6 November report as pasted in that session;
+     its record does not excerpt them.
   3. misure-envab.ps1, COLI_CUDA_GS64 absent vs =1, ten ABBA pairs, with
+     the ISTRUZIONI.md setting (CACHE_ROUTE=1 ROUTE_J=4,
+     QT_PREFILL_REPLAN=1, COLI_DN_GPU=1, the keep-alive),
      COLI_CUDA_GROUP_ZC=1, COLI_CUDA_GROUP_ZC_OUT=1, COLI_CUDA_FLUSH=1,
-     QT_ASYNC_ISSUE=1, the keep-alive and the heat table in both arms:
-     step() 14.73 -> 14.61 ms/token, paired delta -0.12, 95 % [-0.61,
-     +0.37], 6 of 10 negative. No effect on the token distinguishable from
-     the noise. One text in all twenty runs (87ce3f1b34ce2d6b), as the
-     bitwise kernels require.
-     Per-arm means (not paired): wait 1.40 -> 0.73 and take 1.55 -> 0.86
-     (moe 6.39 -> 5.80, -0.59), while dn 4.09 -> 4.37 (+0.28), head 1.06
-     -> 1.19 (+0.13), attn 2.02 -> 2.10 (+0.08) and shared 3.13 -> 3.21
-     (+0.08). The wait for the GPU fell by about what the kernels gained,
-     and about as much reappeared in the DeltaNet, lm_head and attention
-     timers, which run their own GPU work after the expert group.
+     QT_ASYNC_ISSUE=1 and the heat table in both arms: step() 14.73 ->
+     14.61 ms/token, paired delta -0.12, 95 % [-0.61, +0.37], 6 of 10
+     negative; position check 0.36 ms/token (OFF first +0.06, ON first
+     -0.30 on average), cancelled in the mean by the ABBA order if additive
+     and constant. No effect on the token distinguishable from the noise;
+     the interval excludes the whole ~0.8 ms/token the profile frees, not a
+     gain of up to 0.6. One text in all twenty runs (87ce3f1b34ce2d6b), as
+     the bitwise kernels require (-AllowTextDrift was passed as in the
+     earlier A/Bs; it did not come into play). Per-arm means (not paired):
+     wait 1.40 -> 0.73 and take 1.55 -> 0.86 (moe 6.39 -> 5.80, -0.59),
+     while dn 4.09 -> 4.37 (+0.28, all of it in dn-sub proj, 4.08 -> 4.36),
+     head 1.06 -> 1.19 (+0.13), attn 2.02 -> 2.10 (+0.08): +0.49 together,
+     +0.57 with shared 3.13 -> 3.21. Whether that is the same GPU time
+     moving or noise of an unpaired comparison is not measured.
 
-Reading: the kernel change does what it was meant to on the GPU, and the
-token does not see it. The shape is the one COLI_CUDA_DOWN_ROWS showed
-alone in September (docs/ENVIRONMENT.md, that row): faster expert kernels,
-the freed time reappearing in the dense GPU work that follows. Why is not
-measured. Candidates: the GPU idles longer between the end of the expert
-group and the next dense call and comes back slower (clocks, power state),
-or the per-arm shift in dn/head is noise of an unpaired comparison. A
-traced pair (Nsight Systems, the variable off and on) would show whether
-the dense kernels themselves got longer. Not measured: other prompts,
-longer generations, the variant without the zero-copy/async setting.
+Reading: the kernel change does what it was meant to on the GPU; on this
+prompt and setting the token shows no effect distinguishable from the
+noise. The per-arm pattern -- the expert-group wait down, the dense timers
+up -- resembles COLI_CUDA_DOWN_ROWS alone in September in one respect only
+(docs/ENVIRONMENT.md, that row): there the graph was off, take was already
+near zero, the kernel cost +1.15 ms/token, and the row gives a mechanism
+(shared-memory blocks crowding the dense GEMVs on stream 0) that does not
+obviously apply to these kernels, which keep the generic grid and the same
+shared memory per block. Candidates here, none measured: the GPU idling
+longer after the expert group and coming back slower -- less likely with
+the keep-alive on in both arms, which holds the clocks, so it would need
+another mechanism -- or noise of an unpaired comparison. A traced pair
+(Nsight Systems, the variable off and on) would show whether the dense
+kernels themselves got longer. Not measured: other prompts, longer
+generations, the variant without the zero-copy/async setting.
 
 Everything below is from output the operator pasted in the session; where
 lines are left out it says so. The logs and the report stay on the
@@ -84,7 +98,7 @@ A Visual Studio 2022 Developer Command Prompt, C:\colibri-fork\c:
   [cuda] COLI_CUDA_GS64=1: a group that is not all group-size 64 (or has odd dims) keeps the generic kernels
   grouped-g4 gs64 kernels: 24 comparisons (3 shapes x 2 input layouts, hidden + down R=2/4/8), bitwise against the generic kernels
   [CUDA] device 0: NVIDIA GeForce RTX 4070 Ti SUPER, 17.2 GB VRAM, sm_89
-  (... the graph, flush and zero-copy blocks, as in earlier records ...)
+  (... the API, broadcast, graph, flush and zero-copy blocks, as in earlier records ...)
   grouped-g4 gs64: bitwise against the generic kernels per call, in the graph (captured once, replayed), with down-rows 2/8/0 and on the sync path; a per-row member keeps the generic kernels
   OK
 
@@ -102,15 +116,18 @@ The same window:
   set CACHE_ROUTE=1
   set ROUTE_J=4
   set QT_PREFILL_REPLAN=1
-  (COLI_CUDA_DOWN_ROWS, QT_UPLOAD_SYNC, Q36_DN_GPU, COLI_PLACE, QT_ASYNC_SPIN_US,
-   SNAP, COLI_CUDA, COLI_GPUS, COLI_TIMERS, N_NEW, HEAT_FILE cleared)
+  (condensed: one `set X=` line each cleared COLI_CUDA_DOWN_ROWS,
+   QT_UPLOAD_SYNC, Q36_DN_GPU, COLI_PLACE, QT_ASYNC_SPIN_US, SNAP, COLI_CUDA,
+   COLI_GPUS, COLI_TIMERS, N_NEW and HEAT_FILE)
   powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var COLI_CUDA_GS64 -Value 1 -Marker "[cuda] gs64 expert kernels active:" -MarkerFile coli_cuda.dll -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_GROUP_ZC,COLI_CUDA_GROUP_ZC_OUT,COLI_CUDA_FLUSH,QT_ASYNC_ISSUE,COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -AllowTextDrift ON,OFF -Reps 10
 
+  (the "cartella di lavoro" line omitted)
   eseguibile: .\qwen36_clang.exe | 412672 byte | 2026-11-07 07:48:46 | sha256 3FCB158BED10084B
   coli_cuda.dll: 870912 byte | 2026-11-07 07:48:42 | sha256 6D3C3A3244870AA5
   parametri: cap=256 bits=4 N_NEW=128 rip=10 | OFF: COLI_CUDA_GS64 assente | ON: COLI_CUDA_GS64=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_GROUP_ZC,COLI_CUDA_GROUP_ZC_OUT,COLI_CUDA_FLUSH,QT_ASYNC_ISSUE,COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -- DEROGA  | testo-variabile=ON,OFF -- DEROGA: i run di un braccio nominato possono scrivere testi diversi
   marker: [cuda] gs64 expert kernels active:  (testo trovato in C:\colibri-fork\c\coli_cuda.dll)
-  (the build-config, marker-file and heat header lines omitted)
+  (the build-config, marker-file and heat header lines and the "rimuovo 20 log
+   della corsa precedente" line omitted)
 
   rip 1 (OFF prima)  OFF  14.50  ON  15.20  delta   0.70 ms/token
   rip 2 (ON prima )  OFF  15.10  ON  14.90  delta  -0.20 ms/token
@@ -132,7 +149,8 @@ The same window:
   residenza identica in tutti i run: 6812/10240
   braccio OFF: 1 testo in 10 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
   braccio ON: 1 testo in 10 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
-  (the fingerprint lines omitted: 87ce3f1b34ce2d6b for both arms)
+  (the fingerprint lines omitted: 87ce3f1b34ce2d6b for both arms, and the
+   "--- testo fra i due bracci ... ---" section header)
   testo generato IDENTICO fra i due bracci (sullo stdout letto) -- solo ripetizione 1
 
   --- delta appaiati (ON - OFF), ms/token ---
@@ -158,12 +176,14 @@ The same window:
          issue  0.05  cpu-miss  0.56  take  0.86  sh-ovl  3.21  hit  97.7 %  swaps  6.0  miss 1133
          dopo il prefill: hit  98.2 %
          dn-sub:   proj  4.36  conv  0.00  l2n+rec  0.00  norm+out  0.00
-  (the dn-split lines omitted)
+  (the dn-split lines and the closing "Log per run: ..." line omitted)
 
 --- 3. the profile ------------------------------------------------------------------
 
-C:\colibri-ab, after the A/B, the profile environment of 6 November (keep-
-alive, zero-copy and async issue off) with COLI_CUDA_GS64=1:
+C:\colibri-ab, after the A/B (condensed: the `set` lines gave the profile
+environment of 6 November -- SNAP, COLI_CUDA=1, COLI_GPUS=0, N_NEW=16,
+HEAT_FILE=heat.bin, the keep-alive, zero-copy and async issue cleared -- with
+COLI_CUDA_GS64=1):
 
   ncu --kernel-name regex:"grouped_hidden_g4_dual|grouped_down_g4r" --launch-skip 2400 --launch-count 4 --set full --clock-control none -f -o hidden2 C:\colibri-fork\c\qwen36_clang.exe 256 4 prompt25.txt > hidden2-ncu.log 2>&1
 
@@ -173,29 +193,30 @@ alive, zero-copy and async issue off) with COLI_CUDA_GS64=1:
   ==PROF== Profiling "grouped_hidden_g4_dual_gs64": 0%....50%....100% - 45 passes
   ==PROF== Profiling "grouped_down_g4r_gs64": 0%....50%....100% - 45 passes
   ==PROF== Report: C:\colibri-ab\hidden2.ncu-repz
+  (the engine's own output in the log omitted, except the gs64 line above)
+  ncu --import hidden2.ncu-repz --page details > hidden2-details.txt
 
-Excerpts, in launch order:
+Excerpts of hidden2-details.txt, condensed to one line per metric group (the
+values are the report's, decimal commas as printed in its tables, points in
+its rule texts), in launch order:
 
   grouped_hidden_g4_dual_gs64 (512, 1, 8)x(256, 1, 1)
-    SM Frequency 2,53 GHz | Elapsed Cycles 74.049 | DRAM Throughput 49,83 % | Duration 29,22 us
+    DRAM Frequency 10,23 GHz | SM Frequency 2,53 GHz | Elapsed Cycles 74.049 | DRAM Throughput 49,83 % | Duration 29,22 us
     Compute (SM) Throughput 66,75 % | Memory Throughput 326,22 GB/s | Issue Slots Busy 46,95 %
     highest utilized pipeline (66.8%) is LSU | L1TEX stall 10.9 cycles, 52.1% of 20.8
     Executed Instructions 9.121.772 | Registers Per Thread 38 | Achieved Occupancy 86,64 %
   void grouped_down_g4r_gs64<4> (512, 1, 8)x(256, 1, 1)
-    SM Frequency 2,52 GHz | Elapsed Cycles 55.123 | DRAM Throughput 33,75 % | Duration 21,79 us
+    DRAM Frequency 10,21 GHz | SM Frequency 2,52 GHz | Elapsed Cycles 55.123 | DRAM Throughput 33,75 % | Duration 21,79 us
     Compute (SM) Throughput 60,57 % | Memory Throughput 220,48 GB/s | Issue Slots Busy 45,52 %
     highest utilized pipeline (60.6%) is LSU | L1TEX stall 7.4 cycles, 42.3% of 17.5
     Executed Instructions 6.586.368 | Registers Per Thread 48 | Achieved Occupancy 71,22 %
   grouped_hidden_g4_dual_gs64 (512, 1, 8)x(256, 1, 1)
-    SM Frequency 2,52 GHz | Elapsed Cycles 73.172 | DRAM Throughput 50,53 % | Duration 28,96 us
+    DRAM Frequency 10,22 GHz | SM Frequency 2,52 GHz | Elapsed Cycles 73.172 | DRAM Throughput 50,53 % | Duration 28,96 us
     Compute (SM) Throughput 67,59 % | Memory Throughput 330,47 GB/s | Issue Slots Busy 47,26 %
     highest utilized pipeline (67.6%) is LSU | L1TEX stall 11.1 cycles, 53.2% of 20.9
     Executed Instructions 9.066.760 | Registers Per Thread 38 | Achieved Occupancy 88,11 %
   void grouped_down_g4r_gs64<4> (512, 1, 8)x(256, 1, 1)
-    SM Frequency 2,52 GHz | Elapsed Cycles 54.635 | DRAM Throughput 33,95 % | Duration 21,60 us
+    DRAM Frequency 10,23 GHz | SM Frequency 2,52 GHz | Elapsed Cycles 54.635 | DRAM Throughput 33,95 % | Duration 21,60 us
     Compute (SM) Throughput 61,10 % | Memory Throughput 222,35 GB/s | Issue Slots Busy 45,92 %
     highest utilized pipeline (61.1%) is LSU | L1TEX stall 7.4 cycles, 42.9% of 17.4
     Executed Instructions 6.586.368 | Registers Per Thread 48 | Achieved Occupancy 70,86 %
-
-(the excerpts condense the report's sections into one line per metric
-group; the values are the report's, decimal commas as printed.)
