@@ -1247,7 +1247,13 @@ __global__ static void grouped_down_g4r(float *y,const float *x,const GroupDesc 
  * That also needs the compiler to contract acc + x*w*s the same way in both
  * kernels (FMUL then FFMA in nvcc 12.0's SASS for both); the test is the
  * gate for the toolkit the DLL is actually built with.
- * Hypothesis: fewer instructions make both kernels shorter. Not measured.
+ * Measured 7 November 2026 (docs/experiments/qwen36-gs64-measured-2026-11-07-
+ * raw.txt): bitwise on the card with CUDA 13.4; in Nsight Compute the hidden
+ * kernel 44.0 -> 29.1 us and the down kernel 26.1 -> 21.7 us (8 experts);
+ * on the token no effect distinguishable from the noise (-0.12 ms/token,
+ * 95 % [-0.61, +0.37], ten pairs): the wait for the GPU fell and about as
+ * much reappeared in the DeltaNet, lm_head and attention timers, not
+ * explained. Off by default.
  * Off on HIP (wave64 untested here): gs64_mode() returns 0 there. */
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #define gs64_shfl_bcast(v) __shfl((v),0,32)

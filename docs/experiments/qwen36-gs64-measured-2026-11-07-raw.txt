@@ -1,0 +1,201 @@
+Qwen3.6-35B-A3B: COLI_CUDA_GS64=1 (#88) on the card. The CUDA test, the
+A/B (ten pairs) and Nsight Compute on the two gs64 kernels.
+7 November 2026, on the operator's machine (RTX 4070 Ti SUPER, Ryzen 9
+7950X, Windows 11, qwen36_i4_gs64 read from D:, cap 256, 4 bits, CUDA 13.4,
+Nsight Compute 2026.3.0), main at 6a71af1 (the merge of #88). Compared with
+docs/experiments/qwen36-gs64-kernels-2026-11-06-raw.txt (the generic
+kernels, profiled the day before).
+
+Summary:
+
+  1. tests/test_grouped_g4_cuda.cu built with nvcc 13.4 and run on the card:
+     OK, including "grouped-g4 gs64 kernels: 24 comparisons (3 shapes x 2
+     input layouts, hidden + down R=2/4/8), bitwise against the generic
+     kernels" and the API block (per call, graph, down-rows, sync path).
+     The bitwise argument holds with the toolkit the DLL is built with.
+  2. Nsight Compute, the same command as the day before with
+     COLI_CUDA_GS64=1 (decode, sixth token, 8 experts, --set full,
+     --clock-control none). All four launches ran at full clocks (SM
+     2.52-2.53 GHz, DRAM 10.21-10.23 GHz). Against the generic kernels of
+     6 November (one profile each, not paired; the generic hidden kernel
+     ran at SM 2.74 GHz, so cycles are the fairer comparison for it):
+                                  generic (6 Nov)      gs64 (7 Nov)
+       hidden  duration            44.0 us              29.22 / 28.96 us
+               elapsed cycles      120,959              74,049 / 73,172
+               executed instr.     19,261,568           9,121,772 / 9,066,760
+               DRAM throughput     33.4 %, 218 GB/s     49.8-50.5 %, 326-330 GB/s
+               issue slots busy    60.5 %               47.0-47.3 %
+               L1TEX stall share   43.4 %               52.1-53.2 %
+       down<4> duration            26.05 / 26.24 us     21.79 / 21.60 us
+               elapsed cycles      65,993 / 66,422      55,123 / 54,635
+               executed instr.     10,129,408           6,586,368
+               DRAM throughput     28.0-28.3 %          33.8-34.0 %, 220-222 GB/s
+     Both kernels are shorter: hidden -34 % in time (-39 % in cycles), down
+     -17 %. Instructions halved in the hidden kernel; it now waits more on
+     loads (L1TEX stall 52 % of the cycles between issues). Together about
+     19 us per 8-expert group, about 0.8 ms/token of GPU time at 40 groups
+     a token (profiled, isolated kernels; not every group has 8 experts).
+  3. misure-envab.ps1, COLI_CUDA_GS64 absent vs =1, ten ABBA pairs, with
+     COLI_CUDA_GROUP_ZC=1, COLI_CUDA_GROUP_ZC_OUT=1, COLI_CUDA_FLUSH=1,
+     QT_ASYNC_ISSUE=1, the keep-alive and the heat table in both arms:
+     step() 14.73 -> 14.61 ms/token, paired delta -0.12, 95 % [-0.61,
+     +0.37], 6 of 10 negative. No effect on the token distinguishable from
+     the noise. One text in all twenty runs (87ce3f1b34ce2d6b), as the
+     bitwise kernels require.
+     Per-arm means (not paired): wait 1.40 -> 0.73 and take 1.55 -> 0.86
+     (moe 6.39 -> 5.80, -0.59), while dn 4.09 -> 4.37 (+0.28), head 1.06
+     -> 1.19 (+0.13), attn 2.02 -> 2.10 (+0.08) and shared 3.13 -> 3.21
+     (+0.08). The wait for the GPU fell by about what the kernels gained,
+     and about as much reappeared in the DeltaNet, lm_head and attention
+     timers, which run their own GPU work after the expert group.
+
+Reading: the kernel change does what it was meant to on the GPU, and the
+token does not see it. The shape is the one COLI_CUDA_DOWN_ROWS showed
+alone in September (docs/ENVIRONMENT.md, that row): faster expert kernels,
+the freed time reappearing in the dense GPU work that follows. Why is not
+measured. Candidates: the GPU idles longer between the end of the expert
+group and the next dense call and comes back slower (clocks, power state),
+or the per-arm shift in dn/head is noise of an unpaired comparison. A
+traced pair (Nsight Systems, the variable off and on) would show whether
+the dense kernels themselves got longer. Not measured: other prompts,
+longer generations, the variant without the zero-copy/async setting.
+
+Everything below is from output the operator pasted in the session; where
+lines are left out it says so. The logs and the report stay on the
+operator's machine; none is committed and no evidence.sha256 exists for
+them.
+
+--- 1. build and test ---------------------------------------------------------------
+
+A Visual Studio 2022 Developer Command Prompt, C:\colibri-fork\c:
+
+  set PATH=C:\msys64\clang64\bin;%PATH%;C:\msys64\usr\bin
+  git pull                                   (Already up to date: main at 6a71af1)
+  make cuda-dll CC=clang CUDA_ARCH=sm_89
+  make -B qwen36.exe CC=clang CUDA_DLL=1 ARCH=native && copy /Y qwen36.exe qwen36_clang.exe
+  nvcc -O3 -std=c++17 -ftz=false -arch=sm_89 tests\test_grouped_g4_cuda.cu -o grouped_g4_test.exe
+  grouped_g4_test.exe
+
+  note: COLI_CUDA_FLUSH=1 was set in the environment; cleared for this test
+  note: COLI_CUDA_GROUP_ZC=1 was set in the environment; cleared for this test
+  note: COLI_CUDA_GROUP_ZC_OUT=1 was set in the environment; cleared for this test
+  grouped-g4 oracle: 50 trials x 3 experts (gs=64 + tail + per-row member), 0 mismatches
+  [cuda] gs64 expert kernels active: COLI_CUDA_GS64=1, group size 64 compiled in, x read in pairs, warp-shuffle reduction tail (the down kernel only with COLI_CUDA_DOWN_ROWS 2, 4 or 8)
+  [cuda] COLI_CUDA_GS64=1: a group that is not all group-size 64 (or has odd dims) keeps the generic kernels
+  grouped-g4 gs64 kernels: 24 comparisons (3 shapes x 2 input layouts, hidden + down R=2/4/8), bitwise against the generic kernels
+  [CUDA] device 0: NVIDIA GeForce RTX 4070 Ti SUPER, 17.2 GB VRAM, sm_89
+  (... the graph, flush and zero-copy blocks, as in earlier records ...)
+  grouped-g4 gs64: bitwise against the generic kernels per call, in the graph (captured once, replayed), with down-rows 2/8/0 and on the sync path; a per-row member keeps the generic kernels
+  OK
+
+--- 2. the A/B ---------------------------------------------------------------------
+
+The same window:
+
+  set COLI_CUDA_GS64=
+  set COLI_CUDA_GROUP_ZC=1
+  set COLI_CUDA_GROUP_ZC_OUT=1
+  set COLI_CUDA_FLUSH=1
+  set QT_ASYNC_ISSUE=1
+  set COLI_CUDA_KEEPALIVE=1
+  set COLI_DN_GPU=1
+  set CACHE_ROUTE=1
+  set ROUTE_J=4
+  set QT_PREFILL_REPLAN=1
+  (COLI_CUDA_DOWN_ROWS, QT_UPLOAD_SYNC, Q36_DN_GPU, COLI_PLACE, QT_ASYNC_SPIN_US,
+   SNAP, COLI_CUDA, COLI_GPUS, COLI_TIMERS, N_NEW, HEAT_FILE cleared)
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\misure-envab.ps1 -Snap D:\modelli\qwen36_i4_gs64 -Var COLI_CUDA_GS64 -Value 1 -Marker "[cuda] gs64 expert kernels active:" -MarkerFile coli_cuda.dll -HeatFile heat.caldo.bin -AllowEnv COLI_CUDA_GROUP_ZC,COLI_CUDA_GROUP_ZC_OUT,COLI_CUDA_FLUSH,QT_ASYNC_ISSUE,COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -AllowTextDrift ON,OFF -Reps 10
+
+  eseguibile: .\qwen36_clang.exe | 412672 byte | 2026-11-07 07:48:46 | sha256 3FCB158BED10084B
+  coli_cuda.dll: 870912 byte | 2026-11-07 07:48:42 | sha256 6D3C3A3244870AA5
+  parametri: cap=256 bits=4 N_NEW=128 rip=10 | OFF: COLI_CUDA_GS64 assente | ON: COLI_CUDA_GS64=1 | heat: heat.caldo.bin, la stessa in entrambi i bracci | snap=D:\modelli\qwen36_i4_gs64  | prompt=prompt25.txt sha256 35ECA2E6EFD8B6E4  | built=qwen36.exe  | allow-env=COLI_CUDA_GROUP_ZC,COLI_CUDA_GROUP_ZC_OUT,COLI_CUDA_FLUSH,QT_ASYNC_ISSUE,COLI_CUDA_KEEPALIVE,COLI_DN_GPU,CACHE_ROUTE,ROUTE_J,QT_PREFILL_REPLAN -- DEROGA  | testo-variabile=ON,OFF -- DEROGA: i run di un braccio nominato possono scrivere testi diversi
+  marker: [cuda] gs64 expert kernels active:  (testo trovato in C:\colibri-fork\c\coli_cuda.dll)
+  (the build-config, marker-file and heat header lines omitted)
+
+  rip 1 (OFF prima)  OFF  14.50  ON  15.20  delta   0.70 ms/token
+  rip 2 (ON prima )  OFF  15.10  ON  14.90  delta  -0.20 ms/token
+  rip 3 (OFF prima)  OFF  15.00  ON  14.20  delta  -0.80 ms/token
+  rip 4 (ON prima )  OFF  14.20  ON  15.10  delta   0.90 ms/token
+  rip 5 (OFF prima)  OFF  14.60  ON  14.10  delta  -0.50 ms/token
+  rip 6 (ON prima )  OFF  15.60  ON  14.90  delta  -0.70 ms/token
+  rip 7 (OFF prima)  OFF  14.60  ON  14.90  delta   0.30 ms/token
+  rip 8 (ON prima )  OFF  14.70  ON  14.00  delta  -0.70 ms/token
+  rip 9 (OFF prima)  OFF  14.50  ON  15.10  delta   0.60 ms/token
+  rip 10 (ON prima )  OFF  14.50  ON  13.70  delta  -0.80 ms/token
+
+  --- invarianti ---
+  (the executable, build-config, dll, parametri and heat lines repeated; omitted here)
+  tabella heat invariata dall'inizio alla fine della corsa; caricata in tutti i 20 run
+  banner del motore identico in tutti i run:
+    == qwen36 Phase-2 engine | cache=256/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+  [place] auto: identica in tutti i 20 run
+  residenza identica in tutti i run: 6812/10240
+  braccio OFF: 1 testo in 10 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  braccio ON: 1 testo in 10 run, identico nonostante la deroga -AllowTextDrift: sha256 87ce3f1b34ce2d6b
+  (the fingerprint lines omitted: 87ce3f1b34ce2d6b for both arms)
+  testo generato IDENTICO fra i due bracci (sullo stdout letto) -- solo ripetizione 1
+
+  --- delta appaiati (ON - OFF), ms/token ---
+  0.70   -0.20   -0.80   0.90   -0.50   -0.70   0.30   -0.70   0.60   -0.80
+  media    -0.12   sd  0.68   se  0.21   df 9
+  intervallo 95 %:  [-0.61 ; 0.37]   ampiezza +-0.49
+  negativi 6/10
+
+  --- controllo POSIZIONE (ABBA) ---
+  OFF prima:  0.70  -0.80  -0.50  0.30  0.60
+  ON prima:   -0.20  0.90  -0.70  -0.70  -0.80
+  differenza fra le medie dei due gruppi: 0.36 ms/token
+  (three lines of the script's note on the position check omitted)
+
+  --- medie per braccio ---
+  OFF    step  14.73  moe   6.39  attn  2.02  dn  4.09  head  1.06
+         (shared)  3.13  (router)  0.84  wait  1.40
+         issue  0.05  cpu-miss  0.55  take  1.55  sh-ovl  3.13  hit  97.7 %  swaps  6.0  miss 1133
+         dopo il prefill: hit  98.2 %
+         dn-sub:   proj  4.08  conv  0.00  l2n+rec  0.00  norm+out  0.00
+  ON     step  14.61  moe   5.80  attn  2.10  dn  4.37  head  1.19
+         (shared)  3.21  (router)  0.83  wait  0.73
+         issue  0.05  cpu-miss  0.56  take  0.86  sh-ovl  3.21  hit  97.7 %  swaps  6.0  miss 1133
+         dopo il prefill: hit  98.2 %
+         dn-sub:   proj  4.36  conv  0.00  l2n+rec  0.00  norm+out  0.00
+  (the dn-split lines omitted)
+
+--- 3. the profile ------------------------------------------------------------------
+
+C:\colibri-ab, after the A/B, the profile environment of 6 November (keep-
+alive, zero-copy and async issue off) with COLI_CUDA_GS64=1:
+
+  ncu --kernel-name regex:"grouped_hidden_g4_dual|grouped_down_g4r" --launch-skip 2400 --launch-count 4 --set full --clock-control none -f -o hidden2 C:\colibri-fork\c\qwen36_clang.exe 256 4 prompt25.txt > hidden2-ncu.log 2>&1
+
+  [cuda] gs64 expert kernels active: COLI_CUDA_GS64=1, group size 64 compiled in, x read in pairs, warp-shuffle reduction tail (the down kernel only with COLI_CUDA_DOWN_ROWS 2, 4 or 8)
+  ==PROF== Profiling "grouped_hidden_g4_dual_gs64": 0%
+  ==PROF== Profiling "grouped_down_g4r_gs64": 0%
+  ==PROF== Profiling "grouped_hidden_g4_dual_gs64": 0%....50%....100% - 45 passes
+  ==PROF== Profiling "grouped_down_g4r_gs64": 0%....50%....100% - 45 passes
+  ==PROF== Report: C:\colibri-ab\hidden2.ncu-repz
+
+Excerpts, in launch order:
+
+  grouped_hidden_g4_dual_gs64 (512, 1, 8)x(256, 1, 1)
+    SM Frequency 2,53 GHz | Elapsed Cycles 74.049 | DRAM Throughput 49,83 % | Duration 29,22 us
+    Compute (SM) Throughput 66,75 % | Memory Throughput 326,22 GB/s | Issue Slots Busy 46,95 %
+    highest utilized pipeline (66.8%) is LSU | L1TEX stall 10.9 cycles, 52.1% of 20.8
+    Executed Instructions 9.121.772 | Registers Per Thread 38 | Achieved Occupancy 86,64 %
+  void grouped_down_g4r_gs64<4> (512, 1, 8)x(256, 1, 1)
+    SM Frequency 2,52 GHz | Elapsed Cycles 55.123 | DRAM Throughput 33,75 % | Duration 21,79 us
+    Compute (SM) Throughput 60,57 % | Memory Throughput 220,48 GB/s | Issue Slots Busy 45,52 %
+    highest utilized pipeline (60.6%) is LSU | L1TEX stall 7.4 cycles, 42.3% of 17.5
+    Executed Instructions 6.586.368 | Registers Per Thread 48 | Achieved Occupancy 71,22 %
+  grouped_hidden_g4_dual_gs64 (512, 1, 8)x(256, 1, 1)
+    SM Frequency 2,52 GHz | Elapsed Cycles 73.172 | DRAM Throughput 50,53 % | Duration 28,96 us
+    Compute (SM) Throughput 67,59 % | Memory Throughput 330,47 GB/s | Issue Slots Busy 47,26 %
+    highest utilized pipeline (67.6%) is LSU | L1TEX stall 11.1 cycles, 53.2% of 20.9
+    Executed Instructions 9.066.760 | Registers Per Thread 38 | Achieved Occupancy 88,11 %
+  void grouped_down_g4r_gs64<4> (512, 1, 8)x(256, 1, 1)
+    SM Frequency 2,52 GHz | Elapsed Cycles 54.635 | DRAM Throughput 33,95 % | Duration 21,60 us
+    Compute (SM) Throughput 61,10 % | Memory Throughput 222,35 GB/s | Issue Slots Busy 45,92 %
+    highest utilized pipeline (61.1%) is LSU | L1TEX stall 7.4 cycles, 42.9% of 17.4
+    Executed Instructions 6.586.368 | Registers Per Thread 48 | Achieved Occupancy 70,86 %
+
+(the excerpts condense the report's sections into one line per metric
+group; the values are the report's, decimal commas as printed.)
