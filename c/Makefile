@@ -12,10 +12,17 @@ DETECT_CC := $(if $(filter default,$(origin CC)),gcc,$(CC))
 TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 
 MINGW  := $(findstring mingw,$(TRIPLET))
+# LLVM spells the same MinGW target x86_64-w64-windows-gnu, with no "mingw" in
+# it, so a clang build fell through to the generic branch: no -lpsapi, no EXE
+# suffix, and `make qwen36.exe CC=clang` answering "No rule to make target"
+# because the target was called qwen36. MSYS2 CLANG64 is a way to get LLVM's
+# OpenMP runtime on Windows with the MinGW headers, which makes this path worth
+# having.
+WINGNU := $(findstring windows-gnu,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
-IS_WIN := $(MINGW)$(CYGWIN)
+IS_WIN := $(MINGW)$(WINGNU)$(CYGWIN)
 
 # A gcc that targets the MSYS or Cygwin runtime (MSYS2's "MSYS" shell, or its plain
 # `gcc` package) is not a native Windows compiler: it does not define _WIN32, so
@@ -129,19 +136,44 @@ else ifneq ($(IS_WIN),)
 # --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
 # GCC + libgomp + winpthreads: pthread, OpenMP, clock_gettime, opendir/readdir,
 # AVX2 intrinsics - tutto gratis, nessun porting.
+# (MSYS2 CLANG64 -- clang + libomp + winpthreads -- goes through the same block;
+# see WIN_CLANG below for what differs.)
 # ARCH default = x86-64-v3 (portable binary with AVX2). For max speed on THIS
 # machine use ARCH=native: on AVX-VNNI CPUs (Intel Alder Lake+, Meteor Lake+)
 # it also unlocks the 128-bit VPDPBUSD int8/int4 dot kernel (dot_i8i8/dot_i4i8),
 # which the x86-64-v3 baseline does not define. The #ifdef guards in colibri.c mean
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
-CC      = gcc
+# gcc, unless the compiler the triple was read from is an LLVM MinGW one: then
+# that compiler (an environment CC=clang would otherwise detect as clang and
+# build with gcc).
+CC      = $(if $(WINGNU),$(DETECT_CC),gcc)
 ARCH   ?= x86-64-v3
 CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
-LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
+# An LLVM MinGW compiler (MSYS2 CLANG64's clang, or its gcc/cc wrappers) is
+# told apart by the triple it reports, windows-gnu; a MinGW gcc says mingw32.
+WIN_CLANG = $(WINGNU)
+# -static makes the gcc exe self-contained. A clang build links dynamically:
+# its OpenMP runtime comes as libomp.dll, and whether -static can link it is not
+# checked. The exe then needs libomp.dll and libwinpthread-1.dll at run time, so
+# C:\msys64\clang64\bin on PATH.
+WIN_STATIC = $(if $(WIN_CLANG),,-static)
+# MinGW keeps clock_gettime AND the whole pthread surface in libwinpthread.
+# GCC's -fopenmp implies -pthread and pulls it in; clang's -fopenmp links libomp
+# and nothing else, so an otherwise fine build dies on clock_gettime64 plus
+# every pthread_* the expert tier and the prefetch threads use.
+WIN_PTHREAD = $(if $(WIN_CLANG),-lpthread,)
+# Reserve the stack explicitly instead of inheriting whatever the linker picked:
+# GNU ld gives a MinGW target 2 MB, lld follows MSVC and gives 1 MB, and the
+# difference is the kind of thing that turns a working build into
+# STATUS_STACK_OVERFLOW (0xC00000FD) on a different toolchain. 8 MB of RESERVE
+# is address space -- pages commit as they are touched; the exe's reserve is
+# also what threads created without a size get (libomp workers pass their own). Placed before -static -lpsapi, which
+# tests/test_makefile_platform.py expects at the end of the gcc link line.
+LDFLAGS = -lm -fopenmp -Wl,--stack,8388608 $(WIN_STATIC) -lpsapi $(WIN_PTHREAD) $(EXTRA_LDFLAGS)
 ifeq ($(LTO),1)
 CFLAGS  += -flto
 LDFLAGS += -flto
