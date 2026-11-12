@@ -79,6 +79,54 @@ class MakefilePlatformTests(unittest.TestCase):
                 self.assertNotIn("-lvulkan", link)
                 self.assertNotIn("-Bdynamic", link)
 
+    def test_windows_clang_and_gcc_link_lines(self):
+        # MSYS2 CLANG64 clang reports x86_64-w64-windows-gnu (no "mingw"): it
+        # must still get the .exe target and the Windows libraries, link libomp
+        # dynamically (no -static) and add -lpthread for libwinpthread; a MinGW
+        # gcc keeps -static. Both reserve an 8 MB stack. The decision follows
+        # the triple, not the compiler's name (CLANG64's gcc wrapper is clang),
+        # and with a windows-gnu triple the compiler that reported it builds:
+        # an environment CC is not replaced by gcc.
+        cases = (
+            # triple, CC in the environment (None: unset), expected compiler, clang
+            ("x86_64-w64-windows-gnu", "clang", "clang", True),
+            ("x86_64-w64-windows-gnu", None, "gcc", True),
+            ("x86_64-w64-mingw32", None, "gcc", False),
+        )
+
+        for triplet, env_cc, expected_cc, is_clang in cases:
+            with self.subTest(triplet=triplet, env_cc=env_cc):
+                env = os.environ.copy()
+                env.pop("CC", None)
+                if env_cc is not None:
+                    env["CC"] = env_cc
+                result = subprocess.run(
+                    [
+                        MAKE,
+                        "--no-print-directory",
+                        "-B",
+                        "-n",
+                        "qwen36.exe",
+                        f"TRIPLET={triplet}",
+                    ],
+                    cwd=C_DIR,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                link = next(
+                    line
+                    for line in result.stdout.splitlines()
+                    if "-o qwen36.exe " in line
+                )
+                words = link.split()
+                self.assertEqual(words[0], expected_cc)
+                self.assertIn("-lpsapi", words)
+                self.assertIn("-Wl,--stack,8388608", words)
+                self.assertEqual("-static" in words, not is_clang)
+                self.assertEqual("-lpthread" in words, is_clang)
+
     def test_darwin_portable_build_does_not_force_x86_architecture(self):
         missing_libomp = "/colibri-test/missing-libomp"
         result = self._dry_run(
