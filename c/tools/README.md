@@ -56,6 +56,14 @@ not runtime dependencies of the C engine.
 - `make_glm_oracle.py`, `make_glm_bench_model.py`: deterministic fixtures
 - `benchmark_cuda_fixture.py`, `eval_glm.py`, `fetch_benchmarks.py`: benchmarks
 - `gen_unicode.py`: tokenizer table generation
+- `misure-envab.ps1` (Windows PowerShell, comments in Italian): one qwen36
+  environment variable on against off on the same executable, an even number
+  of ABBA-ordered pairs (`-Reps`, 6 by default), paired deltas of `step()`
+  with a 95 % interval. It checks the executable against the build's `.d`
+  files and `coli_cuda.dll` against the `cuda-dll` sources, refuses a shell
+  with engine variables set, requires a marker line in every ON log and none
+  in the OFF ones, and reports per arm the chain's wait and host-expert time
+  per token, its hybrid steps and promotions. Usage is in the script header.
 
 Run them from `c/`, for example:
 
