@@ -129,8 +129,8 @@ class FamilyRegistryTest(unittest.TestCase):
         # `logprobs_echo` is the numeric logprobs/echo channel: the engine emits one ECHO
         # frame per prompt position it read out, position 0 included. `submit_gbytes` is
         # the header SHAPE -- the seventh numeric field coli_submit_parse reads, which a
-        # sibling engine's six-field parser would take for a malformed key and answer with
-        # "bad submit extension". Neither is published metadata: they describe the engine
+        # sibling engine's six-field parser would take for a malformed key and refuse
+        # ("bad submit header"). Neither is published metadata: they describe the engine
         # link, not the user surface.
         by_id, _ = _build_registry(FAMILIES)
         for family_id, echo, gbytes in (("glm", True, True), ("mimo", True, True),
@@ -153,8 +153,8 @@ class FamilyRegistryTest(unittest.TestCase):
         for family_id, expected in (("glm53", True), ("qwen38", True), ("qwen36", True),
                                     ("deepseek_v41", True), ("mimo", True),
                                     ("glm", True),   # Mistral-Large-4's pictures (expand_ml4_images); GLM-5.2's engine says vision=0
-                                    ("kimi", False),
-                                    ("inkling", False), ("olmoe", False),
+                                    ("inkling", True),   # Inkling-2's pictures (expand_inkling2_images); Inkling's renderer refuses them
+                                    ("kimi", False), ("olmoe", False),
                                     ("deepseek_v4", False), ("qwen_image", False)):
             with self.subTest(family=family_id):
                 self.assertIs(by_id[family_id].capabilities.image, expected)

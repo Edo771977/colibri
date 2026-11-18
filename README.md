@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a>
+  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.de.md">Deutsch</a> · <a href="README.ru.md">Русский</a>
 </p>
 
 **Tiny engine, immense model.** colibri runs very large open models on the
@@ -20,7 +20,7 @@ that part in RAM and reads the rest, the experts, from the disk when the model
 asks for them. Pure C, one file per model family, no GPU required.
 
 Thirteen engines run today. Ten are for language models: **GLM-5.2/5.3** (which
-also runs **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3**,
+also runs **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3** (and K3.1 Pro),
 **DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (and Pro),
 **Qwen3.8-Flash-Next**, **Qwen3.6** (which also runs Qwen3-Coder, the dense
 Qwen3.8-27B, **Flint**, **Muse Spark Open** and **LFM3-VL**) and **OLMoE**. One
@@ -87,8 +87,8 @@ the setup:
    RAM, plus a minimum cache of experts, must fit in your RAM, and the download
    on your disk;
 3. **gets the engine**: it builds it for your machine when a compiler is there,
-   otherwise it downloads the prebuilt one, which runs on the CPU and, on Linux
-   and Windows, on a Vulkan GPU too. It builds
+   otherwise it downloads the prebuilt one, which runs on the CPU and, on x86-64
+   Linux and Windows, on a Vulkan GPU too. It builds
    for your GPU when that pays: CUDA for an NVIDIA card on Linux when the CUDA toolkit is installed,
    otherwise Vulkan. On a discrete GPU it always does; on an integrated GPU,
    which shares the CPU's RAM, only for the models measured faster there
@@ -97,7 +97,7 @@ the setup:
    setup again afterwards and it rebuilds for the GPU;
 4. **downloads the model** with progress and resume: stop it whenever you like,
    run it again and it continues where it stopped;
-5. **starts colibri and opens the dashboard** in your browser, and prints the
+5. **starts colibri and opens the chat** in your browser, and prints the
    addresses other apps can use:
 
 ```
@@ -177,7 +177,7 @@ the hottest experts and the dense layers. Where a weight sits changes how fast
 the answer comes, not which weights or which router decisions produce it.
 
 Why: to run models of this size on hardware people already own, to watch them
-work (the dashboard shows every expert as it fires), and to keep the engine
+work (the chat's expert map shows every expert as it fires), and to keep the engine
 small enough that anyone can measure it and make it faster. colibri is also an
 open research platform: an optimisation earns its place with a reproducible
 end-to-end measurement, and the default policy never silently changes model
@@ -223,6 +223,7 @@ a fast NVMe drive helps most)
 | **Inkling** (975B): int4 experts, bf16 dense weights | `inkling` | 514 GB | 120 / 128 GB as downloaded; 25 GB after a [dense conversion](docs/inkling.md) | CUDA, Vulkan | 0.25 tok/s (Ryzen 9 7900, 187 GB, RTX A6000) |
 | MiMo-V2.6 Pro (1.02T): vision and tools | `mimo-v2.6-pro` | 564 GB | 54 / 64 GB | Vulkan | 0.66-0.79 tok/s (A, CPU) |
 | **Kimi K3** (2.8T): the largest | `kimi-k3` | 1.56 TB | 32 / 64 GB | CUDA, Vulkan | about 9.4 s per token, experts read at 6.3 GB/s |
+| **Kimi K3.1 Pro** (2.8T): K3 with sparse attention past 2048 tokens | `kimi-k3.1-pro` | 1.56 TB | 32 / 64 GB | CUDA, Vulkan | |
 
 <a id="other-supported-models"></a>
 
@@ -243,7 +244,7 @@ a fast NVMe drive helps most)
 directory beside it; `--model` that directory, as any other ([gguf.md](docs/gguf.md)). Nothing is
 converted or quantized again: the blocks run as the file holds them, from IQ1_S to Q8_0, F16, BF16
 and MXFP4. The engines of every chat model above read GGUFs too
-([the architectures](docs/gguf.md#supported-architectures)); these four models come as GGUFs:
+([the architectures](docs/gguf.md#supported-architectures)); these models come as GGUFs:
 
 | Model | GGUF | GPU | Measured |
 |---|---|---|---|
@@ -251,6 +252,7 @@ and MXFP4. The engines of every chat model above read GGUFs too
 | **Muse Spark Open** (816B, 42B active): text and tools, under Meta's licence agreement | unsloth, UD-IQ1_S 176 GB to UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1.55-1.58 tok/s with Vulkan, 1.34-1.40 with CUDA, 0.83-0.89 on the CPU (D) |
 | **Flint** (40B, 2.5B active): text and tools, Apache 2.0 | unsloth, UD-IQ1_M 11.4 GB to BF16 79.6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77.4 tok/s with CUDA, 77.7 with Vulkan, 15.8 on the CPU (D) |
 | **LFM3-VL-2B**: text, pictures and tools, LFM Open License | LiquidAI, QAD-Q4_0 to BF16 (or the checkpoint, converted) | CUDA, Vulkan | Q4_K_M: 235.1 tok/s with CUDA, 214.1 with Vulkan, 34.5 on the CPU (D) |
+| **Qwen-Image-2.1** and its **Turbo**: text to picture, non-commercial licence ([qwen-image.md](docs/qwen-image.md#gguf-unsloth)) | unsloth, Q2_K 2.5 GB to F16 14.2 GB, with a Qwen3-VL-8B-Instruct GGUF as the text encoder | Vulkan | Turbo Q4_K_M, 1024x1024 in 8 steps: 37 s of denoising with Vulkan (D); at 512x512 8.4-9.3 s a step on the CPU (A) |
 
 The larger models of the tables above from their GGUFs, on the same machine: [Benchmarks](#large-models-on-the-same-machine).
 
@@ -367,8 +369,8 @@ engines build with `make <engine> CUDA=1`. On
 Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)), and
 every release ships it built: `colibri-<version>-windows-x86_64-cuda.zip` has
 `coli_cuda.dll` (cards of compute capability 8.0 and newer) and the colibri,
-qwen36 and kimi_k3 engines that load it, with DeepSeek V4's own CUDA DLLs. Unpack it
-over the main archive and the setup picks CUDA.
+glm53, qwen36 and kimi_k3 engines that load it, with DeepSeek V4's own CUDA DLLs.
+Unpack it over the main archive and the setup picks CUDA.
 
 - **Every layer on the card** for Qwen3.6, Qwen3.8 and OLMoE: the dense layers,
   the attention and the routed experts the card holds run as one chain, and the
@@ -454,20 +456,19 @@ accepted by a server started without `COLI_API_KEY`). The two official SDKs,
 unmodified, are tested against `coli serve`.
 
 The same mode is in the terminal (`/decide merge | request changes | close` in
-`coli chat`) and on the dashboard's System One page. The request and reply in
+`coli chat`) and on the chat's System One page. The request and reply in
 full, the scoring rules and where it does not help:
 [docs/systemone.md](docs/systemone.md).
 
-## The dashboard
+## The chat in the browser
 
-`coli web` opens it, and so does the one-step setup: the chat, the System One
-page, the Brain and the Profiling page, in a light or a dark theme.
-
-### The chat UI
-
-`coli ui` opens the new chat next to a running `coli serve`: reasoning in its own block,
-pictures for models with a vision tower, web search, the expert map, a live monitor, and
-coding agents opened already pointed at colibri. Seven languages. See [ui/README.md](ui/README.md).
+`coli web` starts the model and the chat in front of it, and opens the chat in the browser;
+so does the one-step setup. `coli ui` opens the same chat next to a `coli serve` that already
+runs, on this machine or another. Reasoning in its own block, pictures for models with a
+vision tower, documents (PDF, Word, OpenDocument, PowerPoint, web pages, text) read into the
+message, web search, the expert map, a live monitor, System One, the Models page, and coding
+agents opened already pointed at colibri. Seven languages, a light and a dark theme. See
+[ui/README.md](ui/README.md).
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="the chat UI: a question, the reasoning folded, the answer, and its speed">
@@ -491,10 +492,8 @@ amber when used in this answer.</em></p>
 <p align="center"><em><strong>System One</strong>: give the model a document and the only answers it may pick. Here Qwen3.6-35B on an RTX PRO 4000
 reads a pull request that breaks a cache's size limit: <strong>request changes at 81%</strong>, entropy 0.56 (unsure), 98 tokens read, 0 generated.</em></p>
 
-The **Profiling** page shows where each turn spends its time, phase by phase,
-with the last 30 turns as a trend. With [joules](https://pypi.org/project/landauer-gap/)
-installed next to the gateway (`pip install landauer-gap`) it also shows the
-machine's watts and the last turn's joules per token.
+The monitor's **profiling** shows where each turn spent its time, phase by phase
+(waiting for experts, their matmuls, attention, the LM head), turn after turn.
 
 ### The terminal UI
 
@@ -715,13 +714,13 @@ template, so the commands are the same for every model:
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -763,7 +762,7 @@ well-controlled failure is worth more here than an unexplained fast number.
 |---|---|
 | The one-step setup and the manual install, every platform | [quickstart.md](docs/quickstart.md) |
 | Setting up through an AI assistant, and the MCP server | [AI_SETUP.md](docs/AI_SETUP.md), [MCP_SERVER.md](docs/MCP_SERVER.md) |
-| The API: OpenAI, Anthropic, tools, KV slots, dashboard | [api.md](docs/api.md) |
+| The API: OpenAI, Anthropic, tools, KV slots | [api.md](docs/api.md) |
 | System One and the decision models | [systemone.md](docs/systemone.md), [laya.md](docs/laya.md), [gliner_decide.md](docs/gliner_decide.md), [clef.md](docs/clef.md) |
 | GGUF files: the architectures, the two modes, what each engine does with the blocks | [gguf.md](docs/gguf.md) |
 | The models on the Qwen3.6 engine (Flint, Muse Spark Open, LFM3-VL) and Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
@@ -819,9 +818,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

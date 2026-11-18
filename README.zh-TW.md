@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>網站</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.de.md">Deutsch</a> · <a href="README.ru.md">Русский</a>
 </p>
 
 **小巧引擎，龐大模型**。colibri 能在你現有的電腦上執行非常大的開放模型。
@@ -18,7 +18,7 @@
 因此 colibri 把這一部分留在 RAM 中，其餘的部分，也就是專家，則在模型需要時才從硬碟讀取。
 純 C 實作，每個模型家族一個檔案，不需要 GPU。
 
-如今有十三個引擎在執行。其中十個用於語言模型：**GLM-5.2/5.3**（也執行 **Mistral-Large-4**）、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**（以及 Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（也執行 Qwen3-Coder、稠密的 Qwen3.8-27B、**Flint**、**Muse Spark Open** 與 **LFM3-VL**）以及 **OLMoE**。一個用來畫圖：**Qwen-Image-2.1**。兩個用來回答決策問題：**Laya** 與 **GLiNER2.5-Decide**，第三個決策模型 **Clef** 執行在 Qwen3.6 引擎上。語言模型也能直接執行已發布的 GGUF 檔案，按原樣讀取（[GGUF](docs/gguf.md)），可在 CPU 上執行，可透過 Vulkan 在任何 GPU 上執行，也可透過 CUDA 在 NVIDIA 顯示卡上執行。[哪一個適合我的機器](#which-model-for-my-machine)
+如今有十三個引擎在執行。其中十個用於語言模型：**GLM-5.2/5.3**（也執行 **Mistral-Large-4**）、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**（以及 K3.1 Pro）、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**（以及 Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（也執行 Qwen3-Coder、稠密的 Qwen3.8-27B、**Flint**、**Muse Spark Open** 與 **LFM3-VL**）以及 **OLMoE**。一個用來畫圖：**Qwen-Image-2.1**。兩個用來回答決策問題：**Laya** 與 **GLiNER2.5-Decide**，第三個決策模型 **Clef** 執行在 Qwen3.6 引擎上。語言模型也能直接執行已發布的 GGUF 檔案，按原樣讀取（[GGUF](docs/gguf.md)），可在 CPU 上執行，可透過 Vulkan 在任何 GPU 上執行，也可透過 CUDA 在 NVIDIA 顯示卡上執行。[哪一個適合我的機器](#which-model-for-my-machine)
 
 ```
 $ ./coli chat
@@ -85,7 +85,7 @@ cd colibri
    它就會為 GPU 重新建置；
 4. **下載模型**，顯示進度並支援續傳：你隨時可以中斷，
    再執行一次就會從中斷的地方繼續；
-5. **啟動 colibri，並在你的瀏覽器中開啟儀表板**，
+5. **啟動 colibri，並在你的瀏覽器中開啟聊天介面**，
    同時印出其他應用程式可以使用的位址：
 
 ```
@@ -163,7 +163,7 @@ Starting colibri
 不會改變產生答案的是哪些權重，也不會改變路由器的決策。
 
 為什麼：為了在人們已經擁有的硬體上執行這種規模的模型，為了觀察它們如何運作
-（儀表板會在每個專家被觸發時把它顯示出來），也為了讓引擎維持得夠小，
+（聊天介面的專家地圖會在每個專家被觸發時把它顯示出來），也為了讓引擎維持得夠小，
 讓任何人都能測量它、讓它變得更快。colibri 同時也是一個開放的研究平台：
 一項最佳化必須以可重現的端到端測量來證明自己的價值，
 而預設策略絕不會在不告知的情況下改變模型精度或路由語意。
@@ -210,6 +210,7 @@ Starting colibri
 | **Inkling**（975B）：int4 專家，bf16 稠密權重 | `inkling` | 514 GB | 按下載格式為 120 / 128 GB；經過[稠密部分轉換](docs/inkling.md)後為 25 GB | CUDA、Vulkan | 0.25 tok/s（Ryzen 9 7900，187 GB，RTX A6000） |
 | MiMo-V2.6 Pro（1.02T）：視覺與工具 | `mimo-v2.6-pro` | 564 GB | 54 / 64 GB | Vulkan | 0.66-0.79 tok/s（A，CPU） |
 | **Kimi K3**（2.8T）：最大的模型 | `kimi-k3` | 1.56 TB | 32 / 64 GB | CUDA、Vulkan | 每個 token 約 9.4 秒，專家讀取速度 6.3 GB/s |
+| **Kimi K3.1 Pro**（2.8T）：超過 2048 個 token 後採用稀疏注意力的 K3 | `kimi-k3.1-pro` | 1.56 TB | 32 / 64 GB | CUDA、Vulkan | |
 
 <a id="other-supported-models"></a>
 
@@ -226,7 +227,7 @@ Starting colibri
 
 **來自 GGUF：已發布的檔案，按原樣讀取**
 
-`./coli import` 接收 GGUF 的第一個檔案（其他分片放在旁邊），並在旁邊寫出一個模型目錄；之後像其他模型一樣把這個目錄傳給 `--model`（[gguf.md](docs/gguf.md)）。不做轉換，也不再次量化：各個區塊按檔案中的樣子執行，從 IQ1_S 到 Q8_0、F16、BF16 與 MXFP4。上面所有聊天模型的引擎也都能讀取 GGUF（[架構列表](docs/gguf.md#supported-architectures)）；以下四個模型以 GGUF 形式發布：
+`./coli import` 接收 GGUF 的第一個檔案（其他分片放在旁邊），並在旁邊寫出一個模型目錄；之後像其他模型一樣把這個目錄傳給 `--model`（[gguf.md](docs/gguf.md)）。不做轉換，也不再次量化：各個區塊按檔案中的樣子執行，從 IQ1_S 到 Q8_0、F16、BF16 與 MXFP4。上面所有聊天模型的引擎也都能讀取 GGUF（[架構列表](docs/gguf.md#supported-architectures)）；以下模型以 GGUF 形式發布：
 
 | 模型 | GGUF | GPU | 實測 |
 |---|---|---|---|
@@ -234,6 +235,7 @@ Starting colibri
 | **Muse Spark Open**（816B，啟用 42B）：文字與工具呼叫，遵循 Meta 的授權協議 | unsloth，從 UD-IQ1_S 176 GB 到 UD-Q4_K_XL 505 GB | CUDA、Vulkan | Vulkan 1.55-1.58 tok/s，CUDA 1.34-1.40，CPU 0.83-0.89（D） |
 | **Flint**（40B，啟用 2.5B）：文字與工具呼叫，Apache 2.0 | unsloth，從 UD-IQ1_M 11.4 GB 到 BF16 79.6 GB | CUDA、Vulkan | UD-Q4_K_XL：CUDA 77.4 tok/s，Vulkan 77.7，CPU 15.8（D） |
 | **LFM3-VL-2B**：文字、圖片與工具呼叫，LFM Open License | LiquidAI，從 QAD-Q4_0 到 BF16（或轉換後的 checkpoint） | CUDA、Vulkan | Q4_K_M：CUDA 235.1 tok/s，Vulkan 214.1，CPU 34.5（D） |
+| **Qwen-Image-2.1** 與其 **Turbo**：文字生成圖片，非商業授權（[qwen-image.md](docs/qwen-image.md#gguf-unsloth)） | unsloth，從 Q2_K 2.5 GB 到 F16 14.2 GB，另需一個 Qwen3-VL-8B-Instruct GGUF 作為文字編碼器 | Vulkan | Turbo Q4_K_M，1024x1024 在 8 步內：Vulkan 去噪 37 秒（D）；512x512 時 CPU 上每步 8.4-9.3 秒（A） |
 
 上面表格中較大的模型從其 GGUF 在同一台機器上的結果：[基準測試](#large-models-on-the-same-machine)。
 
@@ -329,7 +331,7 @@ GPU 加總數字的順序不同，而且會把某些中間結果（activation）
 
 ### CUDA：NVIDIA 顯示卡
 
-安裝了 CUDA 工具包時，安裝程式會在 Linux 上為有 CUDA 路徑的引擎建置 CUDA：GLM-5.2/5.3 與 Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next，以及 Qwen3.6 與它執行的模型；OLMoE 與決策引擎用 `make <引擎> CUDA=1` 建置。在 Windows 上，CUDA 引擎是一個獨立的 DLL（[windows.md](docs/windows.md)），每個版本都附帶編譯好的版本：`colibri-<version>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（compute capability 8.0 以上的顯示卡）以及載入它的 colibri、qwen36 與 kimi_k3 引擎，還有 DeepSeek V4 的 CUDA DLL。把它解壓到主壓縮檔之上，安裝程式就會選擇 CUDA。
+安裝了 CUDA 工具包時，安裝程式會在 Linux 上為有 CUDA 路徑的引擎建置 CUDA：GLM-5.2/5.3 與 Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next，以及 Qwen3.6 與它執行的模型；OLMoE 與決策引擎用 `make <引擎> CUDA=1` 建置。在 Windows 上，CUDA 引擎是一個獨立的 DLL（[windows.md](docs/windows.md)），每個版本都附帶編譯好的版本：`colibri-<version>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（compute capability 8.0 以上的顯示卡）以及載入它的 colibri、glm53、qwen36 與 kimi_k3 引擎，還有 DeepSeek V4 的 CUDA DLL。把它解壓到主壓縮檔之上，安裝程式就會選擇 CUDA。
 
 - **所有層都在顯示卡上**（Qwen3.6、Qwen3.8 與 OLMoE）：稠密層、注意力以及顯示卡持有的路由專家作為一條鏈執行，顯示卡不持有的專家在 CPU 上執行。在 RTX PRO 4000 上，Qwen3.6-35B-A3B UD-Q4_K_M 的解碼速度為 104.8 tok/s，讀取提示詞為 3,491，OLMoE 為 354.6 與 10,418（[表格](#three-backends-on-one-machine)）。
 - **每個引擎都有顯示卡上的路由專家層級**（`cu_tier.h`），DeepSeek V4、V4.1、Kimi K3、GLM-5.3 與 MiMo 的稠密矩陣也放在顯示卡上（`cu_dense.h`）。
@@ -405,17 +407,13 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 都已針對 `coli serve` 測試過。
 
 同樣的模式也可以在終端機中使用（`coli chat` 中的 `/decide merge | request changes | close`），
-以及儀表板的 System One 頁面。完整的請求與回覆格式、評分規則，以及它幫不上忙的情況：
+以及聊天介面的 System One 頁面。完整的請求與回覆格式、評分規則，以及它幫不上忙的情況：
 [docs/systemone.md](docs/systemone.md)。
 
-## 儀表板
+## 瀏覽器中的聊天
 
-`coli web` 會開啟它，一步安裝也會：包含聊天、System One 頁面、
-大腦（Brain）與效能剖析（Profiling）頁面，提供淺色與深色主題。
-
-### 新的聊天介面
-
-`coli ui` 會在執行中的 `coli serve` 旁開啟新的聊天介面：推理有自己的區塊，具備視覺塔的模型可以看圖片，還有網頁搜尋、專家地圖、即時監視器，以及已指向 colibri 的程式設計代理。支援七種語言。請見 [ui/README.md](ui/README.md)。
+`coli web` 會啟動模型並在它前面啟動聊天介面，然後在瀏覽器中開啟聊天；一步安裝也會這樣做。
+`coli ui` 會在已經執行中的 `coli serve` 旁開啟同一個聊天介面，可以在本機，也可以在另一台機器上：推理有自己的區塊，具備視覺塔的模型可以看圖片，文件（PDF、Word、OpenDocument、PowerPoint、網頁、文字）會讀入訊息，還有網頁搜尋、專家地圖、即時監視器、System One、模型頁面，以及已指向 colibri 的程式設計代理。支援七種語言，提供淺色與深色主題。請見 [ui/README.md](ui/README.md)。
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="新的聊天介面：一個問題、收合的推理、回答及其速度">
@@ -438,8 +436,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 <p align="center"><em><strong>System One</strong>：給模型一份文件，以及它唯一可以選擇的幾個答案。圖中 RTX PRO 4000 上的 Qwen3.6-35B 讀取一個破壞快取大小上限的拉取請求：
 <strong>request changes 為 81%</strong>，熵 0.56（不確定），讀取 98 個 token，生成 0 個。</em></p>
 
-**效能剖析**（Profiling）頁面顯示每一輪的時間花在哪裡，逐階段劃分，
-並以最近 30 輪呈現趨勢。
+監視器中的**效能剖析**逐階段（等待專家、專家的矩陣乘法、注意力、LM head）逐輪顯示每一輪的時間花在哪裡。
 
 ### 終端介面
 
@@ -464,6 +461,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
   Qwen3.8-Flash-Next、Qwen3.8-27B、LFM3-VL 與 Mistral-Large-4（來自 GGUF 時，
   把 `mmproj` 檔案放在旁邊），可以是 `coli chat` 訊息中的路徑、`coli web` 或
   `coli ui` 中的附件，或是一個 `image_url` 部分；
+- **文件輸入**：所有聊天引擎皆可使用：在 `coli chat` 中以 `/file PATH`（或 `coli chat --file PATH`）送出文字檔或 PDF 的文字，會隨下一則訊息一併傳送。只會讀取以這種方式指定的檔案，絕不會讀取訊息內的路徑；檔案必須是具文字副檔名或 `.pdf` 的一般檔案，且在 64 MiB 與 200 萬字元以內。PDF 會在獨立的程序中解析，並有時間與記憶體上限，由 `pdftotext`（poppler）或 `pypdf` 負責；
 - **圖片輸出**：使用 Qwen-Image-2.1，透過 `POST /v1/images/generations` 提供，
   `coli chat` 也會直接在終端機中繪出圖片
   （[qwen-image.md](docs/qwen-image.md)）；
@@ -631,13 +629,13 @@ GLM-5.2 請使用帶 int8 MTP head 的 group-scaled（gs64）容器
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -676,7 +674,7 @@ colibri 希望讓前沿模型減少對稀缺硬體的依賴，並降低執行成
 |---|---|
 | 一步安裝與手動安裝，涵蓋所有平台 | [quickstart.md](docs/quickstart.md) |
 | 透過 AI 助手安裝，以及 MCP 伺服器 | [AI_SETUP.md](docs/AI_SETUP.md)、[MCP_SERVER.md](docs/MCP_SERVER.md) |
-| API：OpenAI、Anthropic、工具、KV slots、儀表板 | [api.md](docs/api.md) |
+| API：OpenAI、Anthropic、工具、KV slots | [api.md](docs/api.md) |
 | System One 與決策模型 | [systemone.md](docs/systemone.md)、[laya.md](docs/laya.md)、[gliner_decide.md](docs/gliner_decide.md)、[clef.md](docs/clef.md) |
 | GGUF 檔案：支援的架構、兩種模式、各引擎如何處理這些區塊 | [gguf.md](docs/gguf.md) |
 | Qwen3.6 引擎上的模型（Flint、Muse Spark Open、LFM3-VL）與 Mistral-Large-4 | [qwen36.md](docs/qwen36.md)、[mistral-large4.md](docs/mistral-large4.md) |
@@ -732,9 +730,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

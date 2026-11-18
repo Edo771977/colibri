@@ -81,18 +81,22 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
                               int fmt, int I, int O, int device, int gs) {
     return upload_common(t, w, s, fmt, I, O, device, gs);
 }
+static int fake_tensor_frees;   /* tensors freed (a tier giving memory back) */
 void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
+    fake_tensor_frees += t != NULL;
     free(t);
 }
 /* no bus to copy host memory over: the tier keeps the host's step for those experts. A test of
  * the host pool sets fake_host_reg_ok and fake_planar_rows, and fake_host_reg_bytes to lock only
- * ranges of that size; the page-locks taken and the releases are counted. */
-static int fake_host_reg_ok, fake_planar_rows, fake_host_regs, fake_host_unregs;
+ * ranges of that size, and fake_host_reg_max to refuse a page-lock once that many are held
+ * (the driver's limit, 0: none); the page-locks taken and the releases are counted. */
+static int fake_host_reg_ok, fake_planar_rows, fake_host_regs, fake_host_unregs, fake_host_reg_max;
 static size_t fake_host_reg_bytes;
 int coli_cuda_host_register(void *p, size_t bytes) {
     (void)p;
-    int ok = fake_host_reg_ok && (!fake_host_reg_bytes || bytes == fake_host_reg_bytes);
+    int ok = fake_host_reg_ok && (!fake_host_reg_bytes || bytes == fake_host_reg_bytes) &&
+             (!fake_host_reg_max || fake_host_regs - fake_host_unregs < fake_host_reg_max);
     fake_host_regs += ok;
     return ok;
 }
@@ -147,6 +151,13 @@ void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
 }
 void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
     (void)device; if (count) *count = 0; if (bytes) *bytes = 0;
+}
+
+/* the vision tower's attention (qwen38_vision.h): refused, so the tower takes the CPU's,
+ * as a card without the kernel would. */
+int coli_cuda_vision_attention(int device, float *out, const float *qkv, int n, int heads, int D, float scale) {
+    (void)device; (void)out; (void)qkv; (void)n; (void)heads; (void)D; (void)scale;
+    return 0;
 }
 
 /* dense GEMV on a resident tensor (lm_head / DeltaNet projections placed on a
@@ -404,10 +415,12 @@ static int fcc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf
     }
     return 1;
 }
+/* snap_n > 0: snap holds a table of snap_n addresses (here the host's), row s's copy at address s */
+static float *fcc_snap_at(CcBuf *snap, int off, int s) { unsigned long long a; memcpy(&a, snap->d + off + 2 * s, 8); return (float *)(uintptr_t)a; }
 static int fcc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
-    if (!fcc_ready() || !in || !w || !ring || !out || !p || (p->snap_row >= 0 && !snap)) return 0;
+    if (!fcc_ready() || !in || !w || !ring || !out || !p || ((p->snap_row >= 0 || p->snap_n > 0) && !snap)) return 0;
     fake_chain_ops++;
-    if (p->snap_row >= 0) fake_dn_snapshots++;
+    if (p->snap_row >= 0 || p->snap_n > 0) fake_dn_snapshots++;
     int nh = p->CK - 1;
     for (int c = 0; c < p->CD; c++) {
         float hist[8] = {0};
@@ -422,6 +435,7 @@ static int fcc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap,
             for (int k = 0; k + 1 < nh; k++) hist[k] = hist[k + 1];
             if (nh > 0) hist[nh - 1] = cur;
             if (s == p->snap_row) for (int k = 0; k < nh; k++) snap->d[p->snap_off + c * nh + k] = hist[k];
+            if (s < p->snap_n) for (int k = 0; k < nh; k++) fcc_snap_at(snap, p->snap_off, s)[c * nh + k] = hist[k];
         }
         for (int k = 0; k < nh; k++) ring->d[p->ring_off + c * nh + k] = hist[k];
     }
@@ -429,9 +443,9 @@ static int fcc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap,
 }
 static float fcc_softplus(float x) { if (x > 20.f) return x; float e = expf(x); return e < 1e-4f ? e - 0.5f * e * e : logf(1.f + e); }
 static int fcc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
-    if (!fcc_ready() || !cv || !ab || !z || !st || !prm || !y || !p || (p->snap_row >= 0 && !snap) || KD > 256 || p->VD > 128) return 0;
+    if (!fcc_ready() || !cv || !ab || !z || !st || !prm || !y || !p || ((p->snap_row >= 0 || p->snap_n > 0) && !snap) || KD > 256 || p->VD > 128) return 0;
     fake_chain_ops++;
-    if (p->snap_row >= 0) fake_dn_snapshots++;
+    if (p->snap_row >= 0 || p->snap_n > 0) fake_dn_snapshots++;
     for (int h = 0; h < p->VH; h++) {
         int kh = h / (p->VH / p->KH);
         float *S = st->d + p->st_off + h * KD * p->VD;
@@ -461,6 +475,7 @@ static int fcc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *p
                 y->d[p->y_off + s * p->y_row + h * p->VD + v] = o[v] * r * nw[v] * g;
             }
             if (s == p->snap_row) memcpy(snap->d + p->snap_off + h * KD * p->VD, S, (size_t)KD * p->VD * sizeof(float));
+            if (s < p->snap_n) memcpy(fcc_snap_at(snap, p->snap_off, s) + h * KD * p->VD, S, (size_t)KD * p->VD * sizeof(float));
         }
     }
     return 1;
@@ -719,6 +734,7 @@ static int fcc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, in
     }
     return 1;
 }
+static const void *fcc_dev_addr(const CcBuf *b) { return b ? b->d : NULL; }   /* the host's: the fake's ops read it */
 static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
 static ColiCudaChainOps fake_chain_table = {
     CC_OPS_BASE_SIZE /* no routed experts in the frame by default: the engines' host step */, fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
@@ -727,7 +743,7 @@ static ColiCudaChainOps fake_chain_table = {
     fcc_matmul, fcc_norm, fcc_rope, fcc_attn, fcc_dnconv, fcc_dnrec, fcc_ew, fcc_stats,
     fcc_qsa, fcc_ple,
     fcc_route, fcc_moe, fcc_signal, fcc_wait_host, fcc_tensor_dev,   /* past CC_OPS_BASE_SIZE unless a test raises size */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, fcc_dev_addr, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,   /* fetch .. rope_f16 */
     fcc_pick, fcc_matmul_rows,
     NULL, NULL, NULL, NULL,                          /* kvh .. copy_regions_h */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,        /* the encoders' */
