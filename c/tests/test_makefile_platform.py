@@ -111,6 +111,28 @@ class MakefilePlatformTests(unittest.TestCase):
         )
         self.assertEqual(link.split()[-2:], ["-static", "-lpsapi"])
 
+    def test_windows_gnu_qwen36_links_winpthreads(self):
+        # MSYS2 CLANG64's clang driver adds no -lpthread (only the GCC-based MSYS2
+        # environments patch it in), and qwen36 needs pthread_* and clock_gettime
+        # from winpthreads; a MinGW gcc gets them through its own -fopenmp. The
+        # windows-gnu link also reserves 8 MB of stack (lld's default is 1 MB).
+        cases = (
+            ("x86_64-w64-windows-gnu", "clang", True),
+            ("x86_64-w64-mingw32", "gcc", False),
+        )
+        for triplet, cc, wants in cases:
+            with self.subTest(triplet=triplet):
+                result = self._dry_run("qwen36.exe", triplet, CC=cc, CUDA_DLL=1)
+                link = next(
+                    line for line in result.stdout.splitlines()
+                    if "-o qwen36.exe " in line
+                )
+                words = link.split()
+                self.assertEqual(words[0], cc)
+                self.assertEqual("-lpthread" in words, wants)
+                self.assertEqual("-Wl,--stack,8388608" in words, wants)
+                self.assertEqual(words[-2:], ["-static", "-lpsapi"])
+
     def test_deepseek_v4_windows_link_per_compiler(self):
         # clang links libomp.a: no -pthread (its driver adds winpthreads), no LTO by
         # default (GNU ld lacks LLVM's plugin); gcc's line stays as it was (#2286)
