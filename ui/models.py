@@ -40,8 +40,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _UP = os.path.dirname(HERE)
-# the release archive keeps coli next to ui/, a source checkout keeps it in c/
-COLI_DIR = _UP if os.path.isfile(os.path.join(_UP, "coli")) else os.path.join(_UP, "c")
+# Support modules sit next to ui/ in an archive or libexec installation,
+# and in c/ in a source checkout. An installed launcher lives in bin/.
+COLI_DIR = _UP if os.path.isfile(os.path.join(_UP, "setup_flow.py")) else os.path.join(_UP, "c")
+COLI = os.path.join(COLI_DIR, "coli")
+if not os.path.isfile(COLI):
+    COLI = os.path.join(os.path.dirname(os.path.dirname(COLI_DIR)), "bin", "coli")
 sys.path.insert(0, COLI_DIR)
 import setup_catalog  # noqa: E402
 import setup_download  # noqa: E402
@@ -190,6 +194,31 @@ def _argval(argv, flag):
     return None
 
 
+def coli_command(argv):
+    """`serve` or `web` when argv is coli's (`coli web` serves too, with this UI as its child), else None"""
+    for i, a in enumerate(argv[:3]):
+        if os.path.basename(a) == "coli" and i + 1 < len(argv) and argv[i + 1] in ("serve", "web"):
+            return argv[i + 1]
+    return None
+
+
+def serve_argv(argv):
+    """the command that starts a gateway like this one again: a `coli web` becomes `coli serve`
+    with its options, without the UI's own (this UI stays and follows the new process)"""
+    cmd = coli_command(argv)
+    if cmd != "web":
+        return list(argv)
+    at = next(i for i, a in enumerate(argv[:3]) if os.path.basename(a) == "coli") + 1
+    rest = [a for a in _without(argv[at + 1:], ("--ui-port",)) if a != "--no-browser"]
+    return argv[:at] + ["serve"] + rest
+
+
+# This UI as `coli web`'s child: it exits when that process does (server.py, --exit-with-stdin),
+# but a model switch stops it on purpose. While `switching`, the UI stays; after, it follows `pid`,
+# the gateway the switch started (or the previous one brought back).
+LIFE = {"switching": False, "pid": None}
+
+
 def _without(argv, flags):
     """argv without these options and their values"""
     out, skip = [], False
@@ -260,7 +289,7 @@ def gateway_proc():
             with open("/proc/%d/environ" % pid, "rb") as f:
                 env = dict(x.split("=", 1) for x in f.read().decode(errors="replace").split("\0") if "=" in x)
             info = {"pid": pid, "argv": argv, "cwd": os.readlink("/proc/%d/cwd" % pid), "env": env,
-                    "coli": any(os.path.basename(a) == "coli" for a in argv[:3]) and "serve" in argv}
+                    "coli": coli_command(argv) is not None}
             info["key"] = _argval(argv, "--api-key") or env.get("COLI_API_KEY")
         except OSError:
             info = None
@@ -1132,7 +1161,7 @@ def start_gguf_download(repo, stem):
     job = new_job("download", "%s %s" % (repo.split("/")[-1], v["quant"]), repo=repo, dest=out)
 
     def after(j):
-        r = subprocess.run([sys.executable, os.path.join(COLI_DIR, "coli"), "import", os.path.join(dest, v["files"][0]["path"]),
+        r = subprocess.run([sys.executable, COLI, "import", os.path.join(dest, v["files"][0]["path"]),
                             "--out", out, "--mode", "link"], capture_output=True, text=True, cwd=COLI_DIR)
         if r.returncode:
             raise RuntimeError("coli import: %s" % (r.stderr or r.stdout)[-400:])
@@ -1155,7 +1184,7 @@ def proc_children(pid):
 
 
 def stop_gateway(p, job):
-    kids = proc_children(p["pid"])
+    kids = [k for k in proc_children(p["pid"]) if k != os.getpid()]   # under `coli web` this UI is one
     job.update(state="stopping", msg="fermo il server attuale")
     os.kill(p["pid"], signal.SIGTERM)
     for _ in range(60):
@@ -1256,11 +1285,11 @@ def switch_model(path, force=False, tier=None):
                 if r.returncode or not os.path.exists(binary):
                     raise RuntimeError("make %s non riuscito: %s" % (d.build_target, (r.stderr or r.stdout)[-300:]))
             if old and old["coli"]:
-                argv, cwd, env = list(old["argv"]), old["cwd"], dict(old["env"])
+                argv, cwd, env = serve_argv(old["argv"]), old["cwd"], dict(old["env"])
                 at = argv.index("serve") + 1
                 argv = argv[:at] + ["--model", path] + _without(argv[at:], ("--model",))
             else:
-                argv = [sys.executable, os.path.join(COLI_DIR, "coli"), "serve", "--model", path,
+                argv = [sys.executable, COLI, "serve", "--model", path,
                         "--host", CFG.host, "--port", str(CFG.port)]
                 cwd, env = COLI_DIR, dict(os.environ)
             if tier == "ram":
@@ -1275,10 +1304,14 @@ def switch_model(path, force=False, tier=None):
                 if nvidia and env.get("COLI_CUDA") != "1" and not _argval(argv, "--gpu"):
                     argv += ["--gpu", "auto"]
             if old and old["coli"]:
+                if old["pid"] == os.getppid():
+                    LIFE["switching"] = True   # `coli web` started this UI: it stays while that stops
                 stop_gateway(old, job)
             log = spath("serve.log")
             job.update(state="starting", msg="avvio il nuovo modello")
             proc = launch(argv, cwd, env, log)
+            if LIFE["switching"]:
+                LIFE["pid"] = proc.pid
             try:
                 wait_up(proc, log, job)
             except RuntimeError as e:
@@ -1287,7 +1320,9 @@ def switch_model(path, force=False, tier=None):
                 if not (old and old["coli"]):
                     raise
                 job.update(state="starting", msg=str(e)[:400], note="non parte: riavvio il modello di prima")
-                back = launch(old["argv"], old["cwd"], old["env"], spath("serve-previous.log"))
+                back = launch(serve_argv(old["argv"]), old["cwd"], old["env"], spath("serve-previous.log"))
+                if LIFE["switching"]:
+                    LIFE["pid"] = back.pid
                 try:
                     wait_up(back, spath("serve-previous.log"), job)
                     job["note"] = "riavviato il modello di prima"
@@ -1300,6 +1335,7 @@ def switch_model(path, force=False, tier=None):
         except Exception as e:   # noqa: BLE001 - said on the page
             job.update(state="error", msg=str(e)[:400])
         finally:
+            LIFE["switching"] = False
             _switching.release()
     try:
         threading.Thread(target=go, daemon=True).start()

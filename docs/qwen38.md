@@ -217,6 +217,34 @@ after the first turn), the second turn after the title: Qwen3.6-35B on the CPU 5
 conversation without the title. OLMoE, attention alone, also resumes where a prompt leaves the
 held state (an answer sent back without its reasoning, a changed turn) instead of reading it all.
 
+### Every prompt kept: the prefix store
+
+The live state, the prompt-end snapshot, the system prompt's pin and a parked conversation each hold
+one place, and a pin only the recurrent state: its rows must still be where they were. An agent with
+two system prompts (two roles, two tool sets) wrote one over the other, so each new conversation read
+its system prompt again; a conversation back after another system prompt took the slot, or sent by
+the gateway to the other slot, read everything. `prefix_store.h` keeps every prompt read, as qwen36
+does ([qwen36.md](qwen36.md#the-prefix-store)): the attention layers' K/V and index rows (the MTP
+head's with them) in blocks of 256 tokens named by their tokens, shared by every prompt that starts
+with them, and checkpoints of the rest (the DeltaNet recurrences and conv windows, the PLE ring and
+history, the MTP head's place) where a prompt's messages start (`<|im_start|>`) and where a turn ends.
+A request takes the deepest checkpoint its prompt starts with when it reaches further than what the
+slot holds, in any slot. The MTP head's rows stand below its own length, so a checkpoint is kept
+only when its whole blocks hold every head row: a block other prompts share is whole.
+
+MEASURED
+
+`tests/test_qwen38_prefix_store.py` holds every request that took the store to a fresh engine
+reading the same prompt with the store off, each step's top five logits to the last digit: a new
+conversation on the same system prompt, the first conversation back after another system prompt
+took the slot, two slots with the conversation on the other one, the MTP head on (the same bytes),
+a budget of nothing, the store off, a read-out reading everything; `QWEN38_PS_BACKEND=vulkan` runs
+both engines on the dense chain (Lavapipe in `tests/vulkan_engines.sh`). Leaving out the rows or
+the state makes it fail. `COLI_PREFIX_STORE=0` or `COLI_KV_PREFIX=0` turns it off.
+
+A parked conversation that comes back now lowers the MTP head's device mirror too: it held the short
+request's rows, and the head's drafts read them (the answer the same, the drafts worse).
+
 ## Routed experts as int4-g64
 
 Optional. Decode waits on routed experts: a miss is a disk read, and how many
@@ -331,6 +359,92 @@ reference of the dequantized sidecar through every expert path with the last
 logits identical to the bit across them, and the CUDA tier declining the int4
 experts on the fake backend.
 
+### The sidecar on several drives
+
+A sidecar can be read from copies on other drives. `COLI_MODEL_MIRROR` lists
+directories that each hold a copy of the sidecar directory (`<dir>/experts-int4g64/`
+or the low-bit one in use; the FP8 shards need not be there). A file of a copy is used
+only when its size and safetensors header equal the primary's, so a partial or stale
+copy leaves those files on the primary. Each record is read from the drive a hash of
+its (layer, expert) picks, in shares set by `COLI_DISK_WEIGHTS=<primary>,<mirror>[,...]`
+(relative read bandwidth; equal shares when unset, no probe; a list that is not one
+positive weight per drive is refused). The same expert always comes from the same
+drive and every copy holds the same bytes, so tokens and logits do not move. The
+startup prints the split and the run's end the reads each drive served:
+
+```
+[qwen38 MIRROR] 2 replicas of experts-int4g64/, split COLI_DISK_WEIGHTS: primary 64/256 mirror 192/256
+[qwen38 MIRROR] reads: primary 18 (0.000 GB) | mirror1 44 (0.000 GB)
+```
+
+The snapshot's own FP8 experts, and `COLI_MAP_EXPERTS=1`'s mappings, stay on the
+primary. `make -C c qwen38-tiny-mirror-check` runs the int4 fixture with one and two
+copies (tokens and last logits equal to the run without them, every drive serving
+reads), a differing file, and bad weights.
+
+## Routed experts as MXFP4 (AMD Quark)
+
+AMD publishes the model with its routed experts quantized to MXFP4 with Quark
+(OCP microscaling: e2m1 values two to a byte, one E8M0 exponent per 32
+inputs, 4.25 bits a weight). `tools/convert_qwen38_experts_mxfp4.py` copies
+those bytes, unchanged, into `<model>/experts-mxfp4/` next to the FP8 release,
+which it only reads; nothing is quantized again.
+
+```sh
+python3 c/tools/convert_qwen38_experts_mxfp4.py --model ~/Models/Qwen3.8-Flash-Next-FP8 \
+    --quark ~/Models/Qwen3.8-Flash-Next-MXFP4 --plan
+python3 c/tools/convert_qwen38_experts_mxfp4.py --model ~/Models/Qwen3.8-Flash-Next-FP8 \
+    --quark ~/Models/Qwen3.8-Flash-Next-MXFP4
+```
+
+| | FP8 (release) | int4-g64 sidecar | MXFP4 sidecar |
+|---|---|---|---|
+| bytes per expert | 4,915,200 | 2,764,800 | 2,611,200 (2,613,248 with its pad) |
+
+The layout is the int4 sidecar's (one `layer-NNN.safetensors` per layer and
+`index.json`, resumable, refused when its index or files disagree with
+`config.json`), with one record per expert starting on a 4096-byte boundary:
+
+```
+gate scales U8 [I, H/32] | down scales U8 [H, I/32] | up scales U8 [I, H/32] |
+gate e2m1 U8 [I, H/2] | down e2m1 U8 [H, I/2] | up e2m1 U8 [I, H/2] | pad
+```
+
+named like Quark's tensors (`...experts.E.gate_proj.weight_scale` and
+`.weight`, under the release's prefix) and read as `quant.h`'s
+`matmul_mxfp4` reads them: w = e2m1(nibble) x 2^(scale - 127), the low nibble
+the even column. Before a layer is written the converter checks every
+expert's dtypes and shapes, refuses the E8M0 NaN (255), and compares four
+experts of the layer, dequantized, with the FP8 release's (cosine per matrix,
+`--min-cos`, 0.95 by default): a nibble order, a scale axis or a name mix-up
+shows as a cosine near 0.
+
+`make -C c qwen38-tiny-mxfp4-generate` builds the tiny fixture with MXFP4
+experts (`tools/make_qwen38_tiny.py --mxfp4-experts`): the experts rounded to
+MXFP4, written under `quark/` with Quark's names and as FP8 shards that hold
+the same values exactly, converted, and checked record by record against the
+Quark bytes and value by value against the FP8 shards. Its `ref.json` is the
+float32 reference of those values.
+
+`Q38_EXPERT_LOWBIT=mxfp4` runs the routed experts from the sidecar: one read
+per miss of 2.6 MB instead of 4.9 MB, multiplied by `quant.h`'s
+`matmul_mxfp4`, the kernel the other MXFP4 engines use; a row's result does
+not depend on how many rows the call carries, so decode and the prompt batch
+give the same bits. The sidecar is used only when asked for (the int4-g64 one
+is the only sidecar picked up unasked), refused when its `index.json` or a
+record disagrees with `config.json`, and an incomplete one is refused rather
+than falling back to FP8. The trunk, the shared expert and the MTP head stay
+the FP8 snapshot's. The CUDA and the Vulkan expert tiers do not take MXFP4
+experts yet: with `COLI_CUDA=1` or `COLI_VULKAN=1` they stay on the CPU, with a
+line saying so.
+
+`make -C c qwen38-tiny-mxfp4-check` runs the engine on the fixture's sidecar
+through the single, batched, prompt-batch and mapped expert paths at caps 1, 2
+and 4: every run reproduces `ref.json` with the last logits identical to the
+bit across paths, the same fixture's FP8 experts give the same tokens and
+last logits within cosine 0.99999, and every refusal above is checked in its
+own process.
+
 ## Speculative decoding with the MTP head
 
 On by default from 1.13.0 when the checkpoint has it (`Q38_MTP=0` turns it off, and
@@ -433,6 +547,13 @@ cost of a verify by its rows. Prompt lookup (on by default) adds drafts (up to 5
 the context's n-grams), and a verify carries whichever proposal is worth more. The
 output stays that of plain decoding. Measured on the release with the int4-g64 sidecar: 4.94 tok/s at two drafts against 4.71 at one and 4.12 without MTP on the CPU (2.75 tokens per forward), 4.55 against 4.39 and 3.91 with the Vulkan tier and chain on a Radeon 780M, so two drafts is the default (one on an integrated GPU with 32 or more compute units, the tier and the chain on). The details, the settings and the
 tests are in [speculative.md](speculative.md).
+
+`COLI_DFLASH=<dir>` drafts with a DFlash2 drafter (`incoai/Qwen3.8-Flash-Next-DFlash2`) in
+the head's place on the CUDA chain, its context the four streams after its target layers
+(their sum). On Qwen3.8-Flash-Next IQ2_XS it is at the head's pace at best (3 drafts: 92.0 /
+70.5 / 71.8 tok/s code, prose, a list, the head 91 to 97 / 70 to 71 / 80 to 90): each verify
+row brings its own experts, so the head's cheaper drafts stay the default; see
+[speculative.md](speculative.md#dflash2).
 
 `make -C c qwen38-tiny-mtp-check` adds a head with random weights under the
 release's names to the three tiny fixtures and gates on the head's draft

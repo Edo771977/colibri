@@ -123,6 +123,7 @@ typedef struct {
     size_t smem_optin;      /* shared bytes a block may ask for (the block GEMVs past 48 KiB) */
     int sms;                /* multiprocessors (f32_gemm_launch's tile) */
     char *moe_stage; size_t moe_stage_slot; int moe_stage_n;   /* coli_cuda_moe_stage: a decode step's host experts' copies */
+    struct { cudaStream_t st; void *p; size_t cap; } skp[8];   /* HIP: gemv_i8_w4's split partials, a buffer a stream (gemv_sk_part) */
 #ifdef COLI_ANS
     void *ans_raw; size_t ans_raw_cap;
     void *ans_host; size_t ans_host_cap;
@@ -867,6 +868,210 @@ __global__ static void grouped_down_e8(float *y,const float *x,const GroupDesc *
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
 }
 
+/* ---- Warp-per-row fmt=6 expert kernels -----------------------------------
+ * The block-per-output kernels above give a whole 256-thread block to ONE
+ * output element. With COLI_E8_SUB=32 only width/32 threads have a sub-block to
+ * decode, and the single float they produce is folded by an 8-round
+ * __syncthreads tree:
+ *
+ *   kernel                    width  sub-blocks  idle threads  bytes/block
+ *   grouped_hidden_e8_dual    6144      192          25 %         4704
+ *   grouped_down_e8           2048       64          75 %          784
+ *
+ * Measured on GB10 / GLM-5.2 decode: 8.3 GB of expert weights per token in
+ * ~425 ms = ~21 GB/s out of the machine's 273 GB/s, with nvidia-smi reporting
+ * 96 % "utilization" at 40 W -- the signature of a kernel that is always
+ * resident and always synchronizing, not one that is short of bandwidth or of
+ * blocks (grouped_down_e8 launches 49152 blocks per layer).
+ *
+ * Here one WARP owns one output row and folds with __shfl_down_sync: no barrier
+ * and no shared memory in the reduction. COLI_E8_WARPS_PER_BLOCK warps share ONE
+ * staged copy of the activation row, so the activation is read from global
+ * memory once per block instead of once per output.
+ *
+ * The shared copy is PADDED to 33 floats per sub-block. Without the pad, lane L
+ * reads sx[L*32+k]: for a fixed k every lane lands on bank (L*32+k)%32 == k%32,
+ * i.e. a 32-WAY bank conflict that would have made the staging slower than the
+ * global reads it replaces. With stride 33 the bank is (L+k)%32 -- all distinct.
+ *
+ * The tail sub-block is zero-filled instead of clamped, so the inner loop is a
+ * fixed 32 iterations: a zero activation contributes nothing to the dot product.
+ *
+ * ACCUMULATION ORDER DIFFERS from the block-tree version (warp-strided, folded
+ * pairwise across 5 shuffle rounds, instead of block-strided folded across 8
+ * shared-memory rounds). Results are therefore NOT bit-identical. This matters:
+ * an E8 dot product is 6144 fp32 terms, and reordering one can flip an argmax on
+ * a marginal token. Both orders must be checked against a DOUBLE precision
+ * reference, never against each other -- a test is never better than its oracle.
+ *
+ * COLI_E8_WARP=0 restores the block-per-output kernels for A/B without a rebuild. */
+#define COLI_E8_WARPS_PER_BLOCK 8
+#define COLI_E8_SPAD (COLI_E8_SUB+1)
+static_assert(COLI_E8_SUB==32,"the >>5 / &31 sub-block indexing below assumes COLI_E8_SUB==32");
+
+static int e8_warp_kernels(void){
+    static int v=-1;
+    if(v<0){ const char *e=std::getenv("COLI_E8_WARP"); v=e?std::atoi(e):1; }
+    return v;
+}
+
+__device__ __forceinline__ float e8_warp_fold(float v){
+    for(int off=16;off;off>>=1) v+=f8_shfl_down(v,off);   /* CUDA: __shfl_down_sync, HIP: __shfl_down */
+    return v;
+}
+/* Stage one activation row into padded shared memory; zero-fill the tail. */
+__device__ __forceinline__ void e8_stage_x(float *sx,const float *xs,int n,int nsub){
+    for(int i=threadIdx.x;i<n;i+=blockDim.x)
+        sx[(size_t)(i>>5)*COLI_E8_SPAD+(i&31)]=xs[i];
+    for(int i=n+(int)threadIdx.x;i<nsub*COLI_E8_SUB;i+=blockDim.x)
+        sx[(size_t)(i>>5)*COLI_E8_SPAD+(i&31)]=0.f;
+}
+/* Stage the E8 codebook into shared memory, PRE-SCALED by the 0.5 that
+ * e8_expand_sub_dev applies to every magnitude.
+ *
+ * __constant__ memory is built for BROADCAST -- every thread at one address,
+ * one cycle. Here each lane decodes a different sub-block, so the eight
+ * c_e8_grid[idx] lookups per sub-block are 32 DIVERGENT addresses per warp, and
+ * the constant cache serializes them. Shared memory is banked and takes
+ * divergent addresses in one or two cycles, which is the standard remedy.
+ *
+ * Storing floats rather than the packed bytes also removes an int->float
+ * conversion and a multiply PER WEIGHT, and makes the access a natural 4-byte
+ * bank read instead of a byte extract. Cost: 4 KB of shared memory per block. */
+#define COLI_E8_CB_FLOATS 1024
+__device__ __forceinline__ void e8_stage_codebook(float *cb){
+    for(int i=threadIdx.x;i<COLI_E8_CB_FLOATS;i+=blockDim.x)
+        cb[i]=(float)((const uint8_t*)c_e8_grid)[i]*0.5f;
+}
+/* e8_expand_sub_dev with the codebook in shared memory and the parity computed
+ * in one instruction instead of an 8-step serial XOR chain. The odd-parity bit
+ * that closes each group of 8 is the XOR of the 7 explicit sign bits, i.e.
+ * __popc(seven)&1 -- same value, no dependency chain. Numerically identical to
+ * e8_expand_sub_dev term by term. */
+__device__ __forceinline__ void e8_expand_sub_sm(const uint8_t *blk,int ib,float d,
+                                                 float *out,const float *cb){
+    uint32_t word=e8_ld_u32(blk+COLI_E8_QK/4+ib*4);
+    float db=d*(0.5f+(float)((word>>28)&0xF))*0.5f;
+    const uint8_t *idx=blk+ib*8;
+    for(int l=0;l<4;l++){
+        uint32_t seven=(word>>(7*l))&0x7F;
+        uint32_t signs=seven|((uint32_t)(__popc(seven)&1)<<7);
+        const float *g0=cb+(size_t)idx[l*2+0]*4,*g1=cb+(size_t)idx[l*2+1]*4;
+        for(int j=0;j<8;j++){
+            float mag=(j<4?g0[j]:g1[j-4]);
+            out[l*8+j]=((signs>>j)&1)?-mag*db:mag*db;
+        }
+    }
+}
+
+/* One sub-block's contribution to a dot product, summed locally before it joins
+ * the caller's accumulator: 32 terms then one add, instead of 32 adds onto a
+ * running total.
+ *
+ * COLI_E8_ACCS independent accumulators per lane keep the rounding chain short.
+ * Measured against the double reference at GLM-5.2's decode shape (I=6144,
+ * O=2048, tests/test_backend_cuda.cu with T6_I/T6_O/T6_VERBOSE): one accumulator
+ * per lane gave relative_rms 3.94e-07 against the block kernel's 2.72e-07 --
+ * both far inside the 2e-4 limit, but a 45 % regression bought for nothing. A
+ * warp holds 32 lanes over nsub sub-blocks, so one accumulator means a 192-term
+ * chain at D=6144; four means at most 64. This is the same argument that made
+ * the NEON path MORE accurate than the scalar one it replaced: independent
+ * accumulators break the rounding chain of a long single-precision sum. */
+#define COLI_E8_ACCS 4
+static_assert(COLI_E8_QK/COLI_E8_SUB==8,"the sb>>3 / sb&7 block indexing assumes QK/SUB==8");
+__device__ __forceinline__ void e8_dot_sub(const uint8_t *row,int sb,const float *sx,
+                                           const float *cb,float *acc){
+    const uint8_t *blk=row+(size_t)(sb>>3)*COLI_E8_BBYTES;
+    float w[COLI_E8_SUB]; e8_expand_sub_sm(blk,sb&7,e8_fp16(blk+96),w,cb);
+    const float *xv=sx+(size_t)sb*COLI_E8_SPAD;
+    float s=0; for(int k=0;k<COLI_E8_SUB;k++) s+=xv[k]*w[k];
+    *acc+=s;
+}
+
+__global__ static void grouped_hidden_e8_dual_warp(float *gate,const float *x,
+                                                   const GroupDesc *desc,int I,int D){
+    extern __shared__ float sx[];
+    int lane=threadIdx.x&31,w=threadIdx.x>>5;
+    int s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];
+    int nsub=(D+COLI_E8_SUB-1)/COLI_E8_SUB;
+    float *cb=sx+(size_t)nsub*COLI_E8_SPAD;
+    if(s<d.rows) e8_stage_x(sx,x+(size_t)(d.offset+s)*D,D,nsub);
+    e8_stage_codebook(cb);
+    __syncthreads();                       /* one barrier per BLOCK, not per output */
+    if(s>=d.rows) return;
+    int o=blockIdx.x*COLI_E8_WARPS_PER_BLOCK+w; if(o>=I) return;
+    size_t rb=row_bytes(6,D);
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*rb;
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*rb;
+    float g0=0,g1=0,g2=0,g3=0,u0=0,u1=0,u2=0,u3=0;
+    for(int sb=lane;sb<nsub;sb+=32*COLI_E8_ACCS){
+                            e8_dot_sub(gr,sb,   sx,cb,&g0), e8_dot_sub(ur,sb,   sx,cb,&u0);
+        if(sb+32<nsub)      e8_dot_sub(gr,sb+32,sx,cb,&g1), e8_dot_sub(ur,sb+32,sx,cb,&u1);
+        if(sb+64<nsub)      e8_dot_sub(gr,sb+64,sx,cb,&g2), e8_dot_sub(ur,sb+64,sx,cb,&u2);
+        if(sb+96<nsub)      e8_dot_sub(gr,sb+96,sx,cb,&g3), e8_dot_sub(ur,sb+96,sx,cb,&u3);
+    }
+    float ga=(g0+g1)+(g2+g3),ua=(u0+u1)+(u2+u3);
+    ga=e8_warp_fold(ga); ua=e8_warp_fold(ua);
+    if(!lane) gate[(size_t)(d.offset+s)*I+o]=(ga/(1.f+expf(-ga)))*ua;
+}
+
+__global__ static void grouped_down_e8_warp(float *y,const float *x,
+                                            const GroupDesc *desc,int D,int I){
+    extern __shared__ float sx[];
+    int lane=threadIdx.x&31,w=threadIdx.x>>5;
+    int s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];
+    int nsub=(I+COLI_E8_SUB-1)/COLI_E8_SUB;
+    float *cb=sx+(size_t)nsub*COLI_E8_SPAD;
+    if(s<d.rows) e8_stage_x(sx,x+(size_t)(d.offset+s)*I,I,nsub);
+    e8_stage_codebook(cb);
+    __syncthreads();
+    if(s>=d.rows) return;
+    int o=blockIdx.x*COLI_E8_WARPS_PER_BLOCK+w; if(o>=D) return;
+    size_t rb=row_bytes(6,I);
+    const uint8_t *wr=(const uint8_t*)d.d+(size_t)o*rb;
+    float a0=0,a1=0,a2=0,a3=0;
+    for(int sb=lane;sb<nsub;sb+=32*COLI_E8_ACCS){
+                       e8_dot_sub(wr,sb,   sx,cb,&a0);
+        if(sb+32<nsub) e8_dot_sub(wr,sb+32,sx,cb,&a1);
+        if(sb+64<nsub) e8_dot_sub(wr,sb+64,sx,cb,&a2);
+        if(sb+96<nsub) e8_dot_sub(wr,sb+96,sx,cb,&a3);
+    }
+    float sum=(a0+a1)+(a2+a3);
+    sum=e8_warp_fold(sum);
+    if(!lane) y[(size_t)(d.offset+s)*D+o]=sum;
+}
+/* Shared-memory bytes one warp-kernel block needs: the padded activation row
+ * plus the pre-scaled codebook. D=6144 -> (192*33 + 1024)*4 = 29440 B; I=2048 ->
+ * 12544 B. Both inside the 48 KB a block gets without an opt-in call. */
+static size_t e8_warp_smem(int width){
+    int nsub=(width+COLI_E8_SUB-1)/COLI_E8_SUB;
+    return ((size_t)nsub*COLI_E8_SPAD+COLI_E8_CB_FLOATS)*sizeof(float);
+}
+/* The fmt=6 group, on either kernel family. Both call sites (the synchronous
+ * coli_cuda_expert_group and the issue/take split) go through here so the two
+ * cannot drift -- the rotate between the two matmuls is part of the sequence,
+ * not of either kernel. */
+static int e8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
+                           int max_rows,int count,int total){
+    /* the warp kernels stage a whole row in shared memory: past the 48 KB a block gets without
+     * an opt-in (a width over 10 912) they would not launch, so such a group keeps the block ones */
+    if(e8_warp_kernels() && e8_warp_smem(D) <= 48u*1024u && e8_warp_smem(I) <= 48u*1024u){
+        unsigned hb=(unsigned)((I+COLI_E8_WARPS_PER_BLOCK-1)/COLI_E8_WARPS_PER_BLOCK);
+        unsigned ob=(unsigned)((D+COLI_E8_WARPS_PER_BLOCK-1)/COLI_E8_WARPS_PER_BLOCK);
+        dim3 hg(hb,(unsigned)max_rows,(unsigned)count),og(ob,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_e8_dual_warp<<<hg,256,e8_warp_smem(D),ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
+        if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
+        grouped_down_e8_warp<<<og,256,e8_warp_smem(I),ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        return 1;
+    }
+    dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),
+         og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+    grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
+    if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
+    grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    return 1;
+}
+
 __device__ static void unpack_s4(uint8_t v,float *lo,float *hi){
     int a=v&15,b=v>>4; *lo=(float)(a&8?a-16:a); *hi=(float)(b&8?b-16:b);
 }
@@ -1061,6 +1266,103 @@ __global__ static void grouped_down_f8w(float *y,const float *x,const GroupDesc 
         }
         if(!lane)for(int s=0;s<ns;s++)
             y[(size_t)(d.offset+s0+s)*D+o]=(float)a[s];
+    }
+}
+
+/* fmt=7 (MXFP4) expert groups: one WARP owns one (expert, output row) and its
+ * lanes take the row's 32-input groups in turn (16 bytes of e2m1 nibbles and one
+ * ue8m0 byte each), each decoded once for a tile of up to 4 activation rows. As
+ * in quant.h's matmul_mxfp4, a group's products are summed unscaled in column
+ * order and scaled once by mx4_scale_dev (s=0 gives +0, s=255 +inf, as on the
+ * CPU); the lanes' sums then fold across the warp, so the result matches the CPU
+ * to rounding, not to the bit. K%32==0 rows on 16-byte boundaries take vector
+ * loads, any other K (a short last group) a byte at a time. The 16 decoded
+ * values sit in shared memory, filled from mx4_decode itself. Grid
+ * (ceil(O/8), count) of 256 threads, like the fmt=8 warp kernels. */
+__device__ __forceinline__ void mx4_lut_fill(float *lut){
+    if(threadIdx.x<16)lut[threadIdx.x]=mx4_decode((int)threadIdx.x);
+    __syncthreads();
+}
+__device__ __forceinline__ void mx4_group(const float *lut,const uint8_t *row,int g,int glen,int vec,float *w){
+    if(vec){
+        uint4 q=*(const uint4*)(row+(size_t)g*16);
+        uint32_t v[4]={q.x,q.y,q.z,q.w};
+#pragma unroll
+        for(int j=0;j<4;j++)
+#pragma unroll
+            for(int k=0;k<8;k++)w[j*8+k]=lut[(v[j]>>(4*k))&15];   /* low nibble: the even column */
+        return;
+    }
+#pragma unroll
+    for(int k=0;k<32;k++){int i=(g<<5)+k;w[k]=k<glen?lut[(row[i>>1]>>((i&1)*4))&15]:0.f;}
+}
+/* Up to 4 rows of xs (K wide) against row a (and b, DUAL); pa/pb hold the warp's sums on every lane. */
+template<int DUAL>
+__device__ __forceinline__ void mx4_rows(const float *lut,const uint8_t *a,const uint8_t *as,
+                                         const uint8_t *b,const uint8_t *bs,const float *xs,
+                                         int K,int ns,float *pa,float *pb){
+    int lane=threadIdx.x&31,ng=(K+31)>>5;
+    int vec=!(K&31)&&!((size_t)a&15)&&(!DUAL||!((size_t)b&15))&&!((size_t)xs&15);
+    float sa_[4]={0,0,0,0},sb_[4]={0,0,0,0};
+    for(int g=lane;g<ng;g+=32){
+        int glen=K-(g<<5)<32?K-(g<<5):32;
+        float wa[32],wb[32];
+        mx4_group(lut,a,g,glen,vec,wa);
+        if(DUAL)mx4_group(lut,b,g,glen,vec,wb);
+        float ka=mx4_scale_dev(as[g]),kb=DUAL?mx4_scale_dev(bs[g]):0.f;
+#pragma unroll
+        for(int s=0;s<4;s++){
+            if(s>=ns)break;
+            const float *xr=xs+(size_t)s*K+((size_t)g<<5);
+            float ga=0.f,gb=0.f;
+            if(vec){
+                const float4 *xp=(const float4*)xr;
+#pragma unroll
+                for(int q=0;q<8;q++){
+                    float4 xv=xp[q];
+                    ga+=xv.x*wa[4*q];ga+=xv.y*wa[4*q+1];ga+=xv.z*wa[4*q+2];ga+=xv.w*wa[4*q+3];
+                    if(DUAL){gb+=xv.x*wb[4*q];gb+=xv.y*wb[4*q+1];gb+=xv.z*wb[4*q+2];gb+=xv.w*wb[4*q+3];}
+                }
+            }else{
+#pragma unroll
+                for(int k=0;k<32;k++)if(k<glen){ga+=xr[k]*wa[k];if(DUAL)gb+=xr[k]*wb[k];}
+            }
+            sa_[s]+=ga*ka;if(DUAL)sb_[s]+=gb*kb;
+        }
+    }
+#pragma unroll
+    for(int s=0;s<4;s++){
+        for(int off=16;off;off>>=1){sa_[s]+=f8_shfl_down(sa_[s],off);if(DUAL)sb_[s]+=f8_shfl_down(sb_[s],off);}
+        pa[s]=sa_[s];if(DUAL)pb[s]=sb_[s];
+    }
+}
+__global__ static void grouped_hidden_mx4_dual(float *gate,const float *x,const GroupDesc *desc,int I,int D){
+    __shared__ float lut[16];mx4_lut_fill(lut);
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int o=blockIdx.x*(blockDim.x>>5)+warp,c=blockIdx.y;GroupDesc d=desc[c];
+    if(o>=I)return;
+    size_t rb=(size_t)(D+1)/2,sb=(size_t)(D+31)/32;
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*rb,*ur=(const uint8_t*)d.u+(size_t)o*rb;
+    const uint8_t *gs=(const uint8_t*)d.gs+(size_t)o*sb,*us=(const uint8_t*)d.us+(size_t)o*sb;   /* ue8m0 bytes */
+    for(int s0=0;s0<d.rows;s0+=4){
+        int ns=d.rows-s0<4?d.rows-s0:4;
+        float g[4],u[4];
+        mx4_rows<1>(lut,gr,gs,ur,us,x+(size_t)(d.offset+s0)*D,D,ns,g,u);
+        /* the duals' fused epilogue: silu(gate)*up lands in gate[] */
+        if(!lane)for(int s=0;s<ns;s++)gate[(size_t)(d.offset+s0+s)*I+o]=(g[s]/(1.f+expf(-g[s])))*u[s];
+    }
+}
+__global__ static void grouped_down_mx4(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    __shared__ float lut[16];mx4_lut_fill(lut);
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int o=blockIdx.x*(blockDim.x>>5)+warp,c=blockIdx.y;GroupDesc d=desc[c];
+    if(o>=D)return;
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*((I+1)/2),*sc=(const uint8_t*)d.ds+(size_t)o*((I+31)/32);
+    for(int s0=0;s0<d.rows;s0+=4){
+        int ns=d.rows-s0<4?d.rows-s0:4;
+        float p[4];
+        mx4_rows<0>(lut,row,sc,nullptr,nullptr,x+(size_t)(d.offset+s0)*I,I,ns,p,nullptr);
+        if(!lane)for(int s=0;s<ns;s++)y[(size_t)(d.offset+s0+s)*D+o]=p[s];
     }
 }
 
@@ -1366,8 +1668,11 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         }
 #endif
         g_nctx++;
-        std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
-                     device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
+        /* the PCI address too: nvidia-smi's numbering is the bus order, the runtime's the
+         * CUDA_DEVICE_ORDER the process started with (coli sets PCI_BUS_ID, #2887) */
+        std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d, PCI %04x:%02x:%02x\n",
+                     device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor,
+                     (unsigned)prop.pciDomainID, (unsigned)prop.pciBusID, (unsigned)prop.pciDeviceID);
     }
     return 1;
 }
@@ -1397,6 +1702,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
         for(int b=0;b<27;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
+        for(int b=0;b<8;b++) if(ctx->skp[b].p) cudaFree(ctx->skp[b].p);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
@@ -1564,6 +1870,51 @@ static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fm
  * BD_GEMV_MAX_S rows (a decode step, a verify's) on the GEMV, each row a decode step's bits;
  * more (a prompt chunk) through the tensor cores' tiles where the device has them (bd_tensor_gemm) */
 #define BD_GEMV_MAX_S 8
+/* bd_mmg_k up to this many rows: a verify's of up to 7 drafts, 8 conversations' (more on the GEMV's
+ * tiles, whose bits no GEMV row has) */
+#define BD_MMQ_MAX_S 8
+/* and for matrices of this many outputs or more: a smaller one (Qwen3.8-27B's k and v, 1024; its
+ * DeltaNet's alpha and beta, 48) has too few blocks for it, and stays on the GEMV for every row
+ * count (a matrix's form is its shape's, never its rows': its rows keep the same bits) */
+#define BD_MMQ_MIN_O 2048
+/* the first row count bd_mmg_k takes for t, as quick as the GEMV from there (whose bits its are), by
+ * type and shape from an RTX PRO 4000's measures (us at 1 / 2 / 3 / 4 rows, GEMV against bd_mmg_k):
+ * Q3_K from one row on every shape (5120 x 17408 133 / 119 at 1; the lm_head, 5120 x 248320, 2184 /
+ * 2013); Q6_K and Q8_0 from 2 (Q6_K 17408 x 5120 240 / 210 at 2), the lm_head and Q6_K's rows of 2560 or
+ * fewer inputs from 3 (Q6_K 5120 x 248320 3064 / 3160 at 2, 3288 / 3258 at 3), Q8_0's matrices under
+ * 2^24 weights from 3; Q4_K from 3 (5120 x 10240 82.9 / 83.3 at 3, 90.7 / 86.5 at 4); Q5_K from 3 where
+ * the outputs are 16384 or more, else 4 (17408 x 5120 170.6 / 177.6 at 3); IQ4_XS and IQ4_NL from 3,
+ * rows of 2560 or fewer inputs from 4 (2560 x 10240 42.0 / 43.9 at 3); IQ2_XXS and IQ1_S from 3,
+ * IQ2_XXS 2560 x 8192 or more from 5 (2560 x 10240 34.2 / 35.6 at 4); IQ2_XS, IQ2_S, IQ3_XXS, Q2_K
+ * from 4 (IQ2_XS 5120 x 17408 116.7 / 126.6 at 3, 135.6 / 129.8 at 4); IQ3_S from 4, rows of 2560
+ * inputs from 5 (2560 x 10240 40.7 / 43.1 at 4). COLI_CUDA_BD_MMQ=n: from n rows for every matrix, 0
+ * never. */
+static inline int bd_mmq_min(const ColiCudaTensor *t) {
+    static int v = -2;
+    if (v == -2) { const char *e = std::getenv("COLI_CUDA_BD_MMQ"); v = e && *e ? (std::atoi(e) > 0 ? std::atoi(e) : 0) : -1; }
+    if (v >= 0) return v;
+    const int ty = t->fmt - 100;
+    const size_t n = (size_t)t->I * t->O;
+    if (ty == 11) return 1;
+    if (ty == 19) return 3;
+    if (ty == 16) return t->I <= 2560 && t->O >= 8192 ? 5 : 3;
+    if (ty == 21) return t->I <= 2560 ? 5 : 4;
+    if (ty == 10 || ty == 17 || ty == 18 || ty == 22) return 4;
+    if (ty == 14) return t->O >= 131072 || t->I <= 2560 ? 3 : 2;
+    if (ty == 8) return t->O >= 131072 || n < ((size_t)1 << 24) ? 3 : 2;
+    if (ty == 13) return t->O >= 16384 ? 3 : 4;
+    if (ty == 12) return 3;
+    return t->I <= 2560 ? 4 : 3;   /* IQ4_XS, IQ4_NL */
+}
+/* whether bd_mmg_k takes S rows of t (sm_80 on): its types, the GEMV's classes 8 or more, 2048 outputs or
+ * more (a smaller matrix has too few blocks for it and stays on the GEMV) */
+static inline int bd_mmq_takes(const DeviceContext *ctx, const ColiCudaTensor *t, int S) {
+    const int m = bd_mmq_min(t);
+    return ctx && m > 0 && S >= m && S <= BD_MMQ_MAX_S && t->fmt >= 100 && bd_mmq_has(t->fmt - 100) && t->O >= BD_MMQ_MIN_O &&
+           t->I % 256 == 0 && bd_lpr(t->I) >= 8 && ctx->compute_major >= 8;
+}
+/* cuda_chain.cu's: x unchanged since this thread's last matmul on the stream (bd_xq_quant keeps its quantization) */
+extern "C" void coli_cuda_bd_x_same(int on) { g_bd_x_same = on; }
 static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st);
 static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
     const bd_u32 *tab = bd_table(ctx);
@@ -1575,6 +1926,13 @@ static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
         const char *e = std::getenv("COLI_CUDA_BD_FLOAT"), *q = std::getenv("GQ_EXACT");
         exact = (e && *e == '1') || (q && *q == '1');
     }
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+    /* a verify's rows and several conversations' (bd_mmq_min to BD_MMQ_MAX_S): the tensor cores'
+     * integer steps (bd_mmg_k), each row the GEMV's bits */
+    if (!exact && bd_mmq_takes(ctx, t, S) &&
+        bd_mmg_launch(y, x, (const bd_u32 *)t->weights, t->fmt, t->I, t->O, t->row_words, S, st, tab))
+        return cuda_ok(cudaGetLastError(), "block mmq launch");
+#endif
     if (!exact && S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;
     if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, exact, st)) return 0;
     return cuda_ok(cudaGetLastError(), "block gemv launch");
@@ -1953,6 +2311,73 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* ---- a vision tower's attention (see backend_cuda.h) ---------------------- */
+/* One thread a query of one head, the block's 128 queries sharing each tile of VA_KT keys and values
+ * through shared memory; the softmax online, in float32, the keys in their order: the result does
+ * not depend on the launch. qkv is [n][3][heads][D] (q, k, v of a row side by side, as the tower's
+ * qkv matrix writes them), out [n][heads][D]. */
+#define VA_KT 32
+template <int D>
+__global__ static void vis_attn_k(const float *__restrict__ qkv, float *__restrict__ out, int n, int heads, float scale) {
+    __shared__ float ks[VA_KT][D], vs[VA_KT][D];
+    const int h = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x, H = heads * D;
+    const size_t row = (size_t)3 * H;
+    const bool live = i < n;
+    float q[D], acc[D], m = -INFINITY, l = 0.f;
+    for (int d = 0; d < D; d++) { q[d] = live ? qkv[(size_t)i * row + (size_t)h * D + d] * scale : 0.f; acc[d] = 0.f; }
+    for (int j0 = 0; j0 < n; j0 += VA_KT) {
+        const int tn = n - j0 < VA_KT ? n - j0 : VA_KT;
+        for (int t = threadIdx.x; t < tn * D; t += blockDim.x) {
+            const int jj = t / D, d = t % D;
+            const float *r = qkv + (size_t)(j0 + jj) * row + (size_t)h * D + d;
+            ks[jj][d] = r[H];
+            vs[jj][d] = r[2 * H];
+        }
+        __syncthreads();
+        if (live)
+            for (int jj = 0; jj < tn; jj++) {
+                float s = 0.f;
+                for (int d = 0; d < D; d++) s = fmaf(q[d], ks[jj][d], s);
+                if (s > m) {
+                    const float c = expf(m - s);
+                    l *= c;
+                    for (int d = 0; d < D; d++) acc[d] *= c;
+                    m = s;
+                }
+                const float p = expf(s - m);
+                l += p;
+                for (int d = 0; d < D; d++) acc[d] = fmaf(p, vs[jj][d], acc[d]);
+            }
+        __syncthreads();
+    }
+    if (live) {
+        const float inv = 1.f / l;
+        for (int d = 0; d < D; d++) out[(size_t)i * H + (size_t)h * D + d] = acc[d] * inv;
+    }
+}
+
+extern "C" int coli_cuda_vision_attention(int device, float *out, const float *qkv, int n, int heads, int D, float scale) {
+    if (fault_injected()) return 0;
+    if (n < 1 || heads < 1 || !out || !qkv) return 0;
+    if (D != 64 && D != 72 && D != 80 && D != 96 && D != 128) return 0;   /* another head width: the CPU's */
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    const size_t xb = (size_t)n * 3 * heads * D * sizeof(float), yb = (size_t)n * heads * D * sizeof(float);
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->dx, qkv, xb, cudaMemcpyHostToDevice), "vision qkv upload")) return 0;
+    dim3 grid((unsigned)((n + 127) / 128), (unsigned)heads);
+    switch (D) {
+    case 64: coli_launch(vis_attn_k<64>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    case 72: coli_launch(vis_attn_k<72>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    case 80: coli_launch(vis_attn_k<80>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    case 96: coli_launch(vis_attn_k<96>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    default: coli_launch(vis_attn_k<128>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    }
+    if (!cuda_ok(cudaGetLastError(), "vision attention launch") ||
+        !cuda_ok(cudaMemcpy(out, ctx->dy, yb, cudaMemcpyDeviceToHost), "vision attention download")) return 0;
+    return 1;
+}
+
 /* ---- gated delta layer on the device (see backend_cuda.h) ---------------- */
 #define DN_MAX_HEADS 64
 struct DnGates { float egh[DN_MAX_HEADS]; float beta[DN_MAX_HEADS]; };
@@ -2305,6 +2730,13 @@ static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
     grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
 }
 
+/* fmt=7 groups, the sync and the issue dispatch alike (silu fused in the dual) */
+static void mx4_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,int count){
+    dim3 hg((unsigned)((I+7)/8),(unsigned)count),og((unsigned)((D+7)/8),(unsigned)count);
+    grouped_hidden_mx4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
+    grouped_down_mx4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+}
+
 /* The kernels the CUDA chain runs a decode step's routed experts on (coli_cuda_moe_async: a
  * block of output rows of one (row, slot) pair a launch, its input row in shared memory,
  * 16-byte weight loads), for a small group whose experts share one format: every row of the
@@ -2374,7 +2806,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1;
+    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1,all_mx4=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -2390,6 +2822,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         all_e8&=g->fmt==6&&u->fmt==6&&d->fmt==6;
         any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
         all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
+        all_mx4&=g->fmt==7&&u->fmt==7&&d->fmt==7;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     /* Mixed E8/FP8 groups cannot use a homogeneous grouped kernel. */
@@ -2442,13 +2875,12 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
     if(all_e8){
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
-        if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
-        grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        if(!e8_group_launch(ctx,dev,I,D,max_rows,count,total)) return 0;
     }else if(all_f8){
         /* fp8-e4m3 groups: silu fused in the dual epilogue, like the w4/g4 duals. */
         f8_group_launch(ctx,dev,I,D,max_rows,count);
+    }else if(all_mx4){
+        mx4_group_launch(ctx,dev,I,D,count);
     }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
@@ -2600,7 +3032,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1,
-        all_q4=1,any_g4=0,any_f8=0,all_f8=1;
+        all_q4=1,any_g4=0,any_f8=0,all_f8=1,all_mx4=1;
     GroupDesc host[64];
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -2617,6 +3049,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
         any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
         all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
+        all_mx4&=g->fmt==7&&u->fmt==7&&d->fmt==7;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     if(any_e8&&!all_e8) return 0;
@@ -2641,15 +3074,13 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                 "expert group issue upload")) return 0;
     if(all_e8){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
-        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
-        if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
-        grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        if(!e8_group_launch(ctx,dev,I,D,max_rows,count,total)) return 0;
     }else if(all_f8){
         /* fp8-e4m3 groups on the async decode path: same launch helper as the
          * sync dispatch, silu fused in the dual epilogue. */
         f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
+    }else if(all_mx4){
+        mx4_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,count);
     }else if(group_moe_ok(host,count,total,D,I)){
         /* pin 1: the warp kernels at any row count, so 9..32 rows give the bits of the
          * same experts issued 8 rows at a time (the tensor-core family past
@@ -4281,6 +4712,22 @@ static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
     hcg_part_sum(h, y, S, t->O, st);
     return cuda_ok(cudaGetLastError(), "block gemm launch");
 }
+/* A prompt's rows of a GGUF block matrix outside this backend's tensors (the CUDA expert
+ * tier's, cu_xb.cu, in the same layout: each row the file's blocks in row_words 32-bit
+ * words) on bd_tensor_gemm's f16 tiles, on `stream` of `device`'s context; 0 where they do
+ * not take it (no context, a format or width they decline, no f16 fragments), and the
+ * caller's GEMV does. */
+extern "C" int coli_cuda_bd_gemm_raw(int device, const void *w, int fmt, int I, int O, int row_words,
+                                     const float *x, float *y, int S, void *stream) {   /* cu_xb.cu's, not exported */
+    if (fmt < 100 || !w || !x || !y || S < 2 || I < 1 || O < 1) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    static ColiCudaTensor *t = nullptr;   /* the tier's thread only */
+    if (!t && !(t = (ColiCudaTensor *)calloc(1, sizeof *t))) return 0;
+    t->weights = const_cast<void *>(w); t->scales = nullptr; t->fmt = fmt; t->I = I; t->O = O; t->device = device;
+    t->row_words = row_words; t->weight_bytes = (size_t)row_words * 4 * (size_t)O;
+    return bd_tensor_gemm(ctx, t, y, x, S, (cudaStream_t)stream);
+}
 extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
     if (!p || !bytes) return 0;
     if (cudaHostRegister(p, bytes, cudaHostRegisterPortable) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
@@ -4736,6 +5183,10 @@ extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu
         on = dec && !(b && *b == '0');
     }
     if (fault_injected() || !tg || !tu || !y_dev || !x_dev || S < 1 || tg->fmt < 100 || ((uintptr_t)x_dev & 15)) return 0;
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+    /* rows bd_mmg_k takes: the two matmuls apart on it (the caller's), the bits of the GEMVs and the product */
+    if (bd_mmq_takes(find_ctx(tg->device), tg, S) && bd_mmq_takes(find_ctx(tu->device), tu, S)) return 0;
+#endif
     if (S <= BD_GEMV_MAX_S) {
         if (!dec || tu->fmt != tg->fmt || tu->I != tg->I || tu->O != tg->O || tu->row_words != tg->row_words || tu->device != tg->device) return 0;
         DeviceContext *bc = find_ctx(tg->device);
@@ -4796,6 +5247,31 @@ __global__ static void f32_few_k(float *__restrict__ y, const float *__restrict_
     if ((int)threadIdx.x < O) y[(size_t)s * O + threadIdx.x] = partial[threadIdx.x][0];
 }
 
+/* gemv_i8_w4's split partials on HIP: a buffer a stream that stays for the process, grown (the stream
+ * synchronized first) when a call needs more. The stream-ordered allocator gave each call its own
+ * (hipMallocAsync, hipFreeAsync after the sum) and, without CUDA's release threshold, every
+ * synchronization handed the memory back; an R9700 reported a memory fault in gemv_i8_w4<4> with
+ * the splits on (#2758), which this takes the allocator out of. On a stream past the eight it
+ * keeps, the allocator's as before (NULL). */
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+static void *gemv_sk_part(DeviceContext *ctx, cudaStream_t st, size_t bytes) {
+    int k = -1;
+    for (int i = 0; i < 8 && k < 0; i++) if (ctx->skp[i].p && ctx->skp[i].st == st) k = i;
+    for (int i = 0; i < 8 && k < 0; i++) if (!ctx->skp[i].p) k = i;
+    if (k < 0) return NULL;
+    if (ctx->skp[k].p && ctx->skp[k].cap >= bytes) return ctx->skp[k].p;
+    if (ctx->skp[k].p) {
+        if (cudaStreamSynchronize(st) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+        cudaFree(ctx->skp[k].p); ctx->skp[k].p = NULL; ctx->skp[k].cap = 0;
+    }
+    size_t cap = bytes < ((size_t)1 << 20) ? ((size_t)1 << 20) : bytes;
+    void *p = NULL;
+    if (cudaMalloc(&p, cap) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+    ctx->skp[k].st = st; ctx->skp[k].p = p; ctx->skp[k].cap = cap;
+    return p;
+}
+#endif
+
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
     if (fault_injected()) return 0;
     if (!t || !y_dev || !x_dev || S < 1) return 0;
@@ -4803,6 +5279,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
+    if (!g_bd_x_same) bd_xq_forget(st);   /* x may have changed since the stream's quantization */
     if (t->fmt >= 100) return bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288 && ((uintptr_t)x_dev & 15) == 0) {   /* x in float4 loads */
         unsigned bx = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
@@ -4820,14 +5297,18 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
             int sr = S < GEMV_I8_NR ? S : GEMV_I8_NR;
             size_t xrow = (size_t)(gx4(kc / 4) + 1) * 16;
             while (sr > 1 && sr * xrow > 48 * 1024) sr--;
-            void *part = NULL;
-            if (sr * xrow <= 48 * 1024 && (kz == 1 || cudaMallocAsync(&part, (size_t)kz * S * t->O * sizeof(float), st) == cudaSuccess)) {
+            void *part = NULL; int own = 0;   /* own: the stream's buffer (HIP, gemv_sk_part), kept */
+            const size_t pb = (size_t)kz * S * t->O * sizeof(float);
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+            if (sr * xrow <= 48 * 1024 && kz > 1) own = (part = gemv_sk_part(ctx, st, pb)) != NULL;
+#endif
+            if (sr * xrow <= 48 * 1024 && (kz == 1 || own || cudaMallocAsync(&part, pb, st) == cudaSuccess)) {
                 dim3 g(bw, (unsigned)kz, (unsigned)((S + sr - 1) / sr));
                 if (sr == 1) coli_launch(gemv_i8_w4<1>, g, 256, xrow, st, y_dev, (float *)part, x_dev, w, t->scales, t->I, t->O, S, 1, kc);
                 else coli_launch(gemv_i8_w4<GEMV_I8_NR>, g, 256, sr * xrow, st, y_dev, (float *)part, x_dev, w, t->scales, t->I, t->O, S, sr, kc);
                 if (part) {
                     coli_launch(gemv_i8_sk_sum, dim3((unsigned)((S * t->O + 255) / 256)), 256, 0, st, y_dev, (const float *)part, t->scales, t->O, S, kz);
-                    (void)cudaFreeAsync(part, st);
+                    if (!own) (void)cudaFreeAsync(part, st);
                 }
                 return cuda_ok(cudaGetLastError(), "chain gemv launch (four outputs a warp)");
             }

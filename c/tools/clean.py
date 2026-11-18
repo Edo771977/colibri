@@ -34,13 +34,14 @@ FILES = [
     "backend_cuda_test", "backend_cuda_test.exe",
     "mxfp4_expert_cuda_test", "mxfp4_expert_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
-    "backend_metal.o", "backend_metal_test",
+    "backend_metal.o", "backend_metal_test", "qwen36_metal.o",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
     "tests/compat_prefetch_module.dll",
     "libcoli_xdna.so",                      # `make xdna-helper` (Linux)
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
+    "deepseek_v4.ldflags",
     "deepseek_v41", "deepseek_v41.exe",
     "mimo", "mimo.exe",
     "qwenimage", "qwenimage.exe",

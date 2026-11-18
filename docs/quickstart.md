@@ -37,8 +37,8 @@ Both run `coli setup`, which does the rest:
    in your RAM, and the download fits on your disk.
 3. **Gets the engine**: it builds it for your machine when a compiler is
    there, with Vulkan or CUDA when your GPU can use it, or downloads the
-   prebuilt one when there is no compiler (CPU, and on Linux and Windows
-   Vulkan too). If a package is missing for
+   prebuilt one when there is no compiler (CPU, and on x86-64 Linux and
+   Windows Vulkan too). If a package is missing for
    your GPU it prints the exact command to install it and carries on with the
    CPU; nothing is installed system-wide without you. Run the setup again once
    you have installed it, and it rebuilds the engine for the GPU. CUDA is used
@@ -49,7 +49,7 @@ Both run `coli setup`, which does the rest:
    the build log is.
 4. **Downloads the model** with progress and resume. Interrupt it whenever you
    like: running it again continues where it stopped.
-5. **Starts colibri** and opens the dashboard in your browser, and prints the
+5. **Starts colibri** and opens the chat in your browser, and prints the
    addresses other apps can use.
 
 What you see on Linux (on Windows the same, in the window `START-HERE.bat` opens):
@@ -143,9 +143,12 @@ CPU-only by default.
 > (`ARCH=native` unlocks the vector instructions your chip actually has), or if
 > you plan to hack on the engine.
 >
-> **On ARM64 Linux (AWS Graviton, Ampere, Raspberry Pi, aarch64 VMs) there is no
-> shortcut**: the published Linux archive is x86_64 only. Build from source —
-> sections 1 and 2 work unchanged, and the engine needs no ARM-specific flags.
+> **On ARM64 Linux (AWS Graviton, Ampere, Raspberry Pi, aarch64 VMs)** take
+> `colibri-<version>-linux-aarch64.tar.gz`. It is built for plain armv8-a, so it
+> starts on a Raspberry Pi 4 as well, and runs on the CPU only. A core with the
+> dot-product instructions (Raspberry Pi 5, Graviton, Ampere) runs the SDOT/SMMLA
+> int8/int4 kernels only in an engine built on it: build from source for that —
+> sections 1 and 2 work unchanged.
 
 ### Linux (Ubuntu / Debian)
 
@@ -206,8 +209,13 @@ easy path.
 Install [MSYS2](https://www.msys2.org/), open the **UCRT64** shell, and run:
 
 ```bash
-pacman -S --needed mingw-w64-ucrt-x86_64-gcc make git python
+pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp make git python
 ```
+
+`libgomp` is its own package since gcc 16; without it the link fails with
+`cannot find -lgomp`. An MSYS2 whose package list predates gcc 16 answers
+`target not found: mingw-w64-ucrt-x86_64-libgomp` and installs nothing: run
+`pacman -Syu` first, or leave that package out (its gcc still brings libgomp).
 
 ### macOS
 
@@ -385,5 +393,5 @@ emulator or a hypervisor that reports fewer features than it runs).
 |---|---|
 | Windows native build (and CUDA DLL) | [docs/windows.md](windows.md) |
 | Tuning: cache, prefetch, speculation | [docs/tuning.md](tuning.md) |
-| OpenAI-compatible API + web dashboard | [docs/api.md](api.md) |
+| OpenAI-compatible API + the chat in the browser | [docs/api.md](api.md) |
 | Every environment variable | [docs/ENVIRONMENT.md](ENVIRONMENT.md) |

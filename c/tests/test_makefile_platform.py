@@ -1,12 +1,15 @@
 import os
 import shutil
+import sys
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 
 C_DIR = Path(__file__).resolve().parents[1]
-MAKE = shutil.which("make")
+# GNU make: the BSDs' own make cannot read this Makefile, and they install GNU make as gmake.
+MAKE = shutil.which("gmake" if sys.platform.startswith(("freebsd", "openbsd", "netbsd", "dragonfly")) else "make")
 
 
 @unittest.skipUnless(MAKE, "make is required")
@@ -28,6 +31,27 @@ class MakefilePlatformTests(unittest.TestCase):
             capture_output=True,
             check=True,
         )
+
+    def test_cuda_glibc_compat_opt_out_preserves_other_flags(self):
+        default = self._dry_run("backend_cuda.o", "x86_64-unknown-linux-gnu",
+                                CUDA=1, CUDA_ARCH="sm_86")
+        disabled = self._dry_run("backend_cuda.o", "x86_64-unknown-linux-gnu",
+                                 CUDA=1, CUDA_ARCH="sm_86", CUDA_GLIBC_MATH_COMPAT=0)
+        before = next(line for line in default.stdout.splitlines()
+                      if "-c backend_cuda.cu" in line)
+        after = next(line for line in disabled.stdout.splitlines()
+                     if "-c backend_cuda.cu" in line)
+        # make spells its directory its own way (/d/a/... under MSYS2, where
+        # Python has D:/a/...), so the flag is the one naming the header.
+        compat = [f for f in before.split()
+                  if f.startswith("-Xcompiler=-include,")
+                  and f.endswith(f"/{C_DIR.name}/glibc_c23_math_compat.h")]
+        self.assertEqual(len(compat), 1, before)
+        flag = compat[0]
+        self.assertNotIn("glibc_c23_math_compat.h", after)
+        self.assertEqual(before.replace(flag, "").split(), after.split())
+        stamp = (C_DIR / ".build-config").read_text()
+        self.assertIn("CUDA_GLIBC_MATH_COMPAT=0", stamp)
 
     def test_windows_nt_without_uname_selects_mingw_build(self):
         env = os.environ.copy()
@@ -79,53 +103,81 @@ class MakefilePlatformTests(unittest.TestCase):
                 self.assertNotIn("-lvulkan", link)
                 self.assertNotIn("-Bdynamic", link)
 
-    def test_windows_clang_and_gcc_link_lines(self):
-        # MSYS2 CLANG64 clang reports x86_64-w64-windows-gnu (no "mingw"): it
-        # must still get the .exe target and the Windows libraries, link libomp
-        # dynamically (no -static) and add -lpthread for libwinpthread; a MinGW
-        # gcc keeps -static. Both reserve an 8 MB stack. The decision follows
-        # the triple, not the compiler's name (CLANG64's gcc wrapper is clang),
-        # and with a windows-gnu triple the compiler that reported it builds:
-        # an environment CC is not replaced by gcc.
-        cases = (
-            # triple, CC in the environment (None: unset), expected compiler, clang
-            ("x86_64-w64-windows-gnu", "clang", "clang", True),
-            ("x86_64-w64-windows-gnu", None, "gcc", True),
-            ("x86_64-w64-mingw32", None, "gcc", False),
+    def test_clang_mingw_triple_builds_for_windows(self):
+        # clang names the MinGW target x86_64-w64-windows-gnu, gcc x86_64-w64-mingw32 (#2286)
+        result = self._dry_run("colibri", "x86_64-w64-windows-gnu")
+        link = next(
+            line for line in result.stdout.splitlines() if "-o colibri.exe " in line
         )
+        self.assertEqual(link.split()[-2:], ["-static", "-lpsapi"])
 
-        for triplet, env_cc, expected_cc, is_clang in cases:
-            with self.subTest(triplet=triplet, env_cc=env_cc):
-                env = os.environ.copy()
-                env.pop("CC", None)
-                if env_cc is not None:
-                    env["CC"] = env_cc
+    def test_deepseek_v4_windows_link_per_compiler(self):
+        # clang links libomp.a: no -pthread (its driver adds winpthreads), no LTO by
+        # default (GNU ld lacks LLVM's plugin); gcc's line stays as it was (#2286)
+        cases = (
+            ("gcc", ["-static", "-pthread", "-flto"]),
+            ("clang", ["-lm", "-fopenmp", "-static"]),
+        )
+        for cc, tail in cases:
+            with self.subTest(cc=cc):
                 result = subprocess.run(
-                    [
-                        MAKE,
-                        "--no-print-directory",
-                        "-B",
-                        "-n",
-                        "qwen36.exe",
-                        f"TRIPLET={triplet}",
-                    ],
-                    cwd=C_DIR,
-                    env=env,
-                    text=True,
-                    capture_output=True,
-                    check=True,
+                    [MAKE, "--no-print-directory", "-B", "-n", "-f",
+                     "Makefile.deepseek-v4", "deepseek-v4", "OS=Windows_NT",
+                     f"CC={cc}"],
+                    cwd=C_DIR, text=True, capture_output=True, check=True,
                 )
                 link = next(
-                    line
-                    for line in result.stdout.splitlines()
-                    if "-o qwen36.exe " in line
+                    line for line in result.stdout.splitlines()
+                    if " -o deepseek_v4.exe " in line
                 )
-                words = link.split()
-                self.assertEqual(words[0], expected_cc)
-                self.assertIn("-lpsapi", words)
-                self.assertIn("-Wl,--stack,8388608", words)
-                self.assertEqual("-static" in words, not is_clang)
-                self.assertEqual("-lpthread" in words, is_clang)
+                self.assertEqual(link.split()[0], cc)
+                self.assertEqual(link.split()[-3:], tail)
+
+    def test_deepseek_v4_clang_stub_only_when_num_devices_is_unresolved(self):
+        # libomp.a's weak omp_get_num_devices stays unresolved with MSYS2's 22.1.7 or
+        # binutils 2.46; where it links, no second definition is added (#2286)
+        undefined = "libomp.a(kmp_alloc.cpp.obj): undefined reference to `omp_get_num_devices'"
+        with tempfile.TemporaryDirectory() as tmp:
+            for libomp, error in (("22", undefined), ("23", "")):
+                with self.subTest(libomp=libomp):
+                    fake = Path(tmp) / f"clang-{libomp}"
+                    fake.write_text(
+                        "#!/bin/sh\n"
+                        '[ "$1" = -dumpmachine ] && { echo x86_64-w64-windows-gnu; exit 0; }\n'
+                        f"cat <<'EOF'\n{error}\nEOF\n"
+                    )
+                    fake.chmod(0o755)
+                    result = subprocess.run(
+                        [MAKE, "--no-print-directory", "-B", "-n", "-f",
+                         "Makefile.deepseek-v4", "backend_loader_dsv4.o",
+                         "OS=Windows_NT", f"CC={fake.as_posix()}"],
+                        cwd=C_DIR, text=True, capture_output=True, check=True,
+                    )
+                    compile_line = next(
+                        line for line in result.stdout.splitlines()
+                        if "-c backend_loader_dsv4.c" in line
+                    )
+                    self.assertEqual("-DCOLI_OMP_NUM_DEVICES_STUB" in compile_line,
+                                     libomp == "22", compile_line)
+
+    def test_freebsd_x86_64_builds_with_clang(self):
+        # FreeBSD's own compiler is clang, with libomp in the base system; gcc is a
+        # package there. gcc names the target ...-portbld-freebsd, clang ...-unknown-freebsd.
+        cases = (
+            ("x86_64-unknown-freebsd15.1", {}, "clang"),
+            ("x86_64-portbld-freebsd15.1", {}, "clang"),
+            ("x86_64-unknown-freebsd15.1", {"CC": "gcc"}, "gcc"),
+            ("x86_64-unknown-linux-gnu", {}, "gcc"),
+        )
+
+        for triplet, variables, compiler in cases:
+            with self.subTest(triplet=triplet, variables=variables):
+                result = self._dry_run("colibri", triplet, **variables)
+                link = next(
+                    line for line in result.stdout.splitlines() if "-o colibri " in line
+                )
+                self.assertEqual(link.split()[0], compiler)
+                self.assertIn("-fopenmp", link)
 
     def test_darwin_portable_build_does_not_force_x86_architecture(self):
         missing_libomp = "/colibri-test/missing-libomp"
@@ -137,6 +189,19 @@ class MakefilePlatformTests(unittest.TestCase):
         self.assertNotIn("-mcpu=x86-64-v3", result.stdout)
         self.assertNotIn(missing_libomp, result.stdout)
         self.assertNotIn("-fopenmp", result.stdout)
+
+    def test_dsv4_dll_takes_the_pre_ampere_preset_and_no_tc(self):
+        # The loader tells Pascal/Turing users to build with
+        # CUDA_ARCH=portable-pre-ampere NO_TC=1; cuda-dsv4-dll is the Windows build.
+        out = self._dry_run("cuda-dsv4-dll", "x86_64-w64-mingw32",
+                            CUDA_ARCH="portable-pre-ampere", NO_TC=1).stdout
+        self.assertIn("-o coli_cuda_dsv4.dll", out)
+        self.assertNotIn("-arch=portable-pre-ampere", out)
+        for sm in ("61", "75", "80", "86", "89", "90"):
+            self.assertIn(f"arch=compute_{sm},code=sm_{sm}", out)
+        self.assertIn("arch=compute_90,code=compute_90", out)
+        self.assertIn("-DCOLI_DSV4_NO_TC", out)
+        self.assertNotIn("-lcublasLt", out)
 
 
 if __name__ == "__main__":
