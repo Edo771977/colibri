@@ -150,14 +150,15 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 # and prefetch threads call pthread_* and clock_gettime, which live there, and a
 # CLANG64 link of qwen36.exe without it stopped on clock_gettime64 and every
 # pthread_*. Where the driver adds it already, the second -lpthread is harmless.
-# The same triple links with lld by default in CLANG64, which reserves a 1 MB
-# main-thread stack where GNU ld reserves 2 MB; the clang builds that ran on the
-# operator's machine reserved 8 MB, and so does this (address space: pages
-# commit as they are touched). Before -static so the gcc link line still ends in
-# -static -lpsapi; a MinGW gcc's line is unchanged.
+# The same triple links with lld by default in CLANG64, which reserves 1 MB of
+# stack where GNU ld reserves 2 MB: for the main thread and for every thread made
+# without an explicit size (qwen36's pilot thread among them). The clang builds
+# that ran on the operator's machine reserved 8 MB, and so does this (address
+# space: pages commit as they are touched). Before -static so the link line still
+# ends in -static -lpsapi; $(strip) keeps a MinGW gcc's line byte-identical.
 WIN_GNU_LD_FLAGS := -lpthread -Wl,--stack,8388608
 WIN_GNU_LD := $(if $(findstring windows-gnu,$(TRIPLET)),$(WIN_GNU_LD_FLAGS),)
-LDFLAGS = -lm -fopenmp $(WIN_GNU_LD) -static -lpsapi $(EXTRA_LDFLAGS)
+LDFLAGS = $(strip -lm -fopenmp $(WIN_GNU_LD) -static -lpsapi) $(EXTRA_LDFLAGS)
 # The -static link needs libgomp.a. Since gcc 16 MSYS2 ships it in its own package
 # (mingw-w64-ucrt-x86_64-libgomp) instead of pulling it in with gcc, so a fresh
 # install has -fopenmp but no archive, and the link stops with a bare
